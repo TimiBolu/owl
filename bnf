@@ -1,0 +1,62 @@
+<program> ::= <statements> <sys_result>?
+<statements> ::= <statement> <statements> | ε
+<statement> ::= <schema> | <query>
+
+
+<schema> ::= <ident> "{" <fields> "}"
+<fields> ::= <field> ("," <field>)* | ε
+<field> ::= <ident> <field_type>
+<field_type> ::= "String" | "Int8" | "Float" | "Bool" | "DateTime"
+               | "GeoPoint" ("(" "grid" ":" "{" "resolution" ":" <string> "}")")?
+               | <ident>  // Reference to another schema (e.g., Profession, Industry)
+<ident> ::= [a-zA-Z_][a-zA-Z0-9_]*
+<string> ::= "\"" [^"]* "\""
+
+
+<query> ::= <ident> "=" <source> <operator_chain>?
+<source> ::= <ident> ("::" <ident>)?
+<operator_chain> ::= "::" <operator> <operator_chain>?
+<operator> ::= "filter" "{" <condition> "}"
+             | "geo_within" "{" "field" ":" <field_path> "," "bounds" ":" "{" <bounds> "}" "}"
+             | "lead" "{" "name" ":" <ident> "," "field" ":" <field_path> "," "offset" ":" <number> ("," "order" "by" <order_by>)? "}"
+             | "select" "{" <select_fields> "}"
+             | "batch_insert" "[" <insert_values> "]"
+
+
+<condition> ::= <expr> <op> <expr>
+<op> ::= "==" | "!=" | ">" | "<" | ">=" | "<="
+<expr> ::= <field_path> | <literal> | <arith_expr> | <func_call>
+<field_path> ::= "." <ident> ("." <ident>)*
+<literal> ::= <string> | <number> | "true" | "false" | "null" | <object>
+<number> ::= "-"? [0-9]+ ("." [0-9]+)?
+
+
+<select_fields> ::= <select_field> ("," <select_field>)*
+<select_field> ::= <ident> (":" <expr>)?
+<arith_expr> ::= <literal> "-" <field_path>
+<func_call> ::= "count" "(" <field_path> ")"
+
+
+<sys_result> ::= "sys" "::" "result" "{" <result_map> "}"
+<result_map> ::= <ident> ":" <ident> ("," <ident> ":" <ident>)* | ε
+
+
+
+<program> ::= <statements> <sys_result>?
+<statements> ::= <statement> <statements> | ε
+<statement> ::= <schema> | <query>
+<schema> ::= <ident> "{" <fields> "}"
+<query> ::= <ident> "=" <source> <operator_chain>?
+<source> ::= <ident> ("::" <ident>)?
+<operator_chain> ::= "::" <operator> <operator_chain>?
+<operator> ::= "filter" "{" <condition> "}"
+             | "geo_within" "{" "field" ":" <field_path> "," "bounds" ":" "{" <bounds> "}" "}"
+             | "lead" "{" "name" ":" <ident> "," "field" ":" <field_path> "," "offset" ":" <number> ("," "order" "by" <order_by>)? "}"
+             | "select" "{" <select_fields> "}"
+             | "batch_insert" "[" <insert_values> "]"
+
+
+// function syntax
+fn <name>(<param>: <type>, ...) -> <return_type> {
+    <query_body>
+}

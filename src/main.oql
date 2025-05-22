@@ -1,0 +1,276 @@
+schema org_companies {
+    id: String
+    name: String
+    company: Ref(companies)
+    org_id: String
+    status: String
+    risk: String
+    calculated_risk: String
+    created_at: DateTime
+}
+
+schema companies {
+    id: String
+    name: String
+}
+
+schema org_findings {
+    id: String
+    org_company: Ref(org_companies)
+    finding: Ref(findings)
+    finding_type: Ref(finding_types)
+    level: String
+    visible: Bool
+    work_status: String
+    created_at: DateTime
+}
+
+schema findings {
+    id: String
+    level: String
+    visible: Bool
+}
+
+schema finding_types {
+    id: String
+    default_level: String
+    default_visibility: Bool
+}
+
+schema org_finding_changes {
+    org_finding: Ref(org_findings)
+    org_id: String
+    created_at: DateTime
+    new_severity: String
+    prev_severity: String
+    new_work_status: String
+    prev_work_status: String
+}
+
+schema org_company_changes {
+    org_company: Ref(org_companies)
+    created_at: DateTime
+    new_status: String
+    prev_risk: String
+    prev_calculated_risk: String
+}
+
+fn risk_value(level: String) -> Int {
+    match level {
+        "RISK_LEVEL_UNSPECIFIED" -> 0
+        "RISK_LEVEL_LOW" -> 1
+        "RISK_LEVEL_MEDIUM" -> 2
+        "RISK_LEVEL_HIGH" -> 3
+        "RISK_LEVEL_CRITICAL" -> 4
+        else -> 0
+    }
+}
+
+fn clamp_level(org_level: String, finding_level: String, company_risk: String) -> String {
+    let finding_val = risk_value(finding_level)
+    let company_val = risk_value(company_risk)
+    if org_level != "RISK_LEVEL_UNSPECIFIED" then org_level
+    else if finding_val > company_val && company_risk != "RISK_LEVEL_UNSPECIFIED" then company_risk
+    else finding_level
+}
+
+fn days_series(start: DateTime, end: DateTime, interval: String) -> List<DateTime> {
+    generate_series(start, end, interval)
+}
+
+ListCompaniesWithMostFindings {
+    let org_id = "org123"
+    let query_limit = 10
+
+    let findings = org_findings::where {
+        coalesce(.visible, .finding.visible, .finding_type.default_visibility) == true
+    }::select {
+        id
+        org_company
+        work_status
+        level = coalesce(.level, .finding.level, .finding_type.default_level)
+        org_level = coalesce(.level, "RISK_LEVEL_UNSPECIFIED")
+        company_risk = if .org_company.risk != "RISK_LEVEL_UNSPECIFIED" then .org_company.risk else .org_company.calculated_risk
+    }
+
+    let clamped = findings::select {
+        id
+        org_company
+        work_status
+        level = clamp_level(.org_level, .level, .company_risk)
+        company_risk
+    }
+
+    let companies = org_companies::where {
+        .org_id == org_id &&
+        .status not in ["COMPANY_STATUS_ARCHIVED", "COMPANY_STATUS_REJECTED", "COMPANY_STATUS_OFFBOARDED", "COMPANY_STATUS_UNSPECIFIED", "COMPANY_STATUS_DISCOVERY"]
+    }::group {
+        .id, coalesce(.name, .company.name), .clamped.company_risk
+    }
+
+    companies::select {
+        id
+        name = coalesce(.name, .company.name)
+        risk = .clamped.company_risk
+        critical = sum(if .clamped.level == "RISK_LEVEL_CRITICAL" then 1 else 0 where .clamped.level in ["RISK_LEVEL_CRITICAL", "RISK_LEVEL_HIGH"] && .clamped.work_status in ["FINDING_STATUS_OPEN", "FINDING_STATUS_ONGOING"])
+        high = sum(if .clamped.level == "RISK_LEVEL_HIGH" then 1 else 0 where .clamped.level in ["RISK_LEVEL_CRITICAL", "RISK_LEVEL_HIGH"] && .clamped.work_status in ["FINDING_STATUS_OPEN", "FINDING_STATUS_ONGOING"])
+        total_findings = count(.clamped.id where .clamped.level in ["RISK_LEVEL_CRITICAL", "RISK_LEVEL_HIGH"] && .clamped.work_status in ["FINDING_STATUS_OPEN", "FINDING_STATUS_ONGOING"])
+    }::sort {
+        total_findings desc
+        critical desc
+    }::limit {
+        query_limit
+    }
+}
+
+FindingsCountBySeverityTimeseries {
+    let org_id = "org123"
+    let period = "30 days"
+    let interval = "1 day"
+
+    let days = days_series(now() - period, now(), interval)
+
+    let findings = org_findings::where {
+        coalesce(.visible, .finding.visible, .finding_type.default_visibility) == true
+    }::select {
+        id
+        org_company
+        work_status
+        level = coalesce(.level, .finding.level, .finding_type.default_level)
+        org_level = coalesce(.level, "RISK_LEVEL_UNSPECIFIED")
+        company_risk = if .org_company.risk != "RISK_LEVEL_UNSPECIFIED" then .org_company.risk else .org_company.calculated_risk
+    }
+
+    let clamped = findings::select {
+        id
+        org_company
+        work_status
+        level = clamp_level(.org_level, .level, .company_risk)
+    }
+
+    let events = org_findings::where {
+        .org_company.org_id == org_id
+    }::select {
+        finding_id = .id
+        org_id = .org_company.org_id
+        event_time = .created_at
+        new_severity = .clamped.level
+        new_status = .work_status
+    }::union {
+        org_finding_changes::where {
+            .org_id == org_id
+        }::select {
+            finding_id = .org_finding
+            org_id
+            event_time = .created_at
+            new_severity
+            prev_severity
+            new_status = .new_work_status
+            prev_status = .prev_work_status
+        }
+    }
+
+    let intervals = events::select {
+        finding_id
+        severity = .new_severity
+        prev_severity
+        status = .new_status
+        start_time = .event_time
+        end_time = lead(.event_time, 1, now() + interval) over (partition by .finding_id order by .event_time)
+    }
+
+    let active = days::select {
+        day
+        finding_id = .intervals.finding_id
+        severity = coalesce(.intervals.severity, .intervals.org_findings.level)
+        status = .intervals.status
+    }::where {
+        .status not in ["FINDING_STATUS_ACCEPTED", "FINDING_STATUS_RESOLVED", "FINDING_STATUS_UNSPECIFIED"]
+    }
+
+    active::group {
+        .day
+    }::select {
+        day
+        critical = sum(if .severity == "RISK_LEVEL_CRITICAL" then 1 else 0)
+        high = sum(if .severity == "RISK_LEVEL_HIGH" then 1 else 0)
+        medium = sum(if .severity == "RISK_LEVEL_MEDIUM" then 1 else 0)
+        low = sum(if .severity == "RISK_LEVEL_LOW" then 1 else 0)
+    }::sort {
+        .day asc
+    }
+}
+
+DaysCompaniesInAssessmentRequired {
+    let org_id = "org123"
+
+    let latest_changes = org_company_changes::where {
+        .new_status != null
+    }::group {
+        .org_company
+    }::select {
+        org_company
+        last_change_date = max(.created_at)
+    }
+
+    org_companies::where {
+        .org_id == org_id &&
+        .status in ["COMPANY_STATUS_ASSESSMENT_REQUIRED", "COMPANY_STATUS_RE_ASSESSMENT_REQUIRED"]
+    }::select {
+        days_since_last_change = coalesce(
+            round(extract("day", now() - .latest_changes.last_change_date)),
+            round(extract("day", now() - .created_at))
+        )
+    }
+}
+
+CompaniesInEachRiskByDate {
+    let org_id = "org123"
+    let date = "2023-01-01"
+
+    let changes = org_company_changes::where {
+        .created_at > date
+    }::group {
+        .org_company
+    }::select {
+        org_company
+        latest_change_date = max(.created_at)
+        prev_risk
+        prev_calculated_risk
+    }
+
+    let companies = org_companies::where {
+        .created_at <= date &&
+        .org_id == org_id &&
+        .status not in ["COMPANY_STATUS_ARCHIVED", "COMPANY_STATUS_REJECTED", "COMPANY_STATUS_OFFBOARDED", "COMPANY_STATUS_UNSPECIFIED", "COMPANY_STATUS_DISCOVERY"]
+    }::select {
+        id
+        risk
+        calculated_risk
+        latest_change_date = .changes.latest_change_date
+        prev_risk = .changes.prev_risk
+        prev_calculated_risk = .changes.prev_calculated_risk
+    }
+
+    let risk_levels = ["RISK_LEVEL_LOW", "RISK_LEVEL_MEDIUM", "RISK_LEVEL_HIGH", "RISK_LEVEL_CRITICAL"]
+
+    risk_levels::select {
+        risk_level
+        company_count = count(.companies.id where .companies.risk_level == risk_level)
+    }::where {
+        .companies.risk_level = if .prev_risk != null && .prev_risk != "RISK_LEVEL_UNSPECIFIED" then .prev_risk
+                                else if .prev_calculated_risk != null && .prev_calculated_risk != "RISK_LEVEL_UNSPECIFIED" then .prev_calculated_risk
+                                else if .risk != null && .risk != "RISK_LEVEL_UNSPECIFIED" then .risk
+                                else if .calculated_risk != null && .calculated_risk != "RISK_LEVEL_UNSPECIFIED" then .calculated_risk
+                                else "RISK_LEVEL_LOW"
+    }::sort {
+        .risk_level asc
+    }
+}
+
+sys::result {
+    companies_with_findings: ListCompaniesWithMostFindings
+    severity_timeseries: FindingsCountBySeverityTimeseries
+    days_in_assessment: DaysCompaniesInAssessmentRequired
+    risk_by_date: CompaniesInEachRiskByDate
+}
