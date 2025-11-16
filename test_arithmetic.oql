@@ -1,0 +1,18 @@
+// Test arithmetic expressions
+
+users.insert { id: "user1", name: "Alice", age: 25 }
+users.insert { id: "user2", name: "Bob", age: 30 }
+
+// Test arithmetic in update
+users.where { .age < 30 }.update {
+    age: .age + 1
+}
+
+// Test arithmetic in select
+users.select {
+    id,
+    name,
+    age,
+    age_plus_five: .age + 5,
+    age_times_two: .age * 2
+}

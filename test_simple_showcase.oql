@@ -1,0 +1,37 @@
+// Simple Data Showcase Test
+
+// Insert some test data
+users.insert {
+    id: "user1",
+    name: "Alice Smith", 
+    age: 28,
+    email: "alice@example.com"
+}
+
+users.insert {
+    id: "user2",
+    name: "Bob Johnson",
+    age: 35,
+    email: "bob@example.com"
+}
+
+// Test basic queries
+users
+
+// Test filtering
+users.where { .age > 30 }
+
+// Test select
+users.select {
+    id,
+    name,
+    age
+}
+
+// Test update with arithmetic (this should work)
+users.where { .age < 30 }.update {
+    age: .age + 1
+}
+
+// Final query to see the update
+users

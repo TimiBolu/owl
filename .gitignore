@@ -1,1 +1,85 @@
-/target
+# Rust
+target/
+**/target/
+# Note: Cargo.lock should be tracked for applications, ignored for libraries
+# Keeping it tracked since this is an application
+
+# Zig build artifacts
+zig-out/
+zig-cache/
+.zig-cache/
+owl_storage_zig/zig-out/
+owl_storage_zig/zig-cache/
+
+# Database files
+*.db
+*.owl
+oql_db_data/
+*.log
+*.sst
+*.ldb
+
+# Test files
+test_*.owl
+*_test.owl
+*.test.owl
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Kiro IDE (keep specs, ignore other generated files if they exist)
+.kiro/settings/
+.kiro/cache/
+.kiro/logs/
+.kiro/temp/
+
+# Task summaries and working documents
+TASK_*_SUMMARY.md
+TASK_*_COMPLETE.md
+*_SUMMARY.md
+*_COMPLETE.md
+*_STATUS.md
+NEXT_STEPS.md
+PROTOTYPE_*.md
+SPEC_DRIVEN_*.md
+
+# Comparison documents (working notes)
+*_comparison.md
+
+# Working prototypes and examples
+owl_storage_prototype/
+simple_owl_storage.md
+ZIG_PROTOTYPE_EXAMPLE.zig
+ZIG_REWRITE_*.md
+
+# Test suites and data
+oql_test_suite/
+comprehensive_test.oql
+improved_syntax.oql
+
+# Temporary architecture documents (keep main ones in owl_design_and_architecture/)
+owl_architecture.md
+owl_storage_design.md
+
+# Benchmark results
+criterion/
+*.criterion
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup

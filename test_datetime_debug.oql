@@ -1,0 +1,14 @@
+// Debug DateTime comparison issue
+
+// Insert with created_at as string
+orders.insert {
+    id: "test_order",
+    created_at: "2024-01-15T10:30:00Z",
+    total: 100.0
+}
+
+// Try string comparison (this should work)
+orders.where { .created_at == "2024-01-15T10:30:00Z" }
+
+// Try the problematic comparison
+orders.where { .created_at < "2024-01-01T00:00:00Z" }

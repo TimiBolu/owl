@@ -1,187 +1,111 @@
-// src/main.rs
-mod ast;
-mod executor;
-mod parser;
-mod tokenizer;
+// src/main.rs - OQL Database System
+use owl_db::{execute_oql_file_simple, OQLRunner};
+use std::env;
 
-use executor::execute;
-use parser::Parser;
-use std::error::Error;
-use tokenizer::tokenize;
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = env::args().collect();
+    
+    if args.len() >= 2 {
+        // Execute OQL file from command line argument
+        let file_path = &args[1];
+        println!("🦉 Executing OQL file: {}", file_path);
+        
 
-fn main() -> Result<(), Box<dyn Error>> {
-    let db = sled::open("owl_db_data")?;
-
-    let program_str = r#"
-        SatelliteImagery {
-            coordinates GeoPoint(grid: { resolution: "1km" })
-            fire_detected Bool
-            temperature Float
-            timestamp DateTime
-        }
-
-        Hospitals {
-            location GeoPoint
-            name String
-            bed_capacity Int
-            emergency_contact String
-        }
-
-        Banks {
-            location GeoPoint
-            name String
-        }
-
-        enum SchoolKind {
-            Public,
-            Private
-        }
-
-        Schools {
-            location GeoPoint
-            name String
-            student_count Int
-            kind SchoolKind
-        }
-
-        type GeoGrid {
-            grid_id String
-        }
-
-        type Range {
-            min Number
-            max Number
-        }
-
-        Employee {
-            id String
-            name String
-            age Int8
-            profession String
-            location GeoPoint(grid: { resolution: "1km" })
-        }
-
-        Profession {
-            id String
-            name String
-            industry String
-        }
-
-        Industry {
-            id String
-            name String
-        }
-
-        fn count_one_km_in_zone(Coll Collection<{location GeoPoint}>, zone GeoGrid) -> Number {
-            Coll::filter {
-                geo.grid_cell(.location, "1km") == zone.grid_id
-            }::count { .location }
-        }
-
-        fn locationInZone(Coll Collection<{location GeoPoint}>, zone GeoGrid) -> Collection<{location GeoPoint}> {
-            Coll::filter {
-                geo.grid_cell(.location, "1km") == zone.grid_id
+        
+        execute_oql_file_simple(file_path)?;
+    } else {
+        // Run embedded OQL demonstration
+        println!("🦉 OQL Database System - Interactive Demo");
+        println!("=========================================");
+        
+        // Create OQL runner with temporary database
+        use owl_db::storage::zig_adapter::ZigStore;
+        let store = std::sync::Arc::new(ZigStore::new("./demo_db", 1024 * 1024 * 100)?);
+        let runner = OQLRunner::new(store);
+        
+        // Execute embedded OQL content
+        let demo_oql = r#"
+            // Schema definitions
+            schema users {
+                id: String,
+                name: String,
+                email: String,
+                age: Integer,
+                created_at: String
             }
-        }
-
-        fn count_in_zone(Coll Collection<{location GeoPoint}>, zone GeoGrid) -> Number {
-            locationInZone(Coll, zone)::count { .location }
-        }
-
-        fn students_in_zone(zone GeoGrid) -> Number {
-            locationInZone(LargePublicSchools, zone)::sum { .student_count }
-        }
-
-        fn within_range(value Number, range Range) -> Bool {
-            value >= range.min && value <= range.max
-        }
-
-        EmployeeData = Employee::batch_insert [
-            { id: "e1", name: "Alice", age: 55, profession: "p1", location: { lat: 37.7749, lon: -122.4194 } },
-            { id: "e2", name: "Bob", age: 45, profession: "p2", location: { lat: 40.7128, lon: -74.0060 } },
-            { id: "e3", name: "Charlie", age: 60, profession: "p3", location: { lat: 51.5074, lon: -0.1278 } }
-        ]
-
-        ProfessionData = Profession::batch_insert [
-            { id: "p1", name: "Engineer", industry: "i1" },
-            { id: "p2", name: "Designer", industry: "i2" },
-            { id: "p3", name: "Manager", industry: "i1" }
-        ]
-
-        IndustryData = Industry::batch_insert [
-            { id: "i1", name: "Tech" },
-            { id: "i2", name: "Creative" }
-        ]
-
-        SatelliteData = SatelliteImagery::batch_insert [
-            { coordinates: { lat: 37.7749, lon: -122.4194 }, fire_detected: true, temperature: 35.5, timestamp: "2023-10-01T12:00:00Z" },
-            { coordinates: { lat: 40.7128, lon: -74.0060 }, fire_detected: false, temperature: 22.3, timestamp: "2023-10-01T12:05:00Z" },
-            { coordinates: { lat: 51.5074, lon: -0.1278 }, fire_detected: true, temperature: 40.0, timestamp: "2023-10-01T12:10:00Z" }
-        ]
-
-        HospitalData = Hospitals::batch_insert [
-            { location: { lat: 37.7859, lon: -122.4364 }, name: "SF General", bed_capacity: 200, emergency_contact: "911" },
-            { location: { lat: 40.7228, lon: -74.0160 }, name: "NY Medical", bed_capacity: 150, emergency_contact: "911" }
-        ]
-
-        BankData = Banks::batch_insert [
-            { location: { lat: 37.7959, lon: -122.4264 }, name: "Bank of SF" },
-            { location: { lat: 40.7328, lon: -74.0260 }, name: "NY Bank" }
-        ]
-
-        SchoolData = Schools::batch_insert [
-            { location: { lat: 37.7649, lon: -122.4094 }, name: "SF Public", student_count: 1500, kind: "Public" },
-            { location: { lat: 40.7028, lon: -74.0160 }, name: "NY Private", student_count: 800, kind: "Private" }
-        ]
-
-        LargePublicSchools = Schools::filter {
-            .kind == "Public"
-            .student_count > 1000
-        }
-
-        SeniorEmployees = EmployeeData::filter {
-            .age > 50
-        }::geo_within {
-            field: .location,
-            bounds: { min_lat: 30.0, max_lat: 60.0, min_lon: -130.0, max_lon: 0.0 }
-        }::lead {
-            name: next_employee,
-            field: .name,
-            offset: 1,
-            order by .age asc
-        }::select {
-            name: .name,
-            years_to_retirement: 65 - .age,
-            industry: .profession.industry.name,
-            next_employee,
-            employee_count: count(.id)
-        }
-
-        EmergencyReport = SatelliteData::group {
-            by geo.grid_cell(.coordinates, "1km") as zone
-        }::select {
-            hospitals: count_in_zone(HospitalData, zone),
-            banks: count_in_zone(BankData, zone),
-            school_count: count_in_zone(LargePublicSchools, zone),
-            total_students: students_in_zone(zone),
-            evacuation_capacity: (hospitals * 50 + banks * 10) / total_students
-        }::filter {
-            total_students > 0
-        }
-
-        sys::result {
-            seniors: SeniorEmployees,
-            emergency: EmergencyReport
-        }
-    "#.trim();
-
-    println!("Parsing program: {}", program_str);
-    let tokens = tokenize(program_str);
-    let mut parser = Parser::new(tokens);
-    let program = parser.parse_program()?;
-    println!("AST: {:#?}", program);
-    let result = execute(program, &db)?;
-    println!("Result: {:#?}", result);
-
+            
+            schema orders {
+                id: String,
+                user_id: String,
+                total: Float,
+                status: String,
+                created_at: String
+            }
+            
+            // Insert sample data
+            users.insert {
+                id: "user_001",
+                name: "Alice Smith",
+                email: "alice@example.com",
+                age: 28
+            }
+            
+            users.insert {
+                id: "user_002", 
+                name: "Bob Jones",
+                email: "bob@example.com",
+                age: 35
+            }
+            
+            orders.insert {
+                id: "order_001",
+                user_id: "user_001",
+                total: 299.99,
+                status: "completed"
+            }
+            
+            orders.insert {
+                id: "order_002",
+                user_id: "user_002", 
+                total: 150.00,
+                status: "pending"
+            }
+            
+            // Query the data
+            users
+            
+            users.where { .age > 30 }
+            
+            users.where { .name == "Alice Smith" }
+            
+            orders.where { .status == "pending" }
+            
+            // Update operations
+            users.where { .id == "user_001" }.update {
+                age: 29
+            }
+            
+            orders.where { .id == "order_002" }.update {
+                status: "shipped"
+            }
+            
+            // Final queries to see changes
+            users.where { .id == "user_001" }
+            
+            orders.where { .status == "shipped" }
+        "#;
+        
+        println!("\nExecuting embedded OQL demonstration...\n");
+        runner.execute_content(demo_oql)?;
+        
+        // Cleanup
+        std::fs::remove_dir_all("./demo_db").ok();
+        
+        println!("\n🎉 Demo completed successfully!");
+        println!("\nTo run OQL files:");
+        println!("  {} <oql_file>", args[0]);
+        println!("  {} oql_test_suite/01_basic/crud_operations.oql", args[0]);
+    }
+    
     Ok(())
 }

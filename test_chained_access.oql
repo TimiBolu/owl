@@ -1,0 +1,16 @@
+// Test chained access
+
+orders.insert {
+    id: "order1",
+    items: [
+        { product_id: "prod1", quantity: 2 },
+        { product_id: "prod2", quantity: 1 }
+    ]
+}
+
+// Test chained access: array[index].field
+orders.select {
+    id,
+    first_product_id: .items[0].product_id,
+    first_quantity: .items[0].quantity
+}

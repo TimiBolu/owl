@@ -1,0 +1,22 @@
+[package]
+name = "owl-storage-zig"
+version = "0.1.0"
+edition = "2021"
+authors = ["Owl Team"]
+description = "Safe Rust bindings for Owl Storage Engine (Zig implementation)"
+license = "MIT"
+
+[lib]
+name = "owl_storage_zig"
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"
+crc32fast = "1.4"
+
+[build-dependencies]
+
+[dev-dependencies]
+
+[features]
+default = []

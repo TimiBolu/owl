@@ -1,0 +1,16 @@
+// Test array access
+
+orders.insert {
+    id: "order1",
+    items: [
+        { product_id: "prod1", quantity: 2 },
+        { product_id: "prod2", quantity: 1 }
+    ]
+}
+
+// Test array indexing
+orders.select {
+    id,
+    first_item: .items[0],
+    second_item: .items[1]
+}

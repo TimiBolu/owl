@@ -1,0 +1,4 @@
+users.select {
+    user_id: .id,
+    category: if .age >= 18 then "adult" else "minor"
+}

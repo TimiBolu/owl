@@ -1,0 +1,86 @@
+// Data Showcase Test - Let's see actual query results
+
+// Insert some test data
+users.insert {
+    id: "user1",
+    name: "Alice Smith", 
+    age: 28,
+    email: "alice@example.com",
+    department: "Engineering"
+}
+
+users.insert {
+    id: "user2",
+    name: "Bob Johnson",
+    age: 35,
+    email: "bob@example.com", 
+    department: "Marketing"
+}
+
+users.insert {
+    id: "user3",
+    name: "Carol Davis",
+    age: 42,
+    email: "carol@example.com",
+    department: "Engineering"
+}
+
+// Insert orders with array data
+orders.insert {
+    id: "order1",
+    user_id: "user1",
+    total: 299.99,
+    status: "completed",
+    items: [
+        { product: "Laptop", quantity: 1, price: 299.99 },
+        { product: "Mouse", quantity: 2, price: 25.00 }
+    ]
+}
+
+orders.insert {
+    id: "order2", 
+    user_id: "user2",
+    total: 150.50,
+    status: "pending",
+    items: [
+        { product: "Keyboard", quantity: 1, price: 75.00 },
+        { product: "Monitor", quantity: 1, price: 75.50 }
+    ]
+}
+
+// Test basic queries
+users
+
+// Test filtering
+users.where { .department == "Engineering" }
+
+// Test arithmetic expressions (simplified for now)
+users.select {
+    id,
+    name,
+    age
+}
+
+// Test array access and chained access
+orders.select {
+    id,
+    user_id,
+    total,
+    first_item: .items[0],
+    first_product: .items[0].product,
+    first_price: .items[0].price
+}
+
+// Test null coalescing in sorting
+users.sort { .department || "Unknown", .age.desc }
+
+// Test complex filtering with arithmetic
+users.where { .age + 5 > 40 }
+
+// Test update with arithmetic
+users.where { .age < 30 }.update {
+    age: .age + 1
+}
+
+// Final query to see the update
+users.where { .id == "user1" }

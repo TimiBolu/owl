@@ -1,0 +1,4 @@
+users
+    .where { .age > 25 }
+    .sort { .age.desc }
+    .limit(2)

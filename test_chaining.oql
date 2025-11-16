@@ -1,0 +1,11 @@
+// Test method chaining
+
+users.insert { id: "user1", name: "Alice", age: 25 }
+users.insert { id: "user2", name: "Bob", age: 30 }
+users.insert { id: "user3", name: "Carol", age: 35 }
+
+// Test method chaining
+users
+    .where { .age > 25 }
+    .sort { .age.desc }
+    .limit(2)

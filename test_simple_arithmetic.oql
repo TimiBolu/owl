@@ -1,0 +1,3 @@
+users.insert { id: "user1", name: "Alice", age: 25 }
+
+users.where { .age < 30 }.update { age: .age + 1 }
