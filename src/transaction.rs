@@ -111,7 +111,7 @@ impl TransactionManager {
         Ok(Self {
             // db: Arc::new(db),
             active_transactions: Arc::new(Mutex::new(HashMap::new())),
-            concurrency_manager: Arc::new(ConcurrencyManager::new()),
+            concurrency_manager: Arc::new(ConcurrencyManager::new_with_real_clock()),
         })
     }
 

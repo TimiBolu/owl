@@ -14,7 +14,7 @@ pub struct OQLRunner<S: DocumentStore> {
 impl<S: DocumentStore> OQLRunner<S> {
     /// Create a new OQL runner with the given store
     pub fn new(store: Arc<S>) -> Self {
-        let executor = QueryExecutor::new(store);
+        let executor = QueryExecutor::new_with_real_clock(store);
         Self { executor }
     }
     

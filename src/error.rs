@@ -214,6 +214,21 @@ pub enum OQLError {
         context: Option<ErrorContext>,
         severity: ErrorSeverity,
     },
+
+    #[error("Batch operation error: {message}")]
+    BatchError { message: String },
+
+    #[error("IO error: {0}")]
+    IoError(String),
+
+    #[error("Not found: {0}")]
+    NotFound(String),
+
+    #[error("Consistency error: {0}")]
+    ConsistencyError(String),
+
+    #[error("Recovery error: {0}")]
+    RecoveryError(String),
 }
 
 impl OQLError {
@@ -248,7 +263,12 @@ impl OQLError {
             OQLError::EnhancedConcurrencyError { message, .. } => format!("Concurrency error: {}", message),
             OQLError::EnhancedQueryExecution { message, .. } => format!("Query execution error: {}", message),
             OQLError::EnhancedIo { message, .. } => format!("IO error: {}", message),
+            OQLError::BatchError { message } => format!("Batch operation error: {}", message),
             OQLError::EnhancedGeneric { message, .. } => message.clone(),
+            OQLError::IoError(message) => format!("IO error: {}", message),
+            OQLError::NotFound(message) => format!("Not found: {}", message),
+            OQLError::ConsistencyError(message) => format!("Consistency error: {}", message),
+            OQLError::RecoveryError(message) => format!("Recovery error: {}", message),
         };
 
         // Add context information if available

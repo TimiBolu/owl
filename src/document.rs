@@ -363,8 +363,7 @@ mod tests {
         let mut doc = Document::new("users".to_string(), fields);
         let original_updated_at = doc.updated_at;
         
-        // Small delay to ensure timestamp difference
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        // Small delay to ensure timestamp difference (removed for simulation compatibility)
         
         doc.set_field("age".to_string(), Value::Integer(30));
         
@@ -379,5 +378,69 @@ mod tests {
         assert_eq!(Value::Float(3.14).type_name(), "Float");
         assert_eq!(Value::Boolean(true).type_name(), "Boolean");
         assert_eq!(Value::Null.type_name(), "Null");
+    }
+}
+
+
+impl Value {
+    /// Convert Value to clean JSON without type wrappers
+    pub fn to_clean_json(&self) -> serde_json::Value {
+        match self {
+            Value::String(s) => serde_json::Value::String(s.clone()),
+            Value::Integer(i) => serde_json::Value::Number(serde_json::Number::from(*i)),
+            Value::Float(f) => {
+                serde_json::Number::from_f64(*f)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null)
+            },
+            Value::Boolean(b) => serde_json::Value::Bool(*b),
+            Value::Null => serde_json::Value::Null,
+            Value::List(items) => {
+                let json_items: Vec<serde_json::Value> = items.iter()
+                    .map(|item| item.to_clean_json())
+                    .collect();
+                serde_json::Value::Array(json_items)
+            },
+            Value::DateTime(dt) => serde_json::Value::String(dt.to_rfc3339()),
+            Value::Reference(objref) => {
+                // For references, show the reference ID
+                serde_json::Value::String(objref.to_string_id())
+            },
+            Value::Object(obj) => {
+                let mut json_obj = serde_json::Map::new();
+                for (key, value) in obj {
+                    json_obj.insert(key.clone(), value.to_clean_json());
+                }
+                serde_json::Value::Object(json_obj)
+            }
+        }
+    }
+}
+
+impl Document {
+    /// Convert Document fields to clean JSON without type wrappers
+    pub fn to_clean_json(&self) -> serde_json::Value {
+        let mut json_obj = serde_json::Map::new();
+        
+        // Add document ID
+        json_obj.insert("_id".to_string(), serde_json::Value::String(self.id.clone()));
+        
+        // Add all fields
+        for (key, value) in &self.fields {
+            json_obj.insert(key.clone(), value.to_clean_json());
+        }
+        
+        serde_json::Value::Object(json_obj)
+    }
+    
+    /// Convert Document fields to clean JSON without document ID
+    pub fn fields_to_clean_json(&self) -> serde_json::Value {
+        let mut json_obj = serde_json::Map::new();
+        
+        for (key, value) in &self.fields {
+            json_obj.insert(key.clone(), value.to_clean_json());
+        }
+        
+        serde_json::Value::Object(json_obj)
     }
 }

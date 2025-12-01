@@ -1,0 +1,55 @@
+// Simple Reference Test
+// Testing reference navigation with minimal example
+
+// Define schemas
+schema User {
+    id: String,
+    name: String,
+    email: String
+}
+
+schema Post {
+    id: String,
+    title: String,
+    author: User
+}
+
+// Insert users
+User.insert {
+    id: "u1",
+    name: "Alice",
+    email: "alice@test.com"
+}
+
+User.insert {
+    id: "u2",
+    name: "Bob",
+    email: "bob@test.com"
+}
+
+// Insert posts with user references
+Post.insert {
+    id: "p1",
+    title: "First Post",
+    author: "u1"
+}
+
+Post.insert {
+    id: "p2",
+    title: "Second Post",
+    author: "u2"
+}
+
+// Query 1: Get all users
+User
+
+// Query 2: Get all posts
+Post
+
+// Query 3: Try reference navigation
+Post.select {
+    id,
+    title,
+    author_name: .author.name,
+    author_email: .author.email
+}

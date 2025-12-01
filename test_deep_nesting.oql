@@ -1,0 +1,249 @@
+// Deep Nesting Test - Multiple schemas with references forming deep hierarchies
+
+// Define schemas with references
+schema Country {
+    id: String,
+    name: String,
+    code: String
+}
+
+schema City {
+    id: String,
+    name: String,
+    country: Country,
+    population: Integer
+}
+
+schema Company {
+    id: String,
+    name: String,
+    headquarters: City,
+    founded: Integer
+}
+
+schema Department {
+    id: String,
+    name: String,
+    company: Company,
+    budget: Integer
+}
+
+schema Employee {
+    id: String,
+    name: String,
+    email: String,
+    department: Department,
+    salary: Integer,
+    active: Boolean
+}
+
+schema Project {
+    id: String,
+    title: String,
+    description: String,
+    lead: Employee,
+    department: Department,
+    budget: Integer,
+    status: String
+}
+
+// Insert data - Countries
+Country.insert {
+    id: "usa",
+    name: "United States",
+    code: "US"
+}
+
+Country.insert {
+    id: "uk",
+    name: "United Kingdom",
+    code: "GB"
+}
+
+Country.insert {
+    id: "japan",
+    name: "Japan",
+    code: "JP"
+}
+
+// Insert data - Cities
+City.insert {
+    id: "nyc",
+    name: "New York",
+    country: "usa",
+    population: 8336817
+}
+
+City.insert {
+    id: "london",
+    name: "London",
+    country: "uk",
+    population: 8982000
+}
+
+City.insert {
+    id: "tokyo",
+    name: "Tokyo",
+    country: "japan",
+    population: 13960000
+}
+
+// Insert data - Companies
+Company.insert {
+    id: "techcorp",
+    name: "TechCorp Inc",
+    headquarters: "nyc",
+    founded: 2010
+}
+
+Company.insert {
+    id: "innovate",
+    name: "Innovate Ltd",
+    headquarters: "london",
+    founded: 2015
+}
+
+Company.insert {
+    id: "futuretech",
+    name: "FutureTech KK",
+    headquarters: "tokyo",
+    founded: 2018
+}
+
+// Insert data - Departments
+Department.insert {
+    id: "eng",
+    name: "Engineering",
+    company: "techcorp",
+    budget: 5000000
+}
+
+Department.insert {
+    id: "research",
+    name: "Research & Development",
+    company: "innovate",
+    budget: 3000000
+}
+
+Department.insert {
+    id: "ai",
+    name: "AI Division",
+    company: "futuretech",
+    budget: 8000000
+}
+
+// Insert data - Employees
+Employee.insert {
+    id: "emp1",
+    name: "Alice Johnson",
+    email: "alice@techcorp.com",
+    department: "eng",
+    salary: 150000,
+    active: true
+}
+
+Employee.insert {
+    id: "emp2",
+    name: "Bob Smith",
+    email: "bob@innovate.com",
+    department: "research",
+    salary: 120000,
+    active: true
+}
+
+Employee.insert {
+    id: "emp3",
+    name: "Charlie Chen",
+    email: "charlie@futuretech.jp",
+    department: "ai",
+    salary: 180000,
+    active: true
+}
+
+Employee.insert {
+    id: "emp4",
+    name: "Diana Martinez",
+    email: "diana@techcorp.com",
+    department: "eng",
+    salary: 140000,
+    active: true
+}
+
+// Insert data - Projects
+Project.insert {
+    id: "proj1",
+    title: "Cloud Migration",
+    description: "Migrate all services to cloud infrastructure",
+    lead: "emp1",
+    department: "eng",
+    budget: 2000000,
+    status: "active"
+}
+
+Project.insert {
+    id: "proj2",
+    title: "Quantum Computing Research",
+    description: "Explore quantum computing applications",
+    lead: "emp2",
+    department: "research",
+    budget: 1500000,
+    status: "active"
+}
+
+Project.insert {
+    id: "proj3",
+    title: "Neural Network Optimization",
+    description: "Optimize deep learning models for production",
+    lead: "emp3",
+    department: "ai",
+    budget: 3000000,
+    status: "planning"
+}
+
+// Query 1: Simple query - all projects
+Project
+
+// Query 2: Deep navigation - project with full context
+Project.select {
+    id,
+    title,
+    status,
+    budget,
+    lead_name: .lead.name,
+    lead_email: .lead.email,
+    lead_salary: .lead.salary,
+    dept_name: .department.name,
+    dept_budget: .department.budget,
+    company_name: .department.company.name,
+    company_founded: .department.company.founded,
+    city_name: .department.company.headquarters.name,
+    city_population: .department.company.headquarters.population,
+    country_name: .department.company.headquarters.country.name,
+    country_code: .department.company.headquarters.country.code
+}
+
+// Query 3: Multiple reference paths
+Project.select {
+    title,
+    lead_dept: .lead.department.name,
+    lead_company: .lead.department.company.name,
+    lead_city: .lead.department.company.headquarters.name,
+    project_dept: .department.name,
+    project_company: .department.company.name,
+    project_city: .department.company.headquarters.name
+}
+
+// Query 4: Simple aggregations
+Project.count()
+
+Project.sum(.budget)
+
+Project.avg(.budget)
+
+// Query 5: Filter with deep navigation
+Project.where { .department.company.headquarters.country.code == "US" }.select {
+    title,
+    lead_name: .lead.name,
+    company: .department.company.name,
+    country: .department.company.headquarters.country.name
+}

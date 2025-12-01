@@ -20,10 +20,10 @@ const WAL_MAGIC: u32 = 0x4F574C57; // "OWLW" in ASCII
 const WAL_VERSION: u16 = 1;
 
 /// Maximum WAL file size before rotation (64MB)
-const MAX_WAL_SIZE: u64 = 64 * 1024 * 1024;
+pub const MAX_WAL_SIZE: u64 = 64 * 1024 * 1024;
 
 /// WAL entry alignment (8 bytes for performance)
-const WAL_ALIGNMENT: usize = 8;
+pub const WAL_ALIGNMENT: usize = 8;
 
 /// Log Sequence Number - monotonically increasing transaction ID
 pub const LSN = u64;
@@ -36,6 +36,8 @@ pub const EntryType = enum(u8) {
     checkpoint = 4,
     commit = 5,
     abort = 6,
+    batch_begin = 7, // Marks start of batch operation
+    batch_end = 8, // Marks end of batch operation
 
     pub fn toString(self: EntryType) []const u8 {
         return switch (self) {
@@ -45,12 +47,14 @@ pub const EntryType = enum(u8) {
             .checkpoint => "CHECKPOINT",
             .commit => "COMMIT",
             .abort => "ABORT",
+            .batch_begin => "BATCH_BEGIN",
+            .batch_end => "BATCH_END",
         };
     }
 };
 
 /// WAL file header (32 bytes)
-const WALHeader = extern struct {
+pub const WALHeader = extern struct {
     magic: u32, // Magic number for validation
     version: u16, // WAL format version
     flags: u16, // Feature flags
@@ -91,7 +95,7 @@ const WALHeader = extern struct {
 };
 
 /// WAL entry header (32 bytes - aligned)
-const WALEntryHeader = extern struct {
+pub const WALEntryHeader = extern struct {
     lsn: LSN, // Log sequence number
     entry_type: EntryType, // Type of operation
     _padding1: u8, // Padding
@@ -170,6 +174,51 @@ pub const WALEntry = struct {
     }
 };
 
+/// Batch WAL entry - combines multiple operations into a single atomic unit
+/// This enables group commit with a single fsync for the entire batch
+pub const BatchWALEntry = struct {
+    batch_lsn: LSN, // LSN for the entire batch
+    entries: []WALEntry, // Individual entries in the batch
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator, batch_lsn: LSN, entries: []WALEntry) !BatchWALEntry {
+        return BatchWALEntry{
+            .batch_lsn = batch_lsn,
+            .entries = entries,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *BatchWALEntry) void {
+        for (self.entries) |*entry| {
+            entry.deinit(self.allocator);
+        }
+        self.allocator.free(self.entries);
+    }
+
+    /// Calculate total size of batch including markers
+    pub fn totalSize(self: *const BatchWALEntry) usize {
+        var size: usize = 0;
+        // Batch begin marker
+        size += @sizeOf(WALEntryHeader);
+        // All entries
+        for (self.entries) |*entry| {
+            size += entry.alignedSize();
+        }
+        // Batch end marker
+        size += @sizeOf(WALEntryHeader);
+        return size;
+    }
+
+    /// Validate all entries in the batch
+    pub fn validate(self: *const BatchWALEntry) bool {
+        for (self.entries) |*entry| {
+            if (!entry.validate()) return false;
+        }
+        return true;
+    }
+};
+
 /// WAL statistics
 pub const WALStats = struct {
     file_count: u32,
@@ -179,6 +228,8 @@ pub const WALStats = struct {
     last_checkpoint: LSN,
     recovery_entries: u64,
     corrupted_entries: u64,
+    batch_count: u64, // Number of batch operations
+    batch_entries: u64, // Total entries in batches
 
     pub fn init() WALStats {
         return WALStats{
@@ -189,6 +240,8 @@ pub const WALStats = struct {
             .last_checkpoint = 0,
             .recovery_entries = 0,
             .corrupted_entries = 0,
+            .batch_count = 0,
+            .batch_entries = 0,
         };
     }
 };
@@ -337,6 +390,146 @@ pub const WAL = struct {
         try file.sync();
     }
 
+    /// Atomically append entry to WAL with proper ordering guarantees
+    /// This ensures that the WAL entry is written atomically and durably
+    pub fn atomicAppend(self: *Self, entry: *const WALEntry) !void {
+        // Use the same implementation as append, but with explicit atomic semantics
+        // The file system operations are already atomic at the OS level
+        return self.append(entry);
+    }
+
+    /// Atomically append entry with explicit fsync for durability
+    /// This is used by atomic operations to ensure crash consistency
+    pub fn atomicAppendWithSync(self: *Self, entry: *const WALEntry) !void {
+        const file = self.current_file orelse return error.WALNotOpen;
+
+        // Check if we need to rotate the file
+        if (self.current_size + entry.alignedSize() > MAX_WAL_SIZE) {
+            try self.rotateFile();
+        }
+
+        // Write all data first
+        const header_bytes = std.mem.asBytes(&entry.header);
+        _ = try file.writeAll(header_bytes);
+        _ = try file.writeAll(entry.data);
+
+        // Write padding for alignment
+        const padding_size = entry.alignedSize() - entry.totalSize();
+        if (padding_size > 0) {
+            const padding = [_]u8{0} ** WAL_ALIGNMENT;
+            _ = try file.writeAll(padding[0..padding_size]);
+        }
+
+        // Atomic sync to disk - this is the durability guarantee
+        try file.sync();
+
+        // Update statistics only after successful sync
+        self.current_size += entry.alignedSize();
+        self.stats.entry_count += 1;
+        self.stats.last_lsn = entry.header.lsn;
+    }
+
+    /// Perform crash recovery with detailed error reporting
+    /// This method provides enhanced recovery capabilities for crash recovery
+    pub fn performCrashRecovery(self: *Self, callback: ?RecoveryCallback, user_data: ?*anyopaque) !RecoveryResult {
+        const options = RecoveryOptions{
+            .callback = callback,
+            .user_data = user_data,
+            .strict_mode = false, // Allow recovery to continue despite corruptions
+        };
+
+        var total_recovered: u64 = 0;
+        var total_corrupted: u64 = 0;
+        var max_lsn: LSN = 0;
+
+        // Get list of WAL files
+        var dir = try std.fs.cwd().openDir(self.base_path, .{ .iterate = true });
+        defer dir.close();
+
+        var iterator = dir.iterate();
+        var wal_files: std.ArrayList([]const u8) = .{};
+        defer {
+            for (wal_files.items) |file_name| {
+                self.allocator.free(file_name);
+            }
+            wal_files.deinit(self.allocator);
+        }
+
+        // Collect WAL files
+        while (try iterator.next()) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".wal")) continue;
+
+            const file_name = try self.allocator.dupe(u8, entry.name);
+            try wal_files.append(self.allocator, file_name);
+        }
+
+        // Sort files for ordered recovery
+        std.mem.sort([]const u8, wal_files.items, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.order(u8, a, b) == .lt;
+            }
+        }.lessThan);
+
+        // Process each file
+        for (wal_files.items) |file_name| {
+            const file_path = try std.fs.path.join(self.allocator, &[_][]const u8{ self.base_path, file_name });
+            defer self.allocator.free(file_path);
+
+            const result = self.recoverFileWithOptions(file_path, options) catch |err| {
+                std.log.warn("Failed to recover WAL file {s}: {}", .{ file_path, err });
+                continue;
+            };
+
+            max_lsn = @max(max_lsn, result.last_lsn);
+            total_recovered += result.entries_recovered;
+            total_corrupted += result.entries_corrupted;
+        }
+
+        // Update current LSN
+        self.current_lsn.store(max_lsn + 1, .seq_cst);
+        self.stats.last_lsn = max_lsn;
+        self.stats.recovery_entries = total_recovered;
+        self.stats.corrupted_entries = total_corrupted;
+
+        return RecoveryResult{
+            .last_lsn = max_lsn,
+            .entries_recovered = total_recovered,
+            .entries_corrupted = total_corrupted,
+        };
+    }
+
+    /// Check WAL integrity for crash recovery
+    pub fn checkIntegrity(self: *Self) !bool {
+        var dir = try std.fs.cwd().openDir(self.base_path, .{ .iterate = true });
+        defer dir.close();
+
+        var iterator = dir.iterate();
+        var integrity_ok = true;
+
+        while (try iterator.next()) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".wal")) continue;
+
+            const file_path = try std.fs.path.join(self.allocator, &[_][]const u8{ self.base_path, entry.name });
+            defer self.allocator.free(file_path);
+
+            // Try to read and validate the file
+            const result = self.recoverFile(file_path) catch |err| {
+                std.log.warn("WAL file integrity check failed for {s}: {}", .{ file_path, err });
+                integrity_ok = false;
+                continue;
+            };
+
+            if (result == 0) {
+                std.log.warn("WAL file {s} contains no valid entries", .{file_path});
+                integrity_ok = false;
+            }
+        }
+
+        return integrity_ok;
+    }
+
     /// Append entry with group commit (buffered, higher throughput)
     pub fn appendBuffered(self: *Self, entry: WALEntry) !void {
         self.flush_mutex.lock();
@@ -461,6 +654,78 @@ pub const WAL = struct {
         try file.sync();
 
         self.current_size += total_size;
+    }
+
+    /// Append batch WAL entry with atomic semantics
+    /// This writes a batch begin marker, all entries, and a batch end marker
+    /// with a single fsync for the entire batch
+    pub fn appendBatchAtomic(self: *Self, batch: *const BatchWALEntry) !void {
+        if (batch.entries.len == 0) return;
+
+        const file = self.current_file orelse return error.WALNotOpen;
+
+        // Calculate total size needed
+        const total_size = batch.totalSize();
+
+        // Check if we need to rotate
+        if (self.current_size + total_size > MAX_WAL_SIZE) {
+            try self.rotateFile();
+        }
+
+        // Write batch begin marker
+        const batch_begin_data = "BATCH_BEGIN";
+        var begin_header = WALEntryHeader.init(
+            batch.batch_lsn,
+            .batch_begin,
+            @intCast(batch_begin_data.len),
+            ObjRef.init(0),
+        );
+        begin_header.updateChecksum(batch_begin_data);
+
+        const begin_header_bytes = std.mem.asBytes(&begin_header);
+        _ = try file.writeAll(begin_header_bytes);
+        _ = try file.writeAll(batch_begin_data);
+
+        // Write all entries in the batch
+        for (batch.entries) |*entry| {
+            // Write header
+            const header_bytes = std.mem.asBytes(&entry.header);
+            _ = try file.writeAll(header_bytes);
+
+            // Write data
+            _ = try file.writeAll(entry.data);
+
+            // Write padding
+            const padding_size = entry.alignedSize() - entry.totalSize();
+            if (padding_size > 0) {
+                const padding = [_]u8{0} ** WAL_ALIGNMENT;
+                _ = try file.writeAll(padding[0..padding_size]);
+            }
+        }
+
+        // Write batch end marker
+        const batch_end_data = "BATCH_END";
+        var end_header = WALEntryHeader.init(
+            batch.batch_lsn,
+            .batch_end,
+            @intCast(batch_end_data.len),
+            ObjRef.init(0),
+        );
+        end_header.updateChecksum(batch_end_data);
+
+        const end_header_bytes = std.mem.asBytes(&end_header);
+        _ = try file.writeAll(end_header_bytes);
+        _ = try file.writeAll(batch_end_data);
+
+        // Single sync for entire batch (group commit!)
+        try file.sync();
+
+        // Update statistics
+        self.current_size += total_size;
+        self.stats.entry_count += batch.entries.len + 2; // +2 for begin/end markers
+        self.stats.batch_count += 1;
+        self.stats.batch_entries += batch.entries.len;
+        self.stats.last_lsn = batch.batch_lsn;
     }
 
     /// Create checkpoint entry
@@ -1113,5 +1378,132 @@ test "WAL recovery strict mode" {
         // Should fail in strict mode (could be either error depending on truncation point)
         const result = wal.recoverWithOptions(options);
         try std.testing.expect(std.meta.isError(result));
+    }
+}
+
+test "WAL batch operations" {
+    const allocator = std.testing.allocator;
+    const test_dir = "test_wal_batch";
+
+    // Clean up test directory
+    std.fs.cwd().deleteTree(test_dir) catch {};
+    defer std.fs.cwd().deleteTree(test_dir) catch {};
+
+    var wal = try WAL.init(allocator, test_dir);
+    defer wal.deinit();
+
+    // Create batch entries
+    var entries: std.ArrayList(WALEntry) = .{};
+    defer {
+        for (entries.items) |*entry| {
+            entry.deinit(allocator);
+        }
+        entries.deinit(allocator);
+    }
+
+    // Add 10 entries to batch
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        const data = try std.fmt.allocPrint(allocator, "batch entry {}", .{i});
+        defer allocator.free(data);
+
+        const objref = ObjRef.init(5000 + i * 100);
+        const entry = try WALEntry.init(allocator, wal.nextLSN(), .insert, objref, data);
+        try entries.append(allocator, entry);
+    }
+
+    // Create batch
+    const batch_lsn = wal.nextLSN();
+    var batch = try BatchWALEntry.init(allocator, batch_lsn, try entries.toOwnedSlice(allocator));
+    defer batch.deinit();
+
+    // Append batch atomically
+    try wal.appendBatchAtomic(&batch);
+
+    // Check stats
+    const stats = wal.getStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.batch_count);
+    try std.testing.expectEqual(@as(u64, 10), stats.batch_entries);
+    try std.testing.expectEqual(@as(u64, 12), stats.entry_count); // 10 + begin + end
+}
+
+test "WAL batch validation" {
+    const allocator = std.testing.allocator;
+
+    // Create batch entries
+    var entries: std.ArrayList(WALEntry) = .{};
+    defer {
+        for (entries.items) |*entry| {
+            entry.deinit(allocator);
+        }
+        entries.deinit(allocator);
+    }
+
+    // Add entries
+    var i: usize = 0;
+    while (i < 5) : (i += 1) {
+        const data = try std.fmt.allocPrint(allocator, "entry {}", .{i});
+        defer allocator.free(data);
+
+        const objref = ObjRef.init(6000 + i * 100);
+        const entry = try WALEntry.init(allocator, i + 1, .insert, objref, data);
+        try entries.append(allocator, entry);
+    }
+
+    // Create batch
+    var batch = try BatchWALEntry.init(allocator, 100, try entries.toOwnedSlice(allocator));
+    defer batch.deinit();
+
+    // Validate batch
+    try std.testing.expect(batch.validate());
+    try std.testing.expectEqual(@as(usize, 5), batch.entries.len);
+}
+
+test "WAL batch recovery" {
+    const allocator = std.testing.allocator;
+    const test_dir = "test_wal_batch_recovery";
+
+    // Clean up test directory
+    std.fs.cwd().deleteTree(test_dir) catch {};
+    defer std.fs.cwd().deleteTree(test_dir) catch {};
+
+    // Create WAL and write batch
+    {
+        var wal = try WAL.init(allocator, test_dir);
+        defer wal.deinit();
+
+        // Create batch entries
+        var entries: std.ArrayList(WALEntry) = .{};
+        defer {
+            for (entries.items) |*entry| {
+                entry.deinit(allocator);
+            }
+            entries.deinit(allocator);
+        }
+
+        var i: usize = 0;
+        while (i < 5) : (i += 1) {
+            const data = try std.fmt.allocPrint(allocator, "recovery batch {}", .{i});
+            defer allocator.free(data);
+
+            const objref = ObjRef.init(7000 + i * 100);
+            const entry = try WALEntry.init(allocator, wal.nextLSN(), .insert, objref, data);
+            try entries.append(allocator, entry);
+        }
+
+        const batch_lsn = wal.nextLSN();
+        var batch = try BatchWALEntry.init(allocator, batch_lsn, try entries.toOwnedSlice(allocator));
+        defer batch.deinit();
+
+        try wal.appendBatchAtomic(&batch);
+    }
+
+    // Reopen and verify recovery
+    {
+        var wal = try WAL.init(allocator, test_dir);
+        defer wal.deinit();
+
+        const stats = wal.getStats();
+        try std.testing.expectEqual(@as(u64, 7), stats.recovery_entries); // 5 + begin + end
     }
 }

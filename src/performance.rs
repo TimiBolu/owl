@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
+use crate::simulation::Clock;
 
 /// Performance metrics for query execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,19 +34,27 @@ pub struct PerformanceStats {
     pub last_updated: chrono::DateTime<chrono::Utc>,
 }
 
-/// Performance monitor for tracking query execution metrics
-#[derive(Debug)]
+/// Performance monitor for tracking query execution metrics with Clock dependency injection
 pub struct PerformanceMonitor {
     metrics: Arc<Mutex<Vec<QueryMetrics>>>,
     start_time: Instant,
+    clock: Arc<dyn Clock>,
 }
 
 impl PerformanceMonitor {
-    pub fn new() -> Self {
+    /// Create a new performance monitor with Clock dependency injection
+    pub fn new(clock: Arc<dyn Clock>) -> Self {
         Self {
             metrics: Arc::new(Mutex::new(Vec::new())),
-            start_time: Instant::now(),
+            start_time: clock.now(),
+            clock,
         }
+    }
+    
+    /// Create a new performance monitor with production clock (backward compatibility)
+    pub fn new_with_real_clock() -> Self {
+        use crate::simulation::RealClock;
+        Self::new(Arc::new(RealClock::new()))
     }
 
     /// Record metrics for a query execution
@@ -196,12 +205,11 @@ impl PerformanceMonitor {
 
 impl Default for PerformanceMonitor {
     fn default() -> Self {
-        Self::new()
+        Self::new_with_real_clock()
     }
 }
 
-/// Query execution context for performance tracking
-#[derive(Debug)]
+/// Query execution context for performance tracking with Clock dependency injection
 pub struct QueryExecutionContext {
     pub query_hash: String,
     pub start_time: Instant,
@@ -211,10 +219,12 @@ pub struct QueryExecutionContext {
     pub index_misses: usize,
     pub cache_hits: usize,
     pub cache_misses: usize,
+    clock: Arc<dyn Clock>,
 }
 
 impl QueryExecutionContext {
-    pub fn new(query: &str) -> Self {
+    /// Create a new query execution context with Clock dependency injection
+    pub fn new_with_clock(query: &str, clock: Arc<dyn Clock>) -> Self {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
         
@@ -224,14 +234,21 @@ impl QueryExecutionContext {
 
         Self {
             query_hash,
-            start_time: Instant::now(),
+            start_time: clock.now(),
             documents_scanned: 0,
             references_resolved: 0,
             index_hits: 0,
             index_misses: 0,
             cache_hits: 0,
             cache_misses: 0,
+            clock,
         }
+    }
+    
+    /// Create a new query execution context with production clock (backward compatibility)
+    pub fn new(query: &str) -> Self {
+        use crate::simulation::RealClock;
+        Self::new_with_clock(query, Arc::new(RealClock::new()))
     }
 
     pub fn record_document_scan(&mut self, count: usize) {
@@ -259,9 +276,10 @@ impl QueryExecutionContext {
     }
 
     pub fn finish(self, result_count: usize) -> QueryMetrics {
+        let execution_time = self.clock.now().duration_since(self.start_time);
         QueryMetrics {
             query_hash: self.query_hash,
-            execution_time: self.start_time.elapsed(),
+            execution_time,
             result_count,
             index_hits: self.index_hits,
             index_misses: self.index_misses,
@@ -274,16 +292,26 @@ impl QueryExecutionContext {
     }
 }
 
-/// Performance benchmark suite
+/// Performance benchmark suite with Clock dependency injection
 pub struct PerformanceBenchmark {
     monitor: PerformanceMonitor,
+    clock: Arc<dyn Clock>,
 }
 
 impl PerformanceBenchmark {
-    pub fn new() -> Self {
+    /// Create a new performance benchmark with Clock dependency injection
+    pub fn new_with_clock(clock: Arc<dyn Clock>) -> Self {
         Self {
-            monitor: PerformanceMonitor::new(),
+            monitor: PerformanceMonitor::new(clock.clone()),
+            clock,
         }
+    }
+    
+    /// Create a new performance benchmark with production clock (backward compatibility)
+    pub fn new() -> Self {
+        use crate::simulation::RealClock;
+        let clock = Arc::new(RealClock::new());
+        Self::new_with_clock(clock)
     }
 
     /// Run a performance benchmark with the given name and closure
@@ -292,9 +320,9 @@ impl PerformanceBenchmark {
         F: FnOnce() -> R,
     {
         println!("Running benchmark: {}", name);
-        let start_time = Instant::now();
+        let start_time = self.clock.now();
         let result = f();
-        let duration = start_time.elapsed();
+        let duration = self.clock.now().duration_since(start_time);
         println!("  Completed in {:?}", duration);
         (result, duration)
     }
@@ -308,9 +336,9 @@ impl PerformanceBenchmark {
         let mut durations = Vec::with_capacity(iterations);
         
         for i in 0..iterations {
-            let start_time = Instant::now();
+            let start_time = self.clock.now();
             let _result = f();
-            let duration = start_time.elapsed();
+            let duration = self.clock.now().duration_since(start_time);
             durations.push(duration);
             
             if i % (iterations / 10).max(1) == 0 {

@@ -47,4 +47,17 @@ extern "C" {
         out_success_rate: *mut f64,
     ) -> i32;
     pub fn owl_arena_base_ptr(arena: *mut Arena) -> *mut u8;
+    pub fn owl_arena_write_at(
+        arena: *mut Arena,
+        offset: u64,
+        data: *const u8,
+        data_len: usize,
+    ) -> i32;
+    pub fn owl_arena_read_at(
+        arena: *mut Arena,
+        offset: u64,
+        buffer: *mut u8,
+        buffer_len: usize,
+        out_bytes_read: *mut usize,
+    ) -> i32;
 }

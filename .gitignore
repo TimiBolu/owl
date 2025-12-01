@@ -83,3 +83,7 @@ logs/
 *.temp
 *.bak
 *.backup
+
+# Large backup test files (can be 16-33GB each!)
+*.owlb
+owl_storage_zig/.zig-cache/tmp/*.owlb

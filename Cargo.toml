@@ -29,6 +29,20 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 rand = "0.8"
 toml = "0.8"
 num_cpus = "1.0"
+clap = { version = "4.0", features = ["derive"] }
+
+# Distributed systems
+wyhash = "0.5"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.22"
+opentelemetry = { version = "0.21", features = ["trace"] }
+opentelemetry_sdk = { version = "0.21", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.14", features = ["trace"] }
+prometheus = "0.13"
+lazy_static = "1.4"
 
 # Parsing
 nom = "7.1"
@@ -39,11 +53,52 @@ base64 = "0.21"
 [dev-dependencies]
 tempfile = "3.0"
 criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1.4"
 
 [[bench]]
 name = "performance_benchmarks"
 harness = false
 
 [[bench]]
+name = "lockfree_benchmark"
+harness = false
+
+[[bench]]
 name = "navigation_bench"
 harness = false
+
+[[bench]]
+name = "index_scan_bench"
+harness = false
+
+[[bench]]
+name = "parallel_bench"
+harness = false
+
+[[example]]
+name = "run_complete_e2e_test"
+path = "examples/run_complete_e2e_test.rs"
+
+[[example]]
+name = "verify_saved_data"
+path = "examples/verify_saved_data.rs"
+
+[[example]]
+name = "show_data_demo"
+path = "examples/show_data_demo.rs"
+
+[[example]]
+name = "test_simple_ref"
+path = "examples/test_simple_ref.rs"
+
+[[example]]
+name = "test_deep_nesting"
+path = "examples/test_deep_nesting.rs"
+
+[[example]]
+name = "batch_insert_demo"
+path = "examples/batch_insert_demo.rs"
+
+[[bin]]
+name = "owl-admin"
+path = "src/bin/owl-admin.rs"

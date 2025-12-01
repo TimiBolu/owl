@@ -1,142 +1,158 @@
-# OQL Documentation
+# Owl Database Documentation
 
-Welcome to the OQL database documentation!
+Welcome to the Owl Database documentation! This directory contains comprehensive guides for installing, configuring, operating, and upgrading Owl Database.
+
+## Documentation Index
+
+### Getting Started
+
+- **[Installation Guide](INSTALLATION.md)** - Step-by-step installation instructions for single-node and distributed deployments
+- **[Configuration Reference](CONFIGURATION.md)** - Complete reference for all configuration options
+- **[Quick Start Tutorial](../README.md)** - Get up and running in 5 minutes
+
+### Operations
+
+- **[Operations Manual](OPERATIONS.md)** - Daily operations, monitoring, backup, and troubleshooting procedures
+- **[Upgrade Guide](UPGRADE_GUIDE.md)** - Rolling upgrade procedures, compatibility matrix, and migration tools
+
+### Architecture
+
+- **[OQL Architecture](../owl_design_and_architecture/OQL_ARCHITECTURE.md)** - Query language and execution pipeline
+- **[Storage Engine Design](../owl_storage_design.md)** - Zig-based storage layer architecture
+- **[Deterministic Simulation Testing](../owl_design_and_architecture/DST_INDEX.md)** - Testing methodology
+
+### Advanced Topics
+
+- **[RocksDB Deprecation](ROCKSDB_DEPRECATION.md)** - Migration from RocksDB to Zig storage engine
+- **[Performance Tuning](OPERATIONS.md#performance-tuning)** - Optimization techniques
+- **[Capacity Planning](OPERATIONS.md#capacity-planning)** - Scaling strategies
 
 ## Quick Links
 
-### Getting Started
-- [Main README](../README.md) - Project overview and quick start
-- [OQL Syntax](../owl_design_and_architecture/OQL_SYNTAX.md) - Query language reference
-- [Architecture](../owl_design_and_architecture/OQL_ARCHITECTURE.md) - System architecture
+### For Developers
 
-### Storage Engine
-- **[Zig Storage Design](../.kiro/specs/zig-storage-rewrite/design.md)** - Current storage engine design
-- **[Implementation Tasks](../.kiro/specs/zig-storage-rewrite/tasks.md)** - Development progress
-- **[Performance Benchmarks](../owl_storage_zig/BENCHMARKS.md)** - Performance metrics
+- [OQL Syntax Guide](../owl_design_and_architecture/OQL_SYNTAX.md)
+- [API Reference](../README.md#oql-query-language)
+- [Example Queries](../oql_test_suite/examples/)
 
-### Important Notices
+### For Operators
 
-⚠️ **[RocksDB Deprecation Notice](./ROCKSDB_DEPRECATION.md)** - **READ THIS FIRST**
+- [Health Check Commands](OPERATIONS.md#health-checks)
+- [Backup Procedures](OPERATIONS.md#backup-and-recovery)
+- [Troubleshooting Guide](OPERATIONS.md#troubleshooting)
 
-RocksDB storage has been deprecated and replaced with Zig Arena Storage. If you have existing RocksDB data or are upgrading from an older version, please read the deprecation notice for migration instructions.
+### For Administrators
+
+- [Cluster Management](OPERATIONS.md#maintenance-procedures)
+- [Security Configuration](CONFIGURATION.md#security-configuration)
+- [Monitoring Setup](OPERATIONS.md#monitoring-and-alerting)
+
+## Admin Tools
+
+Owl provides a comprehensive admin CLI for cluster management:
+
+```bash
+# Cluster management
+owl-admin cluster status
+owl-admin cluster nodes
+owl-admin cluster add-node --address node4:8080
+owl-admin cluster rebalance
+
+# Health checks
+owl-admin health check
+owl-admin health monitor --interval 5
+owl-admin health replication
+
+# Backup and restore
+owl-admin backup create --destination /backups --type full
+owl-admin backup restore --source /backups/20251126
+owl-admin backup verify /backups/20251126
+
+# Configuration management
+owl-admin config show
+owl-admin config set performance.max_connections 10000
+owl-admin config validate /etc/owl/owl.toml
+```
+
+## Migration Tools
+
+For upgrading between versions:
+
+```bash
+# Analyze OQL queries for compatibility
+owl-migrate analyze-queries --input queries.oql
+
+# Migrate data between versions
+owl-migrate migrate \
+  --from-version 0.2 \
+  --to-version 1.0 \
+  --data-dir /var/lib/owl/data
+
+# Test queries against new version
+owl-migrate test-queries --input queries.oql --version 1.0
+```
 
 ## Documentation Structure
 
 ```
 docs/
-├── README.md                    # This file
-├── ROCKSDB_DEPRECATION.md      # ⚠️ Important migration notice
-└── (future documentation)
+├── README.md                 # This file
+├── INSTALLATION.md           # Installation guide
+├── CONFIGURATION.md          # Configuration reference
+├── OPERATIONS.md             # Operations manual
+├── UPGRADE_GUIDE.md          # Upgrade procedures
+└── ROCKSDB_DEPRECATION.md   # RocksDB migration guide
 
 owl_design_and_architecture/
-├── OQL_ARCHITECTURE.md         # System architecture
-├── OQL_SYNTAX.md               # Query language syntax
-├── OQL_PIPELINE_ANALYSIS.md    # Query pipeline analysis
-└── TASKS_VERIFICATION.md       # Task verification
+├── OQL_ARCHITECTURE.md       # Query architecture
+├── OQL_SYNTAX.md             # Query language syntax
+├── DST_INDEX.md              # Testing methodology
+└── ...                       # Additional design docs
 
-.kiro/specs/
-├── zig-storage-rewrite/        # Zig storage engine spec
-│   ├── requirements.md
-│   ├── design.md
-│   └── tasks.md
-└── (other specs)
-
-owl_storage_zig/
-├── README.md                   # Zig storage implementation
-├── BENCHMARKS.md               # Performance benchmarks
-└── src/                        # Zig source code
+oql_test_suite/
+├── examples/                 # Example OQL queries
+├── 01_basic/                 # Basic operations
+├── 02_intermediate/          # Complex queries
+└── 03_advanced/              # Advanced features
 ```
-
-## Key Concepts
-
-### O(1) Navigation
-
-OQL's core innovation is **O(1) pointer-based navigation**. When you write:
-
-```oql
-order.customer.profile.name
-```
-
-This executes as 2-3 pointer dereferences (~50ns), not database queries. This is possible because:
-
-1. **ObjRef**: References are 64-bit file offsets, not strings
-2. **Swizzling**: Offsets convert to memory pointers in O(1)
-3. **Co-location**: Related objects stored in same 4KB page
-4. **Memory-mapped**: Direct access to objects via mmap
-
-### Storage Architecture
-
-```
-┌─────────────────────────────────────────────────────────┐
-│   Rust: OQL Query Layer                                 │
-│   - Parser, Executor, Schema                            │
-└────────────────────┬────────────────────────────────────┘
-                     │ C ABI
-┌────────────────────▼────────────────────────────────────┐
-│   Zig: Storage Engine                                    │
-│   - Arena allocation, WAL, MVCC, Cache                  │
-└────────────────────┬────────────────────────────────────┘
-                     │ mmap
-┌────────────────────▼────────────────────────────────────┐
-│   Operating System                                       │
-│   - Page cache, File system                             │
-└─────────────────────────────────────────────────────────┘
-```
-
-### Performance Targets
-
-| Metric | Target | Status |
-|--------|--------|--------|
-| Navigation | <50ns per hop | ✅ Achieved |
-| Allocation | <20ns per object | ✅ Achieved |
-| Memory Overhead | <1.2x | ✅ Achieved |
-| Co-location | >70% | ✅ Achieved (79%) |
-| Compile Time | <10s | ✅ Achieved |
-
-## Development Status
-
-### ✅ Completed Phases
-
-- **Phase 1**: Core Types & Memory Management
-- **Phase 2**: Storage Layer
-- **Phase 3**: WAL & Durability
-- **Phase 4**: Transactions & MVCC
-- **Phase 5**: Performance & Optimization
-- **Phase 8** (partial): Query Engine Integration
-
-### 🚧 In Progress
-
-- **Phase 6**: Testing & Validation
-- **Phase 8**: Query Engine Integration (O(1) navigation working)
-
-### ⏳ Upcoming
-
-- **Phase 7**: Documentation & Polish
-- **Phase 9**: Query Planning & Optimization
-- **Phase 10**: Indexes & Advanced Features
-- **Phase 11**: Final Integration & Testing
-
-## Contributing
-
-We welcome contributions! Areas where help is needed:
-
-1. **Testing**: Property-based tests, crash recovery tests
-2. **Documentation**: Examples, tutorials, API docs
-3. **Performance**: Benchmarking, profiling, optimization
-4. **Migration Tools**: RocksDB to Zig migration utilities
-
-See the [main README](../README.md) for contribution guidelines.
 
 ## Support
 
-- **Issues**: [GitHub Issues](https://github.com/your-org/oql/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/your-org/oql/discussions)
-- **Email**: maintainers@oql-db.org
+### Community Support
+
+- **Documentation**: https://docs.owl-db.io
+- **Community Forum**: https://community.owl-db.io
+- **GitHub Issues**: https://github.com/owl-db/owl/issues
+- **Slack Channel**: https://owl-db.slack.com
+
+### Enterprise Support
+
+- **Email**: support@owl-db.io
+- **Phone**: +1-555-OWL-HELP
+- **SLA**: 24/7 support with 1-hour response time
+
+## Contributing
+
+We welcome contributions to the documentation! Please see our [Contributing Guide](../CONTRIBUTING.md) for details.
+
+### Documentation Guidelines
+
+1. **Clear and Concise**: Write for your audience
+2. **Examples**: Include practical examples
+3. **Up-to-Date**: Keep documentation current
+4. **Tested**: Verify all commands work
+5. **Formatted**: Use consistent markdown formatting
+
+## Version Information
+
+- **Documentation Version**: 1.0
+- **Owl Database Version**: 1.0.0+
+- **Last Updated**: November 26, 2025
 
 ## License
 
-See [LICENSE](../LICENSE) file for details.
+This documentation is licensed under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
 
 ---
 
-*Last Updated: November 16, 2025*
+**Need help?** Start with the [Installation Guide](INSTALLATION.md) or join our [Community Forum](https://community.owl-db.io).

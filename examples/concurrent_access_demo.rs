@@ -44,7 +44,7 @@ fn demo_optimistic_locking() -> Result<(), Box<dyn std::error::Error>> {
     println!("1. Optimistic Locking Demo");
     println!("   Testing version-based conflict detection...\n");
 
-    let manager = ConcurrencyManager::new();
+    let manager = ConcurrencyManager::new_with_real_clock();
     let doc_key = "account_123";
     let txn_id = "transaction_1";
 
@@ -71,7 +71,7 @@ fn demo_lock_compatibility() -> Result<(), Box<dyn std::error::Error>> {
     println!("2. Lock Compatibility Demo");
     println!("   Testing read/write lock interactions...\n");
 
-    let manager = ConcurrencyManager::new();
+    let manager = ConcurrencyManager::new_with_real_clock();
     let doc_key = "shared_document";
 
     // Register multiple transactions

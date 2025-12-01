@@ -4,6 +4,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+// Schema evolution and migration submodules
+pub mod evolution;
+pub mod migration;
+
 /// Schema definition for document collections
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Schema {

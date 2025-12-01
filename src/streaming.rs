@@ -4,6 +4,7 @@
 use crate::document::{Document, DocumentId};
 use crate::error::{OQLError, OQLResult};
 use crate::parser::OQLQuery;
+use crate::simulation::Clock;
 use crate::storage::DocumentStore;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -87,15 +88,22 @@ pub struct StreamConfig {
     pub memory_limit: Option<usize>,
 }
 
-/// Streaming query executor
+/// Streaming query executor with Clock dependency injection
 pub struct StreamingExecutor<S: DocumentStore> {
     store: Arc<S>,
+    clock: Arc<dyn Clock>,
 }
 
 impl<S: DocumentStore> StreamingExecutor<S> {
-    /// Create a new streaming executor
+    /// Create a new streaming executor with Clock dependency injection
+    pub fn new_with_clock(store: Arc<S>, clock: Arc<dyn Clock>) -> Self {
+        Self { store, clock }
+    }
+    
+    /// Create a new streaming executor with production clock (backward compatibility)
     pub fn new(store: Arc<S>) -> Self {
-        Self { store }
+        use crate::simulation::RealClock;
+        Self::new_with_clock(store, Arc::new(RealClock::new()))
     }
     
     /// Execute a query as a stream

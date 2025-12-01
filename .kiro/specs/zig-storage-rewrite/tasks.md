@@ -519,8 +519,8 @@
 
 ## Phase 9: Query Planning & Optimization (Weeks 21-25)
 
-- [ ] 9. Query Planning & Optimization
-  - [ ] 9.1 Logical Planner
+- [x] 9. Query Planning & Optimization
+  - [x] 9.1 Logical Planner
     - Implement logical query planning layer
     - Define `LogicalPlan` enum
     - Convert AST to logical plan
@@ -530,7 +530,7 @@
     - _Files: `src/planner/logical.rs`, `src/planner/types.rs`, `tests/logical_planner_test.rs`_
     - _Requirements: Query planning, type checking_
 
-  - [ ] 9.2 Physical Planner
+  - [x] 9.2 Physical Planner
     - Implement physical query planning layer
     - Define `PhysicalPlan` enum
     - Convert logical to physical plan
@@ -540,7 +540,7 @@
     - _Files: `src/planner/physical.rs`, `src/planner/operators.rs`, `tests/physical_planner_test.rs`_
     - _Requirements: Physical planning, operator selection_
 
-  - [ ] 9.3 Physical Operators
+  - [x] 9.3 Physical Operators
     - Implement iterator-based physical operators
     - `PhysicalOperator` trait defined
     - Implement SeqScan, Filter, Project
@@ -551,7 +551,7 @@
     - _Files: `src/execution/operator.rs`, `src/execution/scan.rs`, `src/execution/join.rs`, `src/execution/aggregate.rs`, `tests/operator_test.rs`_
     - _Requirements: Physical operators, iterator execution_
 
-  - [ ] 9.4 Statistics Collection
+  - [x] 9.4 Statistics Collection
     - Implement statistics collection for cost estimation
     - Table size tracking
     - Cardinality estimation
@@ -562,7 +562,7 @@
     - _Files: `src/optimizer/statistics.rs`, `src/optimizer/histogram.rs`, `tests/statistics_test.rs`_
     - _Requirements: Cost estimation, statistics_
 
-  - [ ] 9.5 Cost-Based Optimizer
+  - [x] 9.5 Cost-Based Optimizer
     - Implement cost-based query optimization
     - Cost model for operators
     - Predicate pushdown
@@ -574,8 +574,8 @@
 
 ## Phase 10: Indexes & Advanced Features (Weeks 26-30)
 
-- [ ] 10. Indexes & Advanced Features
-  - [ ] 10.1 B-Tree Index in Zig
+- [-] 10. Indexes & Advanced Features
+  - [x] 10.1 B-Tree Index in Zig
     - Implement B-tree indexes in Zig
     - B-tree structure with configurable order
     - Insert, delete, search operations
@@ -585,7 +585,7 @@
     - _Files: `owl_storage_zig/src/btree.zig`, `owl_storage_zig/src/btree_test.zig`, `owl_storage_zig/benches/btree_bench.zig`_
     - _Requirements: Index support, B-tree implementation_
 
-  - [ ] 10.2 Index Maintenance
+  - [x] 10.2 Index Maintenance
     - Automatic index maintenance on writes
     - Indexes updated on insert/update/delete
     - Transactional index updates
@@ -595,7 +595,7 @@
     - _Files: `owl_storage_engine/src/index_manager.rs`, `tests/index_maintenance_test.rs`_
     - _Requirements: Index maintenance, consistency_
 
-  - [ ] 10.3 Index Scan Operator
+  - [x] 10.3 Index Scan Operator
     - Implement IndexScan physical operator
     - IndexScan operator implemented
     - Range scan support
@@ -605,7 +605,7 @@
     - _Files: `src/execution/index_scan.rs`, `tests/index_scan_test.rs`, `benches/index_scan_bench.rs`_
     - _Requirements: Index-based query execution_
 
-  - [ ] 10.4 Garbage Collection
+  - [x] 10.4 Garbage Collection
     - Implement garbage collection for deleted objects
     - Mark-and-sweep GC algorithm
     - Reclaim deleted objects
@@ -615,7 +615,7 @@
     - _Files: `owl_storage_zig/src/gc.zig`, `owl_storage_zig/src/gc_test.zig`_
     - _Requirements: Memory reclamation, space efficiency_
 
-  - [ ] 10.5 Parallel Execution
+  - [x] 10.5 Parallel Execution
     - Implement parallel query execution for large scans
     - Parallel SeqScan operator
     - Parallel aggregation
@@ -625,8 +625,38 @@
     - All parallel execution tests pass
     - _Files: `src/execution/parallel_scan.rs`, `src/execution/parallel_aggregate.rs`, `src/execution/thread_pool.rs`, `tests/parallel_execution_test.rs`, `benches/parallel_bench.rs`_
     - _Requirements: Parallel execution, multi-core performance_
+    - _Status: Implementation complete. Tests blocked by storage layer ObjectHeader issue (see 10.6)_
 
-  - [ ] 10.6 Schema Evolution Tools
+  - [x] 10.6 Fix Storage Layer ObjectHeader Integration
+    - **Critical Bug**: ZigStore not writing proper ObjectHeader format
+    - **Root Cause**: Arena expects 48-byte ObjectHeader at start of each object with:
+      - type_tag (u16): Schema type ID
+      - id ([16]u8): UUID bytes
+      - version (u32): MVCC version
+      - size (u32): Total object size
+      - flags (u8): Deleted/Overflow/Pinned flags
+      - checksum (u32): CRC32 for integrity
+      - lsn (u64): Log sequence number
+    - **Current Issue**: Raw serialized data written without header, causing Arena to read garbage as header and interpret FLAG_DELETED bit incorrectly
+    - **Impact**: All document operations fail with "ObjectDeleted" error
+    - **Fix Approach**:
+      1. Create ObjectHeader when storing documents in `store_document_internal()`
+      2. Serialize header + document data together (header_bytes + serialized_doc)
+      3. Allocate space for header + data (48 + data_len bytes)
+      4. Write combined buffer to Arena
+      5. When reading in `read_document_internal()`:
+         - Read first 48 bytes as ObjectHeader
+         - Validate header (check deleted flag, verify checksum)
+         - Read remaining bytes as document data
+         - Deserialize document from data portion
+      6. Update `navigate_reference()` to also read and validate header
+      7. Ensure `delete_document()` sets FLAG_DELETED in header
+    - **Testing**: Once fixed, all parallel execution tests should pass
+    - _Files: `src/storage.rs` (ZigStore implementation), `tests/simple_storage_test.rs`, `tests/parallel_execution_test.rs`_
+    - _Requirements: Proper Arena integration, data integrity_
+    - _Priority: HIGH - Blocks parallel execution testing and other storage operations_
+
+  - [x] 10.7 Schema Evolution Tools
     - Tools for schema evolution and migration
     - Schema versioning system
     - Migration script support

@@ -57,7 +57,7 @@ fn benchAllocSequentialSmall(allocator: std.mem.Allocator) !void {
     const file_path = try std.fs.path.join(allocator, &[_][]const u8{ path, "bench_alloc_small.dat" });
     defer allocator.free(file_path);
 
-    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024);
+    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024, 0); // shard_id = 0
     defer arena.deinit();
 
     var timer = try std.time.Timer.start();
@@ -86,7 +86,7 @@ fn benchAllocMixedSizes(allocator: std.mem.Allocator) !void {
     const file_path = try std.fs.path.join(allocator, &[_][]const u8{ path, "bench_alloc_mixed.dat" });
     defer allocator.free(file_path);
 
-    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024);
+    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024, 0);
     defer arena.deinit();
 
     const sizes = [_]u32{ 64, 128, 256, 512, 1024 };
@@ -116,7 +116,7 @@ fn benchAllocLarge(allocator: std.mem.Allocator) !void {
     const file_path = try std.fs.path.join(allocator, &[_][]const u8{ path, "bench_alloc_large.dat" });
     defer allocator.free(file_path);
 
-    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024);
+    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024, 0);
     defer arena.deinit();
 
     var timer = try std.time.Timer.start();
@@ -160,7 +160,7 @@ fn benchNavSequential(allocator: std.mem.Allocator) !void {
     const file_path = try std.fs.path.join(allocator, &[_][]const u8{ path, "bench_nav_seq.dat" });
     defer allocator.free(file_path);
 
-    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024);
+    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024, 0);
     defer arena.deinit();
 
     // Create chain of objects
@@ -199,7 +199,7 @@ fn benchNavRandomInPage(allocator: std.mem.Allocator) !void {
     const file_path = try std.fs.path.join(allocator, &[_][]const u8{ path, "bench_nav_rand_page.dat" });
     defer allocator.free(file_path);
 
-    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024);
+    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024, 0);
     defer arena.deinit();
 
     // Allocate objects in same page
@@ -239,7 +239,7 @@ fn benchNavRandomAcrossPages(allocator: std.mem.Allocator) !void {
     const file_path = try std.fs.path.join(allocator, &[_][]const u8{ path, "bench_nav_rand_pages.dat" });
     defer allocator.free(file_path);
 
-    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024);
+    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024, 0);
     defer arena.deinit();
 
     // Allocate objects across different pages
@@ -288,7 +288,7 @@ fn benchCoLocationSuccess(allocator: std.mem.Allocator) !void {
     const file_path = try std.fs.path.join(allocator, &[_][]const u8{ path, "bench_coloc_success.dat" });
     defer allocator.free(file_path);
 
-    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024);
+    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024, 0);
     defer arena.deinit();
 
     const parent = try arena.alloc(100);
@@ -319,7 +319,7 @@ fn benchCoLocationFailure(allocator: std.mem.Allocator) !void {
     const file_path = try std.fs.path.join(allocator, &[_][]const u8{ path, "bench_coloc_fail.dat" });
     defer allocator.free(file_path);
 
-    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024);
+    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024, 0);
     defer arena.deinit();
 
     // Fill a page completely
@@ -365,7 +365,7 @@ fn benchReadWriteSequential(allocator: std.mem.Allocator) !void {
     const file_path = try std.fs.path.join(allocator, &[_][]const u8{ path, "bench_rw_seq.dat" });
     defer allocator.free(file_path);
 
-    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024);
+    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024, 0);
     defer arena.deinit();
 
     // Create objects
@@ -409,7 +409,7 @@ fn benchReadWriteRandom(allocator: std.mem.Allocator) !void {
     const file_path = try std.fs.path.join(allocator, &[_][]const u8{ path, "bench_rw_rand.dat" });
     defer allocator.free(file_path);
 
-    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024);
+    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024, 0);
     defer arena.deinit();
 
     // Create objects
@@ -457,7 +457,7 @@ fn benchReadWriteHotSpot(allocator: std.mem.Allocator) !void {
     const file_path = try std.fs.path.join(allocator, &[_][]const u8{ path, "bench_rw_hot.dat" });
     defer allocator.free(file_path);
 
-    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024);
+    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024, 0);
     defer arena.deinit();
 
     // Create objects
@@ -520,7 +520,7 @@ fn benchFragmentation(allocator: std.mem.Allocator) !void {
     const file_path = try std.fs.path.join(allocator, &[_][]const u8{ path, "bench_frag.dat" });
     defer allocator.free(file_path);
 
-    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024);
+    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024, 0);
     defer arena.deinit();
 
     // Allocate and delete alternating pattern (creates fragmentation)
@@ -562,7 +562,7 @@ fn benchPageThrashing(allocator: std.mem.Allocator) !void {
     const file_path = try std.fs.path.join(allocator, &[_][]const u8{ path, "bench_thrash.dat" });
     defer allocator.free(file_path);
 
-    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024);
+    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024, 0);
     defer arena.deinit();
 
     // Allocate objects across many pages
@@ -613,7 +613,7 @@ fn benchMemoryOverhead(allocator: std.mem.Allocator) !void {
     const file_path = try std.fs.path.join(allocator, &[_][]const u8{ path, "bench_mem_overhead.dat" });
     defer allocator.free(file_path);
 
-    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024);
+    var arena = try Arena.init(allocator, file_path, 100 * 1024 * 1024, 0);
     defer arena.deinit();
 
     const id = [_]u8{1} ** 16;
@@ -649,7 +649,7 @@ fn benchMemoryDensity(allocator: std.mem.Allocator) !void {
     defer allocator.free(file_path);
 
     const arena_size = 10 * 1024 * 1024; // 10MB
-    var arena = try Arena.init(allocator, file_path, arena_size);
+    var arena = try Arena.init(allocator, file_path, arena_size, 0);
     defer arena.deinit();
 
     const id = [_]u8{1} ** 16;

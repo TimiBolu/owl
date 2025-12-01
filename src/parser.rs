@@ -489,6 +489,7 @@ pub enum Operation {
     Where(WhereBlock),
     Select(SelectBlock),
     Insert(InsertBlock),
+    InsertMany(Vec<InsertBlock>),  // Batch insert multiple documents
     Update(UpdateBlock),
     Delete,
     Sort(SortBlock),
@@ -1460,8 +1461,48 @@ impl Parser {
             }
             Some(Token::Insert) => {
                 self.advance();
-                let insert_block = self.parse_insert_block_with_validation(schema_name)?;
-                Ok(Operation::Insert(insert_block))
+                
+                // Check if this is insertMany (array of objects)
+                if self.current_token() == Some(&Token::LeftBracket) {
+                    self.advance(); // consume '['
+                    
+                    let mut insert_blocks = Vec::new();
+                    
+                    // Parse array of insert blocks
+                    loop {
+                        if self.current_token() == Some(&Token::RightBracket) {
+                            break;
+                        }
+                        
+                        let insert_block = self.parse_insert_block_with_validation(schema_name)?;
+                        insert_blocks.push(insert_block);
+                        
+                        // Check for comma or end of array
+                        if self.current_token() == Some(&Token::Comma) {
+                            self.advance();
+                        } else if self.current_token() == Some(&Token::RightBracket) {
+                            break;
+                        } else {
+                            return Err(ParseError::UnexpectedToken(
+                                format!("Expected ',' or ']', found {:?}", self.current_token())
+                            ));
+                        }
+                    }
+                    
+                    self.expect_token(Token::RightBracket)?; // consume ']'
+                    
+                    if insert_blocks.is_empty() {
+                        return Err(ParseError::UnexpectedToken(
+                            "insertMany requires at least one document".to_string()
+                        ));
+                    }
+                    
+                    Ok(Operation::InsertMany(insert_blocks))
+                } else {
+                    // Single insert
+                    let insert_block = self.parse_insert_block_with_validation(schema_name)?;
+                    Ok(Operation::Insert(insert_block))
+                }
             }
             Some(Token::Update) => {
                 self.advance();
@@ -3542,19 +3583,53 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
     let mut success_count = 0;
     let mut errors = Vec::new();
     
+    // Create a schema registry for type resolution
+    let registry = crate::schema::SchemaRegistry::new();
+    
+    // First pass: Register all schema names (for forward references)
+    for statement in &file.statements {
+        if let OQLFileStatement::Schema(schema_def) = statement {
+            // Create empty schema just to register the name
+            let empty_schema = crate::schema::Schema::new(
+                schema_def.name.clone(),
+                std::collections::HashMap::new()
+            );
+            registry.register(empty_schema).ok(); // Ignore errors for now
+        }
+    }
+    
+    // Second pass: Convert and register full schemas with resolved types
+    for statement in &file.statements {
+        if let OQLFileStatement::Schema(schema_def) = statement {
+            match schema_definition_to_schema(schema_def, &registry) {
+                Ok(schema) => {
+                    // Register in registry
+                    registry.register(schema.clone()).ok();
+                    // Store in database
+                    executor.store().put_schema(&schema).ok();
+                }
+                Err(e) => {
+                    eprintln!("Warning: Failed to convert schema {}: {}", schema_def.name, e);
+                }
+            }
+        }
+    }
+    
+    // Third pass: Execute statements
     for statement in &file.statements {
         match statement {
             OQLFileStatement::Schema(schema) => {
                 schema_count += 1;
-                // TODO: Create schema in the database
                 println!("📋 Schema definition: {}", schema.name);
                 success_count += 1;
                 results.push(StatementResult::Schema(schema.name.clone()));
             }
             OQLFileStatement::Query(query) => {
                 query_count += 1;
+                let start_time = std::time::Instant::now();
                 match executor.execute_query(query) {
                     Ok(documents) => {
+                        let elapsed = start_time.elapsed();
                         success_count += 1;
                         let query_str = format!("{}.{}", query.collection, 
                             query.operations.iter()
@@ -3562,15 +3637,17 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
                                 .collect::<Vec<_>>()
                                 .join(".")
                         );
-                        println!("✅ {} -> {} documents", 
+                        println!("✅ {} -> {} documents ({:.3}ms)", 
                             query_str.chars().take(50).collect::<String>(), 
-                            documents.len()
+                            documents.len(),
+                            elapsed.as_secs_f64() * 1000.0
                         );
                         results.push(StatementResult::Query(documents.len()));
                     }
                     Err(e) => {
+                        let elapsed = start_time.elapsed();
                         let error_msg = format!("Execution failed: {}", e);
-                        println!("❌ {}", error_msg);
+                        println!("❌ {} ({:.3}ms)", error_msg, elapsed.as_secs_f64() * 1000.0);
                         errors.push(error_msg);
                         results.push(StatementResult::Error(e.to_string()));
                     }
@@ -3620,4 +3697,53 @@ pub enum StatementResult {
     Query(usize), // Number of documents returned
     Function(String),
     Error(String),
+}
+
+/// Convert a SchemaDefinition to a Schema with resolved types
+pub fn schema_definition_to_schema(
+    def: &SchemaDefinition,
+    registry: &crate::schema::SchemaRegistry,
+) -> crate::error::OQLResult<crate::schema::Schema> {
+    use std::collections::HashMap;
+    use crate::schema::{FieldType, ReferenceType};
+    
+    let mut fields = HashMap::new();
+    
+    for field in &def.fields {
+        let field_type = parse_field_type(&field.field_type, registry)?;
+        let final_type = if field.optional {
+            FieldType::Optional(Box::new(field_type))
+        } else {
+            field_type
+        };
+        fields.insert(field.name.clone(), final_type);
+    }
+    
+    Ok(crate::schema::Schema::new(def.name.clone(), fields))
+}
+
+/// Parse a field type string into a FieldType enum
+fn parse_field_type(
+    type_str: &str,
+    registry: &crate::schema::SchemaRegistry,
+) -> crate::error::OQLResult<crate::schema::FieldType> {
+    use crate::schema::{FieldType, ReferenceType};
+    use crate::error::OQLError;
+    
+    match type_str {
+        "String" => Ok(FieldType::String),
+        "Integer" => Ok(FieldType::Integer),
+        "Float" => Ok(FieldType::Float),
+        "Boolean" => Ok(FieldType::Boolean),
+        "DateTime" => Ok(FieldType::DateTime),
+        // Check if it's a schema name (reference type)
+        schema_name if registry.exists(schema_name) => {
+            Ok(FieldType::Reference(ReferenceType::new(schema_name.to_string())))
+        }
+        _ => {
+            // Unknown type - could be a typo or forward reference
+            // For now, treat as String to avoid breaking existing code
+            Ok(FieldType::String)
+        }
+    }
 }

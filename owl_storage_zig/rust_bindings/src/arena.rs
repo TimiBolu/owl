@@ -1,4 +1,4 @@
-//! Safe Arena wrapper with RAII
+//! Safe Arena wrapper with RAII and FileSystem dependency injection
 
 use crate::error::{Error, Result};
 use crate::ffi;
@@ -8,12 +8,13 @@ use std::ffi::CString;
 use std::marker::PhantomData;
 use std::path::Path;
 use std::ptr::NonNull;
+use std::sync::Arc;
 
-/// A memory-mapped arena for object storage.
+/// A memory-mapped arena for object storage with FileSystem dependency injection.
 ///
 /// The Arena provides:
 /// - Fast bump allocation (<20ns per object)
-/// - Memory-mapped file storage
+/// - Memory-mapped file storage (or simulated storage for testing)
 /// - Co-location for cache efficiency
 /// - Thread-safe operations (via atomic operations in Zig)
 ///
@@ -24,14 +25,17 @@ use std::ptr::NonNull;
 /// # Example
 ///
 /// ```no_run
-/// use owl_storage_zig::Arena;
+/// use owl_storage_zig::{Arena, RealFileSystem};
+/// use std::sync::Arc;
 ///
-/// let arena = Arena::create("data.owl", 100 * 1024 * 1024)?;
+/// let fs = Arc::new(RealFileSystem::new());
+/// let arena = Arena::create_with_fs("data.owl", 100 * 1024 * 1024, fs)?;
 /// let obj_ref = arena.alloc(256)?;
 /// # Ok::<(), owl_storage_zig::Error>(())
 /// ```
 pub struct Arena {
     ptr: NonNull<ffi::Arena>,
+    filesystem: Arc<dyn crate::filesystem::FileSystem>,
     _marker: PhantomData<ffi::Arena>,
 }
 
@@ -40,7 +44,53 @@ unsafe impl Send for Arena {}
 unsafe impl Sync for Arena {}
 
 impl Arena {
-    /// Create a new arena with file-backed memory mapping.
+    /// Create a new arena with file-backed memory mapping using dependency injection.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path to the backing file
+    /// * `size` - Size of the arena in bytes (1MB - 1TB)
+    /// * `filesystem` - FileSystem implementation for I/O operations
+    ///
+    /// # Errors
+    ///
+    /// Returns `Error::InvalidArena` if creation fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use owl_storage_zig::{Arena, RealFileSystem};
+    /// use std::sync::Arc;
+    ///
+    /// let fs = Arc::new(RealFileSystem::new());
+    /// let arena = Arena::create_with_fs("data.owl", 100 * 1024 * 1024, fs)?;
+    /// # Ok::<(), owl_storage_zig::Error>(())
+    /// ```
+    pub fn create_with_fs<P: AsRef<Path>>(
+        path: P, 
+        size: usize, 
+        filesystem: Arc<dyn crate::filesystem::FileSystem>
+    ) -> Result<Self> {
+        let path_str = path
+            .as_ref()
+            .to_str()
+            .ok_or(Error::InvalidArena)?;
+        let c_path = CString::new(path_str).map_err(|_| Error::InvalidArena)?;
+
+        let ptr = unsafe { ffi::owl_arena_create(c_path.as_ptr(), size) };
+
+        NonNull::new(ptr)
+            .map(|ptr| Arena {
+                ptr,
+                filesystem,
+                _marker: PhantomData,
+            })
+            .ok_or(Error::InvalidArena)
+    }
+
+    /// Create a new arena with file-backed memory mapping (backward compatibility).
+    ///
+    /// This method uses RealFileSystem for production deployment.
     ///
     /// # Arguments
     ///
@@ -60,20 +110,8 @@ impl Arena {
     /// # Ok::<(), owl_storage_zig::Error>(())
     /// ```
     pub fn create<P: AsRef<Path>>(path: P, size: usize) -> Result<Self> {
-        let path_str = path
-            .as_ref()
-            .to_str()
-            .ok_or(Error::InvalidArena)?;
-        let c_path = CString::new(path_str).map_err(|_| Error::InvalidArena)?;
-
-        let ptr = unsafe { ffi::owl_arena_create(c_path.as_ptr(), size) };
-
-        NonNull::new(ptr)
-            .map(|ptr| Arena {
-                ptr,
-                _marker: PhantomData,
-            })
-            .ok_or(Error::InvalidArena)
+        let filesystem = Arc::new(crate::filesystem::RealFileSystem::new());
+        Self::create_with_fs(path, size, filesystem)
     }
 
     /// Allocate space for an object.
@@ -369,6 +407,65 @@ impl Arena {
     #[inline]
     pub fn base_ptr_mut(&self) -> *mut u8 {
         unsafe { ffi::owl_arena_base_ptr(self.ptr.as_ptr()) }
+    }
+
+    /// Write raw bytes at a specific offset (low-level API).
+    ///
+    /// This bypasses the Object structure and writes raw bytes directly.
+    /// Use this when you need to manage your own data format.
+    ///
+    /// # Arguments
+    ///
+    /// * `offset` - Byte offset in the arena
+    /// * `data` - Data to write
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the offset is out of bounds.
+    #[inline]
+    pub fn write_at(&self, offset: u64, data: &[u8]) -> Result<()> {
+        let code = unsafe {
+            ffi::owl_arena_write_at(
+                self.ptr.as_ptr(),
+                offset,
+                data.as_ptr(),
+                data.len(),
+            )
+        };
+        Error::from_code(code)
+    }
+
+    /// Read raw bytes from a specific offset (low-level API).
+    ///
+    /// This bypasses the Object structure and reads raw bytes directly.
+    /// Use this when you need to manage your own data format.
+    ///
+    /// # Arguments
+    ///
+    /// * `offset` - Byte offset in the arena
+    /// * `buffer` - Buffer to read into
+    ///
+    /// # Returns
+    ///
+    /// Returns the number of bytes read.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the offset is out of bounds.
+    #[inline]
+    pub fn read_at(&self, offset: u64, buffer: &mut [u8]) -> Result<usize> {
+        let mut bytes_read: usize = 0;
+        let code = unsafe {
+            ffi::owl_arena_read_at(
+                self.ptr.as_ptr(),
+                offset,
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut bytes_read,
+            )
+        };
+        Error::from_code(code)?;
+        Ok(bytes_read)
     }
 }
 

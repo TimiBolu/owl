@@ -3,10 +3,10 @@
 
 use crate::document::{Document, DocumentId};
 use crate::error::{ErrorContext, OQLError, OQLResult};
+use crate::simulation::Clock;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
-use std::thread;
 use uuid::Uuid;
 
 /// Lock type for document access
@@ -64,6 +64,8 @@ pub struct ConcurrencyManager {
     wait_for_graph: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     /// Active transactions
     active_transactions: Arc<RwLock<HashSet<String>>>,
+    /// Clock for time operations (dependency injection)
+    clock: Arc<dyn Clock>,
     /// Lock timeout duration
     lock_timeout: Duration,
     /// Deadlock detection interval
@@ -71,28 +73,36 @@ pub struct ConcurrencyManager {
 }
 
 impl ConcurrencyManager {
-    /// Create a new concurrency manager
-    pub fn new() -> Self {
+    /// Create a new concurrency manager with dependency injection
+    pub fn new(clock: Arc<dyn Clock>) -> Self {
         Self {
             locks: Arc::new(RwLock::new(HashMap::new())),
             waiting_queue: Arc::new(Mutex::new(VecDeque::new())),
             wait_for_graph: Arc::new(Mutex::new(HashMap::new())),
             active_transactions: Arc::new(RwLock::new(HashSet::new())),
+            clock,
             lock_timeout: Duration::from_secs(30),
             deadlock_check_interval: Duration::from_millis(100),
         }
     }
 
     /// Create a new concurrency manager with custom timeouts (for testing)
-    pub fn new_with_timeouts(lock_timeout: Duration, deadlock_check_interval: Duration) -> Self {
+    pub fn new_with_timeouts(clock: Arc<dyn Clock>, lock_timeout: Duration, deadlock_check_interval: Duration) -> Self {
         Self {
             locks: Arc::new(RwLock::new(HashMap::new())),
             waiting_queue: Arc::new(Mutex::new(VecDeque::new())),
             wait_for_graph: Arc::new(Mutex::new(HashMap::new())),
             active_transactions: Arc::new(RwLock::new(HashSet::new())),
+            clock,
             lock_timeout,
             deadlock_check_interval,
         }
+    }
+    
+    /// Create a new concurrency manager with production clock (for backward compatibility)
+    pub fn new_with_real_clock() -> Self {
+        use crate::simulation::RealClock;
+        Self::new(Arc::new(RealClock::new()))
     }
 
     /// Register a new transaction
@@ -179,7 +189,7 @@ impl ConcurrencyManager {
         lock_type: LockType,
         expected_version: Option<u64>,
     ) -> OQLResult<()> {
-        let start_time = Instant::now();
+        let start_time = self.clock.now();
         let mut added_to_queue = false;
         
         loop {
@@ -221,7 +231,7 @@ impl ConcurrencyManager {
             }
 
             // Wait a bit before retrying
-            thread::sleep(self.deadlock_check_interval);
+            self.clock.sleep(self.deadlock_check_interval);
         }
     }
 
@@ -284,7 +294,7 @@ impl ConcurrencyManager {
             transaction_id: transaction_id.to_string(),
             document_key: document_key.to_string(),
             lock_type,
-            requested_at: Instant::now(),
+            requested_at: self.clock.now(),
         };
 
         queue.push_back(waiting);
@@ -454,6 +464,7 @@ impl ConcurrencyManager {
         lock_type: LockType,
         expected_version: Option<u64>,
     ) -> OQLResult<()> {
+        let current_time = self.clock.now();
         let document_locks = locks.entry(document_key.to_string()).or_insert_with(Vec::new);
 
         // Check if this transaction already holds a compatible lock
@@ -513,7 +524,7 @@ impl ConcurrencyManager {
             transaction_id: transaction_id.to_string(),
             document_key: document_key.to_string(),
             lock_type,
-            acquired_at: Instant::now(),
+            acquired_at: current_time,
             expected_version,
         };
 
@@ -611,7 +622,7 @@ impl ConcurrencyManager {
 
 impl Default for ConcurrencyManager {
     fn default() -> Self {
-        Self::new()
+        Self::new_with_real_clock()
     }
 }
 
@@ -633,7 +644,7 @@ mod tests {
 
     #[test]
     fn test_basic_locking() {
-        let manager = ConcurrencyManager::new();
+        let manager = ConcurrencyManager::new_with_real_clock();
         let txn1 = "txn1";
         let txn2 = "txn2";
         let doc_key = "doc1";
@@ -659,7 +670,7 @@ mod tests {
 
     #[test]
     fn test_write_lock_exclusivity() {
-        let manager = ConcurrencyManager::new();
+        let manager = ConcurrencyManager::new_with_real_clock();
         let txn1 = "txn1";
         let txn2 = "txn2";
         let doc_key = "doc1";
@@ -693,7 +704,7 @@ mod tests {
 
     #[test]
     fn test_optimistic_locking_version_validation() {
-        let manager = ConcurrencyManager::new();
+        let manager = ConcurrencyManager::new_with_real_clock();
         let doc_key = "doc1";
         let txn_id = "txn1";
 
@@ -707,7 +718,7 @@ mod tests {
 
     #[test]
     fn test_deadlock_detection() {
-        let manager = ConcurrencyManager::new();
+        let manager = ConcurrencyManager::new_with_real_clock();
         
         // Create a simple deadlock scenario in the wait-for graph
         {
@@ -734,7 +745,7 @@ mod tests {
 
     #[test]
     fn test_transaction_registration() {
-        let manager = ConcurrencyManager::new();
+        let manager = ConcurrencyManager::new_with_real_clock();
         let txn_id = "test_txn";
 
         // Register transaction
@@ -755,7 +766,7 @@ mod tests {
 
     #[test]
     fn test_statistics() {
-        let manager = ConcurrencyManager::new();
+        let manager = ConcurrencyManager::new_with_real_clock();
         let txn_id = "test_txn";
         let doc_key = "test_doc";
 

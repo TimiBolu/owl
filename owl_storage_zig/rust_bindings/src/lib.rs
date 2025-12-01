@@ -33,12 +33,14 @@
 mod arena;
 mod error;
 mod ffi;
+mod filesystem;
 mod object;
 mod objref;
 mod stats;
 
 pub use arena::Arena;
 pub use error::{Error, Result};
+pub use filesystem::{FileSystem, FileHandle, RealFileSystem};
 pub use object::Object;
 pub use objref::ObjRef;
 pub use stats::{ArenaStats, ColocationMetrics};

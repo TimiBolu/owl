@@ -3,32 +3,47 @@
 use crate::document::{Document, Value, ObjRef};
 use crate::error::{OQLError, OQLResult};
 use crate::functions::FunctionRegistry;
+use crate::hot_path_optimizations::{
+    get_pooled_document_vec, return_pooled_document_vec, 
+    optimized_get_field, get_profiler,
+    OptimizedHashMap, CacheLineAligned
+};
+use crate::profile_call;
 // use crate::optimizer::QueryOptimizer; // TODO: Re-enable after optimizer module
 use crate::parser::{ComparisonOperator, Condition, Expression, FieldAccess, Literal, OQLQuery, Operation, InsertBlock, UpdateBlock, SelectBlock, GroupByBlock, HavingBlock, SortBlock, SortDirection};
 use crate::reference::ReferenceResolver;
+use crate::simulation::Clock;
 use crate::storage::{DocumentStore, Storage};
 use crate::streaming::{QueryStream, StreamingExecutor, StreamConfig, PaginatedResult, StreamCursor};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Query execution engine for OQL
+/// Query execution engine for OQL with dependency injection
 pub struct QueryExecutor<S: DocumentStore> {
     store: Arc<S>,
+    clock: Arc<dyn Clock>,
     functions: FunctionRegistry,
     // optimizer: QueryOptimizer, // TODO: Re-enable after optimizer module
     streaming_executor: StreamingExecutor<S>,
 }
 
 impl<S: DocumentStore> QueryExecutor<S> {
-    /// Create a new query executor
-    pub fn new(store: Arc<S>) -> Self {
-        let streaming_executor = StreamingExecutor::new(store.clone());
+    /// Create a new query executor with dependency injection
+    pub fn new(store: Arc<S>, clock: Arc<dyn Clock>) -> Self {
+        let streaming_executor = StreamingExecutor::new_with_clock(store.clone(), clock.clone());
         Self { 
             store: store.clone(),
+            clock,
             functions: FunctionRegistry::new(),
             // optimizer: QueryOptimizer::new(), // TODO: Re-enable after optimizer module
             streaming_executor,
         }
+    }
+    
+    /// Create a new query executor with production clock (for backward compatibility)
+    pub fn new_with_real_clock(store: Arc<S>) -> Self {
+        use crate::simulation::RealClock;
+        Self::new(store, Arc::new(RealClock::new()))
     }
     
     /// Register a user-defined function
@@ -91,27 +106,39 @@ impl<S: DocumentStore> QueryExecutor<S> {
     
     /// Execute an OQL query and return matching documents
     pub fn execute_query(&self, query: &OQLQuery) -> OQLResult<Vec<Document>> {
-        let mut documents = Vec::new();
-        let mut is_insert_only = false;
-        
-        // Check if this is an INSERT-only operation
-        if query.operations.len() == 1 {
-            if let Operation::Insert(_) = &query.operations[0] {
-                is_insert_only = true;
+        profile_call!("execute_query", {
+            // Use pooled vector to reduce allocations
+            let mut documents = get_pooled_document_vec();
+            let mut is_insert_only = false;
+            
+            // Check if this is an INSERT-only operation
+            if query.operations.len() == 1 {
+                match &query.operations[0] {
+                    Operation::Insert(_) | Operation::InsertMany(_) => {
+                        is_insert_only = true;
+                    }
+                    _ => {}
+                }
             }
-        }
-        
-        // For non-INSERT operations, start by scanning the collection
-        if !is_insert_only {
-            documents = self.scan_collection(&query.collection)?;
-        }
-        
-        // Apply operations in sequence
-        for operation in &query.operations {
-            documents = self.apply_operation(documents, operation, &query.collection)?;
-        }
-        
-        Ok(documents)
+            
+            // For non-INSERT operations, start by scanning the collection
+            if !is_insert_only {
+                let scanned_docs = self.scan_collection(&query.collection)?;
+                documents.extend(scanned_docs);
+            }
+            
+            // Apply operations in sequence
+            for operation in &query.operations {
+                let temp_docs = std::mem::take(&mut documents);
+                documents = self.apply_operation(temp_docs, operation, &query.collection)?;
+            }
+            
+            // Convert to owned Vec before returning (pooled vec will be returned)
+            let result = documents.clone();
+            return_pooled_document_vec(documents);
+            
+            Ok(result)
+        })
     }
     
     /// Scan all documents in a collection
@@ -132,6 +159,9 @@ impl<S: DocumentStore> QueryExecutor<S> {
             }
             Operation::Insert(insert_block) => {
                 self.apply_insert_operation(collection, insert_block)
+            }
+            Operation::InsertMany(insert_blocks) => {
+                self.apply_insert_many_operation(collection, insert_blocks)
             }
             Operation::Update(update_block) => {
                 self.apply_update_operation(documents, update_block)
@@ -491,33 +521,35 @@ impl<S: DocumentStore> QueryExecutor<S> {
     /// Get field value from document using field access path with implicit null handling
     /// This is the core implementation of OWL's migration-friendly field access
     pub fn get_field_value(&self, document: &Document, field_access: &FieldAccess) -> OQLResult<Value> {
-        if field_access.path.is_empty() {
-            // Return null for empty path instead of error - graceful degradation
-            return Ok(Value::Null);
-        }
-        
-        // Handle single-level field access directly
-        if field_access.path.len() == 1 {
-            let field_name = &field_access.path[0];
+        profile_call!("get_field_value", {
+            if field_access.path.is_empty() {
+                // Return null for empty path instead of error - graceful degradation
+                return Ok(Value::Null);
+            }
             
-            // Handle special fields
-            match field_name.as_str() {
-                "id" => return Ok(Value::String(document.id.clone())),
-                "schema" => return Ok(Value::String(document.schema.clone())),
-                "created_at" => return Ok(Value::DateTime(document.created_at)),
-                "updated_at" => return Ok(Value::DateTime(document.updated_at)),
-                _ => {
-                    // Regular field access - always returns a value (null if missing)
-                    return match document.get_field(field_name) {
-                        Some(value) => Ok(value.clone()),
-                        None => Ok(Value::Null), // Implicit null handling - no errors!
-                    };
+            // Handle single-level field access directly with optimized lookup
+            if field_access.path.len() == 1 {
+                let field_name = &field_access.path[0];
+                
+                // Handle special fields
+                match field_name.as_str() {
+                    "id" => return Ok(Value::String(document.id.clone())),
+                    "schema" => return Ok(Value::String(document.schema.clone())),
+                    "created_at" => return Ok(Value::DateTime(document.created_at)),
+                    "updated_at" => return Ok(Value::DateTime(document.updated_at)),
+                    _ => {
+                        // Use optimized field access with caching
+                        return match optimized_get_field(document, field_name) {
+                            Some(value) => Ok(value),
+                            None => Ok(Value::Null), // Implicit null handling - no errors!
+                        };
+                    }
                 }
             }
-        }
-        
-        // Handle multi-level field access with implicit null handling
-        self.resolve_nested_field_path(document, &field_access.path)
+            
+            // Handle multi-level field access with implicit null handling
+            self.resolve_nested_field_path(document, &field_access.path)
+        })
     }
     
     /// Resolve nested field path with implicit null handling at every level
@@ -949,8 +981,19 @@ impl<S: DocumentStore> QueryExecutor<S> {
         // Create a temporary empty document for expression evaluation context
         let temp_doc = Document::new(collection.to_string(), HashMap::new());
         
+        // Get schema if it exists for type conversion
+        let schema = self.store.get_schema(collection).ok().flatten();
+        
         for insert_field in &insert_block.fields {
-            let value = self.evaluate_expression(&temp_doc, &insert_field.value)?;
+            let mut value = self.evaluate_expression(&temp_doc, &insert_field.value)?;
+            
+            // Convert value to match schema type if needed
+            if let Some(ref schema) = schema {
+                if let Some(field_type) = schema.get_field_type(&insert_field.name) {
+                    value = self.convert_to_schema_type(value, field_type, collection)?;
+                }
+            }
+            
             fields.insert(insert_field.name.clone(), value);
         }
         
@@ -958,7 +1001,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
         let document = Document::new(collection.to_string(), fields);
         
         // Validate against schema if it exists
-        if let Ok(Some(schema)) = self.store.get_schema(collection) {
+        if let Some(schema) = schema {
             schema.validate_document(&document.fields)?;
         }
         
@@ -967,6 +1010,99 @@ impl<S: DocumentStore> QueryExecutor<S> {
         
         // Return the created document
         Ok(vec![document])
+    }
+    
+    /// Apply INSERT MANY operation (batch insert)
+    fn apply_insert_many_operation(&self, collection: &str, insert_blocks: &[InsertBlock]) -> OQLResult<Vec<Document>> {
+        let mut documents = Vec::with_capacity(insert_blocks.len());
+        
+        // Get schema once for all documents
+        let schema = self.store.get_schema(collection).ok().flatten();
+        
+        // Create a temporary empty document for expression evaluation context
+        let temp_doc = Document::new(collection.to_string(), HashMap::new());
+        
+        // Process each insert block
+        for insert_block in insert_blocks {
+            let mut fields = HashMap::new();
+            
+            for insert_field in &insert_block.fields {
+                let mut value = self.evaluate_expression(&temp_doc, &insert_field.value)?;
+                
+                // Convert value to match schema type if needed
+                if let Some(ref schema) = schema {
+                    if let Some(field_type) = schema.get_field_type(&insert_field.name) {
+                        value = self.convert_to_schema_type(value, field_type, collection)?;
+                    }
+                }
+                
+                fields.insert(insert_field.name.clone(), value);
+            }
+            
+            // Create new document
+            let document = Document::new(collection.to_string(), fields);
+            
+            // Validate against schema if it exists
+            if let Some(ref schema) = schema {
+                schema.validate_document(&document.fields)?;
+            }
+            
+            documents.push(document);
+        }
+        
+        // Batch store all documents
+        for document in &documents {
+            self.store.put_document(document)?;
+        }
+        
+        // Return all created documents
+        Ok(documents)
+    }
+    
+    /// Convert a value to match the expected schema type
+    fn convert_to_schema_type(&self, value: Value, field_type: &crate::schema::FieldType, _current_collection: &str) -> OQLResult<Value> {
+        use crate::schema::FieldType;
+        
+        match (value, field_type) {
+            // If we have a string but schema expects a reference, convert it
+            (Value::String(ref_id), FieldType::Reference(ref_type)) => {
+                let target_schema = &ref_type.target_schema;
+                
+                // Scan for the document with this id field value
+                let documents = self.store.scan_documents(target_schema)?;
+                
+                // Find document where the "id" field matches
+                for doc in documents {
+                    if let Some(Value::String(doc_id)) = doc.fields.get("id") {
+                        if doc_id == &ref_id {
+                            // Found the document! Get its ObjRef
+                            if let Some(objref) = self.store.get_objref(target_schema, &doc.id)? {
+                                return Ok(Value::Reference(objref));
+                            }
+                        }
+                    }
+                }
+                
+                // Document not found - return error or null based on whether reference is required
+                if ref_type.required {
+                    Err(OQLError::ReferenceError {
+                        message: format!("Referenced document not found: {} in {}", ref_id, target_schema)
+                    })
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            // Handle optional types
+            (v, FieldType::Optional(inner_type)) => {
+                if v.is_null() {
+                    Ok(Value::Null)
+                } else {
+                    self.convert_to_schema_type(v, inner_type, _current_collection)
+                }
+            }
+            // Pass through if types already match or no conversion needed
+            (v, _) => Ok(v)
+        }
     }
     
     /// Apply UPDATE operation to documents
