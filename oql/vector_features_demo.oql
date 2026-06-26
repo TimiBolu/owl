@@ -1,0 +1,23 @@
+schema products {
+  id: String,
+  title: String,
+  embedding: Vector(3),
+  status: String
+}
+
+products.insert [
+  { id: "p1", title: "alpha", embedding: [1.0, 0.0, 0.0], status: "active" },
+  { id: "p2", title: "beta", embedding: [0.0, 1.0, 0.0], status: "active" },
+  { id: "p3", title: "gamma", embedding: [0.8, 0.2, 0.0], status: "inactive" }
+]
+
+products.nearest {
+  field: .embedding,
+  query: [1.0, 0.0, 0.0],
+  metric: "cosine",
+  k: 2
+}.select {
+  id,
+  title,
+  score: ._score
+}

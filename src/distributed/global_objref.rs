@@ -3,8 +3,8 @@
 // This module implements GlobalObjRef, extending the current 64-bit ObjRef
 // to support distributed object references across shards.
 
-use crate::document::ObjRef;
 use crate::distributed::consistent_hash::ShardId;
+use crate::document::ObjRef;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -194,7 +194,7 @@ impl GlobalObjRef {
         let shard_id = (high >> 32) as u32;
         let local_offset = ((high & 0xFFFFFFFF) << 32) | (low >> 32);
         let flags = (low & 0xFFFFFFFF) as u32;
-        
+
         Self {
             shard_id,
             local_offset,
@@ -216,16 +216,14 @@ impl GlobalObjRef {
         if bytes.len() != 16 {
             return Err("GlobalObjRef requires exactly 16 bytes");
         }
-        
+
         let high = u64::from_le_bytes([
-            bytes[0], bytes[1], bytes[2], bytes[3],
-            bytes[4], bytes[5], bytes[6], bytes[7],
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
         ]);
         let low = u64::from_le_bytes([
-            bytes[8], bytes[9], bytes[10], bytes[11],
-            bytes[12], bytes[13], bytes[14], bytes[15],
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
         ]);
-        
+
         Ok(Self::decode(high, low))
     }
 
@@ -256,6 +254,34 @@ impl GlobalObjRef {
             flags: new_flags,
         }
     }
+
+    /// Stable string form for APIs and persistence edges.
+    pub fn to_string_id(&self) -> String {
+        if self.is_null() {
+            String::new()
+        } else {
+            format!(
+                "gref_{:08x}_{:016x}_{:08x}",
+                self.shard_id, self.local_offset, self.flags
+            )
+        }
+    }
+
+    /// Parse the stable string form produced by `to_string_id`.
+    pub fn from_string(s: &str) -> Option<Self> {
+        if s.is_empty() {
+            return Some(Self::null());
+        }
+        let rest = s.strip_prefix("gref_")?;
+        let mut parts = rest.split('_');
+        let shard = u32::from_str_radix(parts.next()?, 16).ok()?;
+        let offset = u64::from_str_radix(parts.next()?, 16).ok()?;
+        let flags = u32::from_str_radix(parts.next()?, 16).ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(Self::new(shard, offset, flags))
+    }
 }
 
 impl fmt::Display for GlobalObjRef {
@@ -263,8 +289,11 @@ impl fmt::Display for GlobalObjRef {
         if self.is_null() {
             write!(f, "GlobalObjRef(null)")
         } else {
-            write!(f, "GlobalObjRef(shard={}, offset={}, flags=0x{:08x})", 
-                   self.shard_id, self.local_offset, self.flags)
+            write!(
+                f,
+                "GlobalObjRef(shard={}, offset={}, flags=0x{:08x})",
+                self.shard_id, self.local_offset, self.flags
+            )
         }
     }
 }
@@ -289,7 +318,10 @@ pub enum NavigationResult<T> {
     /// Object found locally (fast path)
     Local(T),
     /// Object is on remote shard (requires network call)
-    Remote { shard_id: ShardId, objref: GlobalObjRef },
+    Remote {
+        shard_id: ShardId,
+        objref: GlobalObjRef,
+    },
     /// Reference is null or invalid
     NotFound,
 }
@@ -336,6 +368,14 @@ mod tests {
     }
 
     #[test]
+    fn test_global_objref_string_roundtrip() {
+        let original = GlobalObjRef::new(7, 0x1234_5678_9abc_def0, 0x1020_3040);
+        let encoded = original.to_string_id();
+        let decoded = GlobalObjRef::from_string(&encoded).expect("decode global ref");
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
     fn test_null_reference() {
         let null_ref = GlobalObjRef::null();
         assert!(null_ref.is_null());
@@ -347,12 +387,12 @@ mod tests {
     fn test_local_conversion() {
         let local_ref = ObjRef::new(2048);
         let global_ref = GlobalObjRef::from_local(local_ref, 5);
-        
+
         assert_eq!(global_ref.shard_id(), 5);
         assert_eq!(global_ref.local_offset(), 2048);
         assert!(global_ref.is_local(5));
         assert!(!global_ref.is_local(3));
-        
+
         let local_again = global_ref.to_local();
         assert_eq!(local_again.offset(), 2048);
     }
@@ -360,17 +400,17 @@ mod tests {
     #[test]
     fn test_flags() {
         let mut global_ref = GlobalObjRef::new(1, 1024, 0);
-        
+
         // Set compression flag
         global_ref.set_flag(flags::COMPRESSED_LZ4);
         assert!(global_ref.has_flag(flags::COMPRESSED_LZ4));
         assert!(global_ref.is_compressed());
-        
+
         // Set pinned flag
         global_ref.set_flag(flags::PINNED);
         assert!(global_ref.has_flag(flags::PINNED));
         assert!(global_ref.is_pinned());
-        
+
         // Clear compression flag
         global_ref.clear_flag(flags::COMPRESSED_LZ4);
         assert!(!global_ref.has_flag(flags::COMPRESSED_LZ4));
@@ -381,20 +421,20 @@ mod tests {
     #[test]
     fn test_encoding_decoding() {
         let original = GlobalObjRef::new(0x12345678, 0xABCDEF0123456789, 0x87654321);
-        
+
         let (high, low) = original.encode();
         let decoded = GlobalObjRef::decode(high, low);
-        
+
         assert_eq!(original, decoded);
     }
 
     #[test]
     fn test_bytes_serialization() {
         let original = GlobalObjRef::new(42, 1024 * 1024, flags::COMPRESSED_ZSTD | flags::PINNED);
-        
+
         let bytes = original.to_bytes();
         assert_eq!(bytes.len(), 16);
-        
+
         let decoded = GlobalObjRef::from_bytes(&bytes).unwrap();
         assert_eq!(original, decoded);
     }
@@ -409,7 +449,7 @@ mod tests {
     #[test]
     fn test_page_and_slot() {
         let global_ref = GlobalObjRef::new(1, 4096 + 128, 0);
-        
+
         assert_eq!(global_ref.page_id(), 1);
         assert_eq!(global_ref.slot_id(), 2); // 128 / 64 = 2
     }
@@ -417,12 +457,12 @@ mod tests {
     #[test]
     fn test_with_methods() {
         let original = GlobalObjRef::new(1, 1024, flags::PINNED);
-        
+
         let with_new_shard = original.with_shard(5);
         assert_eq!(with_new_shard.shard_id(), 5);
         assert_eq!(with_new_shard.local_offset(), 1024);
         assert_eq!(with_new_shard.flags(), flags::PINNED);
-        
+
         let with_new_flags = original.with_flags(flags::COMPRESSED_LZ4);
         assert_eq!(with_new_flags.shard_id(), 1);
         assert_eq!(with_new_flags.local_offset(), 1024);
@@ -433,7 +473,7 @@ mod tests {
     fn test_display() {
         let null_ref = GlobalObjRef::null();
         assert_eq!(format!("{}", null_ref), "GlobalObjRef(null)");
-        
+
         let ref_with_flags = GlobalObjRef::new(1, 1024, 0x12345678);
         let display = format!("{}", ref_with_flags);
         assert!(display.contains("shard=1"));
@@ -445,10 +485,10 @@ mod tests {
     fn test_from_conversions() {
         let local_ref = ObjRef::new(2048);
         let global_ref: GlobalObjRef = local_ref.into();
-        
+
         assert_eq!(global_ref.shard_id(), 0); // Default shard
         assert_eq!(global_ref.local_offset(), 2048);
-        
+
         let local_again: ObjRef = global_ref.into();
         assert_eq!(local_again.offset(), 2048);
     }
@@ -457,21 +497,21 @@ mod tests {
     fn test_navigation_result() {
         let local_data = "local_object";
         let local_result = NavigationResult::Local(local_data);
-        
+
         assert!(local_result.is_local());
         assert!(!local_result.is_remote());
         assert_eq!(local_result.local(), Some("local_object"));
-        
+
         let global_ref = GlobalObjRef::new(5, 1024, 0);
         let remote_result: NavigationResult<String> = NavigationResult::Remote {
             shard_id: 5,
             objref: global_ref,
         };
-        
+
         assert!(!remote_result.is_local());
         assert!(remote_result.is_remote());
         assert_eq!(remote_result.remote_info(), Some((5, global_ref)));
-        
+
         let not_found: NavigationResult<String> = NavigationResult::NotFound;
         assert!(!not_found.is_local());
         assert!(!not_found.is_remote());
@@ -480,19 +520,19 @@ mod tests {
     #[test]
     fn test_compression_flags() {
         let mut global_ref = GlobalObjRef::new(1, 1024, 0);
-        
+
         // No compression initially
         assert!(!global_ref.is_compressed());
-        
+
         // LZ4 compression
         global_ref.set_flag(flags::COMPRESSED_LZ4);
         assert!(global_ref.is_compressed());
-        
+
         // Clear LZ4, set ZSTD
         global_ref.clear_flag(flags::COMPRESSED_LZ4);
         global_ref.set_flag(flags::COMPRESSED_ZSTD);
         assert!(global_ref.is_compressed());
-        
+
         // Clear all compression
         global_ref.clear_flag(flags::COMPRESSED_ZSTD);
         assert!(!global_ref.is_compressed());
@@ -501,9 +541,9 @@ mod tests {
     #[test]
     fn test_migration_flag() {
         let mut global_ref = GlobalObjRef::new(1, 1024, 0);
-        
+
         assert!(!global_ref.is_migrated());
-        
+
         global_ref.set_flag(flags::MIGRATED);
         assert!(global_ref.is_migrated());
     }
@@ -514,14 +554,14 @@ mod tests {
         let max_shard = u32::MAX;
         let max_offset = u64::MAX;
         let max_flags = u32::MAX;
-        
+
         let global_ref = GlobalObjRef::new(max_shard, max_offset, max_flags);
-        
+
         let (high, low) = global_ref.encode();
         let decoded = GlobalObjRef::decode(high, low);
-        
+
         assert_eq!(global_ref, decoded);
-        
+
         let bytes = global_ref.to_bytes();
         let from_bytes = GlobalObjRef::from_bytes(&bytes).unwrap();
         assert_eq!(global_ref, from_bytes);

@@ -1,0 +1,37 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: 36 23% 95%;
+  --foreground: 20 10% 11%;
+  --card: 42 33% 98%;
+  --card-foreground: 20 10% 11%;
+  --primary: 28 30% 35%;
+  --primary-foreground: 40 43% 97%;
+  --secondary: 36 21% 90%;
+  --secondary-foreground: 20 10% 11%;
+  --muted: 36 18% 87%;
+  --muted-foreground: 30 7% 38%;
+  --accent: 35 36% 90%;
+  --accent-foreground: 22 12% 18%;
+  --border: 31 20% 78%;
+  --input: 30 22% 77%;
+  --ring: 27 40% 43%;
+  --radius: 0.65rem;
+}
+
+* {
+  @apply border-border;
+}
+
+body {
+  @apply bg-background text-foreground antialiased;
+  font-family: "Titillium Web", "Segoe UI", sans-serif;
+  background-image: radial-gradient(circle at 0% -15%, rgba(186, 164, 143, 0.28), transparent 36%),
+    radial-gradient(circle at 100% -10%, rgba(210, 198, 186, 0.35), transparent 30%);
+}
+
+.mono {
+  font-family: "IBM Plex Mono", "SFMono-Regular", Menlo, monospace;
+}

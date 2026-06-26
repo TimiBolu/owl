@@ -1,0 +1,30 @@
+// Phase 1 transaction syntax litmus:
+// - transaction { ... } block
+// - atomic rollback on statement failure
+
+schema wallets {
+  id: String,
+  owner: String,
+  balance: Integer
+}
+
+wallets.insert [
+  { id: "w1", owner: "Alice", balance: 1000 },
+  { id: "w2", owner: "Bob", balance: 500 }
+]
+
+// Successful transaction
+transaction {
+  wallets.where { .id == "w1" }.update { balance: 900 }
+  wallets.where { .id == "w2" }.update { balance: 600 }
+}
+
+wallets.select { id, owner, balance }.sort { id.asc }
+
+// Failing transaction (unknown function) should roll back both updates
+transaction {
+  wallets.where { .id == "w1" }.update { balance: 800 }
+  wallets.where { unknown_guard(*) }.select { id }
+}
+
+wallets.select { id, owner, balance }.sort { id.asc }

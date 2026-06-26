@@ -87,3 +87,23 @@ logs/
 # Large backup test files (can be 16-33GB each!)
 *.owlb
 owl_storage_zig/.zig-cache/tmp/*.owlb
+binaries
+databases
+owl_explorer/dist
+owl_explorer/node_modules
+owl_storage_zig/dat
+docs/reference_queries/sql/dsb/
+docs/reference_queries/sql/jaffle-shop/
+docs/reference_queries/sql/join-order-benchmark/
+
+*.sbg
+*.wal
+*.sb
+
+temp_oql_db
+vector_db
+vendor
+
+
+stream_db
+ringmpsc-main

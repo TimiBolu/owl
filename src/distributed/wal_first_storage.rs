@@ -6,18 +6,93 @@
 // - Crash recovery with WAL replay for OQL operations
 // - Preserves OQL semantics while ensuring durability
 
-use crate::distributed::global_objref::GlobalObjRef;
 use crate::distributed::consistent_hash::ShardId;
-use crate::distributed::wal::{DistributedWAL, WALEntryType, LSN, TxnId};
+use crate::distributed::global_objref::GlobalObjRef;
+use crate::distributed::wal::{DistributedWAL, TxnId, WALEntryType, LSN};
 use crate::document::{Document, DocumentId, ObjRef};
 use crate::error::{OQLError, OQLResult};
 use crate::simulation::filesystem::FileSystem;
 use crate::storage::DocumentStore;
 use owl_storage_zig::{Arena, ObjRef as ZigObjRef};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::{Arc, Mutex, RwLock};
+
+/// Adapter between simulation::FileSystem and owl_storage_zig::FileSystem
+struct ArenaFileSystemAdapter {
+    inner: Arc<dyn crate::simulation::filesystem::FileSystem>,
+}
+
+impl ArenaFileSystemAdapter {
+    fn new(inner: Arc<dyn crate::simulation::filesystem::FileSystem>) -> Self {
+        Self { inner }
+    }
+}
+
+impl owl_storage_zig::FileSystem for ArenaFileSystemAdapter {
+    fn create(&self, path: &Path) -> std::io::Result<Box<dyn owl_storage_zig::FileHandle>> {
+        let handle = self.inner.create(path)?;
+        Ok(Box::new(ArenaFileHandleAdapter { inner: handle }))
+    }
+
+    fn open(&self, path: &Path) -> std::io::Result<Box<dyn owl_storage_zig::FileHandle>> {
+        let handle = self.inner.open(path)?;
+        Ok(Box::new(ArenaFileHandleAdapter { inner: handle }))
+    }
+
+    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        self.inner.remove(path)
+    }
+
+    fn exists(&self, path: &Path) -> bool {
+        self.inner.exists(path)
+    }
+
+    fn file_size(&self, path: &Path) -> std::io::Result<u64> {
+        self.inner.file_size(path)
+    }
+
+    fn mmap(&self, path: &Path, size: usize) -> std::io::Result<(*mut u8, usize)> {
+        let mmap = self.inner.mmap(path, size)?;
+        let slice = mmap.as_slice();
+        Ok((slice.as_ptr() as *mut u8, slice.len()))
+    }
+
+    fn munmap(&self, _ptr: *mut u8, _size: usize) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn sync(&self, _path: &Path) -> std::io::Result<()> {
+        self.inner.sync_all()
+    }
+}
+
+struct ArenaFileHandleAdapter {
+    inner: Box<dyn crate::simulation::filesystem::FileHandle>,
+}
+
+impl owl_storage_zig::FileHandle for ArenaFileHandleAdapter {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(data)
+    }
+
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buffer)
+    }
+
+    fn seek(&mut self, pos: u64) -> std::io::Result<u64> {
+        self.inner.seek(std::io::SeekFrom::Start(pos))
+    }
+
+    fn sync(&mut self) -> std::io::Result<()> {
+        self.inner.sync()
+    }
+
+    fn size(&self) -> std::io::Result<u64> {
+        self.inner.size()
+    }
+}
 
 /// Reservation for atomic operations
 #[derive(Debug, Clone)]
@@ -33,6 +108,7 @@ pub struct Reservation {
 }
 
 /// WAL-first storage wrapper for OQL operations
+#[allow(dead_code)]
 pub struct WALFirstStorage {
     /// Current shard ID
     shard_id: ShardId,
@@ -59,6 +135,12 @@ pub struct SerializedDocument {
     pub version: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DeletePayload {
+    schema: String,
+    id: DocumentId,
+}
+
 impl SerializedDocument {
     pub fn new(document: Document) -> Self {
         Self {
@@ -80,6 +162,8 @@ impl SerializedDocument {
 }
 
 impl WALFirstStorage {
+    const BLOB_HEADER_SIZE: usize = 8; // [u32 payload_len][u32 crc32(payload)]
+
     /// Create a new WAL-first storage instance
     pub fn new<P: AsRef<Path>>(
         shard_id: ShardId,
@@ -88,15 +172,16 @@ impl WALFirstStorage {
         wal_path: P,
         filesystem: Arc<dyn FileSystem>,
     ) -> OQLResult<Self> {
-        // Create arena with filesystem dependency injection
-        // Note: For now, we'll use the regular create method since the filesystem adapter needs work
-        let arena = Arena::create(&arena_path, arena_size)
-            .map_err(|e| OQLError::storage_error(&format!("Failed to create arena: {:?}", e), None))?;
+        // Create arena with filesystem dependency injection.
+        let arena_fs = Arc::new(ArenaFileSystemAdapter::new(filesystem.clone()));
+        let arena = Arena::create_with_fs(&arena_path, arena_size, arena_fs).map_err(|e| {
+            OQLError::storage_error(&format!("Failed to create arena: {:?}", e), None)
+        })?;
 
         // Create distributed WAL
         let wal = DistributedWAL::new(shard_id, &wal_path, filesystem.clone())?;
 
-        Ok(Self {
+        let store = Self {
             shard_id,
             arena: Arc::new(arena),
             wal: Arc::new(wal),
@@ -104,14 +189,19 @@ impl WALFirstStorage {
             reservations: Arc::new(Mutex::new(HashMap::new())),
             next_reservation_id: Arc::new(Mutex::new(1)),
             filesystem,
-        })
+        };
+
+        // Startup replay makes WAL-first storage restart-safe by default.
+        store.recover_from_wal(1)?;
+        Ok(store)
     }
 
     /// Reserve space for an object (step 1 of atomic write)
     pub fn reserve(&self, size: u32) -> OQLResult<Reservation> {
         // Allocate space in arena but don't write yet
-        let zig_objref = self.arena.alloc(size)
-            .map_err(|e| OQLError::storage_error(&format!("Failed to allocate space: {:?}", e), None))?;
+        let zig_objref = self.arena.alloc(size).map_err(|e| {
+            OQLError::storage_error(&format!("Failed to allocate space: {:?}", e), None)
+        })?;
 
         // Convert to GlobalObjRef via document::ObjRef
         let local_objref = ObjRef::new(zig_objref.offset());
@@ -119,7 +209,9 @@ impl WALFirstStorage {
 
         // Generate reservation ID
         let reservation_id = {
-            let mut next_id = self.next_reservation_id.lock()
+            let mut next_id = self
+                .next_reservation_id
+                .lock()
                 .map_err(|_| OQLError::generic("Failed to acquire reservation ID lock"))?;
             let current_id = *next_id;
             *next_id += 1;
@@ -135,7 +227,9 @@ impl WALFirstStorage {
 
         // Track reservation
         {
-            let mut reservations = self.reservations.lock()
+            let mut reservations = self
+                .reservations
+                .lock()
                 .map_err(|_| OQLError::generic("Failed to acquire reservations lock"))?;
             reservations.insert(reservation_id, reservation.clone());
         }
@@ -153,11 +247,14 @@ impl WALFirstStorage {
     ) -> OQLResult<LSN> {
         // Serialize document for WAL
         let serialized_doc = SerializedDocument::new(document.clone());
-        let wal_data = bincode::serialize(&serialized_doc)
-            .map_err(|e| OQLError::serialization_error(&format!("Failed to serialize document: {}", e), None))?;
+        let wal_data = bincode::serialize(&serialized_doc).map_err(|e| {
+            OQLError::serialization_error(&format!("Failed to serialize document: {}", e), None)
+        })?;
 
         // Write to WAL with fsync - this is the durability guarantee point
-        let lsn = self.wal.append_with_sync(entry_type, objref, wal_data, txn_id)?;
+        let lsn = self
+            .wal
+            .append_with_sync(entry_type, objref, wal_data, txn_id)?;
 
         Ok(lsn)
     }
@@ -168,58 +265,22 @@ impl WALFirstStorage {
         reservation: &Reservation,
         document: &Document,
     ) -> OQLResult<()> {
-        // Serialize document with ObjectHeader for arena storage
-        let serialized_doc = SerializedDocument::new(document.clone());
-        let doc_data = bincode::serialize(&serialized_doc)
-            .map_err(|e| OQLError::serialization_error(&format!("Failed to serialize document: {}", e), None))?;
-
-        // Create ObjectHeader (56 bytes according to Zig layout)
-        let mut header_bytes = vec![0u8; 56];
-        
-        // type_tag (u16) at offset 0 - use schema hash
-        let schema_hash = crc32fast::hash(document.schema.as_bytes()) as u16;
-        header_bytes[0..2].copy_from_slice(&schema_hash.to_le_bytes());
-        
-        // id ([16]u8) at offset 2 - use document ID hash
-        let mut id_bytes = [0u8; 16];
-        let id_str = document.id.to_string();
-        let id_hash = crc32fast::hash(id_str.as_bytes());
-        for i in 0..4 {
-            id_bytes[i*4..(i+1)*4].copy_from_slice(&id_hash.to_le_bytes());
-        }
-        header_bytes[2..18].copy_from_slice(&id_bytes);
-        
-        // version (u32) at offset 18
-        header_bytes[18..22].copy_from_slice(&1u32.to_le_bytes()); // Version 1
-        
-        // size (u32) at offset 22 - total size including header
-        let total_size = 56 + doc_data.len();
-        header_bytes[22..26].copy_from_slice(&(total_size as u32).to_le_bytes());
-        
-        // flags (u8) at offset 26 - not deleted
-        header_bytes[26] = 0;
-        
-        // checksum (u32) at offset 34 - CRC32 of document data
-        let checksum = crc32fast::hash(&doc_data);
-        header_bytes[34..38].copy_from_slice(&checksum.to_le_bytes());
-        
-        // lsn (u64) at offset 40 - use 0 for now
-        header_bytes[40..48].copy_from_slice(&0u64.to_le_bytes());
-
-        // Combine header + document data
-        let mut combined_data = Vec::with_capacity(total_size);
-        combined_data.extend_from_slice(&header_bytes);
-        combined_data.extend_from_slice(&doc_data);
+        // Rust owns logical document framing, Zig handles allocation/read/write primitives.
+        let payload = self.encode_serialized_doc(&SerializedDocument::new(document.clone()))?;
 
         // Write to arena at reserved location
         let local_objref = reservation.objref.to_local();
-        let zig_objref = ZigObjRef::new(local_objref.offset());
-        self.arena.write(zig_objref, &combined_data)
-            .map_err(|e| OQLError::storage_error(&format!("Failed to write to arena: {:?}", e), None))?;
+        self.arena
+            .write_at(local_objref.offset(), &payload)
+            .map_err(|e| {
+                OQLError::storage_error(&format!("Failed to write to arena: {:?}", e), None)
+            })?;
 
         // Update document index
         {
-            let mut index = self.document_index.write()
+            let mut index = self
+                .document_index
+                .write()
                 .map_err(|_| OQLError::generic("Failed to acquire document index lock"))?;
             let key = (document.schema.clone(), document.id.clone());
             index.insert(key, reservation.objref);
@@ -227,7 +288,9 @@ impl WALFirstStorage {
 
         // Remove reservation
         {
-            let mut reservations = self.reservations.lock()
+            let mut reservations = self
+                .reservations
+                .lock()
                 .map_err(|_| OQLError::generic("Failed to acquire reservations lock"))?;
             reservations.remove(&reservation.reservation_id);
         }
@@ -243,19 +306,12 @@ impl WALFirstStorage {
     ) -> OQLResult<GlobalObjRef> {
         // Step 1: Reserve space (don't write yet)
         let serialized_doc = SerializedDocument::new(document.clone());
-        let doc_data = bincode::serialize(&serialized_doc)
-            .map_err(|e| OQLError::serialization_error(&format!("Failed to serialize document: {}", e), None))?;
-        
-        let total_size = 56 + doc_data.len(); // Header + data
+        let payload = self.encode_serialized_doc(&serialized_doc)?;
+        let total_size = payload.len();
         let reservation = self.reserve(total_size as u32)?;
 
         // Step 2: Write to WAL with fsync (DURABLE)
-        let _lsn = self.write_to_wal(
-            WALEntryType::Insert,
-            reservation.objref,
-            document,
-            txn_id,
-        )?;
+        let _lsn = self.write_to_wal(WALEntryType::Insert, reservation.objref, document, txn_id)?;
 
         // Step 3: Commit to arena (now safe - WAL has it)
         self.commit_reservation(&reservation, document)?;
@@ -273,19 +329,21 @@ impl WALFirstStorage {
     ) -> OQLResult<GlobalObjRef> {
         // Get current document reference
         let current_objref = {
-            let index = self.document_index.read()
+            let index = self
+                .document_index
+                .read()
                 .map_err(|_| OQLError::generic("Failed to acquire document index lock"))?;
             let key = (schema.to_string(), id.clone());
-            index.get(&key).copied()
+            index
+                .get(&key)
+                .copied()
                 .ok_or_else(|| OQLError::generic("Document not found for update"))?
         };
 
         // Reserve space for new version
         let serialized_doc = SerializedDocument::with_version(new_document.clone(), 2); // Increment version
-        let doc_data = bincode::serialize(&serialized_doc)
-            .map_err(|e| OQLError::serialization_error(&format!("Failed to serialize document: {}", e), None))?;
-        
-        let total_size = 56 + doc_data.len();
+        let payload = self.encode_serialized_doc(&serialized_doc)?;
+        let total_size = payload.len();
         let reservation = self.reserve(total_size as u32)?;
 
         // Write to WAL with fsync (DURABLE)
@@ -316,7 +374,9 @@ impl WALFirstStorage {
     ) -> OQLResult<bool> {
         // Get current document reference
         let current_objref = {
-            let mut index = self.document_index.write()
+            let mut index = self
+                .document_index
+                .write()
                 .map_err(|_| OQLError::generic("Failed to acquire document index lock"))?;
             let key = (schema.to_string(), id.clone());
             index.remove(&key)
@@ -327,15 +387,25 @@ impl WALFirstStorage {
             let _lsn = self.wal.append_with_sync(
                 WALEntryType::Delete,
                 objref,
-                Vec::new(), // No data for delete
+                bincode::serialize(&DeletePayload {
+                    schema: schema.to_string(),
+                    id: id.clone(),
+                })
+                .map_err(|e| {
+                    OQLError::serialization_error(
+                        &format!("Failed to serialize delete payload: {}", e),
+                        None,
+                    )
+                })?,
                 txn_id,
             )?;
 
             // Mark as deleted in arena
             let local_objref = objref.to_local();
             let zig_objref = ZigObjRef::new(local_objref.offset());
-            self.arena.delete(zig_objref)
-                .map_err(|e| OQLError::storage_error(&format!("Failed to delete from arena: {:?}", e), None))?;
+            self.arena.delete(zig_objref).map_err(|e| {
+                OQLError::storage_error(&format!("Failed to delete from arena: {:?}", e), None)
+            })?;
 
             Ok(true)
         } else {
@@ -345,61 +415,78 @@ impl WALFirstStorage {
 
     /// Recover from WAL after crash
     pub fn recover_from_wal(&self, start_lsn: LSN) -> OQLResult<()> {
-        self.wal.replay_from(start_lsn, |entry| {
+        let entries = self.wal.entries_from(start_lsn)?;
+        let mut committed_txns = HashSet::new();
+        let mut rolled_back_txns = HashSet::new();
+
+        for entry in &entries {
+            if let Some(txn_id) = entry.txn_id {
+                match entry.entry_type {
+                    WALEntryType::TxnCommit => {
+                        committed_txns.insert(txn_id);
+                    }
+                    WALEntryType::TxnRollback => {
+                        rolled_back_txns.insert(txn_id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        for entry in entries {
+            // Apply only autocommit entries or explicitly committed transactions.
+            if let Some(txn_id) = entry.txn_id {
+                if rolled_back_txns.contains(&txn_id) || !committed_txns.contains(&txn_id) {
+                    continue;
+                }
+            }
+
             match entry.entry_type {
                 WALEntryType::Insert | WALEntryType::Update => {
                     // Deserialize document from WAL entry
                     let serialized_doc: SerializedDocument = bincode::deserialize(&entry.data)
-                        .map_err(|e| OQLError::serialization_error(&format!("Failed to deserialize WAL entry: {}", e), None))?;
+                        .map_err(|e| {
+                            OQLError::serialization_error(
+                                &format!("Failed to deserialize WAL entry: {}", e),
+                                None,
+                            )
+                        })?;
 
                     // Apply to arena (replay the commit)
-                    let doc_data = bincode::serialize(&serialized_doc)
-                        .map_err(|e| OQLError::serialization_error(&format!("Failed to serialize document: {}", e), None))?;
-
-                    // Create ObjectHeader
-                    let mut header_bytes = vec![0u8; 56];
-                    let schema_hash = crc32fast::hash(serialized_doc.schema.as_bytes()) as u16;
-                    header_bytes[0..2].copy_from_slice(&schema_hash.to_le_bytes());
-                    
-                    let mut id_bytes = [0u8; 16];
-                    let id_str = serialized_doc.id.to_string();
-                    let id_hash = crc32fast::hash(id_str.as_bytes());
-                    for i in 0..4 {
-                        id_bytes[i*4..(i+1)*4].copy_from_slice(&id_hash.to_le_bytes());
-                    }
-                    header_bytes[2..18].copy_from_slice(&id_bytes);
-                    
-                    header_bytes[18..22].copy_from_slice(&serialized_doc.version.to_le_bytes());
-                    
-                    let total_size = 56 + doc_data.len();
-                    header_bytes[22..26].copy_from_slice(&(total_size as u32).to_le_bytes());
-                    
-                    header_bytes[26] = 0; // Not deleted
-                    
-                    let checksum = crc32fast::hash(&doc_data);
-                    header_bytes[34..38].copy_from_slice(&checksum.to_le_bytes());
-                    
-                    header_bytes[40..48].copy_from_slice(&entry.lsn.to_le_bytes());
-
-                    // Combine and write
-                    let mut combined_data = Vec::with_capacity(total_size);
-                    combined_data.extend_from_slice(&header_bytes);
-                    combined_data.extend_from_slice(&doc_data);
-
+                    let payload = self.encode_serialized_doc(&serialized_doc)?;
                     let local_objref = entry.objref.to_local();
-                    let zig_objref = ZigObjRef::new(local_objref.offset());
-                    self.arena.write(zig_objref, &combined_data)
-                        .map_err(|e| OQLError::storage_error(&format!("Failed to replay write: {:?}", e), None))?;
+                    self.arena
+                        .write_at(local_objref.offset(), &payload)
+                        .map_err(|e| {
+                            OQLError::storage_error(
+                                &format!("Failed to replay write: {:?}", e),
+                                None,
+                            )
+                        })?;
 
                     // Update index
-                    let mut index = self.document_index.write()
+                    let mut index = self
+                        .document_index
+                        .write()
                         .map_err(|_| OQLError::generic("Failed to acquire document index lock"))?;
                     let key = (serialized_doc.schema, serialized_doc.id);
                     index.insert(key, entry.objref);
                 }
                 WALEntryType::Delete => {
-                    // Remove from index
-                    // Note: We'd need to store schema/id in delete entries for full recovery
+                    // Remove from index and mark in arena.
+                    if !entry.data.is_empty() {
+                        let delete_payload: DeletePayload = bincode::deserialize(&entry.data)
+                            .map_err(|e| {
+                                OQLError::serialization_error(
+                                    &format!("Failed to deserialize delete payload: {}", e),
+                                    None,
+                                )
+                            })?;
+                        let mut index = self.document_index.write().map_err(|_| {
+                            OQLError::generic("Failed to acquire document index lock")
+                        })?;
+                        index.remove(&(delete_payload.schema, delete_payload.id));
+                    }
                     let local_objref = entry.objref.to_local();
                     let zig_objref = ZigObjRef::new(local_objref.offset());
                     let _ = self.arena.delete(zig_objref); // Best effort
@@ -414,73 +501,80 @@ impl WALFirstStorage {
                     // Rebalancing operation - would need special handling
                 }
             }
-            Ok(())
-        })
+        }
+
+        Ok(())
     }
 
     /// Get a document by reference (for navigation)
     pub fn get_document_by_ref(&self, objref: GlobalObjRef) -> OQLResult<Option<Document>> {
         if !objref.is_local(self.shard_id) {
-            return Err(OQLError::generic("Cross-shard navigation not implemented in this layer"));
+            return Err(OQLError::generic(
+                "Cross-shard navigation not implemented in this layer",
+            ));
         }
 
-        let local_objref = objref.to_local();
-        let zig_objref = ZigObjRef::new(local_objref.offset());
-        
-        // Read from arena
-        const HEADER_SIZE: usize = 56;
-        let mut header_buffer = [0u8; HEADER_SIZE];
-        
-        let bytes_read = self.arena.read(zig_objref, &mut header_buffer)
-            .map_err(|e| OQLError::storage_error(&format!("Failed to read header: {:?}", e), None))?;
-        
-        if bytes_read < HEADER_SIZE {
-            return Ok(None); // Object not found or invalid
-        }
-        
-        // Parse header
-        let flags = header_buffer[26];
-        const FLAG_DELETED: u8 = 0x01;
-        if (flags & FLAG_DELETED) != 0 {
-            return Ok(None); // Object is deleted
-        }
-        
-        let total_size = u32::from_le_bytes([
-            header_buffer[22], header_buffer[23], header_buffer[24], header_buffer[25],
-        ]) as usize;
-        
-        let stored_checksum = u32::from_le_bytes([
-            header_buffer[34], header_buffer[35], header_buffer[36], header_buffer[37],
-        ]);
-        
-        // Read full object
-        let mut full_buffer = vec![0u8; total_size];
-        let full_bytes_read = self.arena.read_at(objref.local_offset(), &mut full_buffer)
-            .map_err(|e| OQLError::storage_error(&format!("Failed to read full object: {:?}", e), None))?;
-        
-        if full_bytes_read < total_size {
-            return Ok(None);
-        }
-        
-        // Extract document data (skip header)
-        let doc_buffer = &full_buffer[HEADER_SIZE..];
-        
-        // Verify checksum
-        let calculated_checksum = crc32fast::hash(doc_buffer);
-        if calculated_checksum != stored_checksum {
-            return Err(OQLError::storage_error("Checksum mismatch", None));
-        }
-        
-        // Deserialize document
-        let serialized_doc: SerializedDocument = bincode::deserialize(doc_buffer)
-            .map_err(|e| OQLError::serialization_error(&format!("Failed to deserialize: {}", e), None))?;
-        
+        let serialized_doc = self.read_serialized_doc(objref.local_offset())?;
         Ok(Some(serialized_doc.document))
     }
 
+    fn encode_serialized_doc(&self, serialized_doc: &SerializedDocument) -> OQLResult<Vec<u8>> {
+        let doc_data = bincode::serialize(serialized_doc).map_err(|e| {
+            OQLError::serialization_error(&format!("Failed to serialize document: {}", e), None)
+        })?;
+
+        let payload_len = doc_data.len() as u32;
+        let checksum = crc32fast::hash(&doc_data);
+        let mut out = Vec::with_capacity(Self::BLOB_HEADER_SIZE + doc_data.len());
+        out.extend_from_slice(&payload_len.to_le_bytes());
+        out.extend_from_slice(&checksum.to_le_bytes());
+        out.extend_from_slice(&doc_data);
+        Ok(out)
+    }
+
+    fn read_serialized_doc(&self, offset: u64) -> OQLResult<SerializedDocument> {
+        let mut header = [0u8; Self::BLOB_HEADER_SIZE];
+        let bytes_read = self.arena.read_at(offset, &mut header).map_err(|e| {
+            OQLError::storage_error(&format!("Failed to read blob header: {:?}", e), None)
+        })?;
+        if bytes_read < Self::BLOB_HEADER_SIZE {
+            return Err(OQLError::storage_error("Incomplete blob header", None));
+        }
+
+        let payload_size =
+            u32::from_le_bytes([header[0], header[1], header[2], header[3]]) as usize;
+        let expected_checksum = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+        let total_size = Self::BLOB_HEADER_SIZE + payload_size;
+
+        let mut buffer = vec![0u8; total_size];
+        let full_bytes_read = self
+            .arena
+            .read_at(offset, &mut buffer)
+            .map_err(|e| OQLError::storage_error(&format!("Failed to read blob: {:?}", e), None))?;
+        if full_bytes_read < total_size {
+            return Err(OQLError::storage_error("Incomplete blob payload", None));
+        }
+
+        let payload = &buffer[Self::BLOB_HEADER_SIZE..];
+        let actual_checksum = crc32fast::hash(payload);
+        if actual_checksum != expected_checksum {
+            return Err(OQLError::storage_error("Checksum mismatch", None));
+        }
+
+        bincode::deserialize(payload).map_err(|e| {
+            OQLError::serialization_error(&format!("Failed to deserialize: {}", e), None)
+        })
+    }
+
     /// Get document reference by schema and ID
-    pub fn get_document_ref(&self, schema: &str, id: &DocumentId) -> OQLResult<Option<GlobalObjRef>> {
-        let index = self.document_index.read()
+    pub fn get_document_ref(
+        &self,
+        schema: &str,
+        id: &DocumentId,
+    ) -> OQLResult<Option<GlobalObjRef>> {
+        let index = self
+            .document_index
+            .read()
             .map_err(|_| OQLError::generic("Failed to acquire document index lock"))?;
         let key = (schema.to_string(), id.clone());
         Ok(index.get(&key).copied())
@@ -532,7 +626,9 @@ impl DocumentStore for WALFirstStorage {
     }
 
     fn scan_documents(&self, schema: &str) -> OQLResult<Vec<Document>> {
-        let index = self.document_index.read()
+        let index = self
+            .document_index
+            .read()
             .map_err(|_| OQLError::generic("Failed to acquire document index lock"))?;
 
         let mut documents = Vec::new();
@@ -567,12 +663,20 @@ impl DocumentStore for WALFirstStorage {
         self.get_document_by_ref(global_objref)
     }
 
+    fn navigate_global_reference(&self, objref: &GlobalObjRef) -> OQLResult<Option<Document>> {
+        self.get_document_by_ref(*objref)
+    }
+
     fn get_objref(&self, schema: &str, id: &DocumentId) -> OQLResult<Option<ObjRef>> {
         if let Some(global_objref) = self.get_document_ref(schema, id)? {
             Ok(Some(global_objref.to_local()))
         } else {
             Ok(None)
         }
+    }
+
+    fn get_global_objref(&self, schema: &str, id: &DocumentId) -> OQLResult<Option<GlobalObjRef>> {
+        self.get_document_ref(schema, id)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -601,13 +705,8 @@ mod tests {
         let wal_path = temp_dir.path().join("wal.log");
         let filesystem = Arc::new(RealFileSystem::new());
 
-        let storage = WALFirstStorage::new(
-            0,
-            &arena_path,
-            10 * 1024 * 1024,
-            &wal_path,
-            filesystem,
-        ).unwrap();
+        let storage =
+            WALFirstStorage::new(0, &arena_path, 10 * 1024 * 1024, &wal_path, filesystem).unwrap();
 
         assert_eq!(storage.shard_id, 0);
         assert_eq!(storage.current_lsn(), 0);
@@ -620,13 +719,8 @@ mod tests {
         let wal_path = temp_dir.path().join("wal.log");
         let filesystem = Arc::new(RealFileSystem::new());
 
-        let storage = WALFirstStorage::new(
-            0,
-            &arena_path,
-            10 * 1024 * 1024,
-            &wal_path,
-            filesystem,
-        ).unwrap();
+        let storage =
+            WALFirstStorage::new(0, &arena_path, 10 * 1024 * 1024, &wal_path, filesystem).unwrap();
 
         let document = create_test_document("user1", "Alice");
 
@@ -636,19 +730,19 @@ mod tests {
         assert!(!reservation.objref.is_null());
 
         // Step 2: Write to WAL
-        let lsn = storage.write_to_wal(
-            WALEntryType::Insert,
-            reservation.objref,
-            &document,
-            None,
-        ).unwrap();
+        let lsn = storage
+            .write_to_wal(WALEntryType::Insert, reservation.objref, &document, None)
+            .unwrap();
         assert_eq!(lsn, 1);
 
         // Step 3: Commit to arena
         storage.commit_reservation(&reservation, &document).unwrap();
 
         // Verify document can be retrieved
-        let retrieved = storage.get_document_by_ref(reservation.objref).unwrap().unwrap();
+        let retrieved = storage
+            .get_document_by_ref(reservation.objref)
+            .unwrap()
+            .unwrap();
         assert_eq!(retrieved.id, document.id);
         assert_eq!(retrieved.schema, document.schema);
     }
@@ -660,13 +754,8 @@ mod tests {
         let wal_path = temp_dir.path().join("wal.log");
         let filesystem = Arc::new(RealFileSystem::new());
 
-        let storage = WALFirstStorage::new(
-            0,
-            &arena_path,
-            10 * 1024 * 1024,
-            &wal_path,
-            filesystem,
-        ).unwrap();
+        let storage =
+            WALFirstStorage::new(0, &arena_path, 10 * 1024 * 1024, &wal_path, filesystem).unwrap();
 
         let document = create_test_document("user1", "Alice");
 
@@ -676,7 +765,10 @@ mod tests {
         assert_eq!(objref.shard_id(), 0);
 
         // Verify document is retrievable
-        let retrieved = storage.get_document("users", &document.id).unwrap().unwrap();
+        let retrieved = storage
+            .get_document("users", &document.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(retrieved.id, document.id);
         assert_eq!(retrieved.schema, document.schema);
     }
@@ -688,13 +780,8 @@ mod tests {
         let wal_path = temp_dir.path().join("wal.log");
         let filesystem = Arc::new(RealFileSystem::new());
 
-        let storage = WALFirstStorage::new(
-            0,
-            &arena_path,
-            10 * 1024 * 1024,
-            &wal_path,
-            filesystem,
-        ).unwrap();
+        let storage =
+            WALFirstStorage::new(0, &arena_path, 10 * 1024 * 1024, &wal_path, filesystem).unwrap();
 
         let document = create_test_document("user1", "Alice");
         let updated_document = create_test_document("user1", "Alice Updated");
@@ -703,12 +790,9 @@ mod tests {
         storage.write_atomic(&document, None).unwrap();
 
         // Update
-        let new_objref = storage.update_atomic(
-            "users",
-            &document.id,
-            &updated_document,
-            None,
-        ).unwrap();
+        let new_objref = storage
+            .update_atomic("users", &document.id, &updated_document, None)
+            .unwrap();
 
         // Verify updated document
         let retrieved = storage.get_document_by_ref(new_objref).unwrap().unwrap();
@@ -726,13 +810,8 @@ mod tests {
         let wal_path = temp_dir.path().join("wal.log");
         let filesystem = Arc::new(RealFileSystem::new());
 
-        let storage = WALFirstStorage::new(
-            0,
-            &arena_path,
-            10 * 1024 * 1024,
-            &wal_path,
-            filesystem,
-        ).unwrap();
+        let storage =
+            WALFirstStorage::new(0, &arena_path, 10 * 1024 * 1024, &wal_path, filesystem).unwrap();
 
         let document = create_test_document("user1", "Alice");
 
@@ -746,7 +825,9 @@ mod tests {
         assert!(retrieved.is_none());
 
         // Delete non-existent document
-        let not_deleted = storage.delete_atomic("users", &"nonexistent".to_string(), None).unwrap();
+        let not_deleted = storage
+            .delete_atomic("users", &"nonexistent".to_string(), None)
+            .unwrap();
         assert!(!not_deleted);
     }
 
@@ -757,13 +838,8 @@ mod tests {
         let wal_path = temp_dir.path().join("wal.log");
         let filesystem = Arc::new(RealFileSystem::new());
 
-        let storage = WALFirstStorage::new(
-            0,
-            &arena_path,
-            10 * 1024 * 1024,
-            &wal_path,
-            filesystem,
-        ).unwrap();
+        let storage =
+            WALFirstStorage::new(0, &arena_path, 10 * 1024 * 1024, &wal_path, filesystem).unwrap();
 
         let txn_id = 42;
         let document = create_test_document("user1", "Alice");
@@ -780,8 +856,45 @@ mod tests {
         assert!(commit_lsn > begin_lsn);
 
         // Verify document exists
-        let retrieved = storage.get_document("users", &document.id).unwrap().unwrap();
+        let retrieved = storage
+            .get_document("users", &document.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(retrieved.id, document.id);
+    }
+
+    #[test]
+    fn test_recovery_ignores_uncommitted_transaction_entries() {
+        let temp_dir = TempDir::new().unwrap();
+        let arena_path = temp_dir.path().join("arena_uncommitted.owl");
+        let wal_path = temp_dir.path().join("wal_uncommitted.log");
+        let filesystem = Arc::new(RealFileSystem::new());
+
+        {
+            let storage = WALFirstStorage::new(
+                0,
+                &arena_path,
+                10 * 1024 * 1024,
+                &wal_path,
+                filesystem.clone(),
+            )
+            .unwrap();
+
+            let txn_id = 99;
+            let document = create_test_document("user_txn", "Temp");
+            storage.begin_transaction(txn_id).unwrap();
+            storage.write_atomic(&document, Some(txn_id)).unwrap();
+            // No commit marker written.
+        }
+
+        let restarted =
+            WALFirstStorage::new(0, &arena_path, 10 * 1024 * 1024, &wal_path, filesystem).unwrap();
+
+        restarted.recover_from_wal(1).unwrap();
+        let recovered = restarted
+            .get_document("users", &"user_txn".to_string())
+            .unwrap();
+        assert!(recovered.is_none());
     }
 
     #[test]
@@ -791,20 +904,18 @@ mod tests {
         let wal_path = temp_dir.path().join("wal.log");
         let filesystem = Arc::new(RealFileSystem::new());
 
-        let storage = WALFirstStorage::new(
-            0,
-            &arena_path,
-            10 * 1024 * 1024,
-            &wal_path,
-            filesystem,
-        ).unwrap();
+        let storage =
+            WALFirstStorage::new(0, &arena_path, 10 * 1024 * 1024, &wal_path, filesystem).unwrap();
 
         let document = create_test_document("user1", "Alice");
 
         // Test DocumentStore interface
         storage.put_document(&document).unwrap();
-        
-        let retrieved = storage.get_document("users", &document.id).unwrap().unwrap();
+
+        let retrieved = storage
+            .get_document("users", &document.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(retrieved.id, document.id);
 
         let deleted = storage.delete_document("users", &document.id).unwrap();
@@ -829,26 +940,53 @@ mod tests {
                 10 * 1024 * 1024,
                 &wal_path,
                 filesystem.clone(),
-            ).unwrap();
+            )
+            .unwrap();
 
             let document = create_test_document("user1", "Alice");
             storage.write_atomic(&document, None).unwrap();
         }
 
         // Create new storage instance (simulating restart)
-        let storage = WALFirstStorage::new(
-            0,
-            &arena_path,
-            10 * 1024 * 1024,
-            &wal_path,
-            filesystem,
-        ).unwrap();
+        let storage =
+            WALFirstStorage::new(0, &arena_path, 10 * 1024 * 1024, &wal_path, filesystem).unwrap();
 
         // Recover from WAL
         storage.recover_from_wal(1).unwrap();
 
         // Verify data is recovered
         let retrieved = storage.get_document("users", &"user1".to_string()).unwrap();
-        // Note: Recovery might not fully restore index, this is a simplified test
+        assert!(retrieved.is_some());
+    }
+
+    #[test]
+    fn test_wal_recovery_restores_delete_metadata() {
+        let temp_dir = TempDir::new().unwrap();
+        let arena_path = temp_dir.path().join("arena_del.owl");
+        let wal_path = temp_dir.path().join("wal_del.log");
+        let filesystem = Arc::new(RealFileSystem::new());
+
+        {
+            let storage = WALFirstStorage::new(
+                0,
+                &arena_path,
+                10 * 1024 * 1024,
+                &wal_path,
+                filesystem.clone(),
+            )
+            .unwrap();
+
+            let document = create_test_document("user_delete", "Alice");
+            storage.write_atomic(&document, None).unwrap();
+            assert!(storage.delete_atomic("users", &document.id, None).unwrap());
+        }
+
+        let restarted =
+            WALFirstStorage::new(0, &arena_path, 10 * 1024 * 1024, &wal_path, filesystem).unwrap();
+
+        let retrieved = restarted
+            .get_document("users", &"user_delete".to_string())
+            .unwrap();
+        assert!(retrieved.is_none());
     }
 }

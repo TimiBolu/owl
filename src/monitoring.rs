@@ -1,9 +1,8 @@
 // Monitoring and Observability System for OQL Database
 
-use crate::document::{Document, DocumentId};
 use crate::error::{OQLError, OQLResult};
 use crate::parser::OQLQuery;
-use chrono::{DateTime, Utc, Duration};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
@@ -93,6 +92,7 @@ impl QueryMetrics {
             crate::parser::Operation::Max(_) => "aggregate".to_string(),
             crate::parser::Operation::Sort(_) => "sort".to_string(),
             crate::parser::Operation::Limit(_) => "limit".to_string(),
+            crate::parser::Operation::Nearest(_) => "vector_search".to_string(),
             crate::parser::Operation::FunctionDef(_) => "function".to_string(),
         }
     }
@@ -213,10 +213,10 @@ pub struct AlertThresholds {
 impl Default for AlertThresholds {
     fn default() -> Self {
         Self {
-            max_query_time_ms: 5000,     // 5 seconds
-            max_error_rate: 0.05,        // 5%
-            min_cache_hit_rate: 0.8,     // 80%
-            max_memory_usage_bytes: 1024 * 1024 * 1024, // 1GB
+            max_query_time_ms: 5000,                         // 5 seconds
+            max_error_rate: 0.05,                            // 5%
+            min_cache_hit_rate: 0.8,                         // 80%
+            max_memory_usage_bytes: 1024 * 1024 * 1024,      // 1GB
             max_storage_size_bytes: 10 * 1024 * 1024 * 1024, // 10GB
         }
     }
@@ -278,9 +278,7 @@ impl TraceSpan {
     pub fn finish(&mut self) {
         let end_time = Utc::now();
         self.end_time = Some(end_time);
-        self.duration_ms = Some(
-            (end_time - self.start_time).num_milliseconds() as u64
-        );
+        self.duration_ms = Some((end_time - self.start_time).num_milliseconds() as u64);
     }
 }
 
@@ -293,6 +291,7 @@ pub struct TraceLog {
 }
 
 /// Performance monitoring and observability system
+#[allow(dead_code)]
 pub struct MonitoringSystem {
     config: MonitoringConfig,
     query_metrics: Arc<Mutex<VecDeque<QueryMetrics>>>,
@@ -323,10 +322,8 @@ impl MonitoringSystem {
             return Ok(());
         }
 
-        let mut query_metrics = self.query_metrics.lock().map_err(|_| {
-            OQLError::Generic {
-                message: "Failed to acquire query metrics lock".to_string(),
-            }
+        let mut query_metrics = self.query_metrics.lock().map_err(|_| OQLError::Generic {
+            message: "Failed to acquire query metrics lock".to_string(),
         })?;
 
         query_metrics.push_back(metrics.clone());
@@ -356,11 +353,10 @@ impl MonitoringSystem {
         }
 
         {
-            let mut system_metrics = self.system_metrics.write().map_err(|_| {
-                OQLError::Generic {
+            let mut system_metrics =
+                self.system_metrics.write().map_err(|_| OQLError::Generic {
                     message: "Failed to acquire system metrics write lock".to_string(),
-                }
-            })?;
+                })?;
             *system_metrics = metrics;
         }
 
@@ -372,11 +368,13 @@ impl MonitoringSystem {
 
     /// Get current system metrics
     pub fn get_system_metrics(&self) -> OQLResult<SystemMetrics> {
-        let mut metrics = self.system_metrics.read().map_err(|_| {
-            OQLError::Generic {
+        let mut metrics = self
+            .system_metrics
+            .read()
+            .map_err(|_| OQLError::Generic {
                 message: "Failed to acquire system metrics read lock".to_string(),
-            }
-        })?.clone();
+            })?
+            .clone();
 
         // Update uptime
         metrics.uptime_seconds = self.start_time.elapsed().as_secs();
@@ -387,14 +385,12 @@ impl MonitoringSystem {
 
     /// Get query metrics for a time range
     pub fn get_query_metrics(&self, since: Option<DateTime<Utc>>) -> OQLResult<Vec<QueryMetrics>> {
-        let query_metrics = self.query_metrics.lock().map_err(|_| {
-            OQLError::Generic {
-                message: "Failed to acquire query metrics lock".to_string(),
-            }
+        let query_metrics = self.query_metrics.lock().map_err(|_| OQLError::Generic {
+            message: "Failed to acquire query metrics lock".to_string(),
         })?;
 
         let cutoff_time = since.unwrap_or_else(|| Utc::now() - Duration::hours(1));
-        
+
         Ok(query_metrics
             .iter()
             .filter(|m| m.timestamp >= cutoff_time)
@@ -404,10 +400,8 @@ impl MonitoringSystem {
 
     /// Get query performance statistics
     pub fn get_query_stats(&self) -> OQLResult<QueryStats> {
-        let query_metrics = self.query_metrics.lock().map_err(|_| {
-            OQLError::Generic {
-                message: "Failed to acquire query metrics lock".to_string(),
-            }
+        let query_metrics = self.query_metrics.lock().map_err(|_| OQLError::Generic {
+            message: "Failed to acquire query metrics lock".to_string(),
         })?;
 
         let total_queries = query_metrics.len();
@@ -457,10 +451,8 @@ impl MonitoringSystem {
 
     /// Create a new alert
     pub fn create_alert(&self, alert: Alert) -> OQLResult<()> {
-        let mut alerts = self.alerts.lock().map_err(|_| {
-            OQLError::Generic {
-                message: "Failed to acquire alerts lock".to_string(),
-            }
+        let mut alerts = self.alerts.lock().map_err(|_| OQLError::Generic {
+            message: "Failed to acquire alerts lock".to_string(),
         })?;
 
         alerts.push(alert);
@@ -469,10 +461,8 @@ impl MonitoringSystem {
 
     /// Get active alerts
     pub fn get_active_alerts(&self) -> OQLResult<Vec<Alert>> {
-        let alerts = self.alerts.lock().map_err(|_| {
-            OQLError::Generic {
-                message: "Failed to acquire alerts lock".to_string(),
-            }
+        let alerts = self.alerts.lock().map_err(|_| OQLError::Generic {
+            message: "Failed to acquire alerts lock".to_string(),
         })?;
 
         Ok(alerts.iter().filter(|a| !a.resolved).cloned().collect())
@@ -480,10 +470,8 @@ impl MonitoringSystem {
 
     /// Resolve an alert
     pub fn resolve_alert(&self, alert_id: &str) -> OQLResult<bool> {
-        let mut alerts = self.alerts.lock().map_err(|_| {
-            OQLError::Generic {
-                message: "Failed to acquire alerts lock".to_string(),
-            }
+        let mut alerts = self.alerts.lock().map_err(|_| OQLError::Generic {
+            message: "Failed to acquire alerts lock".to_string(),
         })?;
 
         for alert in alerts.iter_mut() {
@@ -500,10 +488,7 @@ impl MonitoringSystem {
     pub fn start_trace(&self, operation_name: String) -> OQLResult<TraceSpan> {
         if !self.config.enable_distributed_tracing {
             // Return a dummy span if tracing is disabled
-            return Ok(TraceSpan::new(
-                "disabled".to_string(),
-                operation_name,
-            ));
+            return Ok(TraceSpan::new("disabled".to_string(), operation_name));
         }
 
         let trace_id = uuid::Uuid::new_v4().to_string();
@@ -519,10 +504,8 @@ impl MonitoringSystem {
 
         span.finish();
 
-        let mut traces = self.traces.lock().map_err(|_| {
-            OQLError::Generic {
-                message: "Failed to acquire traces lock".to_string(),
-            }
+        let mut traces = self.traces.lock().map_err(|_| OQLError::Generic {
+            message: "Failed to acquire traces lock".to_string(),
         })?;
 
         traces
@@ -535,10 +518,8 @@ impl MonitoringSystem {
 
     /// Get traces for a specific trace ID
     pub fn get_trace(&self, trace_id: &str) -> OQLResult<Vec<TraceSpan>> {
-        let traces = self.traces.lock().map_err(|_| {
-            OQLError::Generic {
-                message: "Failed to acquire traces lock".to_string(),
-            }
+        let traces = self.traces.lock().map_err(|_| OQLError::Generic {
+            message: "Failed to acquire traces lock".to_string(),
         })?;
 
         Ok(traces.get(trace_id).cloned().unwrap_or_default())
@@ -553,13 +534,15 @@ impl MonitoringSystem {
                 "Slow Query Detected".to_string(),
                 format!(
                     "Query took {}ms to execute (threshold: {}ms)",
-                    metrics.execution_time_ms,
-                    self.config.alert_thresholds.max_query_time_ms
+                    metrics.execution_time_ms, self.config.alert_thresholds.max_query_time_ms
                 ),
             )
             .with_metadata("query_id".to_string(), metrics.query_id.clone())
             .with_metadata("schema".to_string(), metrics.schema.clone())
-            .with_metadata("execution_time_ms".to_string(), metrics.execution_time_ms.to_string());
+            .with_metadata(
+                "execution_time_ms".to_string(),
+                metrics.execution_time_ms.to_string(),
+            );
 
             self.create_alert(alert)?;
         }
@@ -585,10 +568,8 @@ impl MonitoringSystem {
 
     /// Check for system-level alerts
     fn check_system_alerts(&self) -> OQLResult<()> {
-        let metrics = self.system_metrics.read().map_err(|_| {
-            OQLError::Generic {
-                message: "Failed to acquire system metrics read lock".to_string(),
-            }
+        let metrics = self.system_metrics.read().map_err(|_| OQLError::Generic {
+            message: "Failed to acquire system metrics read lock".to_string(),
         })?;
 
         // Check error rate
@@ -626,8 +607,7 @@ impl MonitoringSystem {
                 "High Memory Usage".to_string(),
                 format!(
                     "Memory usage is {} bytes (threshold: {} bytes)",
-                    metrics.memory_usage_bytes,
-                    self.config.alert_thresholds.max_memory_usage_bytes
+                    metrics.memory_usage_bytes, self.config.alert_thresholds.max_memory_usage_bytes
                 ),
             );
             self.create_alert(alert)?;
@@ -689,37 +669,70 @@ impl MonitoringSystem {
         let mut output = String::new();
 
         // System metrics
-        output.push_str(&format!("# HELP oql_active_connections Number of active connections\n"));
+        output.push_str(&format!(
+            "# HELP oql_active_connections Number of active connections\n"
+        ));
         output.push_str(&format!("# TYPE oql_active_connections gauge\n"));
-        output.push_str(&format!("oql_active_connections {}\n", system_metrics.active_connections));
+        output.push_str(&format!(
+            "oql_active_connections {}\n",
+            system_metrics.active_connections
+        ));
 
-        output.push_str(&format!("# HELP oql_queries_per_second Queries per second\n"));
+        output.push_str(&format!(
+            "# HELP oql_queries_per_second Queries per second\n"
+        ));
         output.push_str(&format!("# TYPE oql_queries_per_second gauge\n"));
-        output.push_str(&format!("oql_queries_per_second {}\n", query_stats.queries_per_second));
+        output.push_str(&format!(
+            "oql_queries_per_second {}\n",
+            query_stats.queries_per_second
+        ));
 
-        output.push_str(&format!("# HELP oql_avg_query_time_ms Average query execution time in milliseconds\n"));
+        output.push_str(&format!(
+            "# HELP oql_avg_query_time_ms Average query execution time in milliseconds\n"
+        ));
         output.push_str(&format!("# TYPE oql_avg_query_time_ms gauge\n"));
-        output.push_str(&format!("oql_avg_query_time_ms {}\n", query_stats.avg_execution_time_ms));
+        output.push_str(&format!(
+            "oql_avg_query_time_ms {}\n",
+            query_stats.avg_execution_time_ms
+        ));
 
         output.push_str(&format!("# HELP oql_cache_hit_rate Cache hit rate\n"));
         output.push_str(&format!("# TYPE oql_cache_hit_rate gauge\n"));
-        output.push_str(&format!("oql_cache_hit_rate {}\n", query_stats.cache_hit_rate));
+        output.push_str(&format!(
+            "oql_cache_hit_rate {}\n",
+            query_stats.cache_hit_rate
+        ));
 
         output.push_str(&format!("# HELP oql_error_rate Error rate\n"));
         output.push_str(&format!("# TYPE oql_error_rate gauge\n"));
         output.push_str(&format!("oql_error_rate {}\n", system_metrics.error_rate));
 
-        output.push_str(&format!("# HELP oql_storage_size_bytes Storage size in bytes\n"));
+        output.push_str(&format!(
+            "# HELP oql_storage_size_bytes Storage size in bytes\n"
+        ));
         output.push_str(&format!("# TYPE oql_storage_size_bytes gauge\n"));
-        output.push_str(&format!("oql_storage_size_bytes {}\n", system_metrics.storage_size_bytes));
+        output.push_str(&format!(
+            "oql_storage_size_bytes {}\n",
+            system_metrics.storage_size_bytes
+        ));
 
-        output.push_str(&format!("# HELP oql_memory_usage_bytes Memory usage in bytes\n"));
+        output.push_str(&format!(
+            "# HELP oql_memory_usage_bytes Memory usage in bytes\n"
+        ));
         output.push_str(&format!("# TYPE oql_memory_usage_bytes gauge\n"));
-        output.push_str(&format!("oql_memory_usage_bytes {}\n", system_metrics.memory_usage_bytes));
+        output.push_str(&format!(
+            "oql_memory_usage_bytes {}\n",
+            system_metrics.memory_usage_bytes
+        ));
 
-        output.push_str(&format!("# HELP oql_uptime_seconds System uptime in seconds\n"));
+        output.push_str(&format!(
+            "# HELP oql_uptime_seconds System uptime in seconds\n"
+        ));
         output.push_str(&format!("# TYPE oql_uptime_seconds counter\n"));
-        output.push_str(&format!("oql_uptime_seconds {}\n", system_metrics.uptime_seconds));
+        output.push_str(&format!(
+            "oql_uptime_seconds {}\n",
+            system_metrics.uptime_seconds
+        ));
 
         Ok(output)
     }
@@ -728,22 +741,22 @@ impl MonitoringSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::parser::{Operation, WhereBlock, Condition, Expression, FieldAccess, ComparisonOperator, Literal};
+    use crate::parser::{
+        ComparisonOperator, Condition, Expression, FieldAccess, Literal, Operation, WhereBlock,
+    };
 
     fn create_test_query() -> OQLQuery {
         OQLQuery {
             collection: "users".to_string(),
-            operations: vec![
-                Operation::Where(WhereBlock {
-                    condition: Condition::Comparison {
-                        left: Expression::FieldAccess(FieldAccess {
-                            path: vec!["name".to_string()],
-                        }),
-                        operator: ComparisonOperator::Equal,
-                        right: Expression::Literal(Literal::String("Alice".to_string())),
-                    },
-                }),
-            ],
+            operations: vec![Operation::Where(WhereBlock {
+                condition: Condition::Comparison {
+                    left: Expression::FieldAccess(FieldAccess {
+                        path: vec!["name".to_string()],
+                    }),
+                    operator: ComparisonOperator::Equal,
+                    right: Expression::Literal(Literal::String("Alice".to_string())),
+                },
+            })],
         }
     }
 
@@ -807,13 +820,13 @@ mod tests {
     #[test]
     fn test_trace_span() {
         let mut span = TraceSpan::new("trace_123".to_string(), "test_operation".to_string());
-        
+
         span = span.tag("user_id".to_string(), "user_123".to_string());
         span.log("info".to_string(), "Starting operation".to_string());
-        
+
         // Simulate some work
         std::thread::sleep(std::time::Duration::from_millis(10));
-        
+
         span.finish();
 
         assert!(span.end_time.is_some());
@@ -829,7 +842,7 @@ mod tests {
         let monitoring = MonitoringSystem::new(config);
 
         let prometheus_output = monitoring.export_prometheus_metrics().unwrap();
-        
+
         assert!(prometheus_output.contains("oql_active_connections"));
         assert!(prometheus_output.contains("oql_queries_per_second"));
         assert!(prometheus_output.contains("oql_avg_query_time_ms"));

@@ -214,14 +214,14 @@ impl ConsistentHashRing {
     pub fn get_shard_for_oql_insert(&self, oql_insert: &str) -> Option<ShardId> {
         // Simple parsing to extract object ID from OQL insert
         // This is a basic implementation - production would use proper OQL parser
-        
+
         // Look for id: 'value' or id: "value" pattern
         if let Some(id_start) = oql_insert.find("id:") {
             let after_id = &oql_insert[id_start + 3..];
-            
+
             // Skip whitespace
             let after_id = after_id.trim_start();
-            
+
             // Extract quoted string
             if let Some(quote_char) = after_id.chars().next() {
                 if quote_char == '\'' || quote_char == '"' {
@@ -232,7 +232,7 @@ impl ConsistentHashRing {
                 }
             }
         }
-        
+
         None
     }
 
@@ -253,7 +253,7 @@ impl ConsistentHashRing {
     pub fn distribution_stats(&self) -> DistributionStats {
         let total_vnodes = self.vnodes.len();
         let shard_count = self.active_shards.len();
-        
+
         if shard_count == 0 {
             return DistributionStats {
                 total_vnodes: 0,
@@ -274,15 +274,17 @@ impl ConsistentHashRing {
         let counts: Vec<usize> = vnode_counts.values().copied().collect();
         let min_vnodes = *counts.iter().min().unwrap_or(&0);
         let max_vnodes = *counts.iter().max().unwrap_or(&0);
-        
+
         // Calculate variance
         let mean = total_vnodes as f64 / shard_count as f64;
-        let variance = counts.iter()
+        let variance = counts
+            .iter()
             .map(|&count| {
                 let diff = count as f64 - mean;
                 diff * diff
             })
-            .sum::<f64>() / shard_count as f64;
+            .sum::<f64>()
+            / shard_count as f64;
 
         DistributionStats {
             total_vnodes,
@@ -351,15 +353,16 @@ impl DistributionStats {
         if self.shards <= 1 {
             return 1.0;
         }
-        
+
         let expected_per_shard = self.total_vnodes as f64 / self.shards as f64;
-        let max_deviation = (self.max_vnodes as f64 - expected_per_shard).abs()
+        let max_deviation = (self.max_vnodes as f64 - expected_per_shard)
+            .abs()
             .max((expected_per_shard - self.min_vnodes as f64).abs());
-        
+
         if expected_per_shard == 0.0 {
             return 1.0;
         }
-        
+
         1.0 - (max_deviation / expected_per_shard).min(1.0)
     }
 }
@@ -379,7 +382,7 @@ mod tests {
     fn test_single_shard() {
         let mut ring = ConsistentHashRing::new();
         ring.add_shard(0);
-        
+
         assert_eq!(ring.shard_count(), 1);
         assert_eq!(ring.get_shard_for_object("test"), Some(0));
         assert_eq!(ring.get_shard_for_object("another"), Some(0));
@@ -391,14 +394,14 @@ mod tests {
         ring.add_shard(0);
         ring.add_shard(1);
         ring.add_shard(2);
-        
+
         assert_eq!(ring.shard_count(), 3);
-        
+
         // All objects should map to some shard
         let shard1 = ring.get_shard_for_object("user1").unwrap();
         let shard2 = ring.get_shard_for_object("user2").unwrap();
         let shard3 = ring.get_shard_for_object("user3").unwrap();
-        
+
         assert!(shard1 < 3);
         assert!(shard2 < 3);
         assert!(shard3 < 3);
@@ -409,7 +412,7 @@ mod tests {
         let mut ring = ConsistentHashRing::new();
         ring.add_shard(0);
         ring.add_shard(1);
-        
+
         // Same object should always map to same shard
         let shard1 = ring.get_shard_for_object("user123");
         let shard2 = ring.get_shard_for_object("user123");
@@ -422,13 +425,13 @@ mod tests {
         ring.add_shard(0);
         ring.add_shard(1);
         ring.add_shard(2);
-        
+
         assert_eq!(ring.shard_count(), 3);
-        
+
         let removed = ring.remove_shard(1);
         assert!(removed);
         assert_eq!(ring.shard_count(), 2);
-        
+
         // Removing non-existent shard should return false
         let removed = ring.remove_shard(1);
         assert!(!removed);
@@ -440,7 +443,7 @@ mod tests {
         ring.add_shard(0);
         ring.add_shard(1);
         ring.add_shard(2);
-        
+
         // Test many objects to check distribution
         let mut shard_counts = std::collections::HashMap::new();
         for i in 0..1000 {
@@ -448,11 +451,15 @@ mod tests {
             let shard = ring.get_shard_for_object(&object_id).unwrap();
             *shard_counts.entry(shard).or_insert(0) += 1;
         }
-        
+
         // Each shard should get roughly 1000/3 = 333 objects
         // Allow some variance but should be reasonably balanced
         for &count in shard_counts.values() {
-            assert!(count > 250 && count < 450, "Shard got {} objects, expected ~333", count);
+            assert!(
+                count > 250 && count < 450,
+                "Shard got {} objects, expected ~333",
+                count
+            );
         }
     }
 
@@ -461,17 +468,17 @@ mod tests {
         let mut ring = ConsistentHashRing::new();
         ring.add_shard(0);
         ring.add_shard(1);
-        
+
         // Test single quotes
         let oql1 = "User.insert { id: 'user123', name: 'Alice' }";
         let shard1 = ring.get_shard_for_oql_insert(oql1);
         assert!(shard1.is_some());
-        
+
         // Test double quotes
         let oql2 = "User.insert { id: \"user456\", name: \"Bob\" }";
         let shard2 = ring.get_shard_for_oql_insert(oql2);
         assert!(shard2.is_some());
-        
+
         // Same ID should map to same shard
         let oql3 = "User.insert { id: 'user123', email: 'alice@example.com' }";
         let shard3 = ring.get_shard_for_oql_insert(oql3);
@@ -483,13 +490,13 @@ mod tests {
         let mut ring = ConsistentHashRing::new();
         ring.add_shard(0);
         ring.add_shard(1);
-        
+
         let user_shard = ring.get_shard_for_schema("User");
         let order_shard = ring.get_shard_for_schema("Order");
-        
+
         assert!(user_shard.is_some());
         assert!(order_shard.is_some());
-        
+
         // Same schema should always map to same shard
         let user_shard2 = ring.get_shard_for_schema("User");
         assert_eq!(user_shard, user_shard2);
@@ -500,12 +507,12 @@ mod tests {
         let mut ring = ConsistentHashRing::with_vnodes_per_shard(10);
         ring.add_shard(0);
         ring.add_shard(1);
-        
+
         let stats = ring.distribution_stats();
         assert_eq!(stats.total_vnodes, 20);
         assert_eq!(stats.shards, 2);
         assert_eq!(stats.vnodes_per_shard, 10);
-        
+
         // Should be perfectly balanced
         assert_eq!(stats.min_vnodes, 10);
         assert_eq!(stats.max_vnodes, 10);
@@ -518,7 +525,7 @@ mod tests {
         let mut ring = ConsistentHashRing::new();
         ring.add_shard(0);
         ring.add_shard(1);
-        
+
         // Record initial assignments
         let mut initial_assignments = std::collections::HashMap::new();
         for i in 0..1000 {
@@ -526,10 +533,10 @@ mod tests {
             let shard = ring.get_shard_for_object(&object_id).unwrap();
             initial_assignments.insert(object_id, shard);
         }
-        
+
         // Add a third shard
         ring.add_shard(2);
-        
+
         // Count how many objects moved
         let mut moved = 0;
         for i in 0..1000 {
@@ -540,10 +547,14 @@ mod tests {
                 moved += 1;
             }
         }
-        
+
         // Should move roughly 1/3 of objects (adding 1 shard to 2 existing)
         // Allow some variance due to hash distribution
-        assert!(moved > 250 && moved < 450, "Moved {} objects, expected ~333", moved);
+        assert!(
+            moved > 250 && moved < 450,
+            "Moved {} objects, expected ~333",
+            moved
+        );
     }
 
     #[test]
@@ -551,7 +562,7 @@ mod tests {
         let mut ring = ConsistentHashRing::new();
         ring.add_shard(0);
         ring.add_shard(0); // Duplicate
-        
+
         assert_eq!(ring.shard_count(), 1);
     }
 
@@ -561,7 +572,7 @@ mod tests {
         ring.add_shard(2);
         ring.add_shard(0);
         ring.add_shard(1);
-        
+
         let mut shards = ring.active_shards();
         shards.sort();
         assert_eq!(shards, vec![0, 1, 2]);

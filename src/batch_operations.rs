@@ -9,11 +9,9 @@
 //! - Batch validation and error handling
 //! - Integration with Zig storage layer for batch allocation
 
+use crate::document::{Document, Value};
 use crate::error::{OQLError, OQLResult};
 use crate::parser::{InsertBlock, UpdateBlock};
-use crate::storage::Document;
-use crate::storage::Value;
-use std::collections::HashMap;
 
 /// Batch operation configuration
 #[derive(Debug, Clone)]
@@ -228,7 +226,7 @@ impl BatchExecutor {
             .iter()
             .map(|doc| {
                 // Rough estimate: collection name + fields
-                doc.collection.len()
+                doc.schema.len()
                     + doc
                         .fields
                         .iter()
@@ -242,16 +240,17 @@ impl BatchExecutor {
     fn estimate_value_size(&self, value: &Value) -> usize {
         match value {
             Value::Null => 1,
-            Value::Bool(_) => 1,
-            Value::Int(_) => 8,
+            Value::Boolean(_) => 1,
+            Value::Integer(_) => 8,
             Value::Float(_) => 8,
             Value::String(s) => s.len(),
-            Value::Array(arr) => arr.iter().map(|v| self.estimate_value_size(v)).sum(),
+            Value::List(arr) => arr.iter().map(|v| self.estimate_value_size(v)).sum(),
             Value::Object(obj) => obj
                 .iter()
                 .map(|(k, v)| k.len() + self.estimate_value_size(v))
                 .sum(),
             Value::Reference(_) => 8, // ObjRef size
+            Value::GlobalReference(_) => 16, // GlobalObjRef size
             Value::DateTime(_) => 8,
         }
     }

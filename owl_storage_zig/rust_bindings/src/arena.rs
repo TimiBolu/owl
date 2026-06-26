@@ -35,7 +35,7 @@ use std::sync::Arc;
 /// ```
 pub struct Arena {
     ptr: NonNull<ffi::Arena>,
-    filesystem: Arc<dyn crate::filesystem::FileSystem>,
+    _filesystem: Arc<dyn crate::filesystem::FileSystem>,
     _marker: PhantomData<ffi::Arena>,
 }
 
@@ -82,7 +82,7 @@ impl Arena {
         NonNull::new(ptr)
             .map(|ptr| Arena {
                 ptr,
-                filesystem,
+                _filesystem: filesystem,
                 _marker: PhantomData,
             })
             .ok_or(Error::InvalidArena)

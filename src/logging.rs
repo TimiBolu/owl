@@ -1,7 +1,6 @@
 // Comprehensive Logging System
 // Provides structured logging with correlation IDs across Rust-Zig boundary
 
-use crate::error::{OQLError, OQLResult};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
@@ -17,12 +16,12 @@ impl CorrelationId {
     pub fn new() -> Self {
         Self(Uuid::new_v4().to_string())
     }
-    
+
     /// Create from string
     pub fn from_string(s: String) -> Self {
         Self(s)
     }
-    
+
     /// Get the string representation
     pub fn as_str(&self) -> &str {
         &self.0
@@ -63,7 +62,7 @@ pub struct LogEntry {
     pub correlation_id: CorrelationId,
     pub level: LogLevel,
     pub message: String,
-    pub layer: String,  // "rust" or "zig"
+    pub layer: String, // "rust" or "zig"
     pub component: String,
     pub timestamp_ms: u64,
     pub duration_ms: Option<u64>,
@@ -93,23 +92,23 @@ impl LogEntry {
             metadata: std::collections::HashMap::new(),
         }
     }
-    
+
     /// Add metadata
     pub fn with_metadata(mut self, key: String, value: String) -> Self {
         self.metadata.insert(key, value);
         self
     }
-    
+
     /// Set duration
     pub fn with_duration(mut self, duration_ms: u64) -> Self {
         self.duration_ms = Some(duration_ms);
         self
     }
-    
+
     /// Log this entry using tracing
     pub fn log(&self) {
         let level: Level = self.level.into();
-        
+
         match level {
             Level::TRACE => debug!(
                 correlation_id = %self.correlation_id.as_str(),
@@ -171,14 +170,14 @@ impl ComponentLogger {
             correlation_id: Arc::new(std::sync::RwLock::new(None)),
         }
     }
-    
+
     /// Set correlation ID for this logger
     pub fn set_correlation_id(&self, id: CorrelationId) {
         if let Ok(mut cid) = self.correlation_id.write() {
             *cid = Some(id);
         }
     }
-    
+
     /// Get or create correlation ID
     fn get_correlation_id(&self) -> CorrelationId {
         if let Ok(cid) = self.correlation_id.read() {
@@ -188,7 +187,7 @@ impl ComponentLogger {
         }
         CorrelationId::new()
     }
-    
+
     /// Log a message
     pub fn log(&self, level: LogLevel, message: String) {
         let entry = LogEntry::new(
@@ -200,7 +199,7 @@ impl ComponentLogger {
         );
         entry.log();
     }
-    
+
     /// Log with metadata
     pub fn log_with_metadata(
         &self,
@@ -218,33 +217,33 @@ impl ComponentLogger {
         entry.metadata = metadata;
         entry.log();
     }
-    
+
     /// Create a timed operation
-    pub fn timed_operation(&self, operation: String) -> TimedOperation {
+    pub fn timed_operation(&self, operation: String) -> TimedOperation<'_> {
         TimedOperation {
             logger: self,
             operation,
             start: Instant::now(),
         }
     }
-    
+
     /// Convenience methods
     pub fn trace(&self, message: String) {
         self.log(LogLevel::Trace, message);
     }
-    
+
     pub fn debug(&self, message: String) {
         self.log(LogLevel::Debug, message);
     }
-    
+
     pub fn info(&self, message: String) {
         self.log(LogLevel::Info, message);
     }
-    
+
     pub fn warn(&self, message: String) {
         self.log(LogLevel::Warn, message);
     }
-    
+
     pub fn error(&self, message: String) {
         self.log(LogLevel::Error, message);
     }
@@ -269,10 +268,10 @@ impl<'a> TimedOperation<'a> {
             self.logger.component.clone(),
         )
         .with_duration(duration.as_millis() as u64);
-        
+
         entry.log();
     }
-    
+
     /// Finish with error
     pub fn finish_with_error(self, error: &str) {
         let duration = self.start.elapsed();
@@ -284,7 +283,7 @@ impl<'a> TimedOperation<'a> {
             self.logger.component.clone(),
         )
         .with_duration(duration.as_millis() as u64);
-        
+
         entry.log();
     }
 }
@@ -300,7 +299,7 @@ impl<'a> Drop for TimedOperation<'a> {
             self.logger.component.clone(),
         )
         .with_duration(duration.as_millis() as u64);
-        
+
         entry.log();
     }
 }
@@ -317,34 +316,37 @@ impl QueryLogger {
             logger: ComponentLogger::new("query_executor".to_string(), "rust".to_string()),
         }
     }
-    
+
     /// Log query start
     pub fn log_query_start(&self, query: &str, correlation_id: CorrelationId) {
         self.logger.set_correlation_id(correlation_id);
         self.logger.info(format!("Query started: {}", query));
     }
-    
+
     /// Log query completion
     pub fn log_query_complete(&self, query: &str, duration_ms: u64, rows_returned: usize) {
         let mut metadata = std::collections::HashMap::new();
         metadata.insert("query".to_string(), query.to_string());
         metadata.insert("duration_ms".to_string(), duration_ms.to_string());
         metadata.insert("rows_returned".to_string(), rows_returned.to_string());
-        
+
         self.logger.log_with_metadata(
             LogLevel::Info,
-            format!("Query completed in {}ms, returned {} rows", duration_ms, rows_returned),
+            format!(
+                "Query completed in {}ms, returned {} rows",
+                duration_ms, rows_returned
+            ),
             metadata,
         );
     }
-    
+
     /// Log slow query
     pub fn log_slow_query(&self, query: &str, duration_ms: u64, threshold_ms: u64) {
         let mut metadata = std::collections::HashMap::new();
         metadata.insert("query".to_string(), query.to_string());
         metadata.insert("duration_ms".to_string(), duration_ms.to_string());
         metadata.insert("threshold_ms".to_string(), threshold_ms.to_string());
-        
+
         self.logger.log_with_metadata(
             LogLevel::Warn,
             format!(
@@ -354,13 +356,13 @@ impl QueryLogger {
             metadata,
         );
     }
-    
+
     /// Log query error
     pub fn log_query_error(&self, query: &str, error: &str) {
         let mut metadata = std::collections::HashMap::new();
         metadata.insert("query".to_string(), query.to_string());
         metadata.insert("error".to_string(), error.to_string());
-        
+
         self.logger.log_with_metadata(
             LogLevel::Error,
             format!("Query failed: {}", error),
@@ -387,13 +389,14 @@ impl StorageLogger {
             logger: ComponentLogger::new("storage".to_string(), "rust".to_string()),
         }
     }
-    
+
     /// Log storage operation
     pub fn log_operation(&self, operation: &str, correlation_id: CorrelationId) {
         self.logger.set_correlation_id(correlation_id);
-        self.logger.debug(format!("Storage operation: {}", operation));
+        self.logger
+            .debug(format!("Storage operation: {}", operation));
     }
-    
+
     /// Log storage statistics
     pub fn log_statistics(&self, stats: &str) {
         self.logger.info(format!("Storage statistics: {}", stats));
@@ -409,8 +412,8 @@ impl Default for StorageLogger {
 // FFI for Zig layer logging
 #[repr(C)]
 pub struct ZigLogEntry {
-    correlation_id: [u8; 36],  // UUID string
-    level: u8,  // 0=trace, 1=debug, 2=info, 3=warn, 4=error
+    correlation_id: [u8; 36], // UUID string
+    level: u8,                // 0=trace, 1=debug, 2=info, 3=warn, 4=error
     message: *const u8,
     message_len: usize,
     component: *const u8,
@@ -424,25 +427,28 @@ pub extern "C" fn owl_log_from_zig(entry: *const ZigLogEntry) {
     if entry.is_null() {
         return;
     }
-    
+
     unsafe {
         let entry_ref = &*entry;
-        
+
         // Parse correlation ID
-        let correlation_id = std::str::from_utf8_unchecked(
-            std::slice::from_raw_parts(entry_ref.correlation_id.as_ptr(), 36)
-        );
-        
+        let correlation_id = std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+            entry_ref.correlation_id.as_ptr(),
+            36,
+        ));
+
         // Parse message
-        let message = std::str::from_utf8_unchecked(
-            std::slice::from_raw_parts(entry_ref.message, entry_ref.message_len)
-        );
-        
+        let message = std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+            entry_ref.message,
+            entry_ref.message_len,
+        ));
+
         // Parse component
-        let component = std::str::from_utf8_unchecked(
-            std::slice::from_raw_parts(entry_ref.component, entry_ref.component_len)
-        );
-        
+        let component = std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+            entry_ref.component,
+            entry_ref.component_len,
+        ));
+
         // Convert level
         let level = match entry_ref.level {
             0 => LogLevel::Trace,
@@ -452,7 +458,7 @@ pub extern "C" fn owl_log_from_zig(entry: *const ZigLogEntry) {
             4 => LogLevel::Error,
             _ => LogLevel::Info,
         };
-        
+
         // Create and log entry
         let log_entry = LogEntry::new(
             CorrelationId::from_string(correlation_id.to_string()),
@@ -462,7 +468,7 @@ pub extern "C" fn owl_log_from_zig(entry: *const ZigLogEntry) {
             component.to_string(),
         )
         .with_duration(entry_ref.duration_ms);
-        
+
         log_entry.log();
     }
 }
@@ -470,16 +476,16 @@ pub extern "C" fn owl_log_from_zig(entry: *const ZigLogEntry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_correlation_id() {
         let id1 = CorrelationId::new();
         let id2 = CorrelationId::new();
-        
+
         assert_ne!(id1.as_str(), id2.as_str());
         assert_eq!(id1.as_str().len(), 36); // UUID length
     }
-    
+
     #[test]
     fn test_log_entry() {
         let entry = LogEntry::new(
@@ -489,12 +495,12 @@ mod tests {
             "rust".to_string(),
             "test".to_string(),
         );
-        
+
         assert_eq!(entry.message, "Test message");
         assert_eq!(entry.layer, "rust");
         assert_eq!(entry.component, "test");
     }
-    
+
     #[test]
     fn test_component_logger() {
         let logger = ComponentLogger::new("test".to_string(), "rust".to_string());
@@ -502,7 +508,7 @@ mod tests {
         logger.debug("Debug message".to_string());
         logger.warn("Warning message".to_string());
     }
-    
+
     #[test]
     fn test_timed_operation() {
         let logger = ComponentLogger::new("test".to_string(), "rust".to_string());

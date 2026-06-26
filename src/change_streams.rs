@@ -7,7 +7,7 @@ use crate::storage::DocumentStore;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 /// Types of document changes that can be tracked
@@ -180,6 +180,12 @@ impl ChangeFilter {
     }
 }
 
+impl Default for ChangeFilter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Handle for a change stream subscription
 pub struct ChangeStreamHandle {
     pub id: String,
@@ -205,10 +211,7 @@ pub enum TriggerAction {
     /// Execute an OQL query
     Query(OQLQuery),
     /// Call a custom function
-    Function {
-        name: String,
-        args: Vec<Expression>,
-    },
+    Function { name: String, args: Vec<Expression> },
     /// Send a notification
     Notification {
         message: String,
@@ -281,9 +284,11 @@ impl Trigger {
 }
 
 /// Change streams and triggers manager
+type SubscriberMap = HashMap<String, (ChangeFilter, mpsc::Sender<DocumentChange>)>;
+
 pub struct ChangeStreamManager<S: DocumentStore> {
     store: Arc<S>,
-    subscribers: Arc<Mutex<HashMap<String, (ChangeFilter, mpsc::Sender<DocumentChange>)>>>,
+    subscribers: Arc<Mutex<SubscriberMap>>,
     triggers: Arc<Mutex<HashMap<String, Trigger>>>,
     change_log: Arc<Mutex<Vec<DocumentChange>>>,
     max_change_log_size: usize,
@@ -305,14 +310,12 @@ impl<S: DocumentStore + Send + Sync + 'static> ChangeStreamManager<S> {
     pub fn record_change(&self, change: DocumentChange) -> OQLResult<()> {
         // Add to change log
         {
-            let mut log = self.change_log.lock().map_err(|_| {
-                OQLError::Generic {
-                    message: "Failed to acquire change log lock".to_string(),
-                }
+            let mut log = self.change_log.lock().map_err(|_| OQLError::Generic {
+                message: "Failed to acquire change log lock".to_string(),
             })?;
-            
+
             log.push(change.clone());
-            
+
             // Trim log if it gets too large
             if log.len() > self.max_change_log_size {
                 let excess = log.len() - self.max_change_log_size;
@@ -322,10 +325,8 @@ impl<S: DocumentStore + Send + Sync + 'static> ChangeStreamManager<S> {
 
         // Notify subscribers
         {
-            let subscribers = self.subscribers.lock().map_err(|_| {
-                OQLError::Generic {
-                    message: "Failed to acquire subscribers lock".to_string(),
-                }
+            let subscribers = self.subscribers.lock().map_err(|_| OQLError::Generic {
+                message: "Failed to acquire subscribers lock".to_string(),
             })?;
 
             for (filter, sender) in subscribers.values() {
@@ -348,12 +349,10 @@ impl<S: DocumentStore + Send + Sync + 'static> ChangeStreamManager<S> {
         let handle_id = uuid::Uuid::new_v4().to_string();
 
         {
-            let mut subscribers = self.subscribers.lock().map_err(|_| {
-                OQLError::Generic {
-                    message: "Failed to acquire subscribers lock".to_string(),
-                }
+            let mut subscribers = self.subscribers.lock().map_err(|_| OQLError::Generic {
+                message: "Failed to acquire subscribers lock".to_string(),
             })?;
-            
+
             subscribers.insert(handle_id.clone(), (filter, sender.clone()));
         }
 
@@ -366,12 +365,10 @@ impl<S: DocumentStore + Send + Sync + 'static> ChangeStreamManager<S> {
 
     /// Unsubscribe from change stream
     pub fn unsubscribe(&self, handle_id: &str) -> OQLResult<()> {
-        let mut subscribers = self.subscribers.lock().map_err(|_| {
-            OQLError::Generic {
-                message: "Failed to acquire subscribers lock".to_string(),
-            }
+        let mut subscribers = self.subscribers.lock().map_err(|_| OQLError::Generic {
+            message: "Failed to acquire subscribers lock".to_string(),
         })?;
-        
+
         subscribers.remove(handle_id);
         Ok(())
     }
@@ -379,47 +376,39 @@ impl<S: DocumentStore + Send + Sync + 'static> ChangeStreamManager<S> {
     /// Register a trigger
     pub fn register_trigger(&self, trigger: Trigger) -> OQLResult<String> {
         let trigger_id = trigger.id.clone();
-        
-        let mut triggers = self.triggers.lock().map_err(|_| {
-            OQLError::Generic {
-                message: "Failed to acquire triggers lock".to_string(),
-            }
+
+        let mut triggers = self.triggers.lock().map_err(|_| OQLError::Generic {
+            message: "Failed to acquire triggers lock".to_string(),
         })?;
-        
+
         triggers.insert(trigger_id.clone(), trigger);
         Ok(trigger_id)
     }
 
     /// Remove a trigger
     pub fn remove_trigger(&self, trigger_id: &str) -> OQLResult<bool> {
-        let mut triggers = self.triggers.lock().map_err(|_| {
-            OQLError::Generic {
-                message: "Failed to acquire triggers lock".to_string(),
-            }
+        let mut triggers = self.triggers.lock().map_err(|_| OQLError::Generic {
+            message: "Failed to acquire triggers lock".to_string(),
         })?;
-        
+
         Ok(triggers.remove(trigger_id).is_some())
     }
 
     /// List all triggers
     pub fn list_triggers(&self) -> OQLResult<Vec<Trigger>> {
-        let triggers = self.triggers.lock().map_err(|_| {
-            OQLError::Generic {
-                message: "Failed to acquire triggers lock".to_string(),
-            }
+        let triggers = self.triggers.lock().map_err(|_| OQLError::Generic {
+            message: "Failed to acquire triggers lock".to_string(),
         })?;
-        
+
         Ok(triggers.values().cloned().collect())
     }
 
     /// Enable or disable a trigger
     pub fn set_trigger_enabled(&self, trigger_id: &str, enabled: bool) -> OQLResult<bool> {
-        let mut triggers = self.triggers.lock().map_err(|_| {
-            OQLError::Generic {
-                message: "Failed to acquire triggers lock".to_string(),
-            }
+        let mut triggers = self.triggers.lock().map_err(|_| OQLError::Generic {
+            message: "Failed to acquire triggers lock".to_string(),
         })?;
-        
+
         if let Some(trigger) = triggers.get_mut(trigger_id) {
             trigger.enabled = enabled;
             Ok(true)
@@ -430,27 +419,23 @@ impl<S: DocumentStore + Send + Sync + 'static> ChangeStreamManager<S> {
 
     /// Get change history
     pub fn get_change_history(&self, limit: Option<usize>) -> OQLResult<Vec<DocumentChange>> {
-        let log = self.change_log.lock().map_err(|_| {
-            OQLError::Generic {
-                message: "Failed to acquire change log lock".to_string(),
-            }
+        let log = self.change_log.lock().map_err(|_| OQLError::Generic {
+            message: "Failed to acquire change log lock".to_string(),
         })?;
-        
+
         let changes = if let Some(limit) = limit {
             log.iter().rev().take(limit).cloned().collect()
         } else {
             log.clone()
         };
-        
+
         Ok(changes)
     }
 
     /// Check and execute triggers for a change
     fn check_triggers(&self, change: &DocumentChange) -> OQLResult<()> {
-        let triggers = self.triggers.lock().map_err(|_| {
-            OQLError::Generic {
-                message: "Failed to acquire triggers lock".to_string(),
-            }
+        let triggers = self.triggers.lock().map_err(|_| OQLError::Generic {
+            message: "Failed to acquire triggers lock".to_string(),
         })?;
 
         for trigger in triggers.values() {
@@ -459,9 +444,11 @@ impl<S: DocumentStore + Send + Sync + 'static> ChangeStreamManager<S> {
                 let trigger_clone = trigger.clone();
                 let change_clone = change.clone();
                 let store_clone = self.store.clone();
-                
+
                 thread::spawn(move || {
-                    if let Err(e) = Self::execute_trigger_action(&store_clone, &trigger_clone, &change_clone) {
+                    if let Err(e) =
+                        Self::execute_trigger_action(&store_clone, &trigger_clone, &change_clone)
+                    {
                         eprintln!("Trigger execution failed: {:?}", e);
                     }
                 });
@@ -481,18 +468,29 @@ impl<S: DocumentStore + Send + Sync + 'static> ChangeStreamManager<S> {
             TriggerAction::Query(_query) => {
                 // In a full implementation, we'd execute the query here
                 // For now, just log the action
-                println!("Trigger '{}' would execute query for change: {:?}", trigger.name, change.change_id);
+                println!(
+                    "Trigger '{}' would execute query for change: {:?}",
+                    trigger.name, change.change_id
+                );
                 Ok(())
             }
             TriggerAction::Function { name, args: _ } => {
                 // In a full implementation, we'd call the function here
-                println!("Trigger '{}' would call function '{}' for change: {:?}", trigger.name, name, change.change_id);
+                println!(
+                    "Trigger '{}' would call function '{}' for change: {:?}",
+                    trigger.name, name, change.change_id
+                );
                 Ok(())
             }
-            TriggerAction::Notification { message, recipients } => {
+            TriggerAction::Notification {
+                message,
+                recipients,
+            } => {
                 // In a full implementation, we'd send notifications here
-                println!("Trigger '{}' would send notification '{}' to {:?} for change: {:?}", 
-                    trigger.name, message, recipients, change.change_id);
+                println!(
+                    "Trigger '{}' would send notification '{}' to {:?} for change: {:?}",
+                    trigger.name, message, recipients, change.change_id
+                );
                 Ok(())
             }
         }
@@ -534,17 +532,17 @@ impl<S: DocumentStore + Send + Sync + 'static> DocumentStore for ChangeTrackingS
     fn put_document(&self, document: &Document) -> OQLResult<()> {
         // Get existing document for change tracking
         let old_document = self.inner.get_document(&document.schema, &document.id)?;
-        
+
         // Store the document
         self.inner.put_document(document)?;
-        
+
         // Record the change
         let change_type = if old_document.is_some() {
             ChangeType::Update
         } else {
             ChangeType::Insert
         };
-        
+
         let change = DocumentChange::new(
             document.id.clone(),
             document.schema.clone(),
@@ -552,19 +550,19 @@ impl<S: DocumentStore + Send + Sync + 'static> DocumentStore for ChangeTrackingS
             old_document,
             Some(document.clone()),
         );
-        
+
         self.change_manager.record_change(change)?;
-        
+
         Ok(())
     }
 
     fn delete_document(&self, schema: &str, id: &DocumentId) -> OQLResult<bool> {
         // Get existing document for change tracking
         let old_document = self.inner.get_document(schema, id)?;
-        
+
         // Delete the document
         let was_deleted = self.inner.delete_document(schema, id)?;
-        
+
         // Record the change if document was actually deleted
         if was_deleted && old_document.is_some() {
             let change = DocumentChange::new(
@@ -574,10 +572,10 @@ impl<S: DocumentStore + Send + Sync + 'static> DocumentStore for ChangeTrackingS
                 old_document,
                 None,
             );
-            
+
             self.change_manager.record_change(change)?;
         }
-        
+
         Ok(was_deleted)
     }
 
@@ -596,11 +594,11 @@ impl<S: DocumentStore + Send + Sync + 'static> DocumentStore for ChangeTrackingS
     fn list_schemas(&self) -> OQLResult<Vec<String>> {
         self.inner.list_schemas()
     }
-    
+
     fn navigate_reference(&self, objref: &crate::document::ObjRef) -> OQLResult<Option<Document>> {
         self.inner.navigate_reference(objref)
     }
-    
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -609,14 +607,14 @@ impl<S: DocumentStore + Send + Sync + 'static> DocumentStore for ChangeTrackingS
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::create_storage;
-    use tempfile::TempDir;
+    use crate::storage::zig_adapter::ZigStore;
     use std::collections::HashMap;
+    use tempfile::TempDir;
 
-    fn create_test_store() -> (ChangeTrackingStore<dyn DocumentStore>, TempDir) {
+    fn create_test_store() -> (ChangeTrackingStore<ZigStore>, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("test.owl");
-        let store = create_storage(path.to_str().unwrap(), 10 * 1024 * 1024).unwrap();
+        let store = Arc::new(ZigStore::new(path.to_str().unwrap(), 10 * 1024 * 1024).unwrap());
         let change_store = ChangeTrackingStore::new(store);
         (change_store, temp_dir)
     }
@@ -669,7 +667,9 @@ mod tests {
 
         // Insert then delete
         store.put_document(&doc).unwrap();
-        store.delete_document("users", &"user_1".to_string()).unwrap();
+        store
+            .delete_document("users", &"user_1".to_string())
+            .unwrap();
 
         // Check change history
         let changes = store.change_manager().get_change_history(None).unwrap();
@@ -683,7 +683,7 @@ mod tests {
     #[test]
     fn test_change_stream_subscription() {
         let (store, _temp_dir) = create_test_store();
-        
+
         // Subscribe to changes
         let filter = ChangeFilter::new().schemas(vec!["users".to_string()]);
         let handle = store.change_manager().subscribe(filter).unwrap();
@@ -703,7 +703,7 @@ mod tests {
     #[test]
     fn test_trigger_registration() {
         let (store, _temp_dir) = create_test_store();
-        
+
         // Register a trigger
         let trigger = Trigger::new(
             "test_trigger".to_string(),
@@ -714,18 +714,18 @@ mod tests {
                 recipients: vec!["admin@example.com".to_string()],
             },
         );
-        
+
         let trigger_id = store.change_manager().register_trigger(trigger).unwrap();
-        
+
         // List triggers
         let triggers = store.change_manager().list_triggers().unwrap();
         assert_eq!(triggers.len(), 1);
         assert_eq!(triggers[0].name, "test_trigger");
-        
+
         // Remove trigger
         let removed = store.change_manager().remove_trigger(&trigger_id).unwrap();
         assert!(removed);
-        
+
         let triggers = store.change_manager().list_triggers().unwrap();
         assert_eq!(triggers.len(), 0);
     }

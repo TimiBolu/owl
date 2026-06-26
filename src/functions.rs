@@ -4,7 +4,7 @@
 use crate::document::Value;
 use crate::error::{OQLError, OQLResult};
 use crate::parser::FunctionDefinition;
-use chrono::{DateTime, Utc, Duration, NaiveDateTime, TimeZone, Datelike, Timelike};
+use chrono::{DateTime, Datelike, Duration, NaiveDateTime, TimeZone, Timelike, Utc};
 use std::collections::HashMap;
 
 /// Function signature for built-in functions
@@ -31,31 +31,31 @@ impl FunctionRegistry {
             builtin_functions: HashMap::new(),
             user_functions: HashMap::new(),
         };
-        
+
         // Register all built-in functions
         registry.register_string_functions();
         registry.register_math_functions();
         registry.register_datetime_functions();
         registry.register_utility_functions();
-        
+
         registry
     }
-    
+
     /// Get a built-in function by name
     pub fn get_function(&self, name: &str) -> Option<&BuiltinFunction> {
         self.builtin_functions.get(name)
     }
-    
+
     /// Get a user-defined function by name
     pub fn get_user_function(&self, name: &str) -> Option<&UserDefinedFunction> {
         self.user_functions.get(name)
     }
-    
+
     /// Check if a function exists (built-in or user-defined)
     pub fn has_function(&self, name: &str) -> bool {
         self.builtin_functions.contains_key(name) || self.user_functions.contains_key(name)
     }
-    
+
     /// Get all function names
     pub fn function_names(&self) -> Vec<String> {
         let mut names = Vec::new();
@@ -63,31 +63,33 @@ impl FunctionRegistry {
         names.extend(self.user_functions.keys().cloned());
         names
     }
-    
+
     /// Register a built-in function
     fn register(&mut self, name: &str, func: BuiltinFunction) {
         self.builtin_functions.insert(name.to_string(), func);
     }
-    
+
     /// Register a user-defined function
     pub fn register_user_function(&mut self, func_def: FunctionDefinition) -> OQLResult<()> {
         // Validate function definition
         self.validate_function_definition(&func_def)?;
-        
-        let parameter_types = func_def.parameters.iter()
+
+        let parameter_types = func_def
+            .parameters
+            .iter()
             .map(|p| p.param_type.clone())
             .collect();
-        
+
         let user_func = UserDefinedFunction {
             return_type: func_def.return_type.clone(),
             parameter_types,
             definition: func_def.clone(),
         };
-        
+
         self.user_functions.insert(func_def.name.clone(), user_func);
         Ok(())
     }
-    
+
     /// Validate a function definition
     fn validate_function_definition(&self, func_def: &FunctionDefinition) -> OQLResult<()> {
         // Check for duplicate function names
@@ -96,7 +98,7 @@ impl FunctionRegistry {
                 message: format!("Function '{}' already exists", func_def.name),
             });
         }
-        
+
         // Validate parameter types
         for param in &func_def.parameters {
             if !self.is_valid_type(&param.param_type) {
@@ -106,7 +108,7 @@ impl FunctionRegistry {
                 });
             }
         }
-        
+
         // Validate return type if specified
         if let Some(return_type) = &func_def.return_type {
             if !self.is_valid_type(return_type) {
@@ -116,18 +118,41 @@ impl FunctionRegistry {
                 });
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Check if a type name is valid
     fn is_valid_type(&self, type_name: &str) -> bool {
-        matches!(type_name, 
-            "String" | "Integer" | "Float" | "Boolean" | "DateTime" | 
-            "customers" | "orders" | "products" | "users" // Schema types
-        )
+        let trimmed = type_name.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "string"
+                | "integer"
+                | "int"
+                | "float"
+                | "double"
+                | "boolean"
+                | "bool"
+                | "datetime"
+                | "timestamp"
+        ) {
+            return true;
+        }
+
+        // Treat identifier-like names as schema/object types.
+        // This keeps function definitions flexible with evolving schemas.
+        let mut chars = trimmed.chars();
+        let Some(first) = chars.next() else {
+            return false;
+        };
+        (first.is_ascii_alphabetic() || first == '_')
+            && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
     }
-    
+
     /// Register all string manipulation functions
     fn register_string_functions(&mut self) {
         self.register("trim", string_trim);
@@ -144,7 +169,7 @@ impl FunctionRegistry {
         self.register("pad_left", string_pad_left);
         self.register("pad_right", string_pad_right);
     }
-    
+
     /// Register all math functions
     fn register_math_functions(&mut self) {
         self.register("abs", math_abs);
@@ -163,7 +188,7 @@ impl FunctionRegistry {
         self.register("exp", math_exp);
         self.register("random", math_random);
     }
-    
+
     /// Register all date/time functions
     fn register_datetime_functions(&mut self) {
         self.register("now", datetime_now);
@@ -184,7 +209,7 @@ impl FunctionRegistry {
         self.register("add_hours", datetime_add_hours);
         self.register("diff_days", datetime_diff_days);
     }
-    
+
     /// Register utility functions
     fn register_utility_functions(&mut self) {
         self.register("coalesce", utility_coalesce);
@@ -211,7 +236,7 @@ fn string_trim(args: &[Value]) -> OQLResult<Value> {
             message: "trim() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     match &args[0] {
         Value::String(s) => Ok(Value::String(s.trim().to_string())),
         Value::Null => Ok(Value::Null),
@@ -229,7 +254,7 @@ fn string_upper(args: &[Value]) -> OQLResult<Value> {
             message: "upper() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     match &args[0] {
         Value::String(s) => Ok(Value::String(s.to_uppercase())),
         Value::Null => Ok(Value::Null),
@@ -247,7 +272,7 @@ fn string_lower(args: &[Value]) -> OQLResult<Value> {
             message: "lower() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     match &args[0] {
         Value::String(s) => Ok(Value::String(s.to_lowercase())),
         Value::Null => Ok(Value::Null),
@@ -265,7 +290,7 @@ fn string_length(args: &[Value]) -> OQLResult<Value> {
             message: "length() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     match &args[0] {
         Value::String(s) => Ok(Value::Integer(s.len() as i64)),
         Value::Null => Ok(Value::Null),
@@ -283,43 +308,49 @@ fn string_substring(args: &[Value]) -> OQLResult<Value> {
             message: "substring() expects 2 or 3 arguments: substring(string, start) or substring(string, start, length)".to_string(),
         });
     }
-    
+
     let string = match &args[0] {
         Value::String(s) => s,
         Value::Null => return Ok(Value::Null),
-        _ => return Err(OQLError::TypeError {
-            expected: "string".to_string(),
-            actual: args[0].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "string".to_string(),
+                actual: args[0].type_name().to_string(),
+            })
+        }
     };
-    
+
     let start = match &args[1] {
         Value::Integer(i) => *i as usize,
-        _ => return Err(OQLError::TypeError {
-            expected: "integer".to_string(),
-            actual: args[1].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "integer".to_string(),
+                actual: args[1].type_name().to_string(),
+            })
+        }
     };
-    
+
     if start >= string.len() {
         return Ok(Value::String(String::new()));
     }
-    
+
     let result = if args.len() == 3 {
         let length = match &args[2] {
             Value::Integer(i) => *i as usize,
-            _ => return Err(OQLError::TypeError {
-                expected: "integer".to_string(),
-                actual: args[2].type_name().to_string(),
-            }),
+            _ => {
+                return Err(OQLError::TypeError {
+                    expected: "integer".to_string(),
+                    actual: args[2].type_name().to_string(),
+                })
+            }
         };
-        
+
         let end = std::cmp::min(start + length, string.len());
         string[start..end].to_string()
     } else {
         string[start..].to_string()
     };
-    
+
     Ok(Value::String(result))
 }
 
@@ -328,7 +359,7 @@ fn string_concat(args: &[Value]) -> OQLResult<Value> {
     if args.is_empty() {
         return Ok(Value::String(String::new()));
     }
-    
+
     let mut result = String::new();
     for arg in args {
         match arg {
@@ -336,11 +367,11 @@ fn string_concat(args: &[Value]) -> OQLResult<Value> {
             Value::Integer(i) => result.push_str(&i.to_string()),
             Value::Float(f) => result.push_str(&f.to_string()),
             Value::Boolean(b) => result.push_str(&b.to_string()),
-            Value::Null => {}, // Skip null values
+            Value::Null => {} // Skip null values
             _ => result.push_str(&arg.to_string_repr()),
         }
     }
-    
+
     Ok(Value::String(result))
 }
 
@@ -351,32 +382,38 @@ fn string_replace(args: &[Value]) -> OQLResult<Value> {
             message: "replace() expects exactly 3 arguments: replace(string, from, to)".to_string(),
         });
     }
-    
+
     let string = match &args[0] {
         Value::String(s) => s,
         Value::Null => return Ok(Value::Null),
-        _ => return Err(OQLError::TypeError {
-            expected: "string".to_string(),
-            actual: args[0].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "string".to_string(),
+                actual: args[0].type_name().to_string(),
+            })
+        }
     };
-    
+
     let from = match &args[1] {
         Value::String(s) => s,
-        _ => return Err(OQLError::TypeError {
-            expected: "string".to_string(),
-            actual: args[1].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "string".to_string(),
+                actual: args[1].type_name().to_string(),
+            })
+        }
     };
-    
+
     let to = match &args[2] {
         Value::String(s) => s,
-        _ => return Err(OQLError::TypeError {
-            expected: "string".to_string(),
-            actual: args[2].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "string".to_string(),
+                actual: args[2].type_name().to_string(),
+            })
+        }
     };
-    
+
     Ok(Value::String(string.replace(from, to)))
 }
 
@@ -387,28 +424,39 @@ fn string_split(args: &[Value]) -> OQLResult<Value> {
             message: "split() expects exactly 2 arguments: split(string, delimiter)".to_string(),
         });
     }
-    
+
     let string = match &args[0] {
         Value::String(s) => s,
         Value::Null => return Ok(Value::Null),
-        _ => return Err(OQLError::TypeError {
-            expected: "string".to_string(),
-            actual: args[0].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "string".to_string(),
+                actual: args[0].type_name().to_string(),
+            })
+        }
     };
-    
+
     let delimiter = match &args[1] {
         Value::String(s) => s,
-        _ => return Err(OQLError::TypeError {
-            expected: "string".to_string(),
-            actual: args[1].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "string".to_string(),
+                actual: args[1].type_name().to_string(),
+            })
+        }
     };
-    
+
     // For now, return a string representation of the array
     // In a full implementation, we'd need a List/Array value type
     let parts: Vec<&str> = string.split(delimiter).collect();
-    let result = format!("[{}]", parts.iter().map(|s| format!("\"{}\"", s)).collect::<Vec<_>>().join(", "));
+    let result = format!(
+        "[{}]",
+        parts
+            .iter()
+            .map(|s| format!("\"{}\"", s))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
     Ok(Value::String(result))
 }
 
@@ -416,27 +464,32 @@ fn string_split(args: &[Value]) -> OQLResult<Value> {
 fn string_starts_with(args: &[Value]) -> OQLResult<Value> {
     if args.len() != 2 {
         return Err(OQLError::Generic {
-            message: "starts_with() expects exactly 2 arguments: starts_with(string, prefix)".to_string(),
+            message: "starts_with() expects exactly 2 arguments: starts_with(string, prefix)"
+                .to_string(),
         });
     }
-    
+
     let string = match &args[0] {
         Value::String(s) => s,
         Value::Null => return Ok(Value::Null),
-        _ => return Err(OQLError::TypeError {
-            expected: "string".to_string(),
-            actual: args[0].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "string".to_string(),
+                actual: args[0].type_name().to_string(),
+            })
+        }
     };
-    
+
     let prefix = match &args[1] {
         Value::String(s) => s,
-        _ => return Err(OQLError::TypeError {
-            expected: "string".to_string(),
-            actual: args[1].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "string".to_string(),
+                actual: args[1].type_name().to_string(),
+            })
+        }
     };
-    
+
     Ok(Value::Boolean(string.starts_with(prefix)))
 }
 
@@ -444,27 +497,32 @@ fn string_starts_with(args: &[Value]) -> OQLResult<Value> {
 fn string_ends_with(args: &[Value]) -> OQLResult<Value> {
     if args.len() != 2 {
         return Err(OQLError::Generic {
-            message: "ends_with() expects exactly 2 arguments: ends_with(string, suffix)".to_string(),
+            message: "ends_with() expects exactly 2 arguments: ends_with(string, suffix)"
+                .to_string(),
         });
     }
-    
+
     let string = match &args[0] {
         Value::String(s) => s,
         Value::Null => return Ok(Value::Null),
-        _ => return Err(OQLError::TypeError {
-            expected: "string".to_string(),
-            actual: args[0].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "string".to_string(),
+                actual: args[0].type_name().to_string(),
+            })
+        }
     };
-    
+
     let suffix = match &args[1] {
         Value::String(s) => s,
-        _ => return Err(OQLError::TypeError {
-            expected: "string".to_string(),
-            actual: args[1].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "string".to_string(),
+                actual: args[1].type_name().to_string(),
+            })
+        }
     };
-    
+
     Ok(Value::Boolean(string.ends_with(suffix)))
 }
 
@@ -472,27 +530,32 @@ fn string_ends_with(args: &[Value]) -> OQLResult<Value> {
 fn string_contains(args: &[Value]) -> OQLResult<Value> {
     if args.len() != 2 {
         return Err(OQLError::Generic {
-            message: "contains() expects exactly 2 arguments: contains(string, substring)".to_string(),
+            message: "contains() expects exactly 2 arguments: contains(string, substring)"
+                .to_string(),
         });
     }
-    
+
     let string = match &args[0] {
         Value::String(s) => s,
         Value::Null => return Ok(Value::Null),
-        _ => return Err(OQLError::TypeError {
-            expected: "string".to_string(),
-            actual: args[0].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "string".to_string(),
+                actual: args[0].type_name().to_string(),
+            })
+        }
     };
-    
+
     let substring = match &args[1] {
         Value::String(s) => s,
-        _ => return Err(OQLError::TypeError {
-            expected: "string".to_string(),
-            actual: args[1].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "string".to_string(),
+                actual: args[1].type_name().to_string(),
+            })
+        }
     };
-    
+
     Ok(Value::Boolean(string.contains(substring)))
 }
 
@@ -503,36 +566,42 @@ fn string_pad_left(args: &[Value]) -> OQLResult<Value> {
             message: "pad_left() expects 2 or 3 arguments: pad_left(string, length) or pad_left(string, length, pad_char)".to_string(),
         });
     }
-    
+
     let string = match &args[0] {
         Value::String(s) => s,
         Value::Null => return Ok(Value::Null),
-        _ => return Err(OQLError::TypeError {
-            expected: "string".to_string(),
-            actual: args[0].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "string".to_string(),
+                actual: args[0].type_name().to_string(),
+            })
+        }
     };
-    
+
     let length = match &args[1] {
         Value::Integer(i) => *i as usize,
-        _ => return Err(OQLError::TypeError {
-            expected: "integer".to_string(),
-            actual: args[1].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "integer".to_string(),
+                actual: args[1].type_name().to_string(),
+            })
+        }
     };
-    
+
     let pad_char = if args.len() == 3 {
         match &args[2] {
             Value::String(s) => s.chars().next().unwrap_or(' '),
-            _ => return Err(OQLError::TypeError {
-                expected: "string".to_string(),
-                actual: args[2].type_name().to_string(),
-            }),
+            _ => {
+                return Err(OQLError::TypeError {
+                    expected: "string".to_string(),
+                    actual: args[2].type_name().to_string(),
+                })
+            }
         }
     } else {
         ' '
     };
-    
+
     if string.len() >= length {
         Ok(Value::String(string.clone()))
     } else {
@@ -548,36 +617,42 @@ fn string_pad_right(args: &[Value]) -> OQLResult<Value> {
             message: "pad_right() expects 2 or 3 arguments: pad_right(string, length) or pad_right(string, length, pad_char)".to_string(),
         });
     }
-    
+
     let string = match &args[0] {
         Value::String(s) => s,
         Value::Null => return Ok(Value::Null),
-        _ => return Err(OQLError::TypeError {
-            expected: "string".to_string(),
-            actual: args[0].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "string".to_string(),
+                actual: args[0].type_name().to_string(),
+            })
+        }
     };
-    
+
     let length = match &args[1] {
         Value::Integer(i) => *i as usize,
-        _ => return Err(OQLError::TypeError {
-            expected: "integer".to_string(),
-            actual: args[1].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "integer".to_string(),
+                actual: args[1].type_name().to_string(),
+            })
+        }
     };
-    
+
     let pad_char = if args.len() == 3 {
         match &args[2] {
             Value::String(s) => s.chars().next().unwrap_or(' '),
-            _ => return Err(OQLError::TypeError {
-                expected: "string".to_string(),
-                actual: args[2].type_name().to_string(),
-            }),
+            _ => {
+                return Err(OQLError::TypeError {
+                    expected: "string".to_string(),
+                    actual: args[2].type_name().to_string(),
+                })
+            }
         }
     } else {
         ' '
     };
-    
+
     if string.len() >= length {
         Ok(Value::String(string.clone()))
     } else {
@@ -595,7 +670,7 @@ fn math_abs(args: &[Value]) -> OQLResult<Value> {
             message: "abs() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     match &args[0] {
         Value::Integer(i) => Ok(Value::Integer(i.abs())),
         Value::Float(f) => Ok(Value::Float(f.abs())),
@@ -614,7 +689,7 @@ fn math_round(args: &[Value]) -> OQLResult<Value> {
             message: "round() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     match &args[0] {
         Value::Integer(i) => Ok(Value::Integer(*i)),
         Value::Float(f) => Ok(Value::Integer(f.round() as i64)),
@@ -633,7 +708,7 @@ fn math_floor(args: &[Value]) -> OQLResult<Value> {
             message: "floor() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     match &args[0] {
         Value::Integer(i) => Ok(Value::Integer(*i)),
         Value::Float(f) => Ok(Value::Integer(f.floor() as i64)),
@@ -652,7 +727,7 @@ fn math_ceil(args: &[Value]) -> OQLResult<Value> {
             message: "ceil() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     match &args[0] {
         Value::Integer(i) => Ok(Value::Integer(*i)),
         Value::Float(f) => Ok(Value::Integer(f.ceil() as i64)),
@@ -671,7 +746,7 @@ fn math_sqrt(args: &[Value]) -> OQLResult<Value> {
             message: "sqrt() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     match &args[0] {
         Value::Integer(i) => {
             if *i < 0 {
@@ -681,7 +756,7 @@ fn math_sqrt(args: &[Value]) -> OQLResult<Value> {
             } else {
                 Ok(Value::Float((*i as f64).sqrt()))
             }
-        },
+        }
         Value::Float(f) => {
             if *f < 0.0 {
                 Err(OQLError::Generic {
@@ -690,7 +765,7 @@ fn math_sqrt(args: &[Value]) -> OQLResult<Value> {
             } else {
                 Ok(Value::Float(f.sqrt()))
             }
-        },
+        }
         Value::Null => Ok(Value::Null),
         _ => Err(OQLError::TypeError {
             expected: "numeric type".to_string(),
@@ -706,27 +781,31 @@ fn math_pow(args: &[Value]) -> OQLResult<Value> {
             message: "pow() expects exactly 2 arguments: pow(base, exponent)".to_string(),
         });
     }
-    
+
     let base = match &args[0] {
         Value::Integer(i) => *i as f64,
         Value::Float(f) => *f,
         Value::Null => return Ok(Value::Null),
-        _ => return Err(OQLError::TypeError {
-            expected: "numeric type".to_string(),
-            actual: args[0].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "numeric type".to_string(),
+                actual: args[0].type_name().to_string(),
+            })
+        }
     };
-    
+
     let exponent = match &args[1] {
         Value::Integer(i) => *i as f64,
         Value::Float(f) => *f,
         Value::Null => return Ok(Value::Null),
-        _ => return Err(OQLError::TypeError {
-            expected: "numeric type".to_string(),
-            actual: args[1].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "numeric type".to_string(),
+                actual: args[1].type_name().to_string(),
+            })
+        }
     };
-    
+
     Ok(Value::Float(base.powf(exponent)))
 }
 
@@ -737,7 +816,7 @@ fn math_min(args: &[Value]) -> OQLResult<Value> {
             message: "min() expects exactly 2 arguments".to_string(),
         });
     }
-    
+
     match (&args[0], &args[1]) {
         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
         (Value::Integer(a), Value::Integer(b)) => Ok(Value::Integer(*a.min(b))),
@@ -758,7 +837,7 @@ fn math_max(args: &[Value]) -> OQLResult<Value> {
             message: "max() expects exactly 2 arguments".to_string(),
         });
     }
-    
+
     match (&args[0], &args[1]) {
         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
         (Value::Integer(a), Value::Integer(b)) => Ok(Value::Integer(*a.max(b))),
@@ -779,7 +858,7 @@ fn math_sin(args: &[Value]) -> OQLResult<Value> {
             message: "sin() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     match &args[0] {
         Value::Integer(i) => Ok(Value::Float((*i as f64).sin())),
         Value::Float(f) => Ok(Value::Float(f.sin())),
@@ -798,7 +877,7 @@ fn math_cos(args: &[Value]) -> OQLResult<Value> {
             message: "cos() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     match &args[0] {
         Value::Integer(i) => Ok(Value::Float((*i as f64).cos())),
         Value::Float(f) => Ok(Value::Float(f.cos())),
@@ -817,7 +896,7 @@ fn math_tan(args: &[Value]) -> OQLResult<Value> {
             message: "tan() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     match &args[0] {
         Value::Integer(i) => Ok(Value::Float((*i as f64).tan())),
         Value::Float(f) => Ok(Value::Float(f.tan())),
@@ -836,7 +915,7 @@ fn math_log(args: &[Value]) -> OQLResult<Value> {
             message: "log() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     match &args[0] {
         Value::Integer(i) => {
             if *i <= 0 {
@@ -846,7 +925,7 @@ fn math_log(args: &[Value]) -> OQLResult<Value> {
             } else {
                 Ok(Value::Float((*i as f64).log10()))
             }
-        },
+        }
         Value::Float(f) => {
             if *f <= 0.0 {
                 Err(OQLError::Generic {
@@ -855,7 +934,7 @@ fn math_log(args: &[Value]) -> OQLResult<Value> {
             } else {
                 Ok(Value::Float(f.log10()))
             }
-        },
+        }
         Value::Null => Ok(Value::Null),
         _ => Err(OQLError::TypeError {
             expected: "numeric type".to_string(),
@@ -871,7 +950,7 @@ fn math_ln(args: &[Value]) -> OQLResult<Value> {
             message: "ln() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     match &args[0] {
         Value::Integer(i) => {
             if *i <= 0 {
@@ -881,7 +960,7 @@ fn math_ln(args: &[Value]) -> OQLResult<Value> {
             } else {
                 Ok(Value::Float((*i as f64).ln()))
             }
-        },
+        }
         Value::Float(f) => {
             if *f <= 0.0 {
                 Err(OQLError::Generic {
@@ -890,7 +969,7 @@ fn math_ln(args: &[Value]) -> OQLResult<Value> {
             } else {
                 Ok(Value::Float(f.ln()))
             }
-        },
+        }
         Value::Null => Ok(Value::Null),
         _ => Err(OQLError::TypeError {
             expected: "numeric type".to_string(),
@@ -906,7 +985,7 @@ fn math_exp(args: &[Value]) -> OQLResult<Value> {
             message: "exp() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     match &args[0] {
         Value::Integer(i) => Ok(Value::Float((*i as f64).exp())),
         Value::Float(f) => Ok(Value::Float(f.exp())),
@@ -925,7 +1004,7 @@ fn math_random(args: &[Value]) -> OQLResult<Value> {
             message: "random() expects no arguments".to_string(),
         });
     }
-    
+
     use rand::Rng;
     let mut rng = rand::thread_rng();
     Ok(Value::Float(rng.gen::<f64>()))
@@ -940,7 +1019,7 @@ fn datetime_now(args: &[Value]) -> OQLResult<Value> {
             message: "now() expects no arguments".to_string(),
         });
     }
-    
+
     Ok(Value::DateTime(Utc::now()))
 }
 
@@ -951,7 +1030,7 @@ fn datetime_today(args: &[Value]) -> OQLResult<Value> {
             message: "today() expects no arguments".to_string(),
         });
     }
-    
+
     let now = Utc::now();
     let today = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
     Ok(Value::DateTime(Utc.from_utc_datetime(&today)))
@@ -964,15 +1043,17 @@ fn datetime_days_ago(args: &[Value]) -> OQLResult<Value> {
             message: "days_ago() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     let days = match &args[0] {
         Value::Integer(i) => *i,
-        _ => return Err(OQLError::TypeError {
-            expected: "integer".to_string(),
-            actual: args[0].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "integer".to_string(),
+                actual: args[0].type_name().to_string(),
+            })
+        }
     };
-    
+
     let now = Utc::now();
     let past = now - Duration::days(days);
     Ok(Value::DateTime(past))
@@ -985,15 +1066,17 @@ fn datetime_hours_ago(args: &[Value]) -> OQLResult<Value> {
             message: "hours_ago() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     let hours = match &args[0] {
         Value::Integer(i) => *i,
-        _ => return Err(OQLError::TypeError {
-            expected: "integer".to_string(),
-            actual: args[0].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "integer".to_string(),
+                actual: args[0].type_name().to_string(),
+            })
+        }
     };
-    
+
     let now = Utc::now();
     let past = now - Duration::hours(hours);
     Ok(Value::DateTime(past))
@@ -1006,15 +1089,17 @@ fn datetime_minutes_ago(args: &[Value]) -> OQLResult<Value> {
             message: "minutes_ago() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     let minutes = match &args[0] {
         Value::Integer(i) => *i,
-        _ => return Err(OQLError::TypeError {
-            expected: "integer".to_string(),
-            actual: args[0].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "integer".to_string(),
+                actual: args[0].type_name().to_string(),
+            })
+        }
     };
-    
+
     let now = Utc::now();
     let past = now - Duration::minutes(minutes);
     Ok(Value::DateTime(past))
@@ -1024,27 +1109,32 @@ fn datetime_minutes_ago(args: &[Value]) -> OQLResult<Value> {
 fn datetime_format(args: &[Value]) -> OQLResult<Value> {
     if args.len() != 2 {
         return Err(OQLError::Generic {
-            message: "format_date() expects exactly 2 arguments: format_date(datetime, format)".to_string(),
+            message: "format_date() expects exactly 2 arguments: format_date(datetime, format)"
+                .to_string(),
         });
     }
-    
+
     let datetime = match &args[0] {
         Value::DateTime(dt) => dt,
         Value::Null => return Ok(Value::Null),
-        _ => return Err(OQLError::TypeError {
-            expected: "datetime".to_string(),
-            actual: args[0].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "datetime".to_string(),
+                actual: args[0].type_name().to_string(),
+            })
+        }
     };
-    
+
     let format = match &args[1] {
         Value::String(s) => s,
-        _ => return Err(OQLError::TypeError {
-            expected: "string".to_string(),
-            actual: args[1].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "string".to_string(),
+                actual: args[1].type_name().to_string(),
+            })
+        }
     };
-    
+
     Ok(Value::String(datetime.format(format).to_string()))
 }
 
@@ -1055,53 +1145,55 @@ fn datetime_parse(args: &[Value]) -> OQLResult<Value> {
             message: "parse_date() expects 1 or 2 arguments: parse_date(string) or parse_date(string, format)".to_string(),
         });
     }
-    
+
     let date_str = match &args[0] {
         Value::String(s) => s,
         Value::Null => return Ok(Value::Null),
-        _ => return Err(OQLError::TypeError {
-            expected: "string".to_string(),
-            actual: args[0].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "string".to_string(),
+                actual: args[0].type_name().to_string(),
+            })
+        }
     };
-    
+
     // Try common formats if no format specified
     if args.len() == 1 {
         // Try ISO 8601 format first
         if let Ok(dt) = DateTime::parse_from_rfc3339(date_str) {
             return Ok(Value::DateTime(dt.with_timezone(&Utc)));
         }
-        
+
         // Try other common formats
-        let formats = [
-            "%Y-%m-%d %H:%M:%S",
-            "%Y-%m-%d",
-            "%m/%d/%Y",
-            "%d/%m/%Y",
-        ];
-        
+        let formats = ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%m/%d/%Y", "%d/%m/%Y"];
+
         for format in &formats {
             if let Ok(naive_dt) = NaiveDateTime::parse_from_str(date_str, format) {
                 return Ok(Value::DateTime(Utc.from_utc_datetime(&naive_dt)));
             }
         }
-        
+
         return Err(OQLError::Generic {
             message: format!("Unable to parse date: {}", date_str),
         });
     } else {
         let format = match &args[1] {
             Value::String(s) => s,
-            _ => return Err(OQLError::TypeError {
-                expected: "string".to_string(),
-                actual: args[1].type_name().to_string(),
-            }),
+            _ => {
+                return Err(OQLError::TypeError {
+                    expected: "string".to_string(),
+                    actual: args[1].type_name().to_string(),
+                })
+            }
         };
-        
+
         match NaiveDateTime::parse_from_str(date_str, format) {
             Ok(naive_dt) => Ok(Value::DateTime(Utc.from_utc_datetime(&naive_dt))),
             Err(_) => Err(OQLError::Generic {
-                message: format!("Unable to parse date '{}' with format '{}'", date_str, format),
+                message: format!(
+                    "Unable to parse date '{}' with format '{}'",
+                    date_str, format
+                ),
             }),
         }
     }
@@ -1114,7 +1206,7 @@ fn datetime_year(args: &[Value]) -> OQLResult<Value> {
             message: "year() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     match &args[0] {
         Value::DateTime(dt) => Ok(Value::Integer(dt.year() as i64)),
         Value::Null => Ok(Value::Null),
@@ -1132,7 +1224,7 @@ fn datetime_month(args: &[Value]) -> OQLResult<Value> {
             message: "month() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     match &args[0] {
         Value::DateTime(dt) => Ok(Value::Integer(dt.month() as i64)),
         Value::Null => Ok(Value::Null),
@@ -1150,7 +1242,7 @@ fn datetime_day(args: &[Value]) -> OQLResult<Value> {
             message: "day() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     match &args[0] {
         Value::DateTime(dt) => Ok(Value::Integer(dt.day() as i64)),
         Value::Null => Ok(Value::Null),
@@ -1168,7 +1260,7 @@ fn datetime_hour(args: &[Value]) -> OQLResult<Value> {
             message: "hour() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     match &args[0] {
         Value::DateTime(dt) => Ok(Value::Integer(dt.hour() as i64)),
         Value::Null => Ok(Value::Null),
@@ -1186,7 +1278,7 @@ fn datetime_minute(args: &[Value]) -> OQLResult<Value> {
             message: "minute() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     match &args[0] {
         Value::DateTime(dt) => Ok(Value::Integer(dt.minute() as i64)),
         Value::Null => Ok(Value::Null),
@@ -1204,7 +1296,7 @@ fn datetime_second(args: &[Value]) -> OQLResult<Value> {
             message: "second() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     match &args[0] {
         Value::DateTime(dt) => Ok(Value::Integer(dt.second() as i64)),
         Value::Null => Ok(Value::Null),
@@ -1222,7 +1314,7 @@ fn datetime_weekday(args: &[Value]) -> OQLResult<Value> {
             message: "weekday() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     match &args[0] {
         Value::DateTime(dt) => Ok(Value::Integer(dt.weekday().num_days_from_sunday() as i64)),
         Value::Null => Ok(Value::Null),
@@ -1240,24 +1332,28 @@ fn datetime_add_days(args: &[Value]) -> OQLResult<Value> {
             message: "add_days() expects exactly 2 arguments: add_days(datetime, days)".to_string(),
         });
     }
-    
+
     let datetime = match &args[0] {
         Value::DateTime(dt) => dt,
         Value::Null => return Ok(Value::Null),
-        _ => return Err(OQLError::TypeError {
-            expected: "datetime".to_string(),
-            actual: args[0].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "datetime".to_string(),
+                actual: args[0].type_name().to_string(),
+            })
+        }
     };
-    
+
     let days = match &args[1] {
         Value::Integer(i) => *i,
-        _ => return Err(OQLError::TypeError {
-            expected: "integer".to_string(),
-            actual: args[1].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "integer".to_string(),
+                actual: args[1].type_name().to_string(),
+            })
+        }
     };
-    
+
     let result = *datetime + Duration::days(days);
     Ok(Value::DateTime(result))
 }
@@ -1266,27 +1362,32 @@ fn datetime_add_days(args: &[Value]) -> OQLResult<Value> {
 fn datetime_add_hours(args: &[Value]) -> OQLResult<Value> {
     if args.len() != 2 {
         return Err(OQLError::Generic {
-            message: "add_hours() expects exactly 2 arguments: add_hours(datetime, hours)".to_string(),
+            message: "add_hours() expects exactly 2 arguments: add_hours(datetime, hours)"
+                .to_string(),
         });
     }
-    
+
     let datetime = match &args[0] {
         Value::DateTime(dt) => dt,
         Value::Null => return Ok(Value::Null),
-        _ => return Err(OQLError::TypeError {
-            expected: "datetime".to_string(),
-            actual: args[0].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "datetime".to_string(),
+                actual: args[0].type_name().to_string(),
+            })
+        }
     };
-    
+
     let hours = match &args[1] {
         Value::Integer(i) => *i,
-        _ => return Err(OQLError::TypeError {
-            expected: "integer".to_string(),
-            actual: args[1].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "integer".to_string(),
+                actual: args[1].type_name().to_string(),
+            })
+        }
     };
-    
+
     let result = *datetime + Duration::hours(hours);
     Ok(Value::DateTime(result))
 }
@@ -1295,28 +1396,33 @@ fn datetime_add_hours(args: &[Value]) -> OQLResult<Value> {
 fn datetime_diff_days(args: &[Value]) -> OQLResult<Value> {
     if args.len() != 2 {
         return Err(OQLError::Generic {
-            message: "diff_days() expects exactly 2 arguments: diff_days(datetime1, datetime2)".to_string(),
+            message: "diff_days() expects exactly 2 arguments: diff_days(datetime1, datetime2)"
+                .to_string(),
         });
     }
-    
+
     let dt1 = match &args[0] {
         Value::DateTime(dt) => dt,
         Value::Null => return Ok(Value::Null),
-        _ => return Err(OQLError::TypeError {
-            expected: "datetime".to_string(),
-            actual: args[0].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "datetime".to_string(),
+                actual: args[0].type_name().to_string(),
+            })
+        }
     };
-    
+
     let dt2 = match &args[1] {
         Value::DateTime(dt) => dt,
         Value::Null => return Ok(Value::Null),
-        _ => return Err(OQLError::TypeError {
-            expected: "datetime".to_string(),
-            actual: args[1].type_name().to_string(),
-        }),
+        _ => {
+            return Err(OQLError::TypeError {
+                expected: "datetime".to_string(),
+                actual: args[1].type_name().to_string(),
+            })
+        }
     };
-    
+
     let diff = *dt2 - *dt1;
     Ok(Value::Integer(diff.num_days()))
 }
@@ -1330,13 +1436,13 @@ fn utility_coalesce(args: &[Value]) -> OQLResult<Value> {
             message: "coalesce() expects at least 1 argument".to_string(),
         });
     }
-    
+
     for arg in args {
         if !arg.is_null() {
             return Ok(arg.clone());
         }
     }
-    
+
     Ok(Value::Null)
 }
 
@@ -1347,7 +1453,7 @@ fn utility_if_null(args: &[Value]) -> OQLResult<Value> {
             message: "if_null() expects exactly 2 arguments: if_null(value, default)".to_string(),
         });
     }
-    
+
     if args[0].is_null() {
         Ok(args[1].clone())
     } else {
@@ -1362,7 +1468,7 @@ fn utility_to_string(args: &[Value]) -> OQLResult<Value> {
             message: "to_string() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     Ok(Value::String(args[0].to_string_repr()))
 }
 
@@ -1373,17 +1479,15 @@ fn utility_to_int(args: &[Value]) -> OQLResult<Value> {
             message: "to_int() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     match &args[0] {
         Value::Integer(i) => Ok(Value::Integer(*i)),
         Value::Float(f) => Ok(Value::Integer(*f as i64)),
-        Value::String(s) => {
-            match s.parse::<i64>() {
-                Ok(i) => Ok(Value::Integer(i)),
-                Err(_) => Err(OQLError::Generic {
-                    message: format!("Cannot convert '{}' to integer", s),
-                }),
-            }
+        Value::String(s) => match s.parse::<i64>() {
+            Ok(i) => Ok(Value::Integer(i)),
+            Err(_) => Err(OQLError::Generic {
+                message: format!("Cannot convert '{}' to integer", s),
+            }),
         },
         Value::Boolean(b) => Ok(Value::Integer(if *b { 1 } else { 0 })),
         Value::Null => Ok(Value::Null),
@@ -1401,17 +1505,15 @@ fn utility_to_float(args: &[Value]) -> OQLResult<Value> {
             message: "to_float() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     match &args[0] {
         Value::Integer(i) => Ok(Value::Float(*i as f64)),
         Value::Float(f) => Ok(Value::Float(*f)),
-        Value::String(s) => {
-            match s.parse::<f64>() {
-                Ok(f) => Ok(Value::Float(f)),
-                Err(_) => Err(OQLError::Generic {
-                    message: format!("Cannot convert '{}' to float", s),
-                }),
-            }
+        Value::String(s) => match s.parse::<f64>() {
+            Ok(f) => Ok(Value::Float(f)),
+            Err(_) => Err(OQLError::Generic {
+                message: format!("Cannot convert '{}' to float", s),
+            }),
         },
         Value::Boolean(b) => Ok(Value::Float(if *b { 1.0 } else { 0.0 })),
         Value::Null => Ok(Value::Null),
@@ -1429,6 +1531,6 @@ fn utility_type_of(args: &[Value]) -> OQLResult<Value> {
             message: "type_of() expects exactly 1 argument".to_string(),
         });
     }
-    
+
     Ok(Value::String(args[0].type_name().to_string()))
 }

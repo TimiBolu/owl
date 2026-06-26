@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en">
+ <head>
+  <title>PostgreSQL: Documentation: 18: Chapter 4. SQL Syntax</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+  <meta http-equiv="Content-Type" content="text/xhtml; charset=utf-8" />
+   
+  <meta name="theme-color" content="#336791"/>
+  <meta name="copyright" content="The PostgreSQL Global Development Group" />
+  <meta property="og:url" content="https://www.postgresql.org/docs/18/sql-syntax.html" />
+  <meta property="og:type" content="article" />
+
+  <meta property="article:published_time" content="2026-02-26T14:07:09" />
+  <meta property="og:image" content="https://www.postgresql.org/media/img/about/press/elephant.png" />
+  <meta property="og:title" content="Chapter 4. SQL Syntax" />
+  <meta property="og:description" content="Chapter&amp;nbsp;4.&amp;nbsp;SQL Syntax Table of Contents 4.1. Lexical Structure 4.1.1. Identifiers and Key Words 4.1.2. Constants 4.1.3. Operators 4.1.4. Special Characters …" />
+  <meta property="og:site_name" content="PostgreSQL Documentation" />
+  <link href="/media/css/fontawesome.css?290b0238" rel="stylesheet">
+  <link rel="stylesheet" href="/media/css/bootstrap-4.4.1.min.css">
+  <link rel="shortcut icon" href="/favicon.ico" />
+  
+  <link rel="stylesheet" type="text/css" href="/dyncss/base.css?290b0238">
+
+  <script src="/media/js/theme.js?290b0238"></script>
+
+  
+
+
+  <link rel="canonical" href="https://www.postgresql.org/docs/current/sql-syntax.html" />
+
+
+  </head>
+  <body>
+    <div class="container-fluid">
+      <div class="row justify-content-md-center">
+        <div class="col">
+          <!-- Header -->
+          <nav class="navbar navbar-expand-lg navbar-light bg-light">
+            <a class="navbar-brand p-0" href="/">
+              <img class="logo" src="/media/img/about/press/elephant.png" alt="PostgreSQL Elephant Logo">
+            </a>
+            <input type="checkbox" id="navbar-toggler" aria-controls="pgNavbar" aria-expanded="false" aria-label="Toggle navigation">
+            <label for="navbar-toggler" id="navbar-toggler-label" class="navbar-toggler" tabindex="0"><span class="navbar-toggler-icon"></span></label>
+            <div class="navbar-collapse" id="pgNavbar">
+              <ul class="navbar-nav mr-auto">
+                <li class="nav-item p-2"><a href="/" title="Home">Home</a></li>
+                <li class="nav-item p-2"><a href="/about/" title="About">About</a></li>
+                <li class="nav-item p-2"><a href="/download/" title="Download">Download</a></li>
+                <li class="nav-item p-2"><a href="/docs/" title="Documentation">Documentation</a></li>
+                <li class="nav-item p-2"><a href="/community/" title="Community">Community</a></li>
+                <li class="nav-item p-2"><a href="/developer/" title="Developers">Developers</a></li>
+                <li class="nav-item p-2"><a href="/support/" title="Support">Support</a></li>
+                <li class="nav-item p-2"><a href="/about/donate/" title="Donate">Donate</a></li>
+                <li class="nav-item p-2"><a href="/account/" title="Your account">Your account</a></li>
+              </ul>
+              <form role="search" method="get" action="/search/">
+                <div class="input-group">
+                  <input id="q" name="q" type="text" size="20" maxlength="255" accesskey="s"  class="form-control" placeholder="Search for...">
+                  <span class="input-group-btn">
+                    <button class="btn btn-default" type="submit"><i class="fas fa-search"></i></button>
+                  </span>
+                </div><!-- /input-group -->
+              </form>
+              <form id="form-theme" class="form-inline d-none">
+                <button id="btn-theme" class="btn btn-default ml-1" type="button"></button>
+              </form>
+            </div>
+          </nav>
+        </div>
+      </div>
+      <div class="row justify-content-center pg-shout-box">
+        <div class="col text-white text-center">February 26, 2026: <a href="/about/news/postgresql-183-179-1613-1517-and-1422-released-3246/">
+  PostgreSQL 18.3, 17.9, 16.13, 15.17, and 14.22 Released!
+</a>
+</div>
+      </div>
+    </div>
+    
+    <div class="container-fluid margin">
+      <div class="row">
+        <div id="pgContentWrap" class="col-11">
+          <div class="row">
+            <div class="col-md-6 mb-2">
+              <div class="row">
+                <div class="col">
+                  <div>
+                    <a href="/docs/" title="Documentation">Documentation</a> &rarr; <a href="/docs/18/index.html">PostgreSQL 18</a>
+                  </div>
+                </div>
+              </div>
+              
+                <div class="row">
+                  <div class="col">
+                    Supported Versions:
+                      
+                        
+                        
+                          <a href="/docs/current/sql-syntax.html" title="PostgreSQL 18 - Chapter 4. SQL Syntax" class="docs-version-selected">Current</a>
+                          (<a href="/docs/18/sql-syntax.html" title="PostgreSQL 18 - Chapter 4. SQL Syntax" class="docs-version-selected">18</a>)
+                        
+                      
+                         / 
+                        
+                          <a href="/docs/17/sql-syntax.html" title="PostgreSQL 17 - Chapter 4. SQL Syntax" >17</a>
+                        
+                      
+                         / 
+                        
+                          <a href="/docs/16/sql-syntax.html" title="PostgreSQL 16 - Chapter 4. SQL Syntax" >16</a>
+                        
+                      
+                         / 
+                        
+                          <a href="/docs/15/sql-syntax.html" title="PostgreSQL 15 - Chapter 4. SQL Syntax" >15</a>
+                        
+                      
+                         / 
+                        
+                          <a href="/docs/14/sql-syntax.html" title="PostgreSQL 14 - Chapter 4. SQL Syntax" >14</a>
+                        
+                      
+                  </div>
+                </div>
+              
+              
+                <div class="row">
+                  <div class="col">
+                    Development Versions:
+                    
+                      
+                      <a href="/docs/devel/sql-syntax.html" title="PostgreSQL devel - Chapter 4. SQL Syntax"  rel="nofollow">devel</a>
+                    
+                  </div>
+                </div>
+              
+              
+                <div class="row">
+                  <div class="col-12">
+                    Unsupported versions:
+                    
+                      
+                      <a href="/docs/13/sql-syntax.html" title="PostgreSQL 13 - Chapter 4. SQL Syntax"  rel="nofollow">13</a>
+                    
+                       / 
+                      <a href="/docs/12/sql-syntax.html" title="PostgreSQL 12 - Chapter 4. SQL Syntax"  rel="nofollow">12</a>
+                    
+                       / 
+                      <a href="/docs/11/sql-syntax.html" title="PostgreSQL 11 - Chapter 4. SQL Syntax"  rel="nofollow">11</a>
+                    
+                       / 
+                      <a href="/docs/10/sql-syntax.html" title="PostgreSQL 10 - Chapter 4. SQL Syntax"  rel="nofollow">10</a>
+                    
+                       / 
+                      <a href="/docs/9.6/sql-syntax.html" title="PostgreSQL 9.6 - Chapter 4. SQL Syntax"  rel="nofollow">9.6</a>
+                    
+                       / 
+                      <a href="/docs/9.5/sql-syntax.html" title="PostgreSQL 9.5 - Chapter 4. SQL Syntax"  rel="nofollow">9.5</a>
+                    
+                       / 
+                      <a href="/docs/9.4/sql-syntax.html" title="PostgreSQL 9.4 - Chapter 4. SQL Syntax"  rel="nofollow">9.4</a>
+                    
+                       / 
+                      <a href="/docs/9.3/sql-syntax.html" title="PostgreSQL 9.3 - Chapter 4. SQL Syntax"  rel="nofollow">9.3</a>
+                    
+                       / 
+                      <a href="/docs/9.2/sql-syntax.html" title="PostgreSQL 9.2 - Chapter 4. SQL Syntax"  rel="nofollow">9.2</a>
+                    
+                       / 
+                      <a href="/docs/9.1/sql-syntax.html" title="PostgreSQL 9.1 - Chapter 4. SQL Syntax"  rel="nofollow">9.1</a>
+                    
+                       / 
+                      <a href="/docs/9.0/sql-syntax.html" title="PostgreSQL 9.0 - Chapter 4. SQL Syntax"  rel="nofollow">9.0</a>
+                    
+                       / 
+                      <a href="/docs/8.4/sql-syntax.html" title="PostgreSQL 8.4 - Chapter 4. SQL Syntax"  rel="nofollow">8.4</a>
+                    
+                       / 
+                      <a href="/docs/8.3/sql-syntax.html" title="PostgreSQL 8.3 - Chapter 4. SQL Syntax"  rel="nofollow">8.3</a>
+                    
+                       / 
+                      <a href="/docs/8.2/sql-syntax.html" title="PostgreSQL 8.2 - Chapter 4. SQL Syntax"  rel="nofollow">8.2</a>
+                    
+                       / 
+                      <a href="/docs/8.1/sql-syntax.html" title="PostgreSQL 8.1 - Chapter 4. SQL Syntax"  rel="nofollow">8.1</a>
+                    
+                       / 
+                      <a href="/docs/8.0/sql-syntax.html" title="PostgreSQL 8.0 - Chapter 4. SQL Syntax"  rel="nofollow">8.0</a>
+                    
+                       / 
+                      <a href="/docs/7.4/sql-syntax.html" title="PostgreSQL 7.4 - Chapter 4. SQL Syntax"  rel="nofollow">7.4</a>
+                    
+                       / 
+                      <a href="/docs/7.3/sql-syntax.html" title="PostgreSQL 7.3 - Chapter 4. SQL Syntax"  rel="nofollow">7.3</a>
+                    
+                       / 
+                      <a href="/docs/7.2/sql-syntax.html" title="PostgreSQL 7.2 - Chapter 4. SQL Syntax"  rel="nofollow">7.2</a>
+                    
+                       / 
+                      <a href="/docs/7.1/sql-syntax.html" title="PostgreSQL 7.1 - Chapter 4. SQL Syntax"  rel="nofollow">7.1</a>
+                    
+                  </div>
+                </div>
+              
+            </div>
+            <div class="col-md-6 col-lg-5 offset-lg-1">
+              <form id="docSearchForm" role="search" method="get" action="/search/">
+                <input type="hidden" name="u" value="/docs/18/" />
+                <div class="input-group">
+                  <input type="text" id="q" name="q" class="form-control" placeholder="Search the documentation for..."/>
+                  <span class="input-group-btn">
+                    <button class="btn btn-default" type="submit"><i class="fas fa-search"></i></button>
+                  </span>
+                </div><!-- /input-group -->
+              </form>
+            </div>
+          </div>
+
+          <div id="docContent">
+            <div class="navheader">
+  <table width="100%" summary="Navigation header">
+    <tr>
+      <th colspan="5" align="center">Chapter&nbsp;4.&nbsp;SQL Syntax</th>
+    </tr>
+    <tr>
+      <td width="10%" align="left"><a accesskey="p" href="sql.html" title="Part&nbsp;II.&nbsp;The SQL Language">Prev</a>&nbsp;</td>
+      <td width="10%" align="left"><a accesskey="u" href="sql.html" title="Part&nbsp;II.&nbsp;The SQL Language">Up</a></td>
+      <th width="60%" align="center">Part&nbsp;II.&nbsp;The SQL Language</th>
+      <td width="10%" align="right"><a accesskey="h" href="index.html" title="PostgreSQL 18.3 Documentation">Home</a></td>
+      <td width="10%" align="right">&nbsp;<a accesskey="n" href="sql-syntax-lexical.html" title="4.1.&nbsp;Lexical Structure">Next</a></td>
+    </tr>
+  </table>
+  <hr />
+</div>
+<div class="chapter" id="SQL-SYNTAX">
+  <div class="titlepage">
+    <div>
+      <div>
+        <h2 class="title">Chapter&nbsp;4.&nbsp;SQL Syntax</h2>
+      </div>
+    </div>
+  </div>
+  <div class="toc">
+    <p><strong>Table of Contents</strong></p>
+    <dl class="toc">
+      <dt><span class="sect1"><a href="sql-syntax-lexical.html">4.1. Lexical Structure</a></span></dt>
+      <dd>
+        <dl>
+          <dt><span class="sect2"><a href="sql-syntax-lexical.html#SQL-SYNTAX-IDENTIFIERS">4.1.1. Identifiers and Key Words</a></span></dt>
+          <dt><span class="sect2"><a href="sql-syntax-lexical.html#SQL-SYNTAX-CONSTANTS">4.1.2. Constants</a></span></dt>
+          <dt><span class="sect2"><a href="sql-syntax-lexical.html#SQL-SYNTAX-OPERATORS">4.1.3. Operators</a></span></dt>
+          <dt><span class="sect2"><a href="sql-syntax-lexical.html#SQL-SYNTAX-SPECIAL-CHARS">4.1.4. Special Characters</a></span></dt>
+          <dt><span class="sect2"><a href="sql-syntax-lexical.html#SQL-SYNTAX-COMMENTS">4.1.5. Comments</a></span></dt>
+          <dt><span class="sect2"><a href="sql-syntax-lexical.html#SQL-PRECEDENCE">4.1.6. Operator Precedence</a></span></dt>
+        </dl>
+      </dd>
+      <dt><span class="sect1"><a href="sql-expressions.html">4.2. Value Expressions</a></span></dt>
+      <dd>
+        <dl>
+          <dt><span class="sect2"><a href="sql-expressions.html#SQL-EXPRESSIONS-COLUMN-REFS">4.2.1. Column References</a></span></dt>
+          <dt><span class="sect2"><a href="sql-expressions.html#SQL-EXPRESSIONS-PARAMETERS-POSITIONAL">4.2.2. Positional Parameters</a></span></dt>
+          <dt><span class="sect2"><a href="sql-expressions.html#SQL-EXPRESSIONS-SUBSCRIPTS">4.2.3. Subscripts</a></span></dt>
+          <dt><span class="sect2"><a href="sql-expressions.html#FIELD-SELECTION">4.2.4. Field Selection</a></span></dt>
+          <dt><span class="sect2"><a href="sql-expressions.html#SQL-EXPRESSIONS-OPERATOR-CALLS">4.2.5. Operator Invocations</a></span></dt>
+          <dt><span class="sect2"><a href="sql-expressions.html#SQL-EXPRESSIONS-FUNCTION-CALLS">4.2.6. Function Calls</a></span></dt>
+          <dt><span class="sect2"><a href="sql-expressions.html#SYNTAX-AGGREGATES">4.2.7. Aggregate Expressions</a></span></dt>
+          <dt><span class="sect2"><a href="sql-expressions.html#SYNTAX-WINDOW-FUNCTIONS">4.2.8. Window Function Calls</a></span></dt>
+          <dt><span class="sect2"><a href="sql-expressions.html#SQL-SYNTAX-TYPE-CASTS">4.2.9. Type Casts</a></span></dt>
+          <dt><span class="sect2"><a href="sql-expressions.html#SQL-SYNTAX-COLLATE-EXPRS">4.2.10. Collation Expressions</a></span></dt>
+          <dt><span class="sect2"><a href="sql-expressions.html#SQL-SYNTAX-SCALAR-SUBQUERIES">4.2.11. Scalar Subqueries</a></span></dt>
+          <dt><span class="sect2"><a href="sql-expressions.html#SQL-SYNTAX-ARRAY-CONSTRUCTORS">4.2.12. Array Constructors</a></span></dt>
+          <dt><span class="sect2"><a href="sql-expressions.html#SQL-SYNTAX-ROW-CONSTRUCTORS">4.2.13. Row Constructors</a></span></dt>
+          <dt><span class="sect2"><a href="sql-expressions.html#SYNTAX-EXPRESS-EVAL">4.2.14. Expression Evaluation Rules</a></span></dt>
+        </dl>
+      </dd>
+      <dt><span class="sect1"><a href="sql-syntax-calling-funcs.html">4.3. Calling Functions</a></span></dt>
+      <dd>
+        <dl>
+          <dt><span class="sect2"><a href="sql-syntax-calling-funcs.html#SQL-SYNTAX-CALLING-FUNCS-POSITIONAL">4.3.1. Using Positional Notation</a></span></dt>
+          <dt><span class="sect2"><a href="sql-syntax-calling-funcs.html#SQL-SYNTAX-CALLING-FUNCS-NAMED">4.3.2. Using Named Notation</a></span></dt>
+          <dt><span class="sect2"><a href="sql-syntax-calling-funcs.html#SQL-SYNTAX-CALLING-FUNCS-MIXED">4.3.3. Using Mixed Notation</a></span></dt>
+        </dl>
+      </dd>
+    </dl>
+  </div><a id="id-1.5.3.2" class="indexterm" name="id-1.5.3.2"></a>
+  <p>This chapter describes the syntax of SQL. It forms the foundation for understanding the following chapters which will go into detail about how SQL commands are applied to define and modify data.</p>
+  <p>We also advise users who are already familiar with SQL to read this chapter carefully because it contains several rules and concepts that are implemented inconsistently among SQL databases or that are specific to <span class="productname">PostgreSQL</span>.</p>
+</div>
+<div class="navfooter">
+  <hr />
+  <table width="100%" summary="Navigation footer">
+    <tr>
+      <td width="40%" align="left"><a accesskey="p" href="sql.html" title="Part&nbsp;II.&nbsp;The SQL Language">Prev</a>&nbsp;</td>
+      <td width="20%" align="center"><a accesskey="u" href="sql.html" title="Part&nbsp;II.&nbsp;The SQL Language">Up</a></td>
+      <td width="40%" align="right">&nbsp;<a accesskey="n" href="sql-syntax-lexical.html" title="4.1.&nbsp;Lexical Structure">Next</a></td>
+    </tr>
+    <tr>
+      <td width="40%" align="left" valign="top">Part&nbsp;II.&nbsp;The SQL Language&nbsp;</td>
+      <td width="20%" align="center"><a accesskey="h" href="index.html" title="PostgreSQL 18.3 Documentation">Home</a></td>
+      <td width="40%" align="right" valign="top">&nbsp;4.1.&nbsp;Lexical Structure</td>
+    </tr>
+  </table>
+</div>
+
+          </div>
+          
+            <div id="docComments">
+              <h2>Submit correction</h2>
+              <p>
+              If you see anything in the documentation that is not correct, does not match
+              your experience with the particular feature or requires further clarification,
+              please use
+              <a href="/account/comments/new/18/sql-syntax.html/" rel="nofollow">this form</a>
+              to report a documentation issue.
+              </p>
+            </div>
+          
+        </div> <!-- pgContentWrap -->
+      </div>
+    </div>
+
+    <!-- Footer -->
+    <footer id="footer">
+      <!-- Copyright -->
+      <div class="container">
+        <a href="/about/policies/">Policies</a> |
+        <a href="/about/policies/coc/">Code of Conduct</a> |
+        <a href="/about/">About PostgreSQL</a> |
+        <a href="/about/contact/">Contact</a><br/>
+        <p>Copyright &copy; 1996-2026 The PostgreSQL Global Development Group</p>
+      </div>
+    </footer>
+    <script src="/media/js/main.js?290b0238"></script>
+
+  </body>
+</html>

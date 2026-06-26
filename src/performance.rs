@@ -1,8 +1,8 @@
+use crate::simulation::Clock;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use serde::{Deserialize, Serialize};
-use crate::simulation::Clock;
 
 /// Performance metrics for query execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +35,7 @@ pub struct PerformanceStats {
 }
 
 /// Performance monitor for tracking query execution metrics with Clock dependency injection
+#[allow(dead_code)]
 pub struct PerformanceMonitor {
     metrics: Arc<Mutex<Vec<QueryMetrics>>>,
     start_time: Instant,
@@ -50,7 +51,7 @@ impl PerformanceMonitor {
             clock,
         }
     }
-    
+
     /// Create a new performance monitor with production clock (backward compatibility)
     pub fn new_with_real_clock() -> Self {
         use crate::simulation::RealClock;
@@ -61,7 +62,7 @@ impl PerformanceMonitor {
     pub fn record_query(&self, metrics: QueryMetrics) {
         let mut metrics_vec = self.metrics.lock().unwrap();
         metrics_vec.push(metrics);
-        
+
         // Keep only the last 10,000 metrics to prevent unbounded growth
         if metrics_vec.len() > 10_000 {
             metrics_vec.drain(0..1_000);
@@ -71,7 +72,7 @@ impl PerformanceMonitor {
     /// Get aggregated performance statistics
     pub fn get_stats(&self) -> PerformanceStats {
         let metrics_vec = self.metrics.lock().unwrap();
-        
+
         if metrics_vec.is_empty() {
             return PerformanceStats {
                 total_queries: 0,
@@ -88,45 +89,40 @@ impl PerformanceMonitor {
         }
 
         let total_queries = metrics_vec.len();
-        let total_execution_time: Duration = metrics_vec.iter()
-            .map(|m| m.execution_time)
-            .sum();
-        
+        let total_execution_time: Duration = metrics_vec.iter().map(|m| m.execution_time).sum();
+
         let avg_execution_time = total_execution_time / total_queries as u32;
-        let min_execution_time = metrics_vec.iter()
+        let min_execution_time = metrics_vec
+            .iter()
             .map(|m| m.execution_time)
             .min()
             .unwrap_or(Duration::from_millis(0));
-        let max_execution_time = metrics_vec.iter()
+        let max_execution_time = metrics_vec
+            .iter()
             .map(|m| m.execution_time)
             .max()
             .unwrap_or(Duration::from_millis(0));
 
-        let total_documents_scanned: usize = metrics_vec.iter()
-            .map(|m| m.documents_scanned)
-            .sum();
-        let total_references_resolved: usize = metrics_vec.iter()
-            .map(|m| m.references_resolved)
-            .sum();
+        let total_documents_scanned: usize = metrics_vec.iter().map(|m| m.documents_scanned).sum();
+        let total_references_resolved: usize =
+            metrics_vec.iter().map(|m| m.references_resolved).sum();
 
-        let total_index_operations: usize = metrics_vec.iter()
+        let total_index_operations: usize = metrics_vec
+            .iter()
             .map(|m| m.index_hits + m.index_misses)
             .sum();
-        let total_index_hits: usize = metrics_vec.iter()
-            .map(|m| m.index_hits)
-            .sum();
+        let total_index_hits: usize = metrics_vec.iter().map(|m| m.index_hits).sum();
         let index_hit_rate = if total_index_operations > 0 {
             total_index_hits as f64 / total_index_operations as f64
         } else {
             0.0
         };
 
-        let total_cache_operations: usize = metrics_vec.iter()
+        let total_cache_operations: usize = metrics_vec
+            .iter()
             .map(|m| m.cache_hits + m.cache_misses)
             .sum();
-        let total_cache_hits: usize = metrics_vec.iter()
-            .map(|m| m.cache_hits)
-            .sum();
+        let total_cache_hits: usize = metrics_vec.iter().map(|m| m.cache_hits).sum();
         let cache_hit_rate = if total_cache_operations > 0 {
             total_cache_hits as f64 / total_cache_operations as f64
         } else {
@@ -157,7 +153,8 @@ impl PerformanceMonitor {
     /// Get metrics for specific query patterns
     pub fn get_query_pattern_stats(&self, pattern: &str) -> Vec<QueryMetrics> {
         let metrics_vec = self.metrics.lock().unwrap();
-        metrics_vec.iter()
+        metrics_vec
+            .iter()
             .filter(|m| m.query_hash.contains(pattern))
             .cloned()
             .collect()
@@ -175,17 +172,20 @@ impl PerformanceMonitor {
     pub fn get_frequent_queries(&self, limit: usize) -> Vec<(String, usize, Duration)> {
         let metrics_vec = self.metrics.lock().unwrap();
         let mut query_counts: HashMap<String, (usize, Duration)> = HashMap::new();
-        
+
         for metric in metrics_vec.iter() {
-            let entry = query_counts.entry(metric.query_hash.clone()).or_insert((0, Duration::from_millis(0)));
+            let entry = query_counts
+                .entry(metric.query_hash.clone())
+                .or_insert((0, Duration::from_millis(0)));
             entry.0 += 1;
             entry.1 += metric.execution_time;
         }
 
-        let mut frequent_queries: Vec<_> = query_counts.into_iter()
+        let mut frequent_queries: Vec<_> = query_counts
+            .into_iter()
             .map(|(query, (count, total_time))| (query, count, total_time / count as u32))
             .collect();
-        
+
         frequent_queries.sort_by(|a, b| b.1.cmp(&a.1));
         frequent_queries.into_iter().take(limit).collect()
     }
@@ -227,7 +227,7 @@ impl QueryExecutionContext {
     pub fn new_with_clock(query: &str, clock: Arc<dyn Clock>) -> Self {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
-        
+
         let mut hasher = DefaultHasher::new();
         query.hash(&mut hasher);
         let query_hash = format!("{:x}", hasher.finish());
@@ -244,7 +244,7 @@ impl QueryExecutionContext {
             clock,
         }
     }
-    
+
     /// Create a new query execution context with production clock (backward compatibility)
     pub fn new(query: &str) -> Self {
         use crate::simulation::RealClock;
@@ -306,7 +306,7 @@ impl PerformanceBenchmark {
             clock,
         }
     }
-    
+
     /// Create a new performance benchmark with production clock (backward compatibility)
     pub fn new() -> Self {
         use crate::simulation::RealClock;
@@ -328,19 +328,24 @@ impl PerformanceBenchmark {
     }
 
     /// Run multiple iterations of a benchmark and return statistics
-    pub fn benchmark_iterations<F, R>(&self, name: &str, iterations: usize, f: F) -> BenchmarkResults
+    pub fn benchmark_iterations<F, R>(
+        &self,
+        name: &str,
+        iterations: usize,
+        f: F,
+    ) -> BenchmarkResults
     where
         F: Fn() -> R,
     {
         println!("Running benchmark: {} ({} iterations)", name, iterations);
         let mut durations = Vec::with_capacity(iterations);
-        
+
         for i in 0..iterations {
             let start_time = self.clock.now();
             let _result = f();
             let duration = self.clock.now().duration_since(start_time);
             durations.push(duration);
-            
+
             if i % (iterations / 10).max(1) == 0 {
                 println!("  Iteration {}/{} completed", i + 1, iterations);
             }
@@ -350,7 +355,7 @@ impl PerformanceBenchmark {
         let avg_duration = total_duration / iterations as u32;
         let min_duration = *durations.iter().min().unwrap();
         let max_duration = *durations.iter().max().unwrap();
-        
+
         // Calculate percentiles
         let mut sorted_durations = durations.clone();
         sorted_durations.sort();
@@ -370,9 +375,11 @@ impl PerformanceBenchmark {
             p99_duration: p99,
         };
 
-        println!("  Results: avg={:?}, min={:?}, max={:?}, p95={:?}", 
-                 results.avg_duration, results.min_duration, results.max_duration, results.p95_duration);
-        
+        println!(
+            "  Results: avg={:?}, min={:?}, max={:?}, p95={:?}",
+            results.avg_duration, results.min_duration, results.max_duration, results.p95_duration
+        );
+
         results
     }
 
@@ -405,6 +412,9 @@ impl BenchmarkResults {
         println!("P50: {:?}", self.p50_duration);
         println!("P95: {:?}", self.p95_duration);
         println!("P99: {:?}", self.p99_duration);
-        println!("Throughput: {:.2} ops/sec", self.iterations as f64 / self.total_duration.as_secs_f64());
+        println!(
+            "Throughput: {:.2} ops/sec",
+            self.iterations as f64 / self.total_duration.as_secs_f64()
+        );
     }
 }

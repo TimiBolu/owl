@@ -131,7 +131,7 @@ impl Default for StatisticsConfig {
         Self {
             histogram_buckets: 100,
             histogram_type: HistogramType::EqualDepth,
-            sample_size: 10000, // Sample 10k rows by default
+            sample_size: 10000,          // Sample 10k rows by default
             auto_update_threshold: 1000, // Update after 1k changes
         }
     }
@@ -142,7 +142,7 @@ impl StatisticsManager {
     pub fn new() -> Self {
         Self::with_config(StatisticsConfig::default())
     }
-    
+
     /// Create a new statistics manager with custom configuration
     pub fn with_config(config: StatisticsConfig) -> Self {
         Self {
@@ -151,7 +151,7 @@ impl StatisticsManager {
             config,
         }
     }
-    
+
     /// Collect statistics for a schema
     pub fn collect_table_statistics(
         &self,
@@ -160,7 +160,7 @@ impl StatisticsManager {
     ) -> OQLResult<TableStatistics> {
         // Scan documents
         let documents = store.scan_documents(schema)?;
-        
+
         if documents.is_empty() {
             return Ok(TableStatistics {
                 schema: schema.to_string(),
@@ -171,20 +171,21 @@ impl StatisticsManager {
                 last_updated: current_timestamp(),
             });
         }
-        
+
         // Sample documents if needed
         let sample = if self.config.sample_size > 0 && documents.len() > self.config.sample_size {
             self.sample_documents(&documents, self.config.sample_size)
         } else {
             documents.clone()
         };
-        
+
         // Collect field statistics
         let field_stats = self.collect_field_statistics(&sample)?;
-        
+
         // Calculate table-level statistics
         let row_count = documents.len() as u64;
-        let total_size: u64 = sample.iter()
+        let total_size: u64 = sample
+            .iter()
             .map(|doc| self.estimate_document_size(doc))
             .sum();
         let avg_row_size = if !sample.is_empty() {
@@ -192,7 +193,7 @@ impl StatisticsManager {
         } else {
             0
         };
-        
+
         let stats = TableStatistics {
             schema: schema.to_string(),
             row_count,
@@ -201,34 +202,41 @@ impl StatisticsManager {
             field_stats,
             last_updated: current_timestamp(),
         };
-        
+
         // Store statistics
         self.store_table_statistics(&stats)?;
-        
+
         Ok(stats)
     }
-    
+
     /// Get statistics for a schema
     pub fn get_table_statistics(&self, schema: &str) -> OQLResult<Option<TableStatistics>> {
-        let stats = self.table_stats.read()
+        let stats = self
+            .table_stats
+            .read()
             .map_err(|_| OQLError::generic("Failed to acquire read lock"))?;
         Ok(stats.get(schema).cloned())
     }
-    
+
     /// Store table statistics
     fn store_table_statistics(&self, stats: &TableStatistics) -> OQLResult<()> {
-        let mut table_stats = self.table_stats.write()
+        let mut table_stats = self
+            .table_stats
+            .write()
             .map_err(|_| OQLError::generic("Failed to acquire write lock"))?;
         table_stats.insert(stats.schema.clone(), stats.clone());
         Ok(())
     }
-    
+
     /// Collect field-level statistics
-    fn collect_field_statistics(&self, documents: &[Document]) -> OQLResult<HashMap<String, FieldStatistics>> {
+    fn collect_field_statistics(
+        &self,
+        documents: &[Document],
+    ) -> OQLResult<HashMap<String, FieldStatistics>> {
         if documents.is_empty() {
             return Ok(HashMap::new());
         }
-        
+
         // Collect all field names
         let mut field_names = std::collections::HashSet::new();
         for doc in documents {
@@ -236,17 +244,17 @@ impl StatisticsManager {
                 field_names.insert(field_name.clone());
             }
         }
-        
+
         // Collect statistics for each field
         let mut field_stats = HashMap::new();
         for field_name in field_names {
             let stats = self.collect_single_field_statistics(&field_name, documents)?;
             field_stats.insert(field_name, stats);
         }
-        
+
         Ok(field_stats)
     }
-    
+
     /// Collect statistics for a single field
     fn collect_single_field_statistics(
         &self,
@@ -256,7 +264,7 @@ impl StatisticsManager {
         let mut values = Vec::new();
         let mut null_count = 0u64;
         let mut total_size = 0u64;
-        
+
         // Collect values
         for doc in documents {
             if let Some(value) = doc.fields.get(field_name) {
@@ -270,26 +278,26 @@ impl StatisticsManager {
                 null_count += 1;
             }
         }
-        
+
         // Calculate distinct count
         let distinct_count = self.estimate_distinct_count(&values);
-        
+
         // Find min/max values
         let (min_value, max_value) = self.find_min_max(&values);
-        
+
         // Build histogram
         let histogram = if !values.is_empty() && self.can_build_histogram(&values) {
             Some(self.build_histogram(&values)?)
         } else {
             None
         };
-        
+
         let avg_size = if !values.is_empty() {
             total_size / values.len() as u64
         } else {
             0
         };
-        
+
         Ok(FieldStatistics {
             field_name: field_name.to_string(),
             distinct_count,
@@ -300,7 +308,7 @@ impl StatisticsManager {
             avg_size,
         })
     }
-    
+
     /// Estimate distinct count using string representation
     fn estimate_distinct_count(&self, values: &[Value]) -> u64 {
         let mut seen = std::collections::HashSet::new();
@@ -310,16 +318,16 @@ impl StatisticsManager {
         }
         seen.len() as u64
     }
-    
+
     /// Find minimum and maximum values
     fn find_min_max(&self, values: &[Value]) -> (Option<Value>, Option<Value>) {
         if values.is_empty() {
             return (None, None);
         }
-        
+
         let mut min = values[0].clone();
         let mut max = values[0].clone();
-        
+
         for value in values.iter().skip(1) {
             if self.compare_values(value, &min) < 0 {
                 min = value.clone();
@@ -328,58 +336,71 @@ impl StatisticsManager {
                 max = value.clone();
             }
         }
-        
+
         (Some(min), Some(max))
     }
-    
+
     /// Compare two values for ordering
     fn compare_values(&self, a: &Value, b: &Value) -> i32 {
         match (a, b) {
             (Value::Integer(a), Value::Integer(b)) => a.cmp(b) as i32,
             (Value::Float(a), Value::Float(b)) => {
-                if a < b { -1 } else if a > b { 1 } else { 0 }
+                if a < b {
+                    -1
+                } else if a > b {
+                    1
+                } else {
+                    0
+                }
             }
             (Value::String(a), Value::String(b)) => a.cmp(b) as i32,
             (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b) as i32,
             _ => 0, // Can't compare different types
         }
     }
-    
+
     /// Check if we can build a histogram for these values
     fn can_build_histogram(&self, values: &[Value]) -> bool {
         if values.is_empty() {
             return false;
         }
-        
+
         // Check if all values are of the same comparable type
         let first_type = std::mem::discriminant(&values[0]);
-        values.iter().all(|v| std::mem::discriminant(v) == first_type)
-            && matches!(values[0], Value::Integer(_) | Value::Float(_) | Value::String(_))
+        values
+            .iter()
+            .all(|v| std::mem::discriminant(v) == first_type)
+            && matches!(
+                values[0],
+                Value::Integer(_) | Value::Float(_) | Value::String(_)
+            )
     }
-    
+
     /// Build a histogram for the given values
     fn build_histogram(&self, values: &[Value]) -> OQLResult<Histogram> {
         if values.is_empty() {
-            return Err(OQLError::generic("Cannot build histogram from empty values"));
+            return Err(OQLError::generic(
+                "Cannot build histogram from empty values",
+            ));
         }
-        
+
         match self.config.histogram_type {
             HistogramType::EqualWidth => self.build_equal_width_histogram(values),
             HistogramType::EqualDepth => self.build_equal_depth_histogram(values),
         }
     }
-    
+
     /// Build an equal-width histogram
     fn build_equal_width_histogram(&self, values: &[Value]) -> OQLResult<Histogram> {
         let mut sorted_values = values.to_vec();
         sorted_values.sort_by(|a, b| self.compare_values(a, b).cmp(&0));
-        
+
         let min = &sorted_values[0];
         let max = &sorted_values[sorted_values.len() - 1];
-        
+
         let bucket_count = self.config.histogram_buckets.min(sorted_values.len());
         let mut buckets = Vec::with_capacity(bucket_count);
-        
+
         // Create buckets
         for i in 0..bucket_count {
             let lower_bound = if i == 0 {
@@ -387,22 +408,24 @@ impl StatisticsManager {
             } else {
                 self.interpolate_value(min, max, i as f64 / bucket_count as f64)
             };
-            
+
             let upper_bound = if i == bucket_count - 1 {
                 max.clone()
             } else {
                 self.interpolate_value(min, max, (i + 1) as f64 / bucket_count as f64)
             };
-            
+
             // Count values in this bucket
-            let count = sorted_values.iter()
+            let count = sorted_values
+                .iter()
                 .filter(|v| {
                     self.compare_values(v, &lower_bound) >= 0
                         && (i == bucket_count - 1 || self.compare_values(v, &upper_bound) < 0)
                 })
                 .count() as u64;
-            
-            let distinct_values: std::collections::HashSet<String> = sorted_values.iter()
+
+            let distinct_values: std::collections::HashSet<String> = sorted_values
+                .iter()
                 .filter(|v| {
                     self.compare_values(v, &lower_bound) >= 0
                         && (i == bucket_count - 1 || self.compare_values(v, &upper_bound) < 0)
@@ -410,7 +433,7 @@ impl StatisticsManager {
                 .map(|v| format!("{:?}", v))
                 .collect();
             let distinct_count = distinct_values.len() as u64;
-            
+
             buckets.push(HistogramBucket {
                 lower_bound,
                 upper_bound,
@@ -418,23 +441,23 @@ impl StatisticsManager {
                 distinct_count,
             });
         }
-        
+
         Ok(Histogram {
             bucket_count,
             buckets,
             histogram_type: HistogramType::EqualWidth,
         })
     }
-    
+
     /// Build an equal-depth histogram
     fn build_equal_depth_histogram(&self, values: &[Value]) -> OQLResult<Histogram> {
         let mut sorted_values = values.to_vec();
         sorted_values.sort_by(|a, b| self.compare_values(a, b).cmp(&0));
-        
+
         let bucket_count = self.config.histogram_buckets.min(sorted_values.len());
         let values_per_bucket = sorted_values.len() / bucket_count;
         let mut buckets = Vec::with_capacity(bucket_count);
-        
+
         for i in 0..bucket_count {
             let start_idx = i * values_per_bucket;
             let end_idx = if i == bucket_count - 1 {
@@ -442,20 +465,19 @@ impl StatisticsManager {
             } else {
                 (i + 1) * values_per_bucket
             };
-            
+
             let bucket_values = &sorted_values[start_idx..end_idx];
             if bucket_values.is_empty() {
                 continue;
             }
-            
+
             let lower_bound = bucket_values[0].clone();
             let upper_bound = bucket_values[bucket_values.len() - 1].clone();
             let count = bucket_values.len() as u64;
-            let distinct_values: std::collections::HashSet<String> = bucket_values.iter()
-                .map(|v| format!("{:?}", v))
-                .collect();
+            let distinct_values: std::collections::HashSet<String> =
+                bucket_values.iter().map(|v| format!("{:?}", v)).collect();
             let distinct_count = distinct_values.len() as u64;
-            
+
             buckets.push(HistogramBucket {
                 lower_bound,
                 upper_bound,
@@ -463,14 +485,14 @@ impl StatisticsManager {
                 distinct_count,
             });
         }
-        
+
         Ok(Histogram {
             bucket_count: buckets.len(),
             buckets,
             histogram_type: HistogramType::EqualDepth,
         })
     }
-    
+
     /// Interpolate a value between min and max
     fn interpolate_value(&self, min: &Value, max: &Value, ratio: f64) -> Value {
         match (min, max) {
@@ -484,22 +506,23 @@ impl StatisticsManager {
             _ => min.clone(), // Fallback
         }
     }
-    
+
     /// Sample documents randomly
     fn sample_documents(&self, documents: &[Document], sample_size: usize) -> Vec<Document> {
         if documents.len() <= sample_size {
             return documents.to_vec();
         }
-        
+
         // Simple sampling: take every nth document
         let step = documents.len() / sample_size;
-        documents.iter()
+        documents
+            .iter()
             .step_by(step)
             .take(sample_size)
             .cloned()
             .collect()
     }
-    
+
     /// Estimate document size in bytes
     fn estimate_document_size(&self, doc: &Document) -> u64 {
         let mut size = 0u64;
@@ -511,7 +534,7 @@ impl StatisticsManager {
         }
         size
     }
-    
+
     /// Estimate value size in bytes
     fn estimate_value_size(&self, value: &Value) -> u64 {
         match value {
@@ -522,48 +545,50 @@ impl StatisticsManager {
             Value::String(s) => s.len() as u64,
             Value::DateTime(_) => 8,
             Value::Reference(_) => 8,
+            Value::GlobalReference(_) => 16,
             Value::List(items) => items.iter().map(|v| self.estimate_value_size(v)).sum(),
-            Value::Object(fields) => {
-                fields.iter()
-                    .map(|(k, v)| k.len() as u64 + self.estimate_value_size(v))
-                    .sum()
-            }
+            Value::Object(fields) => fields
+                .iter()
+                .map(|(k, v)| k.len() as u64 + self.estimate_value_size(v))
+                .sum(),
         }
     }
-    
+
     /// Record index statistics
     pub fn record_index_statistics(&self, stats: IndexStatistics) -> OQLResult<()> {
-        let mut index_stats = self.index_stats.write()
+        let mut index_stats = self
+            .index_stats
+            .write()
             .map_err(|_| OQLError::generic("Failed to acquire write lock"))?;
         index_stats.insert(stats.index_name.clone(), stats);
         Ok(())
     }
-    
+
     /// Get index statistics
     pub fn get_index_statistics(&self, index_name: &str) -> OQLResult<Option<IndexStatistics>> {
-        let stats = self.index_stats.read()
+        let stats = self
+            .index_stats
+            .read()
             .map_err(|_| OQLError::generic("Failed to acquire read lock"))?;
         Ok(stats.get(index_name).cloned())
     }
-    
+
     /// Estimate selectivity for a field predicate
-    pub fn estimate_selectivity(
-        &self,
-        schema: &str,
-        field: &str,
-        value: &Value,
-    ) -> OQLResult<f64> {
-        let table_stats = self.get_table_statistics(schema)?
+    pub fn estimate_selectivity(&self, schema: &str, field: &str, value: &Value) -> OQLResult<f64> {
+        let table_stats = self
+            .get_table_statistics(schema)?
             .ok_or_else(|| OQLError::generic(&format!("No statistics for schema '{}'", schema)))?;
-        
-        let field_stats = table_stats.field_stats.get(field)
+
+        let field_stats = table_stats
+            .field_stats
+            .get(field)
             .ok_or_else(|| OQLError::generic(&format!("No statistics for field '{}'", field)))?;
-        
+
         // If we have a histogram, use it for better estimation
         if let Some(histogram) = &field_stats.histogram {
             return Ok(self.estimate_selectivity_from_histogram(histogram, value));
         }
-        
+
         // Fallback: use distinct count
         if field_stats.distinct_count > 0 {
             Ok(1.0 / field_stats.distinct_count as f64)
@@ -571,7 +596,7 @@ impl StatisticsManager {
             Ok(0.1) // Default selectivity
         }
     }
-    
+
     /// Estimate selectivity from histogram
     fn estimate_selectivity_from_histogram(&self, histogram: &Histogram, value: &Value) -> f64 {
         // Find the bucket containing this value
@@ -586,14 +611,15 @@ impl StatisticsManager {
                 }
             }
         }
-        
+
         // Value not in histogram range
         0.01 // Very selective
     }
-    
+
     /// Get cardinality estimate for a schema
     pub fn get_cardinality(&self, schema: &str) -> OQLResult<u64> {
-        let stats = self.get_table_statistics(schema)?
+        let stats = self
+            .get_table_statistics(schema)?
             .ok_or_else(|| OQLError::generic(&format!("No statistics for schema '{}'", schema)))?;
         Ok(stats.row_count)
     }
@@ -627,12 +653,8 @@ mod tests {
                 fields.insert("name".to_string(), Value::String(format!("User {}", i)));
                 fields.insert("age".to_string(), Value::Integer(20 + (i % 50) as i64));
                 fields.insert("score".to_string(), Value::Float((i % 100) as f64));
-                
-                Document::with_id(
-                    format!("user_{}", i),
-                    "users".to_string(),
-                    fields,
-                )
+
+                Document::with_id(format!("user_{}", i), "users".to_string(), fields)
             })
             .collect()
     }
@@ -647,23 +669,25 @@ mod tests {
     fn test_collect_table_statistics() {
         let storage = create_storage("test_stats.owl", 10 * 1024 * 1024).unwrap();
         let manager = StatisticsManager::new();
-        
+
         // Insert test documents
         let documents = create_test_documents(100);
         for doc in &documents {
             storage.put_document(doc).unwrap();
         }
-        
+
         // Collect statistics
-        let stats = manager.collect_table_statistics(storage.as_ref(), "users").unwrap();
-        
+        let stats = manager
+            .collect_table_statistics(storage.as_ref(), "users")
+            .unwrap();
+
         assert_eq!(stats.schema, "users");
         assert_eq!(stats.row_count, 100);
         assert!(stats.avg_row_size > 0);
         assert!(stats.field_stats.contains_key("id"));
         assert!(stats.field_stats.contains_key("name"));
         assert!(stats.field_stats.contains_key("age"));
-        
+
         std::fs::remove_file("test_stats.owl").ok();
     }
 
@@ -671,21 +695,23 @@ mod tests {
     fn test_field_statistics() {
         let storage = create_storage("test_field_stats.owl", 10 * 1024 * 1024).unwrap();
         let manager = StatisticsManager::new();
-        
+
         let documents = create_test_documents(50);
         for doc in &documents {
             storage.put_document(doc).unwrap();
         }
-        
-        let stats = manager.collect_table_statistics(storage.as_ref(), "users").unwrap();
+
+        let stats = manager
+            .collect_table_statistics(storage.as_ref(), "users")
+            .unwrap();
         let age_stats = stats.field_stats.get("age").unwrap();
-        
+
         assert_eq!(age_stats.field_name, "age");
         assert!(age_stats.distinct_count > 0);
         assert_eq!(age_stats.null_count, 0);
         assert!(age_stats.min_value.is_some());
         assert!(age_stats.max_value.is_some());
-        
+
         std::fs::remove_file("test_field_stats.owl").ok();
     }
 
@@ -693,20 +719,22 @@ mod tests {
     fn test_histogram_generation() {
         let storage = create_storage("test_histogram.owl", 10 * 1024 * 1024).unwrap();
         let manager = StatisticsManager::new();
-        
+
         let documents = create_test_documents(100);
         for doc in &documents {
             storage.put_document(doc).unwrap();
         }
-        
-        let stats = manager.collect_table_statistics(storage.as_ref(), "users").unwrap();
+
+        let stats = manager
+            .collect_table_statistics(storage.as_ref(), "users")
+            .unwrap();
         let age_stats = stats.field_stats.get("age").unwrap();
-        
+
         assert!(age_stats.histogram.is_some());
         let histogram = age_stats.histogram.as_ref().unwrap();
         assert!(histogram.bucket_count > 0);
         assert_eq!(histogram.buckets.len(), histogram.bucket_count);
-        
+
         std::fs::remove_file("test_histogram.owl").ok();
     }
 
@@ -714,23 +742,23 @@ mod tests {
     fn test_selectivity_estimation() {
         let storage = create_storage("test_selectivity.owl", 10 * 1024 * 1024).unwrap();
         let manager = StatisticsManager::new();
-        
+
         let documents = create_test_documents(100);
         for doc in &documents {
             storage.put_document(doc).unwrap();
         }
-        
-        manager.collect_table_statistics(storage.as_ref(), "users").unwrap();
-        
-        let selectivity = manager.estimate_selectivity(
-            "users",
-            "age",
-            &Value::Integer(25),
-        ).unwrap();
-        
+
+        manager
+            .collect_table_statistics(storage.as_ref(), "users")
+            .unwrap();
+
+        let selectivity = manager
+            .estimate_selectivity("users", "age", &Value::Integer(25))
+            .unwrap();
+
         assert!(selectivity > 0.0);
         assert!(selectivity <= 1.0);
-        
+
         std::fs::remove_file("test_selectivity.owl").ok();
     }
 
@@ -738,24 +766,26 @@ mod tests {
     fn test_cardinality_estimation() {
         let storage = create_storage("test_cardinality.owl", 10 * 1024 * 1024).unwrap();
         let manager = StatisticsManager::new();
-        
+
         let documents = create_test_documents(75);
         for doc in &documents {
             storage.put_document(doc).unwrap();
         }
-        
-        manager.collect_table_statistics(storage.as_ref(), "users").unwrap();
-        
+
+        manager
+            .collect_table_statistics(storage.as_ref(), "users")
+            .unwrap();
+
         let cardinality = manager.get_cardinality("users").unwrap();
         assert_eq!(cardinality, 75);
-        
+
         std::fs::remove_file("test_cardinality.owl").ok();
     }
 
     #[test]
     fn test_index_statistics() {
         let manager = StatisticsManager::new();
-        
+
         let index_stats = IndexStatistics {
             index_name: "users_age_idx".to_string(),
             schema: "users".to_string(),
@@ -766,9 +796,11 @@ mod tests {
             lookup_count: 500,
             scan_count: 50,
         };
-        
-        manager.record_index_statistics(index_stats.clone()).unwrap();
-        
+
+        manager
+            .record_index_statistics(index_stats.clone())
+            .unwrap();
+
         let retrieved = manager.get_index_statistics("users_age_idx").unwrap();
         assert!(retrieved.is_some());
         assert_eq!(retrieved.unwrap().entry_count, 1000);

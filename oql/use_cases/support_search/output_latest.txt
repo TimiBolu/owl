@@ -1,0 +1,568 @@
+📋 Schema definition: organizations
+📋 Schema definition: teams
+📋 Schema definition: kb_articles
+📋 Schema definition: kb_chunks
+✅ organizations.InsertMany([InsertBlock { fields: [I -> 2 documents (0.447ms)
+✅ teams.InsertMany([InsertBlock { fields: [InsertFie -> 3 documents (0.421ms)
+✅ kb_articles.InsertMany([InsertBlock { fields: [Ins -> 4 documents (1.157ms)
+✅ kb_chunks.InsertMany([InsertBlock { fields: [Inser -> 6 documents (3.629ms)
+
+📊 Summary: 8/8 statements executed successfully
+   - 4 schemas
+   - 0 bindings
+   - 4 queries
+   - 0 functions
+   - 0 transactions
+setup complete: schemas=4, queries=4, errors=0
+
+==================== PHASE A QUERIES ====================
+script: oql/use_cases/support_search/phaseA_support_search_queries.oql
+binding: liveChunks
+
+[query 1] kb_chunks.Where(WhereBlock { condition: Comparison { left: FieldAccess(FieldAccess { path: ["status"] }), operator: Equal, right: Literal(String("published")) } }) -> Select(SelectBlock { fields: [SelectField { alias: None, expression: FieldAccess(FieldAccess { path: ["id"] }) }, SelectField { alias: Some("article_title"), expression: FieldAccess(FieldAccess { path: ["article", "title"] }) }, SelectField { alias: Some("team_name"), expression: FieldAccess(FieldAccess { path: ["team", "name"] }) }, SelectField { alias: Some("org_name"), expression: FieldAccess(FieldAccess { path: ["org", "name"] }) }, SelectField { alias: None, expression: FieldAccess(FieldAccess { path: ["tags"] }) }, SelectField { alias: Some("freshness_days"), expression: FieldAccess(FieldAccess { path: ["meta", "freshness_days"] }) }] })
+documents returned: 5
+--- doc 1 (824b665d-b5b7-499e-8465-9eb9d97b515a) ---
+{
+  "id": "824b665d-b5b7-499e-8465-9eb9d97b515a",
+  "schema": "kb_chunks",
+  "fields": {
+    "id": {
+      "String": "art_cb_001:1"
+    },
+    "article_title": {
+      "String": "Chargeback dispute workflow"
+    },
+    "org_name": {
+      "String": "Northwind"
+    },
+    "tags": {
+      "List": [
+        {
+          "String": "payments"
+        },
+        {
+          "String": "risk"
+        },
+        {
+          "String": "dispute"
+        }
+      ]
+    },
+    "team_name": {
+      "String": "Payments"
+    },
+    "freshness_days": {
+      "Integer": 2
+    }
+  },
+  "created_at": "2026-02-22T16:18:44.864984Z",
+  "updated_at": "2026-02-22T16:18:44.864984Z",
+  "version": 1
+}
+--- doc 2 (16a3ae04-d5bf-47b6-8af2-843557406659) ---
+{
+  "id": "16a3ae04-d5bf-47b6-8af2-843557406659",
+  "schema": "kb_chunks",
+  "fields": {
+    "org_name": {
+      "String": "Northwind"
+    },
+    "team_name": {
+      "String": "Payments"
+    },
+    "tags": {
+      "List": [
+        {
+          "String": "payments"
+        },
+        {
+          "String": "risk"
+        },
+        {
+          "String": "chargeback"
+        }
+      ]
+    },
+    "article_title": {
+      "String": "Chargeback dispute workflow"
+    },
+    "freshness_days": {
+      "Integer": 2
+    },
+    "id": {
+      "String": "art_cb_001:0"
+    }
+  },
+  "created_at": "2026-02-22T16:18:44.865056Z",
+  "updated_at": "2026-02-22T16:18:44.865056Z",
+  "version": 1
+}
+--- doc 3 (3a700776-6ee4-44e0-81e3-1f423f3d1980) ---
+{
+  "id": "3a700776-6ee4-44e0-81e3-1f423f3d1980",
+  "schema": "kb_chunks",
+  "fields": {
+    "org_name": {
+      "String": "Northwind"
+    },
+    "id": {
+      "String": "art_k8s_001:0"
+    },
+    "team_name": {
+      "String": "Infra"
+    },
+    "freshness_days": {
+      "Integer": 3
+    },
+    "tags": {
+      "List": [
+        {
+          "String": "infra"
+        },
+        {
+          "String": "kubernetes"
+        },
+        {
+          "String": "sre"
+        }
+      ]
+    },
+    "article_title": {
+      "String": "Kubernetes node pressure runbook"
+    }
+  },
+  "created_at": "2026-02-22T16:18:44.865125Z",
+  "updated_at": "2026-02-22T16:18:44.865125Z",
+  "version": 1
+}
+... 2 more documents omitted
+
+[query 2] kb_chunks.Where(WhereBlock { condition: Comparison { left: FieldAccess(FieldAccess { path: ["status"] }), operator: Equal, right: Literal(String("published")) } }) -> Where(WhereBlock { condition: And(Comparison { left: FieldAccess(FieldAccess { path: ["org", "id"] }), operator: Equal, right: Literal(String("org_1")) }, Comparison { left: FieldAccess(FieldAccess { path: ["team", "id"] }), operator: Equal, right: Literal(String("team_payments")) }) }) -> Nearest(NearestBlock { field: FieldAccess { path: ["embedding"] }, query: ArrayLiteral([Literal(Float(0.95)), Literal(Float(0.05)), Literal(Float(0.08)), Literal(Float(0.01))]), metric: Cosine, k: 3, num_candidates: None, exact: None }) -> Select(SelectBlock { fields: [SelectField { alias: None, expression: FieldAccess(FieldAccess { path: ["id"] }) }, SelectField { alias: Some("article_id"), expression: FieldAccess(FieldAccess { path: ["article", "id"] }) }, SelectField { alias: Some("article_title"), expression: FieldAccess(FieldAccess { path: ["article", "title"] }) }, SelectField { alias: Some("team_name"), expression: FieldAccess(FieldAccess { path: ["team", "name"] }) }, SelectField { alias: Some("org_name"), expression: FieldAccess(FieldAccess { path: ["org", "name"] }) }, SelectField { alias: Some("score"), expression: FieldAccess(FieldAccess { path: ["_score"] }) }, SelectField { alias: Some("snippet"), expression: FieldAccess(FieldAccess { path: ["chunk_text"] }) }] })
+documents returned: 3
+--- doc 1 (16a3ae04-d5bf-47b6-8af2-843557406659) ---
+{
+  "id": "16a3ae04-d5bf-47b6-8af2-843557406659",
+  "schema": "kb_chunks",
+  "fields": {
+    "snippet": {
+      "String": "When a chargeback is received, gather payment proof and communication logs before submitting the dispute."
+    },
+    "team_name": {
+      "String": "Payments"
+    },
+    "article_title": {
+      "String": "Chargeback dispute workflow"
+    },
+    "article_id": {
+      "String": "art_cb_001"
+    },
+    "org_name": {
+      "String": "Northwind"
+    },
+    "id": {
+      "String": "art_cb_001:0"
+    },
+    "score": {
+      "Float": 0.9998308420181274
+    }
+  },
+  "created_at": "2026-02-22T16:18:44.866233Z",
+  "updated_at": "2026-02-22T16:18:44.866233Z",
+  "version": 1
+}
+--- doc 2 (824b665d-b5b7-499e-8465-9eb9d97b515a) ---
+{
+  "id": "824b665d-b5b7-499e-8465-9eb9d97b515a",
+  "schema": "kb_chunks",
+  "fields": {
+    "article_id": {
+      "String": "art_cb_001"
+    },
+    "article_title": {
+      "String": "Chargeback dispute workflow"
+    },
+    "team_name": {
+      "String": "Payments"
+    },
+    "org_name": {
+      "String": "Northwind"
+    },
+    "score": {
+      "Float": 0.9989827871322632
+    },
+    "snippet": {
+      "String": "Dispute response should include delivery confirmation, refund history, and fraud screening indicators."
+    },
+    "id": {
+      "String": "art_cb_001:1"
+    }
+  },
+  "created_at": "2026-02-22T16:18:44.866521Z",
+  "updated_at": "2026-02-22T16:18:44.866521Z",
+  "version": 1
+}
+--- doc 3 (1e7804a7-ff2a-423c-84a6-ec0edb1ba96a) ---
+{
+  "id": "1e7804a7-ff2a-423c-84a6-ec0edb1ba96a",
+  "schema": "kb_chunks",
+  "fields": {
+    "article_id": {
+      "String": "art_rf_001"
+    },
+    "article_title": {
+      "String": "Refund processing policy"
+    },
+    "score": {
+      "Float": 0.9967912435531616
+    },
+    "snippet": {
+      "String": "Refunds can be full or partial. Validate original transaction id and settlement state before approval."
+    },
+    "id": {
+      "String": "art_rf_001:0"
+    },
+    "team_name": {
+      "String": "Payments"
+    },
+    "org_name": {
+      "String": "Northwind"
+    }
+  },
+  "created_at": "2026-02-22T16:18:44.866802Z",
+  "updated_at": "2026-02-22T16:18:44.866802Z",
+  "version": 1
+}
+
+[query 3] kb_chunks.Where(WhereBlock { condition: Comparison { left: FieldAccess(FieldAccess { path: ["status"] }), operator: Equal, right: Literal(String("published")) } }) -> Where(WhereBlock { condition: And(Comparison { left: FieldAccess(FieldAccess { path: ["org", "id"] }), operator: Equal, right: Literal(String("org_1")) }, Comparison { left: FieldAccess(FieldAccess { path: ["team", "id"] }), operator: Equal, right: Literal(String("team_infra")) }) }) -> Nearest(NearestBlock { field: FieldAccess { path: ["embedding"] }, query: ArrayLiteral([Literal(Float(0.05)), Literal(Float(0.95)), Literal(Float(0.16)), Literal(Float(0.04))]), metric: Cosine, k: 2, num_candidates: None, exact: None }) -> Select(SelectBlock { fields: [SelectField { alias: None, expression: FieldAccess(FieldAccess { path: ["id"] }) }, SelectField { alias: Some("article_title"), expression: FieldAccess(FieldAccess { path: ["article", "title"] }) }, SelectField { alias: Some("score"), expression: FieldAccess(FieldAccess { path: ["_score"] }) }, SelectField { alias: Some("snippet"), expression: FieldAccess(FieldAccess { path: ["chunk_text"] }) }] })
+documents returned: 2
+--- doc 1 (3a700776-6ee4-44e0-81e3-1f423f3d1980) ---
+{
+  "id": "3a700776-6ee4-44e0-81e3-1f423f3d1980",
+  "schema": "kb_chunks",
+  "fields": {
+    "article_title": {
+      "String": "Kubernetes node pressure runbook"
+    },
+    "snippet": {
+      "String": "If node memory pressure is high, inspect eviction events, tune limits, and rebalance workloads."
+    },
+    "score": {
+      "Float": 0.9994522333145142
+    },
+    "id": {
+      "String": "art_k8s_001:0"
+    }
+  },
+  "created_at": "2026-02-22T16:18:44.867842Z",
+  "updated_at": "2026-02-22T16:18:44.867842Z",
+  "version": 1
+}
+--- doc 2 (2b0a6cfa-931d-470f-b72e-b5717500eb16) ---
+{
+  "id": "2b0a6cfa-931d-470f-b72e-b5717500eb16",
+  "schema": "kb_chunks",
+  "fields": {
+    "id": {
+      "String": "art_k8s_001:1"
+    },
+    "article_title": {
+      "String": "Kubernetes node pressure runbook"
+    },
+    "snippet": {
+      "String": "Restart loops often correlate with memory throttling and failed liveness probes under load."
+    },
+    "score": {
+      "Float": 0.9994418025016785
+    }
+  },
+  "created_at": "2026-02-22T16:18:44.867875Z",
+  "updated_at": "2026-02-22T16:18:44.867875Z",
+  "version": 1
+}
+
+[query 4] kb_chunks.Where(WhereBlock { condition: Comparison { left: FieldAccess(FieldAccess { path: ["status"] }), operator: Equal, right: Literal(String("published")) } }) -> Where(WhereBlock { condition: And(Comparison { left: FieldAccess(FieldAccess { path: ["org", "id"] }), operator: Equal, right: Literal(String("org_1")) }, Comparison { left: FieldAccess(FieldAccess { path: ["meta", "lang"] }), operator: Equal, right: Literal(String("en")) }) }) -> Nearest(NearestBlock { field: FieldAccess { path: ["embedding"] }, query: ArrayLiteral([Literal(Float(0.9)), Literal(Float(0.08)), Literal(Float(0.06)), Literal(Float(0.02))]), metric: Cosine, k: 4, num_candidates: None, exact: None }) -> Select(SelectBlock { fields: [SelectField { alias: None, expression: FieldAccess(FieldAccess { path: ["id"] }) }, SelectField { alias: Some("article_title"), expression: FieldAccess(FieldAccess { path: ["article", "title"] }) }, SelectField { alias: Some("team_name"), expression: FieldAccess(FieldAccess { path: ["team", "name"] }) }, SelectField { alias: Some("score"), expression: FieldAccess(FieldAccess { path: ["_score"] }) }] }) -> Sort(SortBlock { fields: [SortField { expression: ChainedAccess { base: FieldAccess(FieldAccess { path: ["score"] }), field: "desc" }, direction: Asc }] })
+documents returned: 4
+--- doc 1 (16a3ae04-d5bf-47b6-8af2-843557406659) ---
+{
+  "id": "16a3ae04-d5bf-47b6-8af2-843557406659",
+  "schema": "kb_chunks",
+  "fields": {
+    "id": {
+      "String": "art_cb_001:0"
+    },
+    "team_name": {
+      "String": "Payments"
+    },
+    "score": {
+      "Float": 0.9998308420181274
+    },
+    "article_title": {
+      "String": "Chargeback dispute workflow"
+    }
+  },
+  "created_at": "2026-02-22T16:18:44.868492Z",
+  "updated_at": "2026-02-22T16:18:44.868492Z",
+  "version": 1
+}
+--- doc 2 (824b665d-b5b7-499e-8465-9eb9d97b515a) ---
+{
+  "id": "824b665d-b5b7-499e-8465-9eb9d97b515a",
+  "schema": "kb_chunks",
+  "fields": {
+    "id": {
+      "String": "art_cb_001:1"
+    },
+    "score": {
+      "Float": 0.9989827871322632
+    },
+    "team_name": {
+      "String": "Payments"
+    },
+    "article_title": {
+      "String": "Chargeback dispute workflow"
+    }
+  },
+  "created_at": "2026-02-22T16:18:44.868548Z",
+  "updated_at": "2026-02-22T16:18:44.868548Z",
+  "version": 1
+}
+--- doc 3 (1e7804a7-ff2a-423c-84a6-ec0edb1ba96a) ---
+{
+  "id": "1e7804a7-ff2a-423c-84a6-ec0edb1ba96a",
+  "schema": "kb_chunks",
+  "fields": {
+    "team_name": {
+      "String": "Payments"
+    },
+    "score": {
+      "Float": 0.9967912435531616
+    },
+    "id": {
+      "String": "art_rf_001:0"
+    },
+    "article_title": {
+      "String": "Refund processing policy"
+    }
+  },
+  "created_at": "2026-02-22T16:18:44.868604Z",
+  "updated_at": "2026-02-22T16:18:44.868604Z",
+  "version": 1
+}
+... 1 more documents omitted
+
+[query 5] kb_chunks.Where(WhereBlock { condition: Comparison { left: FieldAccess(FieldAccess { path: ["status"] }), operator: Equal, right: Literal(String("published")) } }) -> GroupBy(GroupByBlock { fields: [FieldAccess { path: ["team", "id"] }, FieldAccess { path: ["team", "name"] }] }) -> Select(SelectBlock { fields: [SelectField { alias: Some("team_id"), expression: FieldAccess(FieldAccess { path: ["team", "id"] }) }, SelectField { alias: Some("team_name"), expression: FieldAccess(FieldAccess { path: ["team", "name"] }) }, SelectField { alias: Some("chunk_count"), expression: FunctionCall { name: "count", args: [] } }] })
+documents returned: 2
+--- doc 1 (group_0) ---
+{
+  "id": "group_0",
+  "schema": "group",
+  "fields": {
+    "team_id": "Null",
+    "team_name": "Null",
+    "chunk_count": {
+      "Integer": 2
+    }
+  },
+  "created_at": "2026-02-22T16:18:44.870260Z",
+  "updated_at": "2026-02-22T16:18:44.870260Z",
+  "version": 1
+}
+--- doc 2 (group_1) ---
+{
+  "id": "group_1",
+  "schema": "group",
+  "fields": {
+    "chunk_count": {
+      "Integer": 3
+    },
+    "team_name": "Null",
+    "team_id": "Null"
+  },
+  "created_at": "2026-02-22T16:18:44.870417Z",
+  "updated_at": "2026-02-22T16:18:44.870417Z",
+  "version": 1
+}
+
+==================== PHASE A EVAL ====================
+script: oql/use_cases/support_search/phaseA_support_search_eval.oql
+binding: liveChunks
+
+[query 1] kb_chunks.Where(WhereBlock { condition: Comparison { left: FieldAccess(FieldAccess { path: ["status"] }), operator: Equal, right: Literal(String("published")) } }) -> Nearest(NearestBlock { field: FieldAccess { path: ["embedding"] }, query: ArrayLiteral([Literal(Float(0.96)), Literal(Float(0.04)), Literal(Float(0.08)), Literal(Float(0.02))]), metric: Cosine, k: 3, num_candidates: None, exact: None }) -> Select(SelectBlock { fields: [SelectField { alias: None, expression: FieldAccess(FieldAccess { path: ["id"] }) }, SelectField { alias: Some("article_title"), expression: FieldAccess(FieldAccess { path: ["article", "title"] }) }, SelectField { alias: Some("score"), expression: FieldAccess(FieldAccess { path: ["_score"] }) }] })
+documents returned: 3
+--- doc 1 (16a3ae04-d5bf-47b6-8af2-843557406659) ---
+{
+  "id": "16a3ae04-d5bf-47b6-8af2-843557406659",
+  "schema": "kb_chunks",
+  "fields": {
+    "score": {
+      "Float": 0.9998308420181274
+    },
+    "id": {
+      "String": "art_cb_001:0"
+    },
+    "article_title": {
+      "String": "Chargeback dispute workflow"
+    }
+  },
+  "created_at": "2026-02-22T16:18:44.872555Z",
+  "updated_at": "2026-02-22T16:18:44.872555Z",
+  "version": 1
+}
+--- doc 2 (824b665d-b5b7-499e-8465-9eb9d97b515a) ---
+{
+  "id": "824b665d-b5b7-499e-8465-9eb9d97b515a",
+  "schema": "kb_chunks",
+  "fields": {
+    "id": {
+      "String": "art_cb_001:1"
+    },
+    "article_title": {
+      "String": "Chargeback dispute workflow"
+    },
+    "score": {
+      "Float": 0.9989827871322632
+    }
+  },
+  "created_at": "2026-02-22T16:18:44.872642Z",
+  "updated_at": "2026-02-22T16:18:44.872642Z",
+  "version": 1
+}
+--- doc 3 (1e7804a7-ff2a-423c-84a6-ec0edb1ba96a) ---
+{
+  "id": "1e7804a7-ff2a-423c-84a6-ec0edb1ba96a",
+  "schema": "kb_chunks",
+  "fields": {
+    "article_title": {
+      "String": "Refund processing policy"
+    },
+    "score": {
+      "Float": 0.9967912435531616
+    },
+    "id": {
+      "String": "art_rf_001:0"
+    }
+  },
+  "created_at": "2026-02-22T16:18:44.872727Z",
+  "updated_at": "2026-02-22T16:18:44.872727Z",
+  "version": 1
+}
+
+[query 2] kb_chunks.Where(WhereBlock { condition: Comparison { left: FieldAccess(FieldAccess { path: ["status"] }), operator: Equal, right: Literal(String("published")) } }) -> Nearest(NearestBlock { field: FieldAccess { path: ["embedding"] }, query: ArrayLiteral([Literal(Float(0.87)), Literal(Float(0.1)), Literal(Float(0.06)), Literal(Float(0.01))]), metric: Cosine, k: 3, num_candidates: None, exact: None }) -> Select(SelectBlock { fields: [SelectField { alias: None, expression: FieldAccess(FieldAccess { path: ["id"] }) }, SelectField { alias: Some("article_title"), expression: FieldAccess(FieldAccess { path: ["article", "title"] }) }, SelectField { alias: Some("score"), expression: FieldAccess(FieldAccess { path: ["_score"] }) }] })
+documents returned: 3
+--- doc 1 (1e7804a7-ff2a-423c-84a6-ec0edb1ba96a) ---
+{
+  "id": "1e7804a7-ff2a-423c-84a6-ec0edb1ba96a",
+  "schema": "kb_chunks",
+  "fields": {
+    "id": {
+      "String": "art_rf_001:0"
+    },
+    "score": {
+      "Float": 0.9967912435531616
+    },
+    "article_title": {
+      "String": "Refund processing policy"
+    }
+  },
+  "created_at": "2026-02-22T16:18:44.873630Z",
+  "updated_at": "2026-02-22T16:18:44.873630Z",
+  "version": 1
+}
+--- doc 2 (824b665d-b5b7-499e-8465-9eb9d97b515a) ---
+{
+  "id": "824b665d-b5b7-499e-8465-9eb9d97b515a",
+  "schema": "kb_chunks",
+  "fields": {
+    "id": {
+      "String": "art_cb_001:1"
+    },
+    "article_title": {
+      "String": "Chargeback dispute workflow"
+    },
+    "score": {
+      "Float": 0.9989827871322632
+    }
+  },
+  "created_at": "2026-02-22T16:18:44.873714Z",
+  "updated_at": "2026-02-22T16:18:44.873714Z",
+  "version": 1
+}
+--- doc 3 (16a3ae04-d5bf-47b6-8af2-843557406659) ---
+{
+  "id": "16a3ae04-d5bf-47b6-8af2-843557406659",
+  "schema": "kb_chunks",
+  "fields": {
+    "id": {
+      "String": "art_cb_001:0"
+    },
+    "article_title": {
+      "String": "Chargeback dispute workflow"
+    },
+    "score": {
+      "Float": 0.9998308420181274
+    }
+  },
+  "created_at": "2026-02-22T16:18:44.873798Z",
+  "updated_at": "2026-02-22T16:18:44.873798Z",
+  "version": 1
+}
+
+[query 3] kb_chunks.Where(WhereBlock { condition: Comparison { left: FieldAccess(FieldAccess { path: ["status"] }), operator: Equal, right: Literal(String("published")) } }) -> Nearest(NearestBlock { field: FieldAccess { path: ["embedding"] }, query: ArrayLiteral([Literal(Float(0.07)), Literal(Float(0.93)), Literal(Float(0.17)), Literal(Float(0.05))]), metric: Cosine, k: 3, num_candidates: None, exact: None }) -> Select(SelectBlock { fields: [SelectField { alias: None, expression: FieldAccess(FieldAccess { path: ["id"] }) }, SelectField { alias: Some("article_title"), expression: FieldAccess(FieldAccess { path: ["article", "title"] }) }, SelectField { alias: Some("score"), expression: FieldAccess(FieldAccess { path: ["_score"] }) }] })
+documents returned: 3
+--- doc 1 (2b0a6cfa-931d-470f-b72e-b5717500eb16) ---
+{
+  "id": "2b0a6cfa-931d-470f-b72e-b5717500eb16",
+  "schema": "kb_chunks",
+  "fields": {
+    "article_title": {
+      "String": "Kubernetes node pressure runbook"
+    },
+    "score": {
+      "Float": 0.9994418025016785
+    },
+    "id": {
+      "String": "art_k8s_001:1"
+    }
+  },
+  "created_at": "2026-02-22T16:18:44.874816Z",
+  "updated_at": "2026-02-22T16:18:44.874816Z",
+  "version": 1
+}
+--- doc 2 (3a700776-6ee4-44e0-81e3-1f423f3d1980) ---
+{
+  "id": "3a700776-6ee4-44e0-81e3-1f423f3d1980",
+  "schema": "kb_chunks",
+  "fields": {
+    "article_title": {
+      "String": "Kubernetes node pressure runbook"
+    },
+    "id": {
+      "String": "art_k8s_001:0"
+    },
+    "score": {
+      "Float": 0.9994522333145142
+    }
+  },
+  "created_at": "2026-02-22T16:18:44.874909Z",
+  "updated_at": "2026-02-22T16:18:44.874909Z",
+  "version": 1
+}
+--- doc 3 (1e7804a7-ff2a-423c-84a6-ec0edb1ba96a) ---
+{
+  "id": "1e7804a7-ff2a-423c-84a6-ec0edb1ba96a",
+  "schema": "kb_chunks",
+  "fields": {
+    "article_title": {
+      "String": "Refund processing policy"
+    },
+    "id": {
+      "String": "art_rf_001:0"
+    },
+    "score": {
+      "Float": 0.9967912435531616
+    }
+  },
+  "created_at": "2026-02-22T16:18:44.875030Z",
+  "updated_at": "2026-02-22T16:18:44.875030Z",
+  "version": 1
+}

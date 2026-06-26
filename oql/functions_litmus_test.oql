@@ -1,0 +1,112 @@
+// Function-heavy litmus file for OQL parser + executor coverage
+
+schema users {
+  id: String,
+  name: String,
+  age: Integer,
+  active: Boolean,
+  profile: Object,
+  created_at: String
+}
+
+schema orders {
+  id: String,
+  user_id: String,
+  amount: Float,
+  status: String,
+  metadata: Object,
+  created_at: String
+}
+
+fn is_adult_and_active(age: Integer, active: Boolean) -> Bool {
+  age >= 18 && active == true
+}
+
+fn is_paid(status: String) -> Bool {
+  status == "paid"
+}
+
+fn customer_tier(amount: Float) -> String {
+  if amount >= 500.0 then "gold" else "standard"
+}
+
+fn normalize_name(name: String) -> String {
+  lower(trim(name))
+}
+
+users.insert [
+  {
+    id: "u1",
+    name: "  Alice  ",
+    age: 28,
+    active: true,
+    profile: { city: "Lagos", preferences: { locale: "en" } },
+    created_at: "2026-02-01T00:00:00Z"
+  },
+  {
+    id: "u2",
+    name: "Bob",
+    age: 16,
+    active: true,
+    profile: { city: "Abuja", preferences: { locale: "en" } },
+    created_at: "2026-02-02T00:00:00Z"
+  },
+  {
+    id: "u3",
+    name: "Carol",
+    age: 35,
+    active: false,
+    profile: { city: "Ibadan", preferences: { locale: "fr" } },
+    created_at: "2026-02-03T00:00:00Z"
+  }
+]
+
+orders.insert [
+  {
+    id: "o1",
+    user_id: "u1",
+    amount: 700.0,
+    status: "paid",
+    metadata: { channel: "web" },
+    created_at: "2026-02-10T00:00:00Z"
+  },
+  {
+    id: "o2",
+    user_id: "u1",
+    amount: 120.0,
+    status: "pending",
+    metadata: { channel: "mobile" },
+    created_at: "2026-02-11T00:00:00Z"
+  },
+  {
+    id: "o3",
+    user_id: "u2",
+    amount: 80.0,
+    status: "paid",
+    metadata: { channel: "web" },
+    created_at: "2026-02-12T00:00:00Z"
+  }
+]
+
+activeAdults = users.where { is_adult_and_active(.age, .active) }
+paidOrders = orders.where { is_paid(.status) }
+
+activeAdults.select {
+  id,
+  normalized_name: normalize_name(.name),
+  city: .profile.city
+}
+
+activeAdults.select {
+  id,
+  paid_orders_global: paidOrders.count()
+}
+
+orders.where { is_paid(.status) }
+  .group_by { .user_id }
+  .select {
+    user_id,
+    total_orders: count(),
+    total_amount: sum(.amount),
+    avg_amount: avg(.amount)
+  }

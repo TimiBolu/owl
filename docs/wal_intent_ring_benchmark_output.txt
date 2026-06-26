@@ -1,0 +1,155 @@
+
+================================================================================
+WAL Performance Benchmark: Regular vs Lock-Free vs WalIntentRing
+================================================================================
+
+--- Single-Threaded Durable Append ---
+info: WAL recovery complete: 0 files, 0 entries recovered, 0 corrupted, last LSN: 0
+
+=== Regular WAL (Durable Single-Threaded) ===
+Iterations: 10000
+Total time: 414.97 ms
+Throughput: 24098 ops/sec
+Avg latency: 41.50 μs
+P50 latency: 34.00 μs
+P95 latency: 50.00 μs
+P99 latency: 106.00 μs
+info: WAL recovery complete: 0 files, 0 entries recovered, 0 corrupted, last LSN: 0
+
+=== Lock-Free WAL (Durable Single-Threaded) ===
+Iterations: 10000
+Total time: 410.55 ms
+Throughput: 24357 ops/sec
+Avg latency: 41.06 μs
+P50 latency: 35.00 μs
+P95 latency: 57.00 μs
+P99 latency: 114.00 μs
+info: WAL recovery complete: 0 files, 0 entries recovered, 0 corrupted, last LSN: 0
+
+=== WalIntentRingWAL (Durable Single-Threaded) ===
+Iterations: 10000
+Total time: 432.32 ms
+Throughput: 23131 ops/sec
+Avg latency: 43.23 μs
+P50 latency: 36.00 μs
+P95 latency: 55.00 μs
+P99 latency: 99.00 μs
+
+--- Multi-Producer Buffered Ingress + Final Flush ---
+
+--- 2 Producers ---
+info: WAL recovery complete: 0 files, 0 entries recovered, 0 corrupted, last LSN: 0
+
+=== Lock-Free WAL Buffered Ingress (2 producers) ===
+Iterations: 20000
+Submit phase: 161.79 ms
+Flush phase: 3.04 ms
+Total time: 164.83 ms
+Submit throughput: 123617 ops/sec
+End-to-end throughput: 121337 ops/sec
+Avg submit latency: 8.09 μs
+P50 submit latency: 0.00 μs
+P95 submit latency: 1.00 μs
+P99 submit latency: 2.00 μs
+info: WAL recovery complete: 0 files, 0 entries recovered, 0 corrupted, last LSN: 0
+
+=== WalIntentRingWAL Buffered Ingress (2 producers) ===
+Iterations: 20000
+Submit phase: 8.12 ms
+Flush phase: 61.11 ms
+Total time: 69.23 ms
+Submit throughput: 2463965 ops/sec
+End-to-end throughput: 288896 ops/sec
+Avg submit latency: 0.41 μs
+P50 submit latency: 0.00 μs
+P95 submit latency: 1.00 μs
+P99 submit latency: 1.00 μs
+
+--- 4 Producers ---
+info: WAL recovery complete: 0 files, 0 entries recovered, 0 corrupted, last LSN: 0
+
+=== Lock-Free WAL Buffered Ingress (4 producers) ===
+Iterations: 20000
+Submit phase: 191.08 ms
+Flush phase: 5.57 ms
+Total time: 196.65 ms
+Submit throughput: 104671 ops/sec
+End-to-end throughput: 101706 ops/sec
+Avg submit latency: 9.55 μs
+P50 submit latency: 1.00 μs
+P95 submit latency: 1.00 μs
+P99 submit latency: 5.00 μs
+info: WAL recovery complete: 0 files, 0 entries recovered, 0 corrupted, last LSN: 0
+
+=== WalIntentRingWAL Buffered Ingress (4 producers) ===
+Iterations: 20000
+Submit phase: 10.94 ms
+Flush phase: 140.60 ms
+Total time: 151.54 ms
+Submit throughput: 1828989 ops/sec
+End-to-end throughput: 131980 ops/sec
+Avg submit latency: 0.55 μs
+P50 submit latency: 1.00 μs
+P95 submit latency: 4.00 μs
+P99 submit latency: 13.00 μs
+
+--- 8 Producers ---
+info: WAL recovery complete: 0 files, 0 entries recovered, 0 corrupted, last LSN: 0
+
+=== Lock-Free WAL Buffered Ingress (8 producers) ===
+Iterations: 20000
+Submit phase: 197.98 ms
+Flush phase: 2.08 ms
+Total time: 200.06 ms
+Submit throughput: 101022 ops/sec
+End-to-end throughput: 99971 ops/sec
+Avg submit latency: 9.90 μs
+P50 submit latency: 1.00 μs
+P95 submit latency: 4.00 μs
+P99 submit latency: 10.00 μs
+info: WAL recovery complete: 0 files, 0 entries recovered, 0 corrupted, last LSN: 0
+
+=== WalIntentRingWAL Buffered Ingress (8 producers) ===
+Iterations: 20000
+Submit phase: 9.54 ms
+Flush phase: 151.15 ms
+Total time: 160.69 ms
+Submit throughput: 2096876 ops/sec
+End-to-end throughput: 124467 ops/sec
+Avg submit latency: 0.48 μs
+P50 submit latency: 1.00 μs
+P95 submit latency: 4.00 μs
+P99 submit latency: 17.00 μs
+
+--- 16 Producers ---
+info: WAL recovery complete: 0 files, 0 entries recovered, 0 corrupted, last LSN: 0
+
+=== Lock-Free WAL Buffered Ingress (16 producers) ===
+Iterations: 20000
+Submit phase: 186.63 ms
+Flush phase: 5.56 ms
+Total time: 192.19 ms
+Submit throughput: 107163 ops/sec
+End-to-end throughput: 104064 ops/sec
+Avg submit latency: 9.33 μs
+P50 submit latency: 1.00 μs
+P95 submit latency: 4.00 μs
+P99 submit latency: 14.00 μs
+info: WAL recovery complete: 0 files, 0 entries recovered, 0 corrupted, last LSN: 0
+
+=== WalIntentRingWAL Buffered Ingress (16 producers) ===
+Iterations: 20000
+Submit phase: 9.03 ms
+Flush phase: 155.46 ms
+Total time: 164.48 ms
+Submit throughput: 2216066 ops/sec
+End-to-end throughput: 121595 ops/sec
+Avg submit latency: 0.45 μs
+P50 submit latency: 1.00 μs
+P95 submit latency: 3.00 μs
+P99 submit latency: 13.00 μs
+
+================================================================================
+Benchmark Complete
+================================================================================
+

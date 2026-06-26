@@ -79,6 +79,24 @@ pub fn build(b: *std.Build) void {
     const lockfree_wal_bench_step = b.step("bench-lockfree-wal", "Run lock-free WAL benchmarks");
     lockfree_wal_bench_step.dependOn(&run_lockfree_wal_bench.step);
 
+    // WalIntentRing WAL benchmark
+    const wal_intent_ring_bench = b.addExecutable(.{
+        .name = "wal_intent_ring_bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benches/wal_intent_ring_bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "storage", .module = storage_mod },
+            },
+        }),
+    });
+    b.installArtifact(wal_intent_ring_bench);
+
+    const run_wal_intent_ring_bench = b.addRunArtifact(wal_intent_ring_bench);
+    const wal_intent_ring_bench_step = b.step("bench-wal-intent-ring", "Run WalIntentRing WAL benchmarks");
+    wal_intent_ring_bench_step.dependOn(&run_wal_intent_ring_bench.step);
+
     // SIMD operations benchmark executable (Task 9.8)
     const simd_bench = b.addExecutable(.{
         .name = "simd_bench",

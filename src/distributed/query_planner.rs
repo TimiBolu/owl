@@ -4,11 +4,11 @@
 // It analyzes queries to identify cross-shard operations and creates execution
 // plans that minimize network round-trips.
 
-use crate::distributed::{GlobalObjRef, ShardManager, ShardId};
+use crate::distributed::{ShardId, ShardManager};
 use crate::error::{OQLError, OQLResult};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use serde::{Deserialize, Serialize};
 
 /// OQL Query representation for distributed planning
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,9 +146,7 @@ pub enum PlanOperation {
         offset: Option<usize>,
     },
     /// Union results from multiple operations
-    Union {
-        operations: Vec<PlanOperation>,
-    },
+    Union { operations: Vec<PlanOperation> },
 }
 
 /// Aggregate function in distributed context
@@ -231,11 +229,11 @@ pub struct CostModel {
 impl Default for CostModel {
     fn default() -> Self {
         Self {
-            local_access_cost: 50.0,      // 50ns for local navigation
-            network_hop_cost: 1000.0,     // 1μs for network hop
-            scan_cost: 100.0,             // 100ns per object scanned
-            join_cost: 1000.0,            // 1μs per join operation
-            aggregate_cost: 500.0,        // 500ns per aggregation
+            local_access_cost: 50.0,  // 50ns for local navigation
+            network_hop_cost: 1000.0, // 1μs for network hop
+            scan_cost: 100.0,         // 100ns per object scanned
+            join_cost: 1000.0,        // 1μs per join operation
+            aggregate_cost: 500.0,    // 500ns per aggregation
         }
     }
 }
@@ -283,13 +281,13 @@ impl DistributedQueryPlanner {
     pub fn plan_query(&self, oql: &str) -> OQLResult<DistributedPlan> {
         // Parse OQL query
         let query = self.parse_oql(oql)?;
-        
+
         // Create initial plan
         let initial_plan = self.create_initial_plan(&query)?;
-        
+
         // Optimize the plan
         let optimized_plan = self.optimize_plan(initial_plan)?;
-        
+
         Ok(optimized_plan)
     }
 
@@ -299,7 +297,7 @@ impl DistributedQueryPlanner {
     /// communication and estimates the network overhead.
     pub fn analyze_cross_shard_dependencies(&self, oql: &str) -> OQLResult<CrossShardAnalysis> {
         let query = self.parse_oql(oql)?;
-        
+
         let mut analysis = CrossShardAnalysis {
             total_operations: 0,
             cross_shard_operations: 0,
@@ -310,7 +308,7 @@ impl DistributedQueryPlanner {
         };
 
         self.analyze_query_recursive(&query, &mut analysis)?;
-        
+
         Ok(analysis)
     }
 
@@ -318,48 +316,65 @@ impl DistributedQueryPlanner {
     ///
     /// This method identifies common navigation patterns and optimizes them
     /// for minimal network round-trips.
-    pub fn optimize_navigation_patterns(&self, plan: &DistributedPlan) -> OQLResult<DistributedPlan> {
+    pub fn optimize_navigation_patterns(
+        &self,
+        plan: &DistributedPlan,
+    ) -> OQLResult<DistributedPlan> {
         let mut optimized = plan.clone();
-        
+
         // Apply navigation optimizations
         optimized.root_operation = self.optimize_operation_navigation(&plan.root_operation)?;
-        
+
         // Recalculate cost
         optimized.estimated_cost = self.calculate_operation_cost(&optimized.root_operation);
-        
+
         Ok(optimized)
     }
 
     /// Get query execution statistics
     pub fn get_query_stats(&self, query_pattern: &str) -> OQLResult<Option<QueryStats>> {
-        let stats = self.query_stats.read()
+        let stats = self
+            .query_stats
+            .read()
             .map_err(|_| OQLError::generic("Failed to acquire read lock"))?;
         Ok(stats.get(query_pattern).cloned())
     }
 
     /// Update query execution statistics
-    pub fn update_query_stats(&self, query_pattern: &str, execution_time: f64, network_hops: u32, success: bool) -> OQLResult<()> {
-        let mut stats = self.query_stats.write()
+    pub fn update_query_stats(
+        &self,
+        query_pattern: &str,
+        execution_time: f64,
+        network_hops: u32,
+        success: bool,
+    ) -> OQLResult<()> {
+        let mut stats = self
+            .query_stats
+            .write()
             .map_err(|_| OQLError::generic("Failed to acquire write lock"))?;
-        
-        let entry = stats.entry(query_pattern.to_string()).or_insert(QueryStats {
-            execution_count: 0,
-            avg_execution_time: 0.0,
-            avg_network_hops: 0.0,
-            success_rate: 0.0,
-        });
-        
+
+        let entry = stats
+            .entry(query_pattern.to_string())
+            .or_insert(QueryStats {
+                execution_count: 0,
+                avg_execution_time: 0.0,
+                avg_network_hops: 0.0,
+                success_rate: 0.0,
+            });
+
         // Update running averages
         let count = entry.execution_count as f64;
-        entry.avg_execution_time = (entry.avg_execution_time * count + execution_time) / (count + 1.0);
-        entry.avg_network_hops = (entry.avg_network_hops * count + network_hops as f64) / (count + 1.0);
-        
+        entry.avg_execution_time =
+            (entry.avg_execution_time * count + execution_time) / (count + 1.0);
+        entry.avg_network_hops =
+            (entry.avg_network_hops * count + network_hops as f64) / (count + 1.0);
+
         // Update success rate
         let success_count = (entry.success_rate * count) + if success { 1.0 } else { 0.0 };
         entry.success_rate = success_count / (count + 1.0);
-        
+
         entry.execution_count += 1;
-        
+
         Ok(())
     }
 
@@ -367,7 +382,7 @@ impl DistributedQueryPlanner {
     fn parse_oql(&self, oql: &str) -> OQLResult<OQLQuery> {
         // This is a simplified parser - production would use the full OQL parser
         // For now, create a basic query structure
-        
+
         if oql.contains(".where") && oql.contains(".select") {
             // Complex query with filter and projection
             Ok(OQLQuery::Select {
@@ -414,16 +429,25 @@ impl DistributedQueryPlanner {
 
     /// Create initial execution plan
     fn create_initial_plan(&self, query: &OQLQuery) -> OQLResult<DistributedPlan> {
-        let plan_id = format!("plan_{}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos());
+        let plan_id = format!(
+            "plan_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
 
         let root_operation = match query {
-            OQLQuery::Select { schema, filter, projections, sort, limit } => {
+            OQLQuery::Select {
+                schema,
+                filter,
+                projections,
+                sort,
+                limit,
+            } => {
                 // Determine which shards have this schema
                 let involved_shards = self.get_shards_for_schema(schema)?;
-                
+
                 let mut operation = if involved_shards.len() == 1 {
                     PlanOperation::LocalScan {
                         shard_id: involved_shards[0],
@@ -457,23 +481,29 @@ impl DistributedQueryPlanner {
                 }
 
                 operation
-            },
+            }
             OQLQuery::Insert { schema, data: _ } => {
                 // For inserts, determine target shard
-                let shard_id = self.shard_manager.get_shard_for_object(schema)?
+                let shard_id = self
+                    .shard_manager
+                    .get_shard_for_object(schema)?
                     .unwrap_or(0);
-                
+
                 PlanOperation::LocalScan {
                     shard_id,
                     schema: schema.clone(),
                     filter: None,
                     limit: Some(1),
                 }
-            },
-            OQLQuery::Update { schema, filter, updates: _ } => {
+            }
+            OQLQuery::Update {
+                schema,
+                filter,
+                updates: _,
+            } => {
                 // For updates, scan with filter
                 let involved_shards = self.get_shards_for_schema(schema)?;
-                
+
                 if involved_shards.len() == 1 {
                     PlanOperation::LocalScan {
                         shard_id: involved_shards[0],
@@ -489,11 +519,11 @@ impl DistributedQueryPlanner {
                         limit: None,
                     }
                 }
-            },
+            }
             OQLQuery::Delete { schema, filter } => {
                 // For deletes, scan with filter
                 let involved_shards = self.get_shards_for_schema(schema)?;
-                
+
                 if involved_shards.len() == 1 {
                     PlanOperation::LocalScan {
                         shard_id: involved_shards[0],
@@ -509,7 +539,7 @@ impl DistributedQueryPlanner {
                         limit: None,
                     }
                 }
-            },
+            }
         };
 
         let estimated_cost = self.calculate_operation_cost(&root_operation);
@@ -528,19 +558,19 @@ impl DistributedQueryPlanner {
 
     /// Optimize execution plan
     fn optimize_plan(&self, mut plan: DistributedPlan) -> OQLResult<DistributedPlan> {
-        let original_cost = plan.estimated_cost;
-        
+        let _original_cost = plan.estimated_cost;
+
         // Apply various optimizations
         plan.root_operation = self.optimize_operation_pushdown(&plan.root_operation)?;
         plan.root_operation = self.optimize_operation_navigation(&plan.root_operation)?;
         plan.root_operation = self.optimize_operation_joins(&plan.root_operation)?;
-        
+
         // Recalculate metrics
         plan.estimated_cost = self.calculate_operation_cost(&plan.root_operation);
         plan.estimated_time_ms = (plan.estimated_cost / 1000.0) as u64;
         plan.network_hops = self.estimate_network_hops(&plan.root_operation);
         plan.involved_shards = self.extract_involved_shards(&plan.root_operation);
-        
+
         Ok(plan)
     }
 
@@ -554,17 +584,21 @@ impl DistributedQueryPlanner {
     /// Optimize navigation operations
     fn optimize_operation_navigation(&self, operation: &PlanOperation) -> OQLResult<PlanOperation> {
         match operation {
-            PlanOperation::Navigate { source_operation, path, expected_hops } => {
+            PlanOperation::Navigate {
+                source_operation,
+                path,
+                expected_hops,
+            } => {
                 // Optimize the source first
                 let optimized_source = self.optimize_operation_navigation(source_operation)?;
-                
+
                 // Try to batch navigation operations
                 Ok(PlanOperation::Navigate {
                     source_operation: Box::new(optimized_source),
                     path: path.clone(),
                     expected_hops: *expected_hops,
                 })
-            },
+            }
             _ => Ok(operation.clone()),
         }
     }
@@ -572,17 +606,21 @@ impl DistributedQueryPlanner {
     /// Optimize join operations
     fn optimize_operation_joins(&self, operation: &PlanOperation) -> OQLResult<PlanOperation> {
         match operation {
-            PlanOperation::DistributedJoin { left, right, join_condition } => {
+            PlanOperation::DistributedJoin {
+                left,
+                right,
+                join_condition,
+            } => {
                 // Optimize join order based on estimated cardinality
                 let optimized_left = self.optimize_operation_joins(left)?;
                 let optimized_right = self.optimize_operation_joins(right)?;
-                
+
                 Ok(PlanOperation::DistributedJoin {
                     left: Box::new(optimized_left),
                     right: Box::new(optimized_right),
                     join_condition: join_condition.clone(),
                 })
-            },
+            }
             _ => Ok(operation.clone()),
         }
     }
@@ -592,70 +630,97 @@ impl DistributedQueryPlanner {
         match operation {
             PlanOperation::LocalScan { .. } => {
                 self.cost_model.scan_cost * 1000.0 // Assume 1000 objects
-            },
+            }
             PlanOperation::DistributedScan { shards, .. } => {
-                self.cost_model.scan_cost * 1000.0 * shards.len() as f64 +
-                self.cost_model.network_hop_cost * shards.len() as f64
-            },
-            PlanOperation::Navigate { source_operation, expected_hops, .. } => {
-                self.calculate_operation_cost(source_operation) +
-                self.cost_model.network_hop_cost * (*expected_hops as f64)
-            },
+                self.cost_model.scan_cost * 1000.0 * shards.len() as f64
+                    + self.cost_model.network_hop_cost * shards.len() as f64
+            }
+            PlanOperation::Navigate {
+                source_operation,
+                expected_hops,
+                ..
+            } => {
+                self.calculate_operation_cost(source_operation)
+                    + self.cost_model.network_hop_cost * (*expected_hops as f64)
+            }
             PlanOperation::DistributedJoin { left, right, .. } => {
-                self.calculate_operation_cost(left) +
-                self.calculate_operation_cost(right) +
-                self.cost_model.join_cost
-            },
-            PlanOperation::Aggregate { source_operation, aggregations, .. } => {
-                self.calculate_operation_cost(source_operation) +
-                self.cost_model.aggregate_cost * aggregations.len() as f64
-            },
-            PlanOperation::Project { source_operation, .. } => {
+                self.calculate_operation_cost(left)
+                    + self.calculate_operation_cost(right)
+                    + self.cost_model.join_cost
+            }
+            PlanOperation::Aggregate {
+                source_operation,
+                aggregations,
+                ..
+            } => {
+                self.calculate_operation_cost(source_operation)
+                    + self.cost_model.aggregate_cost * aggregations.len() as f64
+            }
+            PlanOperation::Project {
+                source_operation, ..
+            } => {
                 self.calculate_operation_cost(source_operation) + 100.0 // Projection overhead
-            },
-            PlanOperation::Sort { source_operation, .. } => {
+            }
+            PlanOperation::Sort {
+                source_operation, ..
+            } => {
                 self.calculate_operation_cost(source_operation) + 1000.0 // Sort overhead
-            },
-            PlanOperation::Limit { source_operation, .. } => {
+            }
+            PlanOperation::Limit {
+                source_operation, ..
+            } => {
                 self.calculate_operation_cost(source_operation) * 0.1 // Limit reduces cost
-            },
-            PlanOperation::Union { operations } => {
-                operations.iter().map(|op| self.calculate_operation_cost(op)).sum()
-            },
+            }
+            PlanOperation::Union { operations } => operations
+                .iter()
+                .map(|op| self.calculate_operation_cost(op))
+                .sum(),
         }
     }
 
     /// Extract shards involved in an operation
     fn extract_involved_shards(&self, operation: &PlanOperation) -> HashSet<ShardId> {
         let mut shards = HashSet::new();
-        
+
         match operation {
             PlanOperation::LocalScan { shard_id, .. } => {
                 shards.insert(*shard_id);
-            },
-            PlanOperation::DistributedScan { shards: op_shards, .. } => {
+            }
+            PlanOperation::DistributedScan {
+                shards: op_shards, ..
+            } => {
                 shards.extend(op_shards);
-            },
-            PlanOperation::Navigate { source_operation, .. } => {
+            }
+            PlanOperation::Navigate {
+                source_operation, ..
+            } => {
                 shards.extend(self.extract_involved_shards(source_operation));
-            },
+            }
             PlanOperation::DistributedJoin { left, right, .. } => {
                 shards.extend(self.extract_involved_shards(left));
                 shards.extend(self.extract_involved_shards(right));
-            },
-            PlanOperation::Aggregate { source_operation, .. } |
-            PlanOperation::Project { source_operation, .. } |
-            PlanOperation::Sort { source_operation, .. } |
-            PlanOperation::Limit { source_operation, .. } => {
+            }
+            PlanOperation::Aggregate {
+                source_operation, ..
+            }
+            | PlanOperation::Project {
+                source_operation, ..
+            }
+            | PlanOperation::Sort {
+                source_operation, ..
+            }
+            | PlanOperation::Limit {
+                source_operation, ..
+            } => {
                 shards.extend(self.extract_involved_shards(source_operation));
-            },
+            }
             PlanOperation::Union { operations } => {
                 for op in operations {
                     shards.extend(self.extract_involved_shards(op));
                 }
-            },
+            }
         }
-        
+
         shards
     }
 
@@ -664,21 +729,30 @@ impl DistributedQueryPlanner {
         match operation {
             PlanOperation::LocalScan { .. } => 0,
             PlanOperation::DistributedScan { shards, .. } => shards.len() as u32,
-            PlanOperation::Navigate { source_operation, expected_hops, .. } => {
-                self.estimate_network_hops(source_operation) + expected_hops
-            },
+            PlanOperation::Navigate {
+                source_operation,
+                expected_hops,
+                ..
+            } => self.estimate_network_hops(source_operation) + expected_hops,
             PlanOperation::DistributedJoin { left, right, .. } => {
                 self.estimate_network_hops(left) + self.estimate_network_hops(right) + 1
-            },
-            PlanOperation::Aggregate { source_operation, .. } |
-            PlanOperation::Project { source_operation, .. } |
-            PlanOperation::Sort { source_operation, .. } |
-            PlanOperation::Limit { source_operation, .. } => {
-                self.estimate_network_hops(source_operation)
-            },
-            PlanOperation::Union { operations } => {
-                operations.iter().map(|op| self.estimate_network_hops(op)).sum()
-            },
+            }
+            PlanOperation::Aggregate {
+                source_operation, ..
+            }
+            | PlanOperation::Project {
+                source_operation, ..
+            }
+            | PlanOperation::Sort {
+                source_operation, ..
+            }
+            | PlanOperation::Limit {
+                source_operation, ..
+            } => self.estimate_network_hops(source_operation),
+            PlanOperation::Union { operations } => operations
+                .iter()
+                .map(|op| self.estimate_network_hops(op))
+                .sum(),
         }
     }
 
@@ -690,15 +764,19 @@ impl DistributedQueryPlanner {
     }
 
     /// Analyze query recursively for cross-shard dependencies
-    fn analyze_query_recursive(&self, _query: &OQLQuery, analysis: &mut CrossShardAnalysis) -> OQLResult<()> {
+    fn analyze_query_recursive(
+        &self,
+        _query: &OQLQuery,
+        analysis: &mut CrossShardAnalysis,
+    ) -> OQLResult<()> {
         analysis.total_operations += 1;
-        
+
         // Simplified analysis - production would do deep query analysis
         analysis.cross_shard_operations += 1;
         analysis.estimated_network_hops += 2;
         analysis.involved_shards.insert(0);
         analysis.involved_shards.insert(1);
-        
+
         Ok(())
     }
 }
@@ -742,8 +820,8 @@ mod tests {
     #[test]
     fn test_query_planner_creation() {
         let shard_manager = Arc::new(ShardManager::new());
-        let planner = DistributedQueryPlanner::new(shard_manager);
-        
+        let _planner = DistributedQueryPlanner::new(shard_manager);
+
         // Test basic functionality
         let cost_model = CostModel::default();
         assert_eq!(cost_model.local_access_cost, 50.0);
@@ -753,11 +831,11 @@ mod tests {
     fn test_simple_query_planning() {
         let shard_manager = Arc::new(ShardManager::new());
         let planner = DistributedQueryPlanner::new(shard_manager);
-        
+
         let oql = "User.select { id, name }";
         let result = planner.plan_query(oql);
         assert!(result.is_ok());
-        
+
         let plan = result.unwrap();
         assert!(!plan.plan_id.is_empty());
         assert!(plan.estimated_cost > 0.0);
@@ -767,11 +845,11 @@ mod tests {
     fn test_cross_shard_analysis() {
         let shard_manager = Arc::new(ShardManager::new());
         let planner = DistributedQueryPlanner::new(shard_manager);
-        
+
         let oql = "User.where { .age > 25 }.select { id, name }";
         let result = planner.analyze_cross_shard_dependencies(oql);
         assert!(result.is_ok());
-        
+
         let analysis = result.unwrap();
         assert!(analysis.total_operations > 0);
     }
@@ -780,24 +858,24 @@ mod tests {
     fn test_cost_calculation() {
         let shard_manager = Arc::new(ShardManager::new());
         let planner = DistributedQueryPlanner::new(shard_manager);
-        
+
         let local_scan = PlanOperation::LocalScan {
             shard_id: 0,
             schema: "User".to_string(),
             filter: None,
             limit: None,
         };
-        
+
         let cost = planner.calculate_operation_cost(&local_scan);
         assert!(cost > 0.0);
-        
+
         let distributed_scan = PlanOperation::DistributedScan {
             shards: vec![0, 1, 2],
             schema: "User".to_string(),
             filter: None,
             limit: None,
         };
-        
+
         let dist_cost = planner.calculate_operation_cost(&distributed_scan);
         assert!(dist_cost > cost); // Distributed should cost more
     }
@@ -806,16 +884,18 @@ mod tests {
     fn test_query_stats() {
         let shard_manager = Arc::new(ShardManager::new());
         let planner = DistributedQueryPlanner::new(shard_manager);
-        
+
         let query_pattern = "User.select";
-        
+
         // Initially no stats
         let stats = planner.get_query_stats(query_pattern).unwrap();
         assert!(stats.is_none());
-        
+
         // Update stats
-        planner.update_query_stats(query_pattern, 100.0, 2, true).unwrap();
-        
+        planner
+            .update_query_stats(query_pattern, 100.0, 2, true)
+            .unwrap();
+
         // Check updated stats
         let stats = planner.get_query_stats(query_pattern).unwrap();
         assert!(stats.is_some());
@@ -829,14 +909,14 @@ mod tests {
     fn test_involved_shards_extraction() {
         let shard_manager = Arc::new(ShardManager::new());
         let planner = DistributedQueryPlanner::new(shard_manager);
-        
+
         let operation = PlanOperation::DistributedScan {
             shards: vec![1, 2, 3],
             schema: "User".to_string(),
             filter: None,
             limit: None,
         };
-        
+
         let shards = planner.extract_involved_shards(&operation);
         assert_eq!(shards.len(), 3);
         assert!(shards.contains(&1));
@@ -848,23 +928,23 @@ mod tests {
     fn test_network_hops_estimation() {
         let shard_manager = Arc::new(ShardManager::new());
         let planner = DistributedQueryPlanner::new(shard_manager);
-        
+
         let local_op = PlanOperation::LocalScan {
             shard_id: 0,
             schema: "User".to_string(),
             filter: None,
             limit: None,
         };
-        
+
         assert_eq!(planner.estimate_network_hops(&local_op), 0);
-        
+
         let distributed_op = PlanOperation::DistributedScan {
             shards: vec![0, 1, 2],
             schema: "User".to_string(),
             filter: None,
             limit: None,
         };
-        
+
         assert_eq!(planner.estimate_network_hops(&distributed_op), 3);
     }
 
@@ -878,10 +958,10 @@ mod tests {
             reference_navigations: vec!["user.orders".to_string()],
             join_operations: vec!["user JOIN order".to_string()],
         };
-        
+
         assert_eq!(analysis.cross_shard_ratio(), 0.3);
         assert!(!analysis.is_local_only());
-        
+
         analysis.cross_shard_operations = 0;
         assert!(analysis.is_local_only());
     }

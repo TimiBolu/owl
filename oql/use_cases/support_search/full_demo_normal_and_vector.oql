@@ -1,0 +1,86 @@
+schema users {
+  id: String,
+  name: String,
+  age: Integer,
+  is_employee: Boolean,
+  profile: Object
+}
+
+schema orders {
+  id: String,
+  user_id: String,
+  amount: Float,
+  status: String,
+  meta: Object
+}
+
+schema products {
+  id: String,
+  title: String,
+  status: String,
+  category: String,
+  embedding: Vector(3)
+}
+
+users.insert [
+  { id: "u1", name: "Trex", age: 28, is_employee: true, profile: { city: "Lagos", prefs: { alerts: true } } },
+  { id: "u2", name: "Trish", age: 21, is_employee: true, profile: { city: "Abuja", prefs: { alerts: false } } },
+  { id: "u3", name: "Fey", age: 27, is_employee: false, profile: { city: "Ibadan", prefs: { alerts: true } } }
+]
+
+orders.insert [
+  { id: "o1", user_id: "u1", amount: 320.0, status: "paid", meta: { channel: "web" } },
+  { id: "o2", user_id: "u1", amount: 120.0, status: "pending", meta: { channel: "mobile" } },
+  { id: "o3", user_id: "u2", amount: 80.0, status: "paid", meta: { channel: "web" } },
+  { id: "o4", user_id: "u3", amount: 560.0, status: "paid", meta: { channel: "partner" } }
+]
+
+products.insert [
+  { id: "p1", title: "Laptop Sleeve", status: "active", category: "accessories", embedding: [0.95, 0.10, 0.02] },
+  { id: "p2", title: "Gaming Mouse", status: "active", category: "peripherals", embedding: [0.90, 0.20, 0.05] },
+  { id: "p3", title: "Coffee Mug", status: "active", category: "lifestyle", embedding: [0.15, 0.95, 0.10] },
+  { id: "p4", title: "Desk Lamp", status: "inactive", category: "office", embedding: [0.30, 0.85, 0.12] }
+]
+
+users.where { .profile.prefs.alerts == true }.select {
+  id,
+  name,
+  city: .profile.city
+}
+
+orders.where { .status == "paid" }.select {
+  id,
+  user_id,
+  amount,
+  channel: .meta.channel
+}
+
+orders.group_by { .user_id }.select {
+  user_id,
+  total_orders: count(),
+  total_amount: sum(.amount),
+  avg_amount: avg(.amount)
+}
+
+products.where { .status == "active" }.nearest {
+  field: .embedding,
+  query: [1.0, 0.0, 0.0],
+  metric: "cosine",
+  k: 3
+}.select {
+  id,
+  title,
+  category,
+  score: ._score
+}
+
+products.nearest {
+  field: .embedding,
+  query: [0.0, 1.0, 0.0],
+  metric: "cosine",
+  k: 2
+}.select {
+  id,
+  title,
+  score: ._score
+}

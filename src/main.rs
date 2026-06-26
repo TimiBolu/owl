@@ -4,25 +4,23 @@ use std::env;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
-    
+
     if args.len() >= 2 {
         // Execute OQL file from command line argument
         let file_path = &args[1];
         println!("🦉 Executing OQL file: {}", file_path);
-        
 
-        
         execute_oql_file_simple(file_path)?;
     } else {
         // Run embedded OQL demonstration
         println!("🦉 OQL Database System - Interactive Demo");
         println!("=========================================");
-        
+
         // Create OQL runner with temporary database
         use owl_db::storage::zig_adapter::ZigStore;
         let store = std::sync::Arc::new(ZigStore::new("./demo_db", 1024 * 1024 * 100)?);
         let runner = OQLRunner::new(store);
-        
+
         // Execute embedded OQL content
         let demo_oql = r#"
             // Schema definitions
@@ -94,18 +92,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             
             orders.where { .status == "shipped" }
         "#;
-        
+
         println!("\nExecuting embedded OQL demonstration...\n");
         runner.execute_content(demo_oql)?;
-        
+
         // Cleanup
         std::fs::remove_dir_all("./demo_db").ok();
-        
+
         println!("\n🎉 Demo completed successfully!");
         println!("\nTo run OQL files:");
         println!("  {} <oql_file>", args[0]);
         println!("  {} oql_test_suite/01_basic/crud_operations.oql", args[0]);
     }
-    
+
     Ok(())
 }

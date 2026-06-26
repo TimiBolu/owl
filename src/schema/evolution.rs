@@ -1,8 +1,8 @@
 use crate::error::{OQLError, OQLResult};
-use crate::schema::{Schema, FieldType, ReferenceType};
+use crate::schema::{FieldType, Schema};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use chrono::{DateTime, Utc};
 
 /// Schema version with metadata
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -56,14 +56,9 @@ pub enum FieldChange {
         default_value: Option<String>,
     },
     /// Remove an existing field
-    RemoveField {
-        field_name: String,
-    },
+    RemoveField { field_name: String },
     /// Rename a field
-    RenameField {
-        old_name: String,
-        new_name: String,
-    },
+    RenameField { old_name: String, new_name: String },
     /// Change field type
     ChangeType {
         field_name: String,
@@ -71,9 +66,7 @@ pub enum FieldChange {
         new_type: FieldType,
     },
     /// Make field optional
-    MakeOptional {
-        field_name: String,
-    },
+    MakeOptional { field_name: String },
     /// Make field required
     MakeRequired {
         field_name: String,
@@ -91,8 +84,16 @@ impl FieldChange {
     /// Get a human-readable description of the change
     pub fn description(&self) -> String {
         match self {
-            FieldChange::AddField { field_name, field_type, .. } => {
-                format!("Add field '{}' of type {}", field_name, field_type.type_name())
+            FieldChange::AddField {
+                field_name,
+                field_type,
+                ..
+            } => {
+                format!(
+                    "Add field '{}' of type {}",
+                    field_name,
+                    field_type.type_name()
+                )
             }
             FieldChange::RemoveField { field_name } => {
                 format!("Remove field '{}'", field_name)
@@ -100,9 +101,17 @@ impl FieldChange {
             FieldChange::RenameField { old_name, new_name } => {
                 format!("Rename field '{}' to '{}'", old_name, new_name)
             }
-            FieldChange::ChangeType { field_name, old_type, new_type } => {
-                format!("Change field '{}' type from {} to {}", 
-                    field_name, old_type.type_name(), new_type.type_name())
+            FieldChange::ChangeType {
+                field_name,
+                old_type,
+                new_type,
+            } => {
+                format!(
+                    "Change field '{}' type from {} to {}",
+                    field_name,
+                    old_type.type_name(),
+                    new_type.type_name()
+                )
             }
             FieldChange::MakeOptional { field_name } => {
                 format!("Make field '{}' optional", field_name)
@@ -110,8 +119,15 @@ impl FieldChange {
             FieldChange::MakeRequired { field_name, .. } => {
                 format!("Make field '{}' required", field_name)
             }
-            FieldChange::ChangeReferenceTarget { field_name, old_target, new_target } => {
-                format!("Change reference '{}' from {} to {}", field_name, old_target, new_target)
+            FieldChange::ChangeReferenceTarget {
+                field_name,
+                old_target,
+                new_target,
+            } => {
+                format!(
+                    "Change reference '{}' from {} to {}",
+                    field_name, old_target, new_target
+                )
             }
         }
     }
@@ -190,18 +206,24 @@ impl SchemaEvolution {
     /// Register a schema version
     pub fn register_version(&mut self, version: SchemaVersion) -> OQLResult<()> {
         let schema_name = version.schema_name.clone();
-        let versions = self.versions.entry(schema_name.clone()).or_insert_with(Vec::new);
-        
+        let versions = self
+            .versions
+            .entry(schema_name.clone())
+            .or_insert_with(Vec::new);
+
         // Check for duplicate version numbers
         if versions.iter().any(|v| v.version == version.version) {
             return Err(OQLError::SchemaValidation {
-                message: format!("Version {} already exists for schema '{}'", version.version, schema_name),
+                message: format!(
+                    "Version {} already exists for schema '{}'",
+                    version.version, schema_name
+                ),
             });
         }
-        
+
         versions.push(version);
         versions.sort_by_key(|v| v.version);
-        
+
         Ok(())
     }
 
@@ -212,14 +234,16 @@ impl SchemaEvolution {
 
     /// Get a specific version of a schema
     pub fn get_version(&self, schema_name: &str, version: u32) -> Option<&SchemaVersion> {
-        self.versions.get(schema_name)?
+        self.versions
+            .get(schema_name)?
             .iter()
             .find(|v| v.version == version)
     }
 
     /// Get all versions of a schema
     pub fn get_all_versions(&self, schema_name: &str) -> Vec<&SchemaVersion> {
-        self.versions.get(schema_name)
+        self.versions
+            .get(schema_name)
             .map(|versions| versions.iter().collect())
             .unwrap_or_default()
     }
@@ -253,8 +277,9 @@ impl SchemaEvolution {
                             default_value: None,
                         });
                     } else if Self::is_reference_target_change(old_type, new_type) {
-                        if let (Some(old_target), Some(new_target)) = 
-                            (old_type.referenced_schema(), new_type.referenced_schema()) {
+                        if let (Some(old_target), Some(new_target)) =
+                            (old_type.referenced_schema(), new_type.referenced_schema())
+                        {
                             changes.push(FieldChange::ChangeReferenceTarget {
                                 field_name: field_name.clone(),
                                 old_target: old_target.to_string(),
@@ -311,9 +336,13 @@ impl SchemaEvolution {
     }
 
     /// Check compatibility between two schema versions
-    pub fn check_compatibility(&self, old_schema: &Schema, new_schema: &Schema) -> CompatibilityCheck {
+    pub fn check_compatibility(
+        &self,
+        old_schema: &Schema,
+        new_schema: &Schema,
+    ) -> CompatibilityCheck {
         let changes = self.detect_changes(old_schema, new_schema);
-        
+
         if changes.is_empty() {
             return CompatibilityCheck::compatible();
         }
@@ -324,7 +353,11 @@ impl SchemaEvolution {
 
         for change in &changes {
             match change {
-                FieldChange::AddField { field_name, field_type, .. } => {
+                FieldChange::AddField {
+                    field_name,
+                    field_type,
+                    ..
+                } => {
                     if !field_type.is_optional() {
                         issues.push(format!(
                             "Adding required field '{}' is a breaking change - existing documents won't have this field",
@@ -351,16 +384,24 @@ impl SchemaEvolution {
                         old_name, new_name
                     ));
                 }
-                FieldChange::ChangeType { field_name, old_type, new_type } => {
+                FieldChange::ChangeType {
+                    field_name,
+                    old_type,
+                    new_type,
+                } => {
                     if Self::is_compatible_type_change(old_type, new_type) {
                         warnings.push(format!(
                             "Changing type of '{}' from {} to {} may require data conversion",
-                            field_name, old_type.type_name(), new_type.type_name()
+                            field_name,
+                            old_type.type_name(),
+                            new_type.type_name()
                         ));
                     } else {
                         issues.push(format!(
                             "Changing type of '{}' from {} to {} is incompatible",
-                            field_name, old_type.type_name(), new_type.type_name()
+                            field_name,
+                            old_type.type_name(),
+                            new_type.type_name()
                         ));
                         is_breaking = true;
                     }
@@ -378,7 +419,11 @@ impl SchemaEvolution {
                     ));
                     is_breaking = true;
                 }
-                FieldChange::ChangeReferenceTarget { field_name, old_target, new_target } => {
+                FieldChange::ChangeReferenceTarget {
+                    field_name,
+                    old_target,
+                    new_target,
+                } => {
                     issues.push(format!(
                         "Changing reference target of '{}' from {} to {} is a breaking change",
                         field_name, old_target, new_target
@@ -411,7 +456,11 @@ impl SchemaEvolution {
     }
 
     /// Validate a schema evolution
-    pub fn validate_evolution(&self, old_version: &SchemaVersion, new_version: &SchemaVersion) -> OQLResult<()> {
+    pub fn validate_evolution(
+        &self,
+        old_version: &SchemaVersion,
+        new_version: &SchemaVersion,
+    ) -> OQLResult<()> {
         // Check version numbers
         if new_version.version <= old_version.version {
             return Err(OQLError::SchemaValidation {
@@ -436,10 +485,7 @@ impl SchemaEvolution {
         let compat = self.check_compatibility(&old_version.schema, &new_version.schema);
         if !compat.is_safe() {
             return Err(OQLError::SchemaValidation {
-                message: format!(
-                    "Breaking changes detected: {}",
-                    compat.issues.join(", ")
-                ),
+                message: format!("Breaking changes detected: {}", compat.issues.join(", ")),
             });
         }
 
@@ -507,7 +553,7 @@ mod tests {
     fn test_schema_version_creation() {
         let schema = create_test_schema("users");
         let version = SchemaVersion::initial(schema.clone());
-        
+
         assert_eq!(version.version, 1);
         assert_eq!(version.schema_name, "users");
         assert_eq!(version.description, "Initial schema version");
@@ -566,7 +612,10 @@ mod tests {
         let old_schema = Schema::new("users".to_string(), old_fields);
 
         let mut new_fields = HashMap::new();
-        new_fields.insert("email".to_string(), FieldType::Optional(Box::new(FieldType::String)));
+        new_fields.insert(
+            "email".to_string(),
+            FieldType::Optional(Box::new(FieldType::String)),
+        );
         let new_schema = Schema::new("users".to_string(), new_fields);
 
         let evolution = SchemaEvolution::new();
@@ -589,7 +638,10 @@ mod tests {
 
         let mut new_fields = HashMap::new();
         new_fields.insert("name".to_string(), FieldType::String);
-        new_fields.insert("email".to_string(), FieldType::Optional(Box::new(FieldType::String)));
+        new_fields.insert(
+            "email".to_string(),
+            FieldType::Optional(Box::new(FieldType::String)),
+        );
         let new_schema = Schema::new("users".to_string(), new_fields);
 
         let evolution = SchemaEvolution::new();

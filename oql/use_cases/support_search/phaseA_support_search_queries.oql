@@ -1,0 +1,73 @@
+// Phase A - Support Knowledge Search
+// Query script: hybrid filtering + vector retrieval + ref-aware projection
+
+liveChunks = kb_chunks.where { .status == "published" }
+
+// 1) Baseline browse query (non-vector)
+liveChunks.select {
+  id,
+  article_title: .article.title,
+  team_name: .team.name,
+  org_name: .org.name,
+  tags,
+  freshness_days: .meta.freshness_days
+}
+
+// 2) Payments-focused semantic search in org_1
+liveChunks
+  .where { .org.id == "org_1" && .team.id == "team_payments" }
+  .nearest {
+    field: .embedding,
+    query: [0.95, 0.05, 0.08, 0.01],
+    metric: "cosine",
+    k: 3
+  }
+  .select {
+    id,
+    article_id: .article.id,
+    article_title: .article.title,
+    team_name: .team.name,
+    org_name: .org.name,
+    score: ._score,
+    snippet: .chunk_text
+  }
+
+// 3) Infra-focused semantic search in org_1
+liveChunks
+  .where { .org.id == "org_1" && .team.id == "team_infra" }
+  .nearest {
+    field: .embedding,
+    query: [0.05, 0.95, 0.16, 0.04],
+    metric: "cosine",
+    k: 2
+  }
+  .select {
+    id,
+    article_title: .article.title,
+    score: ._score,
+    snippet: .chunk_text
+  }
+
+// 4) Wide org scope semantic search with post-filters
+liveChunks
+  .where { .org.id == "org_1" && .meta.lang == "en" }
+  .nearest {
+    field: .embedding,
+    query: [0.90, 0.08, 0.06, 0.02],
+    metric: "cosine",
+    k: 4
+  }
+  .select {
+    id,
+    article_title: .article.title,
+    team_name: .team.name,
+    score: ._score
+  }
+  .sort { score.desc }
+
+// 5) Distribution view for live chunks by team
+liveChunks.group_by { .team.id, .team.name }.select {
+  team_id: .team.id,
+  team_name: .team.name,
+  chunk_count: count()
+}

@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -110,6 +111,122 @@ int owl_arena_colocation_metrics(Arena* arena, size_t* out_total_attempts, size_
  * @return Base pointer or NULL on failure
  */
 uint8_t* owl_arena_base_ptr(Arena* arena);
+
+/**
+ * Recover best superblock record.
+ * @return 1 if a record was found, 0 if not found, negative error code on failure
+ */
+int owl_superblock_recover(
+    const char* path,
+    bool strict,
+    uint64_t* out_sequence,
+    uint64_t* out_arena_size,
+    uint64_t* out_wal_size,
+    uint64_t* out_document_count,
+    uint32_t* out_schema_count,
+    uint32_t* out_record_crc32
+);
+
+/**
+ * Persist superblock copyset record.
+ * @return OWL_OK on success, negative error code otherwise
+ */
+int owl_superblock_persist(
+    const char* path,
+    uint64_t sequence,
+    uint32_t parent_crc32,
+    uint64_t arena_size,
+    uint64_t wal_size,
+    uint64_t document_count,
+    uint32_t schema_count,
+    bool initial_full,
+    uint32_t* out_record_crc32
+);
+
+/**
+ * Append framed WAL record (magic + metadata + CRC-protected payload).
+ * @return OWL_OK on success, negative error code otherwise
+ */
+int owl_wal_append_framed(
+    const char* path,
+    const uint8_t* payload,
+    size_t payload_len
+);
+
+/**
+ * Exact top-k vector search over dense row-major f32 vectors.
+ *
+ * Metric encoding:
+ * - 0: cosine similarity
+ * - 1: negative L2 distance
+ * - 2: dot product
+ *
+ * @return OWL_OK on success, negative error code otherwise
+ */
+int owl_vector_topk_f32(
+    const float* vectors_ptr,
+    size_t vector_count,
+    size_t dimension,
+    const float* query_ptr,
+    uint32_t metric,
+    size_t k,
+    uint32_t* out_indices,
+    float* out_scores,
+    size_t* out_count
+);
+
+/**
+ * Create a new HNSW index handle.
+ * Returns NULL on failure.
+ */
+void* owl_hnsw_index_create(
+    uint32_t dimension,
+    uint32_t m,
+    uint32_t ef_construction
+);
+
+/**
+ * Destroy an HNSW index handle.
+ */
+void owl_hnsw_index_destroy(void* index);
+
+/**
+ * Add a vector to HNSW index.
+ * @return OWL_OK on success, negative error code otherwise
+ */
+int owl_hnsw_index_add_vector(
+    void* index,
+    uint64_t id,
+    const float* vector_ptr,
+    size_t vector_len
+);
+
+/**
+ * Search HNSW index.
+ * @return OWL_OK on success, negative error code otherwise
+ */
+int owl_hnsw_index_search(
+    void* index,
+    const float* query_ptr,
+    size_t query_len,
+    size_t k,
+    size_t ef,
+    uint64_t* out_ids,
+    float* out_scores,
+    size_t* out_count
+);
+
+/**
+ * Save HNSW index to disk.
+ * @return OWL_OK on success, negative error code otherwise
+ */
+int owl_hnsw_index_save(void* index, const char* path);
+
+/**
+ * Load HNSW index from disk.
+ * Returns NULL on failure.
+ */
+void* owl_hnsw_index_load(const char* path);
 
 #ifdef __cplusplus
 }

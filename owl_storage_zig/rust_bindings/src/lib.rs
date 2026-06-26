@@ -31,16 +31,23 @@
 //! ```
 
 mod arena;
+mod btree;
+mod durability;
 mod error;
 mod ffi;
 mod filesystem;
+mod hnsw;
 mod object;
 mod objref;
 mod stats;
+pub mod vector;
 
 pub use arena::Arena;
+pub use btree::BTreeIndex;
+pub use durability::{append_wal_framed, persist_superblock, recover_superblock, SuperblockRecord};
 pub use error::{Error, Result};
 pub use filesystem::{FileSystem, FileHandle, RealFileSystem};
+pub use hnsw::{HnswHit, HnswIndex};
 pub use object::Object;
 pub use objref::ObjRef;
 pub use stats::{ArenaStats, ColocationMetrics};

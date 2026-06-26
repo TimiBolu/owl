@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use crate::distributed::GlobalObjRef;
+
 // Import ObjRef from the Zig storage bindings
 #[cfg(feature = "zig-storage")]
 use owl_storage_zig::ObjRef;
@@ -17,10 +19,12 @@ impl ObjRef {
             return Some(Self::null());
         }
         // Use a simple hash of the string as the offset
-        let hash = s.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+        let hash = s
+            .bytes()
+            .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
         Some(Self::new(hash))
     }
-    
+
     pub fn to_string_id(&self) -> String {
         if self.is_null() {
             String::new()
@@ -41,32 +45,32 @@ impl ObjRef {
     pub const fn new(offset: u64) -> Self {
         Self(offset)
     }
-    
+
     pub const fn null() -> Self {
         Self(0)
     }
-    
+
     pub const fn is_null(self) -> bool {
         self.0 == 0
     }
-    
+
     pub const fn offset(self) -> u64 {
         self.0
     }
-    
+
     pub const fn page_id(self) -> u32 {
         (self.0 / 4096) as u32
     }
-    
+
     pub const fn slot_id(self) -> u16 {
         ((self.0 % 4096) / 64) as u16
     }
-    
+
     pub const fn from_page_slot(page_id: u32, slot_id: u16) -> Self {
         let offset = (page_id as u64 * 4096) + (slot_id as u64 * 64);
         Self(offset)
     }
-    
+
     pub fn from_string(s: &str) -> Option<Self> {
         // Parse string reference ID to ObjRef
         // For backward compatibility, we'll use a simple hash
@@ -74,10 +78,12 @@ impl ObjRef {
             return Some(Self::null());
         }
         // Use a simple hash of the string as the offset
-        let hash = s.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+        let hash = s
+            .bytes()
+            .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
         Some(Self::new(hash))
     }
-    
+
     pub fn to_string_id(&self) -> String {
         if self.is_null() {
             String::new()
@@ -106,7 +112,7 @@ impl Document {
     pub fn new(schema: String, fields: HashMap<String, Value>) -> Self {
         let now = Utc::now();
         let id = Uuid::new_v4().to_string();
-        
+
         Self {
             id,
             schema,
@@ -116,11 +122,11 @@ impl Document {
             version: 1, // Start with version 1
         }
     }
-    
+
     /// Create a document with a specific ID
     pub fn with_id(id: DocumentId, schema: String, fields: HashMap<String, Value>) -> Self {
         let now = Utc::now();
-        
+
         Self {
             id,
             schema,
@@ -130,37 +136,37 @@ impl Document {
             version: 1, // Start with version 1
         }
     }
-    
+
     /// Update the document's fields and timestamp
     pub fn update_fields(&mut self, new_fields: HashMap<String, Value>) {
         self.fields.extend(new_fields);
         self.updated_at = Utc::now();
         self.version += 1; // Increment version on update
     }
-    
+
     /// Get a field value by name
     pub fn get_field(&self, field_name: &str) -> Option<&Value> {
         self.fields.get(field_name)
     }
-    
+
     /// Set a field value
     pub fn set_field(&mut self, field_name: String, value: Value) {
         self.fields.insert(field_name, value);
         self.updated_at = Utc::now();
         self.version += 1; // Increment version on update
     }
-    
+
     /// Increment the document version
     pub fn increment_version(&mut self) {
         self.version += 1;
         self.updated_at = Utc::now();
     }
-    
+
     /// Create a new version of this document with updated fields
     pub fn new_version_with_fields(&self, new_fields: HashMap<String, Value>) -> Self {
         let mut updated_fields = self.fields.clone();
         updated_fields.extend(new_fields);
-        
+
         Self {
             id: self.id.clone(),
             schema: self.schema.clone(),
@@ -181,6 +187,7 @@ pub enum Value {
     Boolean(bool),
     DateTime(DateTime<Utc>),
     Reference(ObjRef), // Physical pointer to referenced document
+    GlobalReference(GlobalObjRef), // Shard-aware physical pointer for distributed traversal
     List(Vec<Value>),
     Object(HashMap<String, Value>), // Nested objects for schema evolution
     Null,
@@ -189,17 +196,21 @@ pub enum Value {
 impl Value {
     /// Create a reference from a string ID (for backward compatibility)
     pub fn reference_from_string(s: String) -> Self {
+        if let Some(global_ref) = GlobalObjRef::from_string(&s) {
+            return Value::GlobalReference(global_ref);
+        }
         if let Some(objref) = ObjRef::from_string(&s) {
             Value::Reference(objref)
         } else {
             Value::Reference(ObjRef::null())
         }
     }
-    
+
     /// Get the string representation of a reference (for backward compatibility)
     pub fn reference_to_string(&self) -> Option<String> {
         match self {
             Value::Reference(objref) => Some(objref.to_string_id()),
+            Value::GlobalReference(objref) => Some(objref.to_string_id()),
             _ => None,
         }
     }
@@ -215,12 +226,13 @@ impl Value {
             Value::Boolean(_) => "Boolean",
             Value::DateTime(_) => "DateTime",
             Value::Reference(_) => "Reference",
+            Value::GlobalReference(_) => "Reference",
             Value::List(_) => "List",
             Value::Object(_) => "Object",
             Value::Null => "Null",
         }
     }
-    
+
     /// Convert value to string representation
     pub fn to_string_repr(&self) -> String {
         match self {
@@ -230,22 +242,30 @@ impl Value {
             Value::Boolean(b) => b.to_string(),
             Value::DateTime(dt) => dt.to_rfc3339(),
             Value::Reference(objref) => objref.to_string_id(),
-            Value::List(list) => format!("[{}]", list.iter().map(|v| v.to_string_repr()).collect::<Vec<_>>().join(", ")),
+            Value::GlobalReference(objref) => objref.to_string_id(),
+            Value::List(list) => format!(
+                "[{}]",
+                list.iter()
+                    .map(|v| v.to_string_repr())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             Value::Object(obj) => {
-                let pairs: Vec<String> = obj.iter()
+                let pairs: Vec<String> = obj
+                    .iter()
                     .map(|(k, v)| format!("{}: {}", k, v.to_string_repr()))
                     .collect();
                 format!("{{{}}}", pairs.join(", "))
-            },
+            }
             Value::Null => "null".to_string(),
         }
     }
-    
+
     /// Check if this value is null
     pub fn is_null(&self) -> bool {
         matches!(self, Value::Null)
     }
-    
+
     /// Extract integer value if this is an Integer
     pub fn as_integer(&self) -> Option<i64> {
         match self {
@@ -253,7 +273,7 @@ impl Value {
             _ => None,
         }
     }
-    
+
     /// Extract string value if this is a String
     pub fn as_string(&self) -> Option<&str> {
         match self {
@@ -261,7 +281,7 @@ impl Value {
             _ => None,
         }
     }
-    
+
     /// Extract float value if this is a Float
     pub fn as_float(&self) -> Option<f64> {
         match self {
@@ -269,7 +289,7 @@ impl Value {
             _ => None,
         }
     }
-    
+
     /// Extract boolean value if this is a Boolean
     pub fn as_boolean(&self) -> Option<bool> {
         match self {
@@ -277,7 +297,7 @@ impl Value {
             _ => None,
         }
     }
-    
+
     /// Extract object value if this is an Object
     pub fn as_object(&self) -> Option<&HashMap<String, Value>> {
         match self {
@@ -285,7 +305,7 @@ impl Value {
             _ => None,
         }
     }
-    
+
     /// Extract mutable object value if this is an Object
     pub fn as_object_mut(&mut self) -> Option<&mut HashMap<String, Value>> {
         match self {
@@ -340,37 +360,40 @@ impl From<HashMap<String, Value>> for Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_document_creation() {
         let mut fields = HashMap::new();
         fields.insert("name".to_string(), Value::String("Alice".to_string()));
         fields.insert("age".to_string(), Value::Integer(30));
-        
+
         let doc = Document::new("users".to_string(), fields);
-        
+
         assert_eq!(doc.schema, "users");
-        assert_eq!(doc.get_field("name"), Some(&Value::String("Alice".to_string())));
+        assert_eq!(
+            doc.get_field("name"),
+            Some(&Value::String("Alice".to_string()))
+        );
         assert_eq!(doc.get_field("age"), Some(&Value::Integer(30)));
         assert!(!doc.id.is_empty());
     }
-    
+
     #[test]
     fn test_document_update() {
         let mut fields = HashMap::new();
         fields.insert("name".to_string(), Value::String("Alice".to_string()));
-        
+
         let mut doc = Document::new("users".to_string(), fields);
         let original_updated_at = doc.updated_at;
-        
+
         // Small delay to ensure timestamp difference (removed for simulation compatibility)
-        
+
         doc.set_field("age".to_string(), Value::Integer(30));
-        
+
         assert_eq!(doc.get_field("age"), Some(&Value::Integer(30)));
         assert!(doc.updated_at > original_updated_at);
     }
-    
+
     #[test]
     fn test_value_type_names() {
         assert_eq!(Value::String("test".to_string()).type_name(), "String");
@@ -381,31 +404,28 @@ mod tests {
     }
 }
 
-
 impl Value {
     /// Convert Value to clean JSON without type wrappers
     pub fn to_clean_json(&self) -> serde_json::Value {
         match self {
             Value::String(s) => serde_json::Value::String(s.clone()),
             Value::Integer(i) => serde_json::Value::Number(serde_json::Number::from(*i)),
-            Value::Float(f) => {
-                serde_json::Number::from_f64(*f)
-                    .map(serde_json::Value::Number)
-                    .unwrap_or(serde_json::Value::Null)
-            },
+            Value::Float(f) => serde_json::Number::from_f64(*f)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
             Value::Boolean(b) => serde_json::Value::Bool(*b),
             Value::Null => serde_json::Value::Null,
             Value::List(items) => {
-                let json_items: Vec<serde_json::Value> = items.iter()
-                    .map(|item| item.to_clean_json())
-                    .collect();
+                let json_items: Vec<serde_json::Value> =
+                    items.iter().map(|item| item.to_clean_json()).collect();
                 serde_json::Value::Array(json_items)
-            },
+            }
             Value::DateTime(dt) => serde_json::Value::String(dt.to_rfc3339()),
             Value::Reference(objref) => {
                 // For references, show the reference ID
                 serde_json::Value::String(objref.to_string_id())
-            },
+            }
+            Value::GlobalReference(objref) => serde_json::Value::String(objref.to_string_id()),
             Value::Object(obj) => {
                 let mut json_obj = serde_json::Map::new();
                 for (key, value) in obj {
@@ -421,26 +441,29 @@ impl Document {
     /// Convert Document fields to clean JSON without type wrappers
     pub fn to_clean_json(&self) -> serde_json::Value {
         let mut json_obj = serde_json::Map::new();
-        
+
         // Add document ID
-        json_obj.insert("_id".to_string(), serde_json::Value::String(self.id.clone()));
-        
+        json_obj.insert(
+            "_id".to_string(),
+            serde_json::Value::String(self.id.clone()),
+        );
+
         // Add all fields
         for (key, value) in &self.fields {
             json_obj.insert(key.clone(), value.to_clean_json());
         }
-        
+
         serde_json::Value::Object(json_obj)
     }
-    
+
     /// Convert Document fields to clean JSON without document ID
     pub fn fields_to_clean_json(&self) -> serde_json::Value {
         let mut json_obj = serde_json::Map::new();
-        
+
         for (key, value) in &self.fields {
             json_obj.insert(key.clone(), value.to_clean_json());
         }
-        
+
         serde_json::Value::Object(json_obj)
     }
 }

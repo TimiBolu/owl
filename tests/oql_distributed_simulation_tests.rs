@@ -15,9 +15,9 @@ use owl_db::error::{OQLError, OQLResult};
 use owl_db::executor::QueryExecutor;
 use owl_db::parser::parse_oql;
 use owl_db::simulation::{Clock, Network, SimulatedClock, SimulatedNetwork, Simulation};
-use owl_db::storage::{create_storage, DocumentStore};
+use owl_db::storage::zig_adapter::ZigStore;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -25,7 +25,7 @@ use tempfile::TempDir;
 struct DistributedOQLExecutor {
     shard_manager: Arc<ShardManager>,
     hash_ring: Arc<ConsistentHashRing>,
-    local_executors: HashMap<u32, Arc<QueryExecutor<dyn DocumentStore>>>,
+    local_executors: HashMap<u32, Arc<QueryExecutor<ZigStore>>>,
     query_planner: Arc<DistributedQueryPlanner>,
     clock: Arc<SimulatedClock>,
     network: Arc<SimulatedNetwork>,
@@ -56,7 +56,7 @@ impl DistributedOQLExecutor {
     /// Add a shard with its local executor
     fn add_shard(&mut self, shard_id: u32, temp_dir: &TempDir) -> Result<(), OQLError> {
         let path = temp_dir.path().join(format!("shard_{}.owl", shard_id));
-        let store = create_storage(path.to_str().unwrap(), 10 * 1024 * 1024)?;
+        let store = Arc::new(ZigStore::new(path, 10 * 1024 * 1024)?);
         let executor = Arc::new(QueryExecutor::new(store, self.clock.clone()));
         
         self.local_executors.insert(shard_id, executor);
@@ -270,14 +270,14 @@ fn test_oql_queries_during_network_partitions() -> OQLResult<()> {
     
     // Create distributed system with 5 shards
     let temp_dir = TempDir::new().unwrap();
-    let shard_manager = Arc::new(ShardManager::new(sim.clock()));
-    let hash_ring = Arc::new(ConsistentHashRing::new(256));
+    let shard_manager = Arc::new(ShardManager::new());
+    let hash_ring = Arc::new(ConsistentHashRing::new());
     
     let mut executor = DistributedOQLExecutor::new(
         shard_manager,
         hash_ring,
-        sim.clock(),
-        sim.network(),
+        sim.simulated_clock(),
+        sim.simulated_network(),
     )?;
     
     // Add shards
@@ -294,7 +294,7 @@ fn test_oql_queries_during_network_partitions() -> OQLResult<()> {
     assert!(!normal_results.is_empty(), "Should have results under normal conditions");
     
     // Create network partition: {1, 2} | {3, 4, 5}
-    sim.network().partition(&[1, 2], &[3, 4, 5]);
+    sim.partition_network(&[1, 2], &[3, 4, 5]);
     
     // Test query execution during partition
     let partition_query = r#"users.where { .status == "active" }"#;
@@ -315,7 +315,7 @@ fn test_oql_queries_during_network_partitions() -> OQLResult<()> {
     }
     
     // Heal partition
-    sim.network().heal_partition();
+    sim.heal_network();
     
     // Test query execution after healing
     let healed_query = r#"users.select { id, name }"#;
@@ -332,14 +332,14 @@ fn test_reference_navigation_with_node_failures() -> OQLResult<()> {
     let mut sim = Simulation::new(seed);
     
     let temp_dir = TempDir::new().unwrap();
-    let shard_manager = Arc::new(ShardManager::new(sim.clock()));
-    let hash_ring = Arc::new(ConsistentHashRing::new(256));
+    let shard_manager = Arc::new(ShardManager::new());
+    let hash_ring = Arc::new(ConsistentHashRing::new());
     
     let mut executor = DistributedOQLExecutor::new(
         shard_manager,
         hash_ring,
-        sim.clock(),
-        sim.network(),
+        sim.simulated_clock(),
+        sim.simulated_network(),
     )?;
     
     // Add shards
@@ -355,7 +355,7 @@ fn test_reference_navigation_with_node_failures() -> OQLResult<()> {
     assert!(nav_result.is_ok(), "Reference navigation should work normally");
     
     // Simulate node failure
-    sim.network().remove_node(2);
+    sim.simulated_network().remove_node(2);
     
     // Test navigation when target shard is unavailable
     let failed_objref = GlobalObjRef::new(2, 2000, 0);
@@ -379,7 +379,7 @@ fn test_reference_navigation_with_node_failures() -> OQLResult<()> {
     assert!(available_nav.is_ok(), "Navigation to available shard should work");
     
     // Recover failed node
-    sim.network().add_node(2);
+    sim.simulated_network().add_node(2);
     
     // Test navigation after recovery
     let recovered_nav = executor.navigate_reference(failed_objref, ".profile.settings");
@@ -395,14 +395,14 @@ fn test_oql_transactions_across_failing_shards() -> OQLResult<()> {
     let mut sim = Simulation::new(seed);
     
     let temp_dir = TempDir::new().unwrap();
-    let shard_manager = Arc::new(ShardManager::new(sim.clock()));
-    let hash_ring = Arc::new(ConsistentHashRing::new(256));
+    let shard_manager = Arc::new(ShardManager::new());
+    let hash_ring = Arc::new(ConsistentHashRing::new());
     
     let mut executor = DistributedOQLExecutor::new(
         shard_manager,
         hash_ring,
-        sim.clock(),
-        sim.network(),
+        sim.simulated_clock(),
+        sim.simulated_network(),
     )?;
     
     // Add shards
@@ -421,7 +421,7 @@ fn test_oql_transactions_across_failing_shards() -> OQLResult<()> {
     assert!(success_result.is_ok(), "Transaction should succeed under normal conditions");
     
     // Simulate shard failure during transaction
-    sim.network().remove_node(2);
+    sim.simulated_network().remove_node(2);
     
     let failing_operations = vec![
         r#"users.insert { id: "tx_user2", name: "Bob", balance: 500 }"#.to_string(),
@@ -443,7 +443,7 @@ fn test_oql_transactions_across_failing_shards() -> OQLResult<()> {
     }
     
     // Recover shard and test transaction again
-    sim.network().add_node(2);
+    sim.simulated_network().add_node(2);
     
     let recovery_operations = vec![
         r#"users.insert { id: "tx_user3", name: "Charlie", balance: 750 }"#.to_string(),
@@ -463,14 +463,14 @@ fn test_oql_semantics_preservation_under_failures() -> OQLResult<()> {
     let mut sim = Simulation::new(seed);
     
     let temp_dir = TempDir::new().unwrap();
-    let shard_manager = Arc::new(ShardManager::new(sim.clock()));
-    let hash_ring = Arc::new(ConsistentHashRing::new(256));
+    let shard_manager = Arc::new(ShardManager::new());
+    let hash_ring = Arc::new(ConsistentHashRing::new());
     
     let mut executor = DistributedOQLExecutor::new(
         shard_manager,
         hash_ring,
-        sim.clock(),
-        sim.network(),
+        sim.simulated_clock(),
+        sim.simulated_network(),
     )?;
     
     // Add shards
@@ -503,7 +503,7 @@ fn test_oql_semantics_preservation_under_failures() -> OQLResult<()> {
     }
     
     // Test under packet loss
-    sim.network().set_packet_loss_rate(0.3);
+    sim.set_packet_loss(0.3);
     
     for query in &test_queries {
         let result = executor.execute_oql(query);
@@ -530,10 +530,10 @@ fn test_oql_semantics_preservation_under_failures() -> OQLResult<()> {
     }
     
     // Reset network conditions
-    sim.network().set_packet_loss_rate(0.0);
+    sim.set_packet_loss(0.0);
     
     // Test under high latency
-    sim.network().set_base_latency(Duration::from_millis(500));
+    sim.simulated_network().set_base_latency(Duration::from_millis(500));
     
     for query in &test_queries {
         let start_time = sim.clock().now();
@@ -562,8 +562,8 @@ fn test_oql_semantics_preservation_under_failures() -> OQLResult<()> {
     }
     
     // Test under network partition
-    sim.network().set_base_latency(Duration::from_millis(10)); // Reset latency
-    sim.network().partition(&[1, 2], &[3, 4]);
+    sim.simulated_network().set_base_latency(Duration::from_millis(10)); // Reset latency
+    sim.partition_network(&[1, 2], &[3, 4]);
     
     for query in &test_queries {
         let result = executor.execute_oql(query);
@@ -586,7 +586,7 @@ fn test_oql_semantics_preservation_under_failures() -> OQLResult<()> {
     }
     
     // Heal partition and verify full functionality returns
-    sim.network().heal_partition();
+    sim.heal_network();
     
     let final_query = r#"users.select { id, name, age }"#;
     let final_result = executor.execute_oql(final_query)?;
@@ -602,14 +602,14 @@ fn test_oql_query_optimization_under_failures() -> OQLResult<()> {
     let mut sim = Simulation::new(seed);
     
     let temp_dir = TempDir::new().unwrap();
-    let shard_manager = Arc::new(ShardManager::new(sim.clock()));
-    let hash_ring = Arc::new(ConsistentHashRing::new(256));
+    let shard_manager = Arc::new(ShardManager::new());
+    let hash_ring = Arc::new(ConsistentHashRing::new());
     
     let mut executor = DistributedOQLExecutor::new(
         shard_manager,
         hash_ring,
-        sim.clock(),
-        sim.network(),
+        sim.simulated_clock(),
+        sim.simulated_network(),
     )?;
     
     // Add shards
@@ -626,8 +626,8 @@ fn test_oql_query_optimization_under_failures() -> OQLResult<()> {
     let normal_time = sim.clock().now().duration_since(normal_start);
     
     // Simulate some shard failures
-    sim.network().remove_node(2);
-    sim.network().remove_node(4);
+    sim.simulated_network().remove_node(2);
+    sim.simulated_network().remove_node(4);
     
     // Execute same query with fewer available shards
     let failure_start = sim.clock().now();

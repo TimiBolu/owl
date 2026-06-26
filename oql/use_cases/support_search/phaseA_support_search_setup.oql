@@ -1,0 +1,131 @@
+// Phase A - Support Knowledge Search
+// Setup script: schemas + seed data (refs + nested metadata + vectors)
+
+schema organizations {
+  id: String,
+  name: String,
+  profile: Object
+}
+
+schema teams {
+  id: String,
+  org: Ref(organizations),
+  name: String,
+  settings: Object
+}
+
+schema kb_articles {
+  id: String,
+  team: Ref(teams),
+  title: String,
+  status: String,
+  tags: List(String),
+  meta: Object
+}
+
+schema kb_chunks {
+  id: String,
+  article: Ref(kb_articles),
+  team: Ref(teams),
+  org: Ref(organizations),
+  chunk_index: Integer,
+  status: String,
+  chunk_text: String,
+  tags: List(String),
+  meta: Object,
+  embedding: Vector(4)
+}
+
+organizations.insert [
+  { id: "org_1", name: "Northwind", profile: { region: "west", tier: "enterprise" } },
+  { id: "org_2", name: "Contoso", profile: { region: "east", tier: "growth" } }
+]
+
+teams.insert [
+  { id: "team_payments", org: "org_1", name: "Payments", settings: { timezone: "UTC", lang: "en" } },
+  { id: "team_infra", org: "org_1", name: "Infra", settings: { timezone: "UTC+1", lang: "en" } },
+  { id: "team_commerce", org: "org_2", name: "Commerce", settings: { timezone: "UTC-5", lang: "en" } }
+]
+
+kb_articles.insert [
+  { id: "art_cb_001", team: "team_payments", title: "Chargeback dispute workflow", status: "published", tags: ["payments", "risk"], meta: { source: "runbook", lang: "en", updated_at: "2026-02-21T12:10:00Z" } },
+  { id: "art_rf_001", team: "team_payments", title: "Refund processing policy", status: "published", tags: ["payments", "refunds"], meta: { source: "policy", lang: "en", updated_at: "2026-02-19T09:00:00Z" } },
+  { id: "art_k8s_001", team: "team_infra", title: "Kubernetes node pressure runbook", status: "published", tags: ["infra", "kubernetes"], meta: { source: "runbook", lang: "en", updated_at: "2026-02-20T16:45:00Z" } },
+  { id: "art_idx_001", team: "team_commerce", title: "Catalog indexing lag playbook", status: "draft", tags: ["search", "commerce"], meta: { source: "playbook", lang: "en", updated_at: "2026-02-18T11:30:00Z" } }
+]
+
+kb_chunks.insert [
+  {
+    id: "art_cb_001:0",
+    article: "art_cb_001",
+    team: "team_payments",
+    org: "org_1",
+    chunk_index: 0,
+    status: "published",
+    chunk_text: "When a chargeback is received, gather payment proof and communication logs before submitting the dispute.",
+    tags: ["payments", "risk", "chargeback"],
+    meta: { lang: "en", freshness_days: 2, channel: "web" },
+    embedding: [0.93, 0.06, 0.07, 0.02]
+  },
+  {
+    id: "art_cb_001:1",
+    article: "art_cb_001",
+    team: "team_payments",
+    org: "org_1",
+    chunk_index: 1,
+    status: "published",
+    chunk_text: "Dispute response should include delivery confirmation, refund history, and fraud screening indicators.",
+    tags: ["payments", "risk", "dispute"],
+    meta: { lang: "en", freshness_days: 2, channel: "ops" },
+    embedding: [0.90, 0.08, 0.09, 0.03]
+  },
+  {
+    id: "art_rf_001:0",
+    article: "art_rf_001",
+    team: "team_payments",
+    org: "org_1",
+    chunk_index: 0,
+    status: "published",
+    chunk_text: "Refunds can be full or partial. Validate original transaction id and settlement state before approval.",
+    tags: ["payments", "refunds"],
+    meta: { lang: "en", freshness_days: 4, channel: "web" },
+    embedding: [0.85, 0.11, 0.05, 0.01]
+  },
+  {
+    id: "art_k8s_001:0",
+    article: "art_k8s_001",
+    team: "team_infra",
+    org: "org_1",
+    chunk_index: 0,
+    status: "published",
+    chunk_text: "If node memory pressure is high, inspect eviction events, tune limits, and rebalance workloads.",
+    tags: ["infra", "kubernetes", "sre"],
+    meta: { lang: "en", freshness_days: 3, channel: "infra" },
+    embedding: [0.08, 0.94, 0.15, 0.04]
+  },
+  {
+    id: "art_k8s_001:1",
+    article: "art_k8s_001",
+    team: "team_infra",
+    org: "org_1",
+    chunk_index: 1,
+    status: "published",
+    chunk_text: "Restart loops often correlate with memory throttling and failed liveness probes under load.",
+    tags: ["infra", "kubernetes", "debugging"],
+    meta: { lang: "en", freshness_days: 3, channel: "infra" },
+    embedding: [0.06, 0.91, 0.18, 0.05]
+  },
+  {
+    id: "art_idx_001:0",
+    article: "art_idx_001",
+    team: "team_commerce",
+    org: "org_2",
+    chunk_index: 0,
+    status: "draft",
+    chunk_text: "Indexing lag can result in stale product pages and delayed search visibility.",
+    tags: ["search", "commerce", "indexing"],
+    meta: { lang: "en", freshness_days: 10, channel: "search" },
+    embedding: [0.18, 0.24, 0.82, 0.12]
+  }
+]
+

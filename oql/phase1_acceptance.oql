@@ -1,0 +1,79 @@
+// Phase 1 acceptance script:
+// - shared type syntax in schema parsing (Ref/List/Optional)
+// - function definitions executable in script mode
+// - query bindings reusable across subsequent statements
+
+schema organizations {
+  id: String,
+  name: String,
+  region: String
+}
+
+schema users {
+  id: String,
+  org: Ref(organizations),
+  status: String,
+  tags: List(String),
+  nickname: Optional(String),
+  created_at: String
+}
+
+fn is_active_user(u: users) -> Bool {
+  u.status == "active"
+}
+
+fn has_tag(u: users, tag: String) -> Bool {
+  u.tags contains tag
+}
+
+organizations.insert [
+  { id: "org_1", name: "Northwind", region: "west" },
+  { id: "org_2", name: "Contoso", region: "east" }
+]
+
+users.insert [
+  {
+    id: "u1",
+    org: "org_1",
+    status: "active",
+    tags: ["beta", "staff"],
+    nickname: "ace",
+    created_at: "2026-02-20T10:00:00Z"
+  },
+  {
+    id: "u2",
+    org: "org_1",
+    status: "inactive",
+    tags: ["staff"],
+    created_at: "2026-02-20T10:05:00Z"
+  },
+  {
+    id: "u3",
+    org: "org_2",
+    status: "active",
+    tags: ["beta"],
+    nickname: null,
+    created_at: "2026-02-20T10:10:00Z"
+  }
+]
+
+activeUsers = users.where { is_active_user(*) }
+
+activeUsers.select {
+  id,
+  org_name: .org.name,
+  nickname
+}
+
+activeUsers.where { has_tag(*, "beta") }.select {
+  id,
+  org_name: .org.name
+}
+
+activeUsers
+  .group_by { .org.id, .org.name }
+  .select {
+    org_id: .org.id,
+    org_name: .org.name,
+    active_count: count()
+  }

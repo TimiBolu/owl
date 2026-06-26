@@ -352,25 +352,19 @@ pub enum Environment {
 impl DatabaseConfig {
     /// Load configuration from file
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> OQLResult<Self> {
-        let content = fs::read_to_string(path).map_err(|e| {
-            OQLError::Generic {
-                message: format!("Failed to read config file: {}", e),
-            }
+        let content = fs::read_to_string(path).map_err(|e| OQLError::Generic {
+            message: format!("Failed to read config file: {}", e),
         })?;
 
         let config: DatabaseConfig = if content.trim_start().starts_with('{') {
             // JSON format
-            serde_json::from_str(&content).map_err(|e| {
-                OQLError::Generic {
-                    message: format!("Failed to parse JSON config: {}", e),
-                }
+            serde_json::from_str(&content).map_err(|e| OQLError::Generic {
+                message: format!("Failed to parse JSON config: {}", e),
             })?
         } else {
             // TOML format
-            toml::from_str(&content).map_err(|e| {
-                OQLError::Generic {
-                    message: format!("Failed to parse TOML config: {}", e),
-                }
+            toml::from_str(&content).map_err(|e| OQLError::Generic {
+                message: format!("Failed to parse TOML config: {}", e),
             })?
         };
 
@@ -381,22 +375,18 @@ impl DatabaseConfig {
     /// Save configuration to file
     pub fn save_to_file<P: AsRef<Path>>(&self, path: P, format: ConfigFormat) -> OQLResult<()> {
         let content = match format {
-            ConfigFormat::JSON => serde_json::to_string_pretty(self).map_err(|e| {
-                OQLError::Generic {
+            ConfigFormat::JSON => {
+                serde_json::to_string_pretty(self).map_err(|e| OQLError::Generic {
                     message: format!("Failed to serialize config to JSON: {}", e),
-                }
-            })?,
-            ConfigFormat::TOML => toml::to_string_pretty(self).map_err(|e| {
-                OQLError::Generic {
-                    message: format!("Failed to serialize config to TOML: {}", e),
-                }
+                })?
+            }
+            ConfigFormat::TOML => toml::to_string_pretty(self).map_err(|e| OQLError::Generic {
+                message: format!("Failed to serialize config to TOML: {}", e),
             })?,
         };
 
-        fs::write(path, content).map_err(|e| {
-            OQLError::Generic {
-                message: format!("Failed to write config file: {}", e),
-            }
+        fs::write(path, content).map_err(|e| OQLError::Generic {
+            message: format!("Failed to write config file: {}", e),
         })?;
 
         Ok(())
@@ -411,27 +401,24 @@ impl DatabaseConfig {
             config.storage.data_dir = PathBuf::from(data_dir);
         }
         if let Ok(max_size) = std::env::var("OQL_MAX_SIZE_BYTES") {
-            config.storage.max_size_bytes = Some(max_size.parse().map_err(|_| {
-                OQLError::Generic {
+            config.storage.max_size_bytes =
+                Some(max_size.parse().map_err(|_| OQLError::Generic {
                     message: "Invalid OQL_MAX_SIZE_BYTES value".to_string(),
-                }
-            })?);
+                })?);
         }
 
         // Performance configuration
         if let Ok(max_conn) = std::env::var("OQL_MAX_CONNECTIONS") {
-            config.performance.max_connections = max_conn.parse().map_err(|_| {
-                OQLError::Generic {
+            config.performance.max_connections =
+                max_conn.parse().map_err(|_| OQLError::Generic {
                     message: "Invalid OQL_MAX_CONNECTIONS value".to_string(),
-                }
-            })?;
+                })?;
         }
         if let Ok(timeout) = std::env::var("OQL_QUERY_TIMEOUT") {
-            config.performance.query_timeout_seconds = timeout.parse().map_err(|_| {
-                OQLError::Generic {
+            config.performance.query_timeout_seconds =
+                timeout.parse().map_err(|_| OQLError::Generic {
                     message: "Invalid OQL_QUERY_TIMEOUT value".to_string(),
-                }
-            })?;
+                })?;
         }
 
         // Network configuration
@@ -439,10 +426,8 @@ impl DatabaseConfig {
             config.network.bind_address = bind_addr;
         }
         if let Ok(port) = std::env::var("OQL_PORT") {
-            config.network.port = port.parse().map_err(|_| {
-                OQLError::Generic {
-                    message: "Invalid OQL_PORT value".to_string(),
-                }
+            config.network.port = port.parse().map_err(|_| OQLError::Generic {
+                message: "Invalid OQL_PORT value".to_string(),
             })?;
         }
 
@@ -508,7 +493,8 @@ impl DatabaseConfig {
         if self.security.enable_tls {
             if self.security.tls_cert_path.is_none() || self.security.tls_key_path.is_none() {
                 return Err(OQLError::Generic {
-                    message: "TLS certificate and key paths must be specified when TLS is enabled".to_string(),
+                    message: "TLS certificate and key paths must be specified when TLS is enabled"
+                        .to_string(),
                 });
             }
         }
@@ -579,24 +565,25 @@ impl BackupManager {
     }
 
     /// Create a backup of the database
-    pub fn create_backup<P: AsRef<Path>>(&self, source_dir: P, backup_name: Option<String>) -> OQLResult<PathBuf> {
+    pub fn create_backup<P: AsRef<Path>>(
+        &self,
+        source_dir: P,
+        backup_name: Option<String>,
+    ) -> OQLResult<PathBuf> {
         if !self.config.enabled {
             return Err(OQLError::Generic {
                 message: "Backups are disabled in configuration".to_string(),
             });
         }
 
-        let backup_name = backup_name.unwrap_or_else(|| {
-            chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string()
-        });
+        let backup_name =
+            backup_name.unwrap_or_else(|| chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string());
 
         let backup_path = self.config.backup_dir.join(&backup_name);
 
         // Create backup directory if it doesn't exist
-        fs::create_dir_all(&backup_path).map_err(|e| {
-            OQLError::Generic {
-                message: format!("Failed to create backup directory: {}", e),
-            }
+        fs::create_dir_all(&backup_path).map_err(|e| OQLError::Generic {
+            message: format!("Failed to create backup directory: {}", e),
         })?;
 
         // Copy database files
@@ -606,14 +593,12 @@ impl BackupManager {
         let final_path = if self.config.compress {
             let compressed_path = backup_path.with_extension("tar.gz");
             self.compress_backup(&backup_path, &compressed_path)?;
-            
+
             // Remove uncompressed backup
-            fs::remove_dir_all(&backup_path).map_err(|e| {
-                OQLError::Generic {
-                    message: format!("Failed to remove uncompressed backup: {}", e),
-                }
+            fs::remove_dir_all(&backup_path).map_err(|e| OQLError::Generic {
+                message: format!("Failed to remove uncompressed backup: {}", e),
             })?;
-            
+
             compressed_path
         } else {
             backup_path
@@ -626,7 +611,11 @@ impl BackupManager {
     }
 
     /// Restore database from backup
-    pub fn restore_backup<P: AsRef<Path>, Q: AsRef<Path>>(&self, backup_path: P, target_dir: Q) -> OQLResult<()> {
+    pub fn restore_backup<P: AsRef<Path>, Q: AsRef<Path>>(
+        &self,
+        backup_path: P,
+        target_dir: Q,
+    ) -> OQLResult<()> {
         let backup_path = backup_path.as_ref();
         let target_dir = target_dir.as_ref();
 
@@ -638,10 +627,8 @@ impl BackupManager {
         }
 
         // Create target directory
-        fs::create_dir_all(target_dir).map_err(|e| {
-            OQLError::Generic {
-                message: format!("Failed to create target directory: {}", e),
-            }
+        fs::create_dir_all(target_dir).map_err(|e| OQLError::Generic {
+            message: format!("Failed to create target directory: {}", e),
         })?;
 
         // Decompress if needed
@@ -661,24 +648,18 @@ impl BackupManager {
         }
 
         let mut backups = Vec::new();
-        let entries = fs::read_dir(&self.config.backup_dir).map_err(|e| {
-            OQLError::Generic {
-                message: format!("Failed to read backup directory: {}", e),
-            }
+        let entries = fs::read_dir(&self.config.backup_dir).map_err(|e| OQLError::Generic {
+            message: format!("Failed to read backup directory: {}", e),
         })?;
 
         for entry in entries {
-            let entry = entry.map_err(|e| {
-                OQLError::Generic {
-                    message: format!("Failed to read directory entry: {}", e),
-                }
+            let entry = entry.map_err(|e| OQLError::Generic {
+                message: format!("Failed to read directory entry: {}", e),
             })?;
 
             let path = entry.path();
-            let metadata = entry.metadata().map_err(|e| {
-                OQLError::Generic {
-                    message: format!("Failed to read file metadata: {}", e),
-                }
+            let metadata = entry.metadata().map_err(|e| OQLError::Generic {
+                message: format!("Failed to read file metadata: {}", e),
             })?;
 
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
@@ -686,7 +667,9 @@ impl BackupManager {
                     name: name.to_string(),
                     path: path.clone(),
                     size_bytes: metadata.len(),
-                    created_at: metadata.created().ok()
+                    created_at: metadata
+                        .created()
+                        .ok()
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                         .map(|d| chrono::DateTime::from_timestamp(d.as_secs() as i64, 0))
                         .flatten()
@@ -706,18 +689,18 @@ impl BackupManager {
     fn copy_directory(&self, source: &Path, target: &Path) -> OQLResult<()> {
         // This is a simplified implementation
         // In a real implementation, we'd use a proper directory copying library
-        fs::create_dir_all(target).map_err(|e| {
-            OQLError::Generic {
-                message: format!("Failed to create directory: {}", e),
-            }
+        fs::create_dir_all(target).map_err(|e| OQLError::Generic {
+            message: format!("Failed to create directory: {}", e),
         })?;
 
         // For now, just create a placeholder file
         let placeholder = target.join("backup_placeholder.txt");
-        fs::write(&placeholder, format!("Backup created from: {}", source.display())).map_err(|e| {
-            OQLError::Generic {
-                message: format!("Failed to write backup placeholder: {}", e),
-            }
+        fs::write(
+            &placeholder,
+            format!("Backup created from: {}", source.display()),
+        )
+        .map_err(|e| OQLError::Generic {
+            message: format!("Failed to write backup placeholder: {}", e),
         })?;
 
         Ok(())
@@ -728,10 +711,8 @@ impl BackupManager {
         // This is a simplified implementation
         // In a real implementation, we'd use a proper compression library
         let content = format!("Compressed backup of: {}", source.display());
-        fs::write(target, content).map_err(|e| {
-            OQLError::Generic {
-                message: format!("Failed to create compressed backup: {}", e),
-            }
+        fs::write(target, content).map_err(|e| OQLError::Generic {
+            message: format!("Failed to create compressed backup: {}", e),
         })?;
 
         Ok(())
@@ -741,17 +722,13 @@ impl BackupManager {
     fn decompress_backup(&self, source: &Path, target: &Path) -> OQLResult<()> {
         // This is a simplified implementation
         // In a real implementation, we'd use a proper decompression library
-        let content = fs::read_to_string(source).map_err(|e| {
-            OQLError::Generic {
-                message: format!("Failed to read compressed backup: {}", e),
-            }
+        let content = fs::read_to_string(source).map_err(|e| OQLError::Generic {
+            message: format!("Failed to read compressed backup: {}", e),
         })?;
 
         let placeholder = target.join("restored_backup.txt");
-        fs::write(&placeholder, content).map_err(|e| {
-            OQLError::Generic {
-                message: format!("Failed to write restored backup: {}", e),
-            }
+        fs::write(&placeholder, content).map_err(|e| OQLError::Generic {
+            message: format!("Failed to write restored backup: {}", e),
         })?;
 
         Ok(())
@@ -760,22 +737,18 @@ impl BackupManager {
     /// Clean up old backups
     fn cleanup_old_backups(&self) -> OQLResult<()> {
         let backups = self.list_backups()?;
-        
+
         if backups.len() > self.config.max_backups as usize {
             let to_remove = &backups[self.config.max_backups as usize..];
-            
+
             for backup in to_remove {
                 if backup.path.is_file() {
-                    fs::remove_file(&backup.path).map_err(|e| {
-                        OQLError::Generic {
-                            message: format!("Failed to remove old backup: {}", e),
-                        }
+                    fs::remove_file(&backup.path).map_err(|e| OQLError::Generic {
+                        message: format!("Failed to remove old backup: {}", e),
                     })?;
                 } else if backup.path.is_dir() {
-                    fs::remove_dir_all(&backup.path).map_err(|e| {
-                        OQLError::Generic {
-                            message: format!("Failed to remove old backup directory: {}", e),
-                        }
+                    fs::remove_dir_all(&backup.path).map_err(|e| OQLError::Generic {
+                        message: format!("Failed to remove old backup directory: {}", e),
                     })?;
                 }
             }
@@ -813,7 +786,7 @@ impl MigrationManager {
     /// Migrate data from source to target configuration
     pub fn migrate_data(&self) -> OQLResult<MigrationResult> {
         let start_time = chrono::Utc::now();
-        
+
         // This is a simplified implementation
         // In a real implementation, we'd:
         // 1. Open source database
@@ -918,10 +891,10 @@ mod tests {
     #[test]
     fn test_config_validation() {
         let mut config = DatabaseConfig::default();
-        
+
         // Valid config should pass
         assert!(config.validate().is_ok());
-        
+
         // Invalid config should fail
         config.performance.max_connections = 0;
         assert!(config.validate().is_err());
@@ -939,14 +912,16 @@ mod tests {
         };
 
         let backup_manager = BackupManager::new(backup_config);
-        
+
         // Create a test source directory
         let source_dir = temp_dir.path().join("source");
         fs::create_dir_all(&source_dir).unwrap();
         fs::write(source_dir.join("test.txt"), "test data").unwrap();
 
         // Create backup
-        let backup_path = backup_manager.create_backup(&source_dir, Some("test_backup".to_string())).unwrap();
+        let backup_path = backup_manager
+            .create_backup(&source_dir, Some("test_backup".to_string()))
+            .unwrap();
         assert!(backup_path.exists());
 
         // List backups
@@ -959,12 +934,12 @@ mod tests {
     fn test_migration_manager() {
         let mut source_config = DatabaseConfig::default();
         source_config.storage.compression = CompressionType::Snappy;
-        
+
         let mut target_config = DatabaseConfig::for_environment(Environment::Production);
         target_config.storage.compression = CompressionType::LZ4;
 
         let migration_manager = MigrationManager::new(source_config, target_config);
-        
+
         // Validate migration
         let issues = migration_manager.validate_migration().unwrap();
         assert!(!issues.is_empty()); // Should have some warnings about config differences

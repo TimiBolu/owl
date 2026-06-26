@@ -17,6 +17,7 @@ pub struct PhysicalPlan {
 }
 
 /// Physical query planner
+#[allow(dead_code)]
 pub struct PhysicalPlanner {
     /// Schema registry for optimization decisions
     schema_registry: Option<SchemaRegistry>,
@@ -41,7 +42,7 @@ impl PhysicalPlanner {
             statistics: None,
         }
     }
-    
+
     /// Create a planner with schema registry
     pub fn with_schema_registry(schema_registry: SchemaRegistry) -> Self {
         Self {
@@ -49,23 +50,23 @@ impl PhysicalPlanner {
             statistics: None,
         }
     }
-    
+
     /// Create a planner with statistics
     pub fn with_statistics(mut self, statistics: Statistics) -> Self {
         self.statistics = Some(statistics);
         self
     }
-    
+
     /// Convert a logical plan to a physical plan
     pub fn plan(&self, logical_plan: &LogicalPlan) -> OQLResult<PhysicalPlan> {
         let root = self.plan_node(&logical_plan.root)?;
-        
+
         Ok(PhysicalPlan {
             root,
             schema_registry: logical_plan.schema_registry.clone(),
         })
     }
-    
+
     /// Convert a logical plan node to a physical operator
     fn plan_node(&self, node: &PlanNode) -> OQLResult<PhysicalOperator> {
         match node.plan_type {
@@ -80,17 +81,21 @@ impl PhysicalPlanner {
             PlanType::Insert => self.plan_insert(node),
             PlanType::Update => self.plan_update(node),
             PlanType::Delete => self.plan_delete(node),
+            PlanType::VectorNearest => self.plan_vector_nearest(node),
             PlanType::Join => self.plan_join(node),
         }
     }
-    
+
     /// Plan a scan operation - choose between SeqScan and IndexScan
     fn plan_scan(&self, node: &PlanNode) -> OQLResult<PhysicalOperator> {
-        let schema = node.metadata.schema.clone()
+        let schema = node
+            .metadata
+            .schema
+            .clone()
             .ok_or_else(|| OQLError::Generic {
                 message: "Scan node missing schema".to_string(),
             })?;
-        
+
         // Check if we have an index available and a condition to use it
         if let Some(stats) = &self.statistics {
             if let Some(indexes) = stats.available_indexes.get(&schema) {
@@ -103,7 +108,7 @@ impl PhysicalPlanner {
                                 // Use index scan
                                 let index_name = format!("idx_{}_{}", schema, index_field);
                                 let estimated_rows = self.estimate_table_size(&schema) / 10; // Assume 10% selectivity
-                                
+
                                 return Ok(PhysicalOperator::IndexScan(IndexScanOperator {
                                     schema: schema.clone(),
                                     index_name,
@@ -116,25 +121,32 @@ impl PhysicalPlanner {
                 }
             }
         }
-        
+
         // Default to sequential scan
         Ok(PhysicalOperator::SeqScan(SeqScanOperator {
             schema: schema.clone(),
             estimated_rows: self.estimate_table_size(&schema),
         }))
     }
-    
+
     /// Extract the field name from a filter condition for index selection
-    fn extract_index_field(&self, condition: &crate::planner::types::FilterCondition) -> Option<String> {
-        use crate::planner::types::FilterCondition;
+    fn extract_index_field(
+        &self,
+        condition: &crate::planner::types::FilterCondition,
+    ) -> Option<String> {
         use crate::parser::Expression;
-        
+        use crate::planner::types::FilterCondition;
+
         match condition {
-            FilterCondition::Comparison { left, operator: _, right: _ } => {
+            FilterCondition::Comparison {
+                left,
+                operator: _,
+                right: _,
+            } => {
                 // Extract field from left side
                 if let Expression::FieldAccess(field_access) = left {
                     if !field_access.path.is_empty() {
-                        return Some(field_access.path[0].clone());
+                        return Some(field_access.path.join("."));
                     }
                 }
                 None
@@ -146,14 +158,17 @@ impl PhysicalPlanner {
             _ => None,
         }
     }
-    
+
     /// Plan a filter operation
     fn plan_filter(&self, node: &PlanNode) -> OQLResult<PhysicalOperator> {
-        let condition = node.metadata.condition.clone()
+        let condition = node
+            .metadata
+            .condition
+            .clone()
             .ok_or_else(|| OQLError::Generic {
                 message: "Filter node missing condition".to_string(),
             })?;
-        
+
         let input = if node.children.is_empty() {
             return Err(OQLError::Generic {
                 message: "Filter node missing input".to_string(),
@@ -161,18 +176,18 @@ impl PhysicalPlanner {
         } else {
             Box::new(self.plan_node(&node.children[0])?)
         };
-        
+
         Ok(PhysicalOperator::Filter(FilterOperator {
             condition,
             input,
             selectivity: 0.1, // Default selectivity estimate
         }))
     }
-    
+
     /// Plan a projection operation
     fn plan_project(&self, node: &PlanNode) -> OQLResult<PhysicalOperator> {
         let projections = node.metadata.projections.clone();
-        
+
         let input = if node.children.is_empty() {
             return Err(OQLError::Generic {
                 message: "Project node missing input".to_string(),
@@ -180,17 +195,17 @@ impl PhysicalPlanner {
         } else {
             Box::new(self.plan_node(&node.children[0])?)
         };
-        
+
         Ok(PhysicalOperator::Project(ProjectOperator {
             projections,
             input,
         }))
     }
-    
+
     /// Plan a sort operation
     fn plan_sort(&self, node: &PlanNode) -> OQLResult<PhysicalOperator> {
         let sort_specs = node.metadata.sort_specs.clone();
-        
+
         let input = if node.children.is_empty() {
             return Err(OQLError::Generic {
                 message: "Sort node missing input".to_string(),
@@ -198,20 +213,16 @@ impl PhysicalPlanner {
         } else {
             Box::new(self.plan_node(&node.children[0])?)
         };
-        
-        Ok(PhysicalOperator::Sort(SortOperator {
-            sort_specs,
-            input,
-        }))
+
+        Ok(PhysicalOperator::Sort(SortOperator { sort_specs, input }))
     }
-    
+
     /// Plan a limit operation
     fn plan_limit(&self, node: &PlanNode) -> OQLResult<PhysicalOperator> {
-        let limit = node.metadata.limit
-            .ok_or_else(|| OQLError::Generic {
-                message: "Limit node missing limit value".to_string(),
-            })?;
-        
+        let limit = node.metadata.limit.ok_or_else(|| OQLError::Generic {
+            message: "Limit node missing limit value".to_string(),
+        })?;
+
         let input = if node.children.is_empty() {
             return Err(OQLError::Generic {
                 message: "Limit node missing input".to_string(),
@@ -219,17 +230,14 @@ impl PhysicalPlanner {
         } else {
             Box::new(self.plan_node(&node.children[0])?)
         };
-        
-        Ok(PhysicalOperator::Limit(LimitOperator {
-            limit,
-            input,
-        }))
+
+        Ok(PhysicalOperator::Limit(LimitOperator { limit, input }))
     }
-    
+
     /// Plan a group by operation
     fn plan_group_by(&self, node: &PlanNode) -> OQLResult<PhysicalOperator> {
         let group_by_fields = node.metadata.group_by_fields.clone();
-        
+
         let input = if node.children.is_empty() {
             return Err(OQLError::Generic {
                 message: "GroupBy node missing input".to_string(),
@@ -237,20 +245,23 @@ impl PhysicalPlanner {
         } else {
             Box::new(self.plan_node(&node.children[0])?)
         };
-        
+
         Ok(PhysicalOperator::GroupBy(GroupByOperator {
             group_by_fields,
             input,
         }))
     }
-    
+
     /// Plan a having operation
     fn plan_having(&self, node: &PlanNode) -> OQLResult<PhysicalOperator> {
-        let condition = node.metadata.condition.clone()
+        let condition = node
+            .metadata
+            .condition
+            .clone()
             .ok_or_else(|| OQLError::Generic {
                 message: "Having node missing condition".to_string(),
             })?;
-        
+
         let input = if node.children.is_empty() {
             return Err(OQLError::Generic {
                 message: "Having node missing input".to_string(),
@@ -258,17 +269,17 @@ impl PhysicalPlanner {
         } else {
             Box::new(self.plan_node(&node.children[0])?)
         };
-        
+
         Ok(PhysicalOperator::Having(HavingOperator {
             condition,
             input,
         }))
     }
-    
+
     /// Plan an aggregate operation
     fn plan_aggregate(&self, node: &PlanNode) -> OQLResult<PhysicalOperator> {
         let aggregates = node.metadata.aggregates.clone();
-        
+
         let input = if node.children.is_empty() {
             return Err(OQLError::Generic {
                 message: "Aggregate node missing input".to_string(),
@@ -276,32 +287,35 @@ impl PhysicalPlanner {
         } else {
             Box::new(self.plan_node(&node.children[0])?)
         };
-        
+
         Ok(PhysicalOperator::Aggregate(AggregateOperator {
             aggregates,
             input,
         }))
     }
-    
+
     /// Plan an insert operation
     fn plan_insert(&self, node: &PlanNode) -> OQLResult<PhysicalOperator> {
-        let schema = node.metadata.schema.clone()
+        let schema = node
+            .metadata
+            .schema
+            .clone()
             .ok_or_else(|| OQLError::Generic {
                 message: "Insert node missing schema".to_string(),
             })?;
-        
+
         let field_updates = node.metadata.field_updates.clone();
-        
+
         Ok(PhysicalOperator::Insert(InsertOperator {
             schema,
             field_updates,
         }))
     }
-    
+
     /// Plan an update operation
     fn plan_update(&self, node: &PlanNode) -> OQLResult<PhysicalOperator> {
         let field_updates = node.metadata.field_updates.clone();
-        
+
         let input = if node.children.is_empty() {
             return Err(OQLError::Generic {
                 message: "Update node missing input".to_string(),
@@ -309,13 +323,13 @@ impl PhysicalPlanner {
         } else {
             Box::new(self.plan_node(&node.children[0])?)
         };
-        
+
         Ok(PhysicalOperator::Update(UpdateOperator {
             field_updates,
             input,
         }))
     }
-    
+
     /// Plan a delete operation
     fn plan_delete(&self, node: &PlanNode) -> OQLResult<PhysicalOperator> {
         let input = if node.children.is_empty() {
@@ -325,12 +339,64 @@ impl PhysicalPlanner {
         } else {
             Box::new(self.plan_node(&node.children[0])?)
         };
-        
-        Ok(PhysicalOperator::Delete(DeleteOperator {
+
+        Ok(PhysicalOperator::Delete(DeleteOperator { input }))
+    }
+
+    fn plan_vector_nearest(&self, node: &PlanNode) -> OQLResult<PhysicalOperator> {
+        let input = if node.children.is_empty() {
+            return Err(OQLError::Generic {
+                message: "VectorNearest node missing input".to_string(),
+            });
+        } else {
+            Box::new(self.plan_node(&node.children[0])?)
+        };
+
+        let schema = node
+            .children
+            .first()
+            .and_then(|c| c.metadata.schema.clone())
+            .or_else(|| node.metadata.schema.clone())
+            .ok_or_else(|| OQLError::Generic {
+                message: "VectorNearest node missing schema".to_string(),
+            })?;
+
+        let field_path = node
+            .metadata
+            .vector_field
+            .clone()
+            .ok_or_else(|| OQLError::Generic {
+                message: "VectorNearest node missing field path".to_string(),
+            })?;
+        let query = node
+            .metadata
+            .vector_query
+            .clone()
+            .ok_or_else(|| OQLError::Generic {
+                message: "VectorNearest node missing query vector expression".to_string(),
+            })?;
+        let metric = node
+            .metadata
+            .vector_metric
+            .ok_or_else(|| OQLError::Generic {
+                message: "VectorNearest node missing metric".to_string(),
+            })?;
+        let k = node.metadata.vector_k.ok_or_else(|| OQLError::Generic {
+            message: "VectorNearest node missing k".to_string(),
+        })?;
+
+        Ok(PhysicalOperator::VectorKnn(VectorKnnOperator {
+            schema,
+            field_path,
+            query,
+            metric,
+            k,
+            num_candidates: node.metadata.vector_num_candidates,
+            exact: node.metadata.vector_exact,
             input,
         }))
     }
-    
+
     /// Plan a join operation - choose between NestedLoopJoin and HashJoin
     fn plan_join(&self, node: &PlanNode) -> OQLResult<PhysicalOperator> {
         if node.children.len() < 2 {
@@ -338,14 +404,14 @@ impl PhysicalPlanner {
                 message: "Join node requires two inputs".to_string(),
             });
         }
-        
+
         let left = Box::new(self.plan_node(&node.children[0])?);
         let right = Box::new(self.plan_node(&node.children[1])?);
-        
+
         // Estimate sizes for join algorithm selection
         let left_size = self.estimate_operator_size(&left);
         let right_size = self.estimate_operator_size(&right);
-        
+
         // Use hash join if one side is significantly smaller (good for building hash table)
         // Otherwise use nested loop join
         if left_size < 1000 || right_size < 1000 {
@@ -362,7 +428,7 @@ impl PhysicalPlanner {
             }))
         }
     }
-    
+
     /// Estimate table size from statistics
     fn estimate_table_size(&self, schema: &str) -> u64 {
         if let Some(stats) = &self.statistics {
@@ -371,7 +437,7 @@ impl PhysicalPlanner {
             1000 // Default estimate
         }
     }
-    
+
     /// Estimate the output size of an operator
     fn estimate_operator_size(&self, operator: &PhysicalOperator) -> u64 {
         match operator {
@@ -401,12 +467,12 @@ impl PhysicalPlan {
     pub fn root(&self) -> &PhysicalOperator {
         &self.root
     }
-    
+
     /// Get the schema registry
     pub fn schema_registry(&self) -> Option<&SchemaRegistry> {
         self.schema_registry.as_ref()
     }
-    
+
     /// Estimate the cost of executing this plan
     pub fn estimate_cost(&self) -> f64 {
         self.root.estimate_cost()
@@ -421,12 +487,12 @@ impl Statistics {
             available_indexes: std::collections::HashMap::new(),
         }
     }
-    
+
     /// Set table size
     pub fn set_table_size(&mut self, schema: String, size: u64) {
         self.table_sizes.insert(schema, size);
     }
-    
+
     /// Add an index
     pub fn add_index(&mut self, schema: String, field: String) {
         self.available_indexes
@@ -439,5 +505,66 @@ impl Statistics {
 impl Default for Statistics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser::{ComparisonOperator, Expression, FieldAccess, Literal};
+    use crate::planner::types::{FilterCondition, PlanNode, PlanType};
+
+    #[test]
+    fn test_plan_scan_uses_index_when_available_for_condition_field() {
+        let scan = PlanNode::new(PlanType::Scan)
+            .with_schema("users".to_string())
+            .with_condition(FilterCondition::Comparison {
+                left: Expression::FieldAccess(FieldAccess {
+                    path: vec!["age".to_string()],
+                }),
+                operator: ComparisonOperator::GreaterEqual,
+                right: Expression::Literal(Literal::Integer(18)),
+            });
+        let logical = LogicalPlan {
+            root: scan,
+            schema_registry: None,
+        };
+
+        let mut stats = Statistics::new();
+        stats.set_table_size("users".to_string(), 1000);
+        stats.add_index("users".to_string(), "age".to_string());
+        let planner = PhysicalPlanner::new().with_statistics(stats);
+
+        let physical = planner.plan(&logical).expect("plan");
+        match physical.root {
+            PhysicalOperator::IndexScan(op) => {
+                assert_eq!(op.index_name, "idx_users_age");
+            }
+            other => panic!("expected IndexScan, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_plan_scan_falls_back_to_seq_scan_when_index_missing() {
+        let scan = PlanNode::new(PlanType::Scan)
+            .with_schema("users".to_string())
+            .with_condition(FilterCondition::Comparison {
+                left: Expression::FieldAccess(FieldAccess {
+                    path: vec!["age".to_string()],
+                }),
+                operator: ComparisonOperator::Equal,
+                right: Expression::Literal(Literal::Integer(21)),
+            });
+        let logical = LogicalPlan {
+            root: scan,
+            schema_registry: None,
+        };
+
+        let mut stats = Statistics::new();
+        stats.set_table_size("users".to_string(), 1000);
+        let planner = PhysicalPlanner::new().with_statistics(stats);
+
+        let physical = planner.plan(&logical).expect("plan");
+        assert!(matches!(physical.root, PhysicalOperator::SeqScan(_)));
     }
 }

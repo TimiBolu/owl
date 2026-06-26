@@ -145,11 +145,11 @@ pub enum RebalanceStatus {
 /// use oql::distributed::ShardManager;
 ///
 /// let mut manager = ShardManager::new();
-/// 
+///
 /// // Add nodes to cluster
 /// manager.add_node("node1", "192.168.1.10:8080").unwrap();
 /// manager.add_node("node2", "192.168.1.11:8080").unwrap();
-/// 
+///
 /// // Create initial shards
 /// manager.create_shard("node1").unwrap();
 /// manager.create_shard("node2").unwrap();
@@ -224,11 +224,16 @@ impl ShardManager {
     /// * `Ok(())` if node was added successfully
     /// * `Err(OQLError)` if node already exists or other error
     pub fn add_node(&self, node_id: &str, address: &str) -> OQLResult<()> {
-        let mut nodes = self.nodes.write()
+        let mut nodes = self
+            .nodes
+            .write()
             .map_err(|_| OQLError::generic("Failed to acquire write lock"))?;
 
         if nodes.contains_key(node_id) {
-            return Err(OQLError::generic(&format!("Node {} already exists", node_id)));
+            return Err(OQLError::generic(&format!(
+                "Node {} already exists",
+                node_id
+            )));
         }
 
         let node_info = NodeInfo {
@@ -261,17 +266,20 @@ impl ShardManager {
     /// * `Ok(())` if removal was initiated
     /// * `Err(OQLError)` if node doesn't exist or has active shards
     pub fn remove_node(&self, node_id: &str) -> OQLResult<()> {
-        let mut nodes = self.nodes.write()
+        let mut nodes = self
+            .nodes
+            .write()
             .map_err(|_| OQLError::generic("Failed to acquire write lock"))?;
 
-        let node = nodes.get_mut(node_id)
+        let node = nodes
+            .get_mut(node_id)
             .ok_or_else(|| OQLError::generic(&format!("Node {} not found", node_id)))?;
 
         if !node.shards.is_empty() {
             // Start draining shards
             node.status = NodeStatus::Leaving;
             drop(nodes);
-            
+
             // Initiate shard migration
             self.drain_node_shards(node_id)?;
             return Ok(());
@@ -293,20 +301,28 @@ impl ShardManager {
     pub fn create_shard(&self, node_id: &str) -> OQLResult<ShardId> {
         // Check if node exists and is active
         {
-            let nodes = self.nodes.read()
+            let nodes = self
+                .nodes
+                .read()
                 .map_err(|_| OQLError::generic("Failed to acquire read lock"))?;
-            
-            let node = nodes.get(node_id)
+
+            let node = nodes
+                .get(node_id)
                 .ok_or_else(|| OQLError::generic(&format!("Node {} not found", node_id)))?;
-            
+
             if node.status != NodeStatus::Active && node.status != NodeStatus::Joining {
-                return Err(OQLError::generic(&format!("Node {} is not active", node_id)));
+                return Err(OQLError::generic(&format!(
+                    "Node {} is not active",
+                    node_id
+                )));
             }
         }
 
         // Allocate new shard ID
         let shard_id = {
-            let mut next_id = self.next_shard_id.write()
+            let mut next_id = self
+                .next_shard_id
+                .write()
                 .map_err(|_| OQLError::generic("Failed to acquire write lock"))?;
             let id = *next_id;
             *next_id += 1;
@@ -326,14 +342,18 @@ impl ShardManager {
 
         // Add to shard registry
         {
-            let mut shards = self.shards.write()
+            let mut shards = self
+                .shards
+                .write()
                 .map_err(|_| OQLError::generic("Failed to acquire write lock"))?;
             shards.insert(shard_id, shard_info);
         }
 
         // Add to node's shard list
         {
-            let mut nodes = self.nodes.write()
+            let mut nodes = self
+                .nodes
+                .write()
                 .map_err(|_| OQLError::generic("Failed to acquire write lock"))?;
             if let Some(node) = nodes.get_mut(node_id) {
                 node.shards.insert(shard_id);
@@ -342,7 +362,9 @@ impl ShardManager {
 
         // Add to hash ring
         {
-            let mut ring = self.hash_ring.write()
+            let mut ring = self
+                .hash_ring
+                .write()
                 .map_err(|_| OQLError::generic("Failed to acquire write lock"))?;
             ring.add_shard(shard_id);
         }
@@ -352,10 +374,13 @@ impl ShardManager {
 
     /// Mark a shard as active (ready to serve requests)
     pub fn activate_shard(&self, shard_id: ShardId) -> OQLResult<()> {
-        let mut shards = self.shards.write()
+        let mut shards = self
+            .shards
+            .write()
             .map_err(|_| OQLError::generic("Failed to acquire write lock"))?;
 
-        let shard = shards.get_mut(&shard_id)
+        let shard = shards
+            .get_mut(&shard_id)
             .ok_or_else(|| OQLError::generic(&format!("Shard {} not found", shard_id)))?;
 
         shard.status = ShardStatus::Active;
@@ -364,15 +389,18 @@ impl ShardManager {
 
     /// Update node heartbeat and capacity metrics
     pub fn update_node_heartbeat(&self, node_id: &str, capacity: NodeCapacity) -> OQLResult<()> {
-        let mut nodes = self.nodes.write()
+        let mut nodes = self
+            .nodes
+            .write()
             .map_err(|_| OQLError::generic("Failed to acquire write lock"))?;
 
-        let node = nodes.get_mut(node_id)
+        let node = nodes
+            .get_mut(node_id)
             .ok_or_else(|| OQLError::generic(&format!("Node {} not found", node_id)))?;
 
         node.last_heartbeat = Instant::now();
         node.capacity = capacity;
-        
+
         // Activate joining nodes
         if node.status == NodeStatus::Joining {
             node.status = NodeStatus::Active;
@@ -382,11 +410,19 @@ impl ShardManager {
     }
 
     /// Update shard statistics
-    pub fn update_shard_stats(&self, shard_id: ShardId, data_size: u64, object_count: u64) -> OQLResult<()> {
-        let mut shards = self.shards.write()
+    pub fn update_shard_stats(
+        &self,
+        shard_id: ShardId,
+        data_size: u64,
+        object_count: u64,
+    ) -> OQLResult<()> {
+        let mut shards = self
+            .shards
+            .write()
             .map_err(|_| OQLError::generic("Failed to acquire write lock"))?;
 
-        let shard = shards.get_mut(&shard_id)
+        let shard = shards
+            .get_mut(&shard_id)
             .ok_or_else(|| OQLError::generic(&format!("Shard {} not found", shard_id)))?;
 
         shard.data_size = data_size;
@@ -398,44 +434,58 @@ impl ShardManager {
 
     /// Get shard information
     pub fn get_shard(&self, shard_id: ShardId) -> OQLResult<Option<ShardInfo>> {
-        let shards = self.shards.read()
+        let shards = self
+            .shards
+            .read()
             .map_err(|_| OQLError::generic("Failed to acquire read lock"))?;
         Ok(shards.get(&shard_id).cloned())
     }
 
     /// Get node information
     pub fn get_node(&self, node_id: &str) -> OQLResult<Option<NodeInfo>> {
-        let nodes = self.nodes.read()
+        let nodes = self
+            .nodes
+            .read()
             .map_err(|_| OQLError::generic("Failed to acquire read lock"))?;
         Ok(nodes.get(node_id).cloned())
     }
 
     /// List all active shards
     pub fn list_shards(&self) -> OQLResult<Vec<ShardInfo>> {
-        let shards = self.shards.read()
+        let shards = self
+            .shards
+            .read()
             .map_err(|_| OQLError::generic("Failed to acquire read lock"))?;
         Ok(shards.values().cloned().collect())
     }
 
     /// List all nodes
     pub fn list_nodes(&self) -> OQLResult<Vec<NodeInfo>> {
-        let nodes = self.nodes.read()
+        let nodes = self
+            .nodes
+            .read()
             .map_err(|_| OQLError::generic("Failed to acquire read lock"))?;
         Ok(nodes.values().cloned().collect())
     }
 
     /// Get the shard responsible for an object
     pub fn get_shard_for_object(&self, object_id: &str) -> OQLResult<Option<ShardId>> {
-        let ring = self.hash_ring.read()
+        let ring = self
+            .hash_ring
+            .read()
             .map_err(|_| OQLError::generic("Failed to acquire read lock"))?;
         Ok(ring.get_shard_for_object(object_id))
     }
 
     /// Check cluster health and detect failed nodes
     pub fn check_cluster_health(&self) -> OQLResult<ClusterHealth> {
-        let nodes = self.nodes.read()
+        let nodes = self
+            .nodes
+            .read()
             .map_err(|_| OQLError::generic("Failed to acquire read lock"))?;
-        let shards = self.shards.read()
+        let shards = self
+            .shards
+            .read()
             .map_err(|_| OQLError::generic("Failed to acquire read lock"))?;
 
         let now = Instant::now();
@@ -445,7 +495,7 @@ impl ShardManager {
 
         for (node_id, node) in nodes.iter() {
             let time_since_heartbeat = now.duration_since(node.last_heartbeat);
-            
+
             if time_since_heartbeat > self.heartbeat_timeout {
                 if node.status == NodeStatus::Suspected {
                     down_nodes.push(node_id.clone());
@@ -458,7 +508,8 @@ impl ShardManager {
         }
 
         let total_shards = shards.len();
-        let active_shards = shards.values()
+        let active_shards = shards
+            .values()
             .filter(|s| s.status == ShardStatus::Active)
             .count();
 
@@ -475,16 +526,22 @@ impl ShardManager {
 
     /// Trigger automatic rebalancing if needed
     pub fn trigger_rebalancing(&self) -> OQLResult<Vec<String>> {
-        let nodes = self.nodes.read()
+        let nodes = self
+            .nodes
+            .read()
             .map_err(|_| OQLError::generic("Failed to acquire read lock"))?;
-        let shards = self.shards.read()
+        let shards = self
+            .shards
+            .read()
             .map_err(|_| OQLError::generic("Failed to acquire read lock"))?;
 
         // Calculate load per node
         let mut node_loads = HashMap::new();
         for (node_id, node) in nodes.iter() {
             if node.status == NodeStatus::Active {
-                let total_data: u64 = node.shards.iter()
+                let total_data: u64 = node
+                    .shards
+                    .iter()
                     .filter_map(|shard_id| shards.get(shard_id))
                     .map(|shard| shard.data_size)
                     .sum();
@@ -502,11 +559,11 @@ impl ShardManager {
         let threshold = average_load * self.rebalance_config.load_balance_threshold;
 
         let mut operations = Vec::new();
-        
+
         // Find overloaded and underloaded nodes
         let mut overloaded = Vec::new();
         let mut underloaded = Vec::new();
-        
+
         for (node_id, &load) in &node_loads {
             let load_f64 = load as f64;
             if load_f64 > average_load + threshold {
@@ -535,26 +592,32 @@ impl ShardManager {
 
     /// Drain all shards from a node (for node removal)
     fn drain_node_shards(&self, node_id: &str) -> OQLResult<()> {
-        let nodes = self.nodes.read()
+        let nodes = self
+            .nodes
+            .read()
             .map_err(|_| OQLError::generic("Failed to acquire read lock"))?;
-        
-        let node = nodes.get(node_id)
+
+        let node = nodes
+            .get(node_id)
             .ok_or_else(|| OQLError::generic(&format!("Node {} not found", node_id)))?;
-        
+
         let shards_to_drain: Vec<ShardId> = node.shards.iter().copied().collect();
         drop(nodes);
 
         // Find target nodes for each shard
         let active_nodes: Vec<String> = {
             let nodes = self.nodes.read().unwrap();
-            nodes.values()
+            nodes
+                .values()
                 .filter(|n| n.status == NodeStatus::Active && n.node_id != node_id)
                 .map(|n| n.node_id.clone())
                 .collect()
         };
 
         if active_nodes.is_empty() {
-            return Err(OQLError::generic("No active nodes available for shard migration"));
+            return Err(OQLError::generic(
+                "No active nodes available for shard migration",
+            ));
         }
 
         // Create migration operations
@@ -567,11 +630,18 @@ impl ShardManager {
     }
 
     /// Find a suitable shard to move from an overloaded node
-    fn find_shard_to_move(&self, node_id: &str, shards: &HashMap<ShardId, ShardInfo>) -> OQLResult<Option<ShardId>> {
-        let nodes = self.nodes.read()
+    fn find_shard_to_move(
+        &self,
+        node_id: &str,
+        shards: &HashMap<ShardId, ShardInfo>,
+    ) -> OQLResult<Option<ShardId>> {
+        let nodes = self
+            .nodes
+            .read()
             .map_err(|_| OQLError::generic("Failed to acquire read lock"))?;
-        
-        let node = nodes.get(node_id)
+
+        let node = nodes
+            .get(node_id)
             .ok_or_else(|| OQLError::generic(&format!("Node {} not found", node_id)))?;
 
         // Find the largest shard that meets minimum size requirement
@@ -580,9 +650,10 @@ impl ShardManager {
 
         for &shard_id in &node.shards {
             if let Some(shard) = shards.get(&shard_id) {
-                if shard.status == ShardStatus::Active 
+                if shard.status == ShardStatus::Active
                     && shard.data_size >= self.rebalance_config.min_rebalance_size
-                    && shard.data_size > best_size {
+                    && shard.data_size > best_size
+                {
                     best_shard = Some(shard_id);
                     best_size = shard.data_size;
                 }
@@ -593,9 +664,18 @@ impl ShardManager {
     }
 
     /// Create a new rebalancing operation
-    fn create_rebalance_operation(&self, shard_id: ShardId, source_node: &str, target_node: &str) -> OQLResult<String> {
-        let operation_id = format!("rebalance_{}_{}", shard_id, Instant::now().elapsed().as_nanos());
-        
+    fn create_rebalance_operation(
+        &self,
+        shard_id: ShardId,
+        source_node: &str,
+        target_node: &str,
+    ) -> OQLResult<String> {
+        let operation_id = format!(
+            "rebalance_{}_{}",
+            shard_id,
+            Instant::now().elapsed().as_nanos()
+        );
+
         let operation = RebalanceOperation {
             operation_id: operation_id.clone(),
             shard_id,
@@ -607,7 +687,9 @@ impl ShardManager {
             progress: 0.0,
         };
 
-        let mut ops = self.rebalance_ops.write()
+        let mut ops = self
+            .rebalance_ops
+            .write()
             .map_err(|_| OQLError::generic("Failed to acquire write lock"))?;
         ops.insert(operation_id.clone(), operation);
 
@@ -643,7 +725,7 @@ pub struct ClusterHealth {
 impl ClusterHealth {
     /// Check if cluster is healthy
     pub fn is_healthy(&self) -> bool {
-        self.suspected_nodes.is_empty() 
+        self.suspected_nodes.is_empty()
             && self.down_nodes.is_empty()
             && self.active_shards == self.total_shards
     }
@@ -665,7 +747,7 @@ mod tests {
     fn test_shard_manager_creation() {
         let manager = ShardManager::new();
         let health = manager.check_cluster_health().unwrap();
-        
+
         assert_eq!(health.total_nodes, 0);
         assert_eq!(health.total_shards, 0);
         assert!(health.is_healthy());
@@ -674,13 +756,13 @@ mod tests {
     #[test]
     fn test_add_remove_node() {
         let manager = ShardManager::new();
-        
+
         // Add node
         manager.add_node("node1", "192.168.1.10:8080").unwrap();
         let nodes = manager.list_nodes().unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].node_id, "node1");
-        
+
         // Remove node (no shards)
         manager.remove_node("node1").unwrap();
         let nodes = manager.list_nodes().unwrap();
@@ -691,7 +773,7 @@ mod tests {
     fn test_create_shard() {
         let manager = ShardManager::new();
         manager.add_node("node1", "192.168.1.10:8080").unwrap();
-        
+
         // Update heartbeat to activate node
         let capacity = NodeCapacity {
             memory_bytes: 1024 * 1024 * 1024,
@@ -700,11 +782,11 @@ mod tests {
             load: 0.5,
         };
         manager.update_node_heartbeat("node1", capacity).unwrap();
-        
+
         // Create shard
         let shard_id = manager.create_shard("node1").unwrap();
         assert_eq!(shard_id, 0);
-        
+
         let shards = manager.list_shards().unwrap();
         assert_eq!(shards.len(), 1);
         assert_eq!(shards[0].shard_id, 0);
@@ -715,7 +797,7 @@ mod tests {
     fn test_shard_activation() {
         let manager = ShardManager::new();
         manager.add_node("node1", "192.168.1.10:8080").unwrap();
-        
+
         let capacity = NodeCapacity {
             memory_bytes: 1024 * 1024 * 1024,
             disk_bytes: 10 * 1024 * 1024 * 1024,
@@ -723,13 +805,13 @@ mod tests {
             load: 0.5,
         };
         manager.update_node_heartbeat("node1", capacity).unwrap();
-        
+
         let shard_id = manager.create_shard("node1").unwrap();
-        
+
         // Initially initializing
         let shard = manager.get_shard(shard_id).unwrap().unwrap();
         assert_eq!(shard.status, ShardStatus::Initializing);
-        
+
         // Activate shard
         manager.activate_shard(shard_id).unwrap();
         let shard = manager.get_shard(shard_id).unwrap().unwrap();
@@ -741,23 +823,25 @@ mod tests {
         let manager = ShardManager::new();
         manager.add_node("node1", "192.168.1.10:8080").unwrap();
         manager.add_node("node2", "192.168.1.11:8080").unwrap();
-        
+
         let capacity = NodeCapacity {
             memory_bytes: 1024 * 1024 * 1024,
             disk_bytes: 10 * 1024 * 1024 * 1024,
             cpu_cores: 4,
             load: 0.5,
         };
-        manager.update_node_heartbeat("node1", capacity.clone()).unwrap();
+        manager
+            .update_node_heartbeat("node1", capacity.clone())
+            .unwrap();
         manager.update_node_heartbeat("node2", capacity).unwrap();
-        
+
         let shard1 = manager.create_shard("node1").unwrap();
         let shard2 = manager.create_shard("node2").unwrap();
-        
+
         // Objects should be assigned to shards
         let shard = manager.get_shard_for_object("user123").unwrap();
         assert!(shard == Some(shard1) || shard == Some(shard2));
-        
+
         // Same object should always get same shard
         let shard2 = manager.get_shard_for_object("user123").unwrap();
         assert_eq!(shard, shard2);
@@ -767,7 +851,7 @@ mod tests {
     fn test_cluster_health() {
         let manager = ShardManager::new();
         manager.add_node("node1", "192.168.1.10:8080").unwrap();
-        
+
         let capacity = NodeCapacity {
             memory_bytes: 1024 * 1024 * 1024,
             disk_bytes: 10 * 1024 * 1024 * 1024,
@@ -775,10 +859,10 @@ mod tests {
             load: 0.5,
         };
         manager.update_node_heartbeat("node1", capacity).unwrap();
-        
+
         let shard_id = manager.create_shard("node1").unwrap();
         manager.activate_shard(shard_id).unwrap();
-        
+
         let health = manager.check_cluster_health().unwrap();
         assert_eq!(health.total_nodes, 1);
         assert_eq!(health.healthy_nodes, 1);
@@ -792,7 +876,7 @@ mod tests {
     fn test_shard_stats_update() {
         let manager = ShardManager::new();
         manager.add_node("node1", "192.168.1.10:8080").unwrap();
-        
+
         let capacity = NodeCapacity {
             memory_bytes: 1024 * 1024 * 1024,
             disk_bytes: 10 * 1024 * 1024 * 1024,
@@ -800,12 +884,14 @@ mod tests {
             load: 0.5,
         };
         manager.update_node_heartbeat("node1", capacity).unwrap();
-        
+
         let shard_id = manager.create_shard("node1").unwrap();
-        
+
         // Update stats
-        manager.update_shard_stats(shard_id, 1024 * 1024, 100).unwrap();
-        
+        manager
+            .update_shard_stats(shard_id, 1024 * 1024, 100)
+            .unwrap();
+
         let shard = manager.get_shard(shard_id).unwrap().unwrap();
         assert_eq!(shard.data_size, 1024 * 1024);
         assert_eq!(shard.object_count, 100);
@@ -814,7 +900,7 @@ mod tests {
     #[test]
     fn test_duplicate_node_addition() {
         let manager = ShardManager::new();
-        
+
         manager.add_node("node1", "192.168.1.10:8080").unwrap();
         let result = manager.add_node("node1", "192.168.1.10:8080");
         assert!(result.is_err());
@@ -823,11 +909,11 @@ mod tests {
     #[test]
     fn test_nonexistent_node_operations() {
         let manager = ShardManager::new();
-        
+
         // Try to create shard on non-existent node
         let result = manager.create_shard("nonexistent");
         assert!(result.is_err());
-        
+
         // Try to remove non-existent node
         let result = manager.remove_node("nonexistent");
         assert!(result.is_err());

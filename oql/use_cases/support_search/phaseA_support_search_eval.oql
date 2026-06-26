@@ -1,0 +1,41 @@
+// Phase A - Evaluation script
+// Run after setup to visually verify relevance and score ordering.
+
+liveChunks = kb_chunks.where { .status == "published" }
+
+// Eval 1: "How do I dispute a chargeback?"
+liveChunks.nearest {
+  field: .embedding,
+  query: [0.96, 0.04, 0.08, 0.02],
+  metric: "cosine",
+  k: 3
+}.select {
+  id,
+  article_title: .article.title,
+  score: ._score
+}
+
+// Eval 2: "Refund workflow for partial refunds"
+liveChunks.nearest {
+  field: .embedding,
+  query: [0.87, 0.10, 0.06, 0.01],
+  metric: "cosine",
+  k: 3
+}.select {
+  id,
+  article_title: .article.title,
+  score: ._score
+}
+
+// Eval 3: "Kubernetes memory pressure and restarts"
+liveChunks.nearest {
+  field: .embedding,
+  query: [0.07, 0.93, 0.17, 0.05],
+  metric: "cosine",
+  k: 3
+}.select {
+  id,
+  article_title: .article.title,
+  score: ._score
+}
+

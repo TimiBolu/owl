@@ -1,11 +1,10 @@
-use crate::error::{OQLError, OQLResult};
 use crate::document::{Document, Value};
-use crate::schema::{Schema, FieldType};
+use crate::error::{OQLError, OQLResult};
 use crate::schema::evolution::{FieldChange, SchemaVersion};
+use crate::schema::FieldType;
 use crate::storage::DocumentStore;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 /// Migration step for transforming data
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,24 +15,16 @@ pub enum MigrationStep {
         default_value: Value,
     },
     /// Remove a field
-    RemoveField {
-        field_name: String,
-    },
+    RemoveField { field_name: String },
     /// Rename a field
-    RenameField {
-        old_name: String,
-        new_name: String,
-    },
+    RenameField { old_name: String, new_name: String },
     /// Transform a field value
     TransformField {
         field_name: String,
         transform: FieldTransform,
     },
     /// Copy a field to a new name
-    CopyField {
-        source: String,
-        destination: String,
-    },
+    CopyField { source: String, destination: String },
     /// Custom transformation function
     Custom {
         description: String,
@@ -112,11 +103,15 @@ impl MigrationScript {
 
         for change in changes {
             match change {
-                FieldChange::AddField { field_name, field_type, default_value } => {
+                FieldChange::AddField {
+                    field_name,
+                    field_type,
+                    default_value,
+                } => {
                     let default = default_value
                         .and_then(|v| Self::parse_default_value(&v, &field_type))
                         .unwrap_or(Value::Null);
-                    
+
                     script.add_step(MigrationStep::AddField {
                         field_name,
                         default_value: default,
@@ -128,7 +123,11 @@ impl MigrationScript {
                 FieldChange::RenameField { old_name, new_name } => {
                     script.add_step(MigrationStep::RenameField { old_name, new_name });
                 }
-                FieldChange::ChangeType { field_name, old_type, new_type } => {
+                FieldChange::ChangeType {
+                    field_name,
+                    old_type,
+                    new_type,
+                } => {
                     if let Some(transform) = Self::infer_transform(&old_type, &new_type) {
                         script.add_step(MigrationStep::TransformField {
                             field_name,
@@ -142,20 +141,26 @@ impl MigrationScript {
                         transform: FieldTransform::MakeOptional,
                     });
                 }
-                FieldChange::MakeRequired { field_name, default_value } => {
+                FieldChange::MakeRequired {
+                    field_name,
+                    default_value,
+                } => {
                     let default = default_value
                         .and_then(|v| serde_json::from_str(&v).ok())
                         .unwrap_or(Value::Null);
-                    
+
                     script.add_step(MigrationStep::TransformField {
                         field_name,
-                        transform: FieldTransform::UnwrapOptional { default_value: default },
+                        transform: FieldTransform::UnwrapOptional {
+                            default_value: default,
+                        },
                     });
                 }
                 FieldChange::ChangeReferenceTarget { .. } => {
                     // Reference target changes require custom handling
                     script.add_step(MigrationStep::Custom {
-                        description: "Reference target change requires manual migration".to_string(),
+                        description: "Reference target change requires manual migration"
+                            .to_string(),
                     });
                 }
             }
@@ -197,7 +202,10 @@ impl MigrationScript {
     /// Apply a single migration step to a document
     fn apply_step(&self, doc: &mut Document, step: &MigrationStep) -> OQLResult<()> {
         match step {
-            MigrationStep::AddField { field_name, default_value } => {
+            MigrationStep::AddField {
+                field_name,
+                default_value,
+            } => {
                 if !doc.fields.contains_key(field_name) {
                     doc.fields.insert(field_name.clone(), default_value.clone());
                 }
@@ -210,12 +218,18 @@ impl MigrationScript {
                     doc.fields.insert(new_name.clone(), value);
                 }
             }
-            MigrationStep::TransformField { field_name, transform } => {
+            MigrationStep::TransformField {
+                field_name,
+                transform,
+            } => {
                 if let Some(value) = doc.fields.get_mut(field_name) {
                     *value = self.apply_transform(value, transform)?;
                 }
             }
-            MigrationStep::CopyField { source, destination } => {
+            MigrationStep::CopyField {
+                source,
+                destination,
+            } => {
                 if let Some(value) = doc.fields.get(source) {
                     doc.fields.insert(destination.clone(), value.clone());
                 }
@@ -243,59 +257,56 @@ impl MigrationScript {
                     Value::List(_) => "[list]".to_string(),
                     Value::DateTime(dt) => dt.to_rfc3339(),
                     Value::Reference(_) => "[reference]".to_string(),
+                    Value::GlobalReference(_) => "[reference]".to_string(),
                     Value::Object(_) => "[object]".to_string(),
                 };
                 Ok(Value::String(string_val))
             }
-            FieldTransform::ToInteger => {
-                match value {
-                    Value::Integer(i) => Ok(Value::Integer(*i)),
-                    Value::Float(f) => Ok(Value::Integer(*f as i64)),
-                    Value::String(s) => s.parse::<i64>()
+            FieldTransform::ToInteger => match value {
+                Value::Integer(i) => Ok(Value::Integer(*i)),
+                Value::Float(f) => Ok(Value::Integer(*f as i64)),
+                Value::String(s) => {
+                    s.parse::<i64>()
                         .map(Value::Integer)
                         .map_err(|_| OQLError::Generic {
                             message: format!("Cannot convert '{}' to integer", s),
-                        }),
-                    _ => Err(OQLError::TypeError {
-                        expected: "Integer".to_string(),
-                        actual: value.type_name().to_string(),
-                    }),
+                        })
                 }
-            }
-            FieldTransform::ToFloat => {
-                match value {
-                    Value::Float(f) => Ok(Value::Float(*f)),
-                    Value::Integer(i) => Ok(Value::Float(*i as f64)),
-                    Value::String(s) => s.parse::<f64>()
+                _ => Err(OQLError::TypeError {
+                    expected: "Integer".to_string(),
+                    actual: value.type_name().to_string(),
+                }),
+            },
+            FieldTransform::ToFloat => match value {
+                Value::Float(f) => Ok(Value::Float(*f)),
+                Value::Integer(i) => Ok(Value::Float(*i as f64)),
+                Value::String(s) => {
+                    s.parse::<f64>()
                         .map(Value::Float)
                         .map_err(|_| OQLError::Generic {
                             message: format!("Cannot convert '{}' to float", s),
-                        }),
-                    _ => Err(OQLError::TypeError {
-                        expected: "Float".to_string(),
-                        actual: value.type_name().to_string(),
-                    }),
+                        })
                 }
-            }
-            FieldTransform::ToBoolean => {
-                match value {
-                    Value::Boolean(b) => Ok(Value::Boolean(*b)),
-                    Value::String(s) => {
-                        match s.to_lowercase().as_str() {
-                            "true" | "yes" | "1" => Ok(Value::Boolean(true)),
-                            "false" | "no" | "0" => Ok(Value::Boolean(false)),
-                            _ => Err(OQLError::Generic {
-                                message: format!("Cannot convert '{}' to boolean", s),
-                            }),
-                        }
-                    }
-                    Value::Integer(i) => Ok(Value::Boolean(*i != 0)),
-                    _ => Err(OQLError::TypeError {
-                        expected: "Boolean".to_string(),
-                        actual: value.type_name().to_string(),
+                _ => Err(OQLError::TypeError {
+                    expected: "Float".to_string(),
+                    actual: value.type_name().to_string(),
+                }),
+            },
+            FieldTransform::ToBoolean => match value {
+                Value::Boolean(b) => Ok(Value::Boolean(*b)),
+                Value::String(s) => match s.to_lowercase().as_str() {
+                    "true" | "yes" | "1" => Ok(Value::Boolean(true)),
+                    "false" | "no" | "0" => Ok(Value::Boolean(false)),
+                    _ => Err(OQLError::Generic {
+                        message: format!("Cannot convert '{}' to boolean", s),
                     }),
-                }
-            }
+                },
+                Value::Integer(i) => Ok(Value::Boolean(*i != 0)),
+                _ => Err(OQLError::TypeError {
+                    expected: "Boolean".to_string(),
+                    actual: value.type_name().to_string(),
+                }),
+            },
             FieldTransform::MakeOptional => Ok(value.clone()),
             FieldTransform::UnwrapOptional { default_value } => {
                 if value.is_null() {
@@ -354,14 +365,14 @@ impl MigrationPlan {
         for i in 0..versions.len() - 1 {
             let from = versions[i];
             let to = versions[i + 1];
-            
+
             let script = MigrationScript::from_changes(
                 from.schema_name.clone(),
                 from.version,
                 to.version,
                 to.changes.clone(),
             );
-            
+
             plan.add_script(script);
         }
 
@@ -381,9 +392,18 @@ impl MigrationPlan {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum MigrationStatus {
     Pending,
-    InProgress { started_at: DateTime<Utc>, progress: f64 },
-    Completed { completed_at: DateTime<Utc>, documents_migrated: usize },
-    Failed { failed_at: DateTime<Utc>, error: String },
+    InProgress {
+        started_at: DateTime<Utc>,
+        progress: f64,
+    },
+    Completed {
+        completed_at: DateTime<Utc>,
+        documents_migrated: usize,
+    },
+    Failed {
+        failed_at: DateTime<Utc>,
+        error: String,
+    },
 }
 
 /// Migration record for tracking
@@ -401,7 +421,10 @@ impl Migration {
     /// Create a new migration record
     pub fn new(schema_name: String, from_version: u32, to_version: u32) -> Self {
         Self {
-            id: format!("migration_{}_{}_to_{}", schema_name, from_version, to_version),
+            id: format!(
+                "migration_{}_{}_to_{}",
+                schema_name, from_version, to_version
+            ),
             schema_name,
             from_version,
             to_version,
@@ -496,17 +519,14 @@ impl<S: DocumentStore> MigrationExecutor<S> {
     }
 
     /// Dry run - validate migration without applying changes
-    pub fn dry_run(
-        &self,
-        schema: &str,
-        plan: &MigrationPlan,
-    ) -> OQLResult<Vec<String>> {
+    pub fn dry_run(&self, schema: &str, plan: &MigrationPlan) -> OQLResult<Vec<String>> {
         let mut issues = Vec::new();
         let documents = self.store.scan_documents(schema)?;
 
-        for doc in documents.iter().take(10) {  // Sample first 10 documents
+        for doc in documents.iter().take(10) {
+            // Sample first 10 documents
             let mut doc_clone = doc.clone();
-            
+
             if let Err(e) = plan.apply_to_document(&mut doc_clone) {
                 issues.push(format!("Document {}: {}", doc.id, e));
             }
@@ -523,12 +543,7 @@ mod tests {
 
     #[test]
     fn test_migration_script_creation() {
-        let script = MigrationScript::new(
-            "users".to_string(),
-            1,
-            2,
-            "Add email field".to_string(),
-        );
+        let script = MigrationScript::new("users".to_string(), 1, 2, "Add email field".to_string());
 
         assert_eq!(script.from_version, 1);
         assert_eq!(script.to_version, 2);
@@ -538,20 +553,17 @@ mod tests {
 
     #[test]
     fn test_add_field_migration() {
-        let mut script = MigrationScript::new(
-            "users".to_string(),
-            1,
-            2,
-            "Add email field".to_string(),
-        );
+        let mut script =
+            MigrationScript::new("users".to_string(), 1, 2, "Add email field".to_string());
 
         script.add_step(MigrationStep::AddField {
             field_name: "email".to_string(),
             default_value: Value::String("unknown@example.com".to_string()),
         });
 
-        let mut doc = Document::new("user1".to_string());
-        doc.fields.insert("name".to_string(), Value::String("Alice".to_string()));
+        let mut doc = Document::with_id("user1".to_string(), "users".to_string(), HashMap::new());
+        doc.fields
+            .insert("name".to_string(), Value::String("Alice".to_string()));
 
         script.apply_to_document(&mut doc).unwrap();
 
@@ -564,20 +576,20 @@ mod tests {
 
     #[test]
     fn test_remove_field_migration() {
-        let mut script = MigrationScript::new(
-            "users".to_string(),
-            1,
-            2,
-            "Remove old field".to_string(),
-        );
+        let mut script =
+            MigrationScript::new("users".to_string(), 1, 2, "Remove old field".to_string());
 
         script.add_step(MigrationStep::RemoveField {
             field_name: "old_field".to_string(),
         });
 
-        let mut doc = Document::new("user1".to_string());
-        doc.fields.insert("name".to_string(), Value::String("Alice".to_string()));
-        doc.fields.insert("old_field".to_string(), Value::String("deprecated".to_string()));
+        let mut doc = Document::with_id("user1".to_string(), "users".to_string(), HashMap::new());
+        doc.fields
+            .insert("name".to_string(), Value::String("Alice".to_string()));
+        doc.fields.insert(
+            "old_field".to_string(),
+            Value::String("deprecated".to_string()),
+        );
 
         script.apply_to_document(&mut doc).unwrap();
 
@@ -587,21 +599,21 @@ mod tests {
 
     #[test]
     fn test_rename_field_migration() {
-        let mut script = MigrationScript::new(
-            "users".to_string(),
-            1,
-            2,
-            "Rename field".to_string(),
-        );
+        let mut script =
+            MigrationScript::new("users".to_string(), 1, 2, "Rename field".to_string());
 
         script.add_step(MigrationStep::RenameField {
             old_name: "email".to_string(),
             new_name: "email_address".to_string(),
         });
 
-        let mut doc = Document::new("user1".to_string());
-        doc.fields.insert("name".to_string(), Value::String("Alice".to_string()));
-        doc.fields.insert("email".to_string(), Value::String("alice@example.com".to_string()));
+        let mut doc = Document::with_id("user1".to_string(), "users".to_string(), HashMap::new());
+        doc.fields
+            .insert("name".to_string(), Value::String("Alice".to_string()));
+        doc.fields.insert(
+            "email".to_string(),
+            Value::String("alice@example.com".to_string()),
+        );
 
         script.apply_to_document(&mut doc).unwrap();
 
@@ -614,42 +626,38 @@ mod tests {
 
     #[test]
     fn test_transform_to_string() {
-        let mut script = MigrationScript::new(
-            "users".to_string(),
-            1,
-            2,
-            "Transform field".to_string(),
-        );
+        let mut script =
+            MigrationScript::new("users".to_string(), 1, 2, "Transform field".to_string());
 
         script.add_step(MigrationStep::TransformField {
             field_name: "age".to_string(),
             transform: FieldTransform::ToString,
         });
 
-        let mut doc = Document::new("user1".to_string());
+        let mut doc = Document::with_id("user1".to_string(), "users".to_string(), HashMap::new());
         doc.fields.insert("age".to_string(), Value::Integer(30));
 
         script.apply_to_document(&mut doc).unwrap();
 
-        assert_eq!(doc.fields.get("age"), Some(&Value::String("30".to_string())));
+        assert_eq!(
+            doc.fields.get("age"),
+            Some(&Value::String("30".to_string()))
+        );
     }
 
     #[test]
     fn test_transform_to_integer() {
-        let mut script = MigrationScript::new(
-            "users".to_string(),
-            1,
-            2,
-            "Transform field".to_string(),
-        );
+        let mut script =
+            MigrationScript::new("users".to_string(), 1, 2, "Transform field".to_string());
 
         script.add_step(MigrationStep::TransformField {
             field_name: "age".to_string(),
             transform: FieldTransform::ToInteger,
         });
 
-        let mut doc = Document::new("user1".to_string());
-        doc.fields.insert("age".to_string(), Value::String("30".to_string()));
+        let mut doc = Document::with_id("user1".to_string(), "users".to_string(), HashMap::new());
+        doc.fields
+            .insert("age".to_string(), Value::String("30".to_string()));
 
         script.apply_to_document(&mut doc).unwrap();
 
@@ -675,8 +683,9 @@ mod tests {
         plan.add_script(script1);
         plan.add_script(script2);
 
-        let mut doc = Document::new("user1".to_string());
-        doc.fields.insert("name".to_string(), Value::String("Alice".to_string()));
+        let mut doc = Document::with_id("user1".to_string(), "users".to_string(), HashMap::new());
+        doc.fields
+            .insert("name".to_string(), Value::String("Alice".to_string()));
 
         plan.apply_to_document(&mut doc).unwrap();
 
@@ -691,7 +700,10 @@ mod tests {
         assert_eq!(migration.status, MigrationStatus::Pending);
 
         migration.start();
-        assert!(matches!(migration.status, MigrationStatus::InProgress { .. }));
+        assert!(matches!(
+            migration.status,
+            MigrationStatus::InProgress { .. }
+        ));
 
         migration.update_progress(0.5);
         if let MigrationStatus::InProgress { progress, .. } = migration.status {
@@ -701,6 +713,9 @@ mod tests {
         }
 
         migration.complete(100);
-        assert!(matches!(migration.status, MigrationStatus::Completed { .. }));
+        assert!(matches!(
+            migration.status,
+            MigrationStatus::Completed { .. }
+        ));
     }
 }

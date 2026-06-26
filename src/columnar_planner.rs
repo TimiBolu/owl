@@ -125,6 +125,7 @@ pub enum ExecutionPlan {
 }
 
 /// Columnar query planner
+#[allow(dead_code)]
 pub struct ColumnarQueryPlanner {
     /// Hot column tracker
     tracker: Arc<HotColumnTracker>,
@@ -137,15 +138,12 @@ pub struct ColumnarQueryPlanner {
 }
 
 impl ColumnarQueryPlanner {
-    pub fn new(
-        tracker: Arc<HotColumnTracker>,
-        invalidator: Arc<ProjectionInvalidator>,
-    ) -> Self {
+    pub fn new(tracker: Arc<HotColumnTracker>, invalidator: Arc<ProjectionInvalidator>) -> Self {
         Self {
             tracker,
             invalidator,
-            row_scan_cost: 1.0,        // Base cost for row scan
-            columnar_scan_cost: 0.1,   // 10x faster for columnar scan
+            row_scan_cost: 1.0,          // Base cost for row scan
+            columnar_scan_cost: 0.1,     // 10x faster for columnar scan
             materialization_cost: 100.0, // One-time cost to materialize
         }
     }
@@ -168,9 +166,7 @@ impl ColumnarQueryPlanner {
                 // Check if columnar projection exists
                 if let Some(proj_columns) = self.invalidator.get_projection_columns(type_tag) {
                     // Check if projection covers requested columns
-                    let covered = columns
-                        .iter()
-                        .all(|col| proj_columns.contains(col));
+                    let covered = columns.iter().all(|col| proj_columns.contains(col));
 
                     if covered {
                         return ExecutionPlan::ColumnarProjection {
@@ -295,13 +291,8 @@ impl ColumnarQueryPlanner {
         bytes_scanned: u64,
     ) {
         for column in columns {
-            self.tracker.record_access(
-                type_tag,
-                column,
-                rows_returned,
-                total_rows,
-                bytes_scanned,
-            );
+            self.tracker
+                .record_access(type_tag, column, rows_returned, total_rows, bytes_scanned);
         }
     }
 }
@@ -459,11 +450,8 @@ mod tests {
             join_count: 0,
         };
 
-        let should_mat = planner.should_materialize(
-            1,
-            &chars,
-            &["age".to_string(), "salary".to_string()],
-        );
+        let should_mat =
+            planner.should_materialize(1, &chars, &["age".to_string(), "salary".to_string()]);
 
         assert!(should_mat);
     }

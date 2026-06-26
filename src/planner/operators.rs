@@ -3,6 +3,7 @@
 
 use crate::parser::Expression;
 use crate::planner::types::{AggregateSpec, FilterCondition, ProjectionField, SortSpec};
+use crate::storage::VectorMetricType;
 use std::collections::HashMap;
 
 /// Physical operator types
@@ -32,6 +33,8 @@ pub enum PhysicalOperator {
     Update(UpdateOperator),
     /// Delete rows
     Delete(DeleteOperator),
+    /// Vector nearest-neighbor search
+    VectorKnn(VectorKnnOperator),
     /// Nested loop join
     NestedLoopJoin(NestedLoopJoinOperator),
     /// Hash join
@@ -150,6 +153,19 @@ pub struct DeleteOperator {
     pub input: Box<PhysicalOperator>,
 }
 
+/// Vector nearest-neighbor operator.
+#[derive(Debug, Clone)]
+pub struct VectorKnnOperator {
+    pub schema: String,
+    pub field_path: Vec<String>,
+    pub query: Expression,
+    pub metric: VectorMetricType,
+    pub k: u64,
+    pub num_candidates: Option<u64>,
+    pub exact: Option<bool>,
+    pub input: Box<PhysicalOperator>,
+}
+
 /// Nested loop join operator
 #[derive(Debug, Clone)]
 pub struct NestedLoopJoinOperator {
@@ -226,6 +242,17 @@ impl PhysicalOperator {
                 // Cost of finding rows plus delete cost
                 op.input.estimate_cost() + (op.input.estimate_rows() as f64 * 1.5)
             }
+            PhysicalOperator::VectorKnn(op) => {
+                let n = op.input.estimate_rows() as f64;
+                let candidate_factor = if op.exact.unwrap_or(false) {
+                    1.0
+                } else {
+                    op.num_candidates
+                        .map(|c| (c as f64 / n.max(1.0)).clamp(0.05, 1.0))
+                        .unwrap_or(0.25)
+                };
+                op.input.estimate_cost() + (n * candidate_factor)
+            }
             PhysicalOperator::NestedLoopJoin(op) => {
                 // Nested loop is expensive: O(n * m)
                 let left_rows = op.left.estimate_rows() as f64;
@@ -240,7 +267,7 @@ impl PhysicalOperator {
             }
         }
     }
-    
+
     /// Estimate the number of rows this operator will produce
     pub fn estimate_rows(&self) -> u64 {
         match self {
@@ -264,6 +291,7 @@ impl PhysicalOperator {
             PhysicalOperator::Insert(_) => 1,
             PhysicalOperator::Update(op) => op.input.estimate_rows(),
             PhysicalOperator::Delete(op) => op.input.estimate_rows(),
+            PhysicalOperator::VectorKnn(op) => op.k.min(op.input.estimate_rows()),
             PhysicalOperator::NestedLoopJoin(op) => {
                 // Join can produce many rows
                 op.left.estimate_rows() * op.right.estimate_rows() / 10
@@ -274,7 +302,7 @@ impl PhysicalOperator {
             }
         }
     }
-    
+
     /// Get the operator type as a string
     pub fn operator_type(&self) -> &str {
         match self {
@@ -290,6 +318,7 @@ impl PhysicalOperator {
             PhysicalOperator::Insert(_) => "Insert",
             PhysicalOperator::Update(_) => "Update",
             PhysicalOperator::Delete(_) => "Delete",
+            PhysicalOperator::VectorKnn(_) => "VectorKnn",
             PhysicalOperator::NestedLoopJoin(_) => "NestedLoopJoin",
             PhysicalOperator::HashJoin(_) => "HashJoin",
         }

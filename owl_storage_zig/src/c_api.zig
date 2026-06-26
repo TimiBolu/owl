@@ -3,6 +3,9 @@
 
 const std = @import("std");
 const Arena = @import("arena.zig").Arena;
+const BTree = @import("btree.zig").BTree;
+const BTreeConfig = @import("btree.zig").BTreeConfig;
+const HnswIndex = @import("hnsw_index.zig").HnswIndex;
 const ObjRef = @import("objref.zig").ObjRef;
 const Object = @import("object.zig").Object;
 const ObjectHeader = @import("object_header.zig").ObjectHeader;
@@ -40,6 +43,271 @@ pub const OWL_ERR_UNKNOWN: c_int = -999;
 
 // Global allocator for C API (uses libc allocator)
 var gpa = std.heap.c_allocator;
+
+const SUPERBLOCK_MAGIC: u32 = 0x3142534f; // "OSB1"
+const SUPERBLOCK_VERSION: u16 = 1;
+const SUPERBLOCK_COPIES: usize = 4;
+const SUPERBLOCK_RECORD_SIZE: usize = 128;
+const WAL_MAGIC: u32 = 0x4c41574f; // "OWAL"
+const WAL_VERSION: u8 = 1;
+const WAL_FRAME_META_SIZE: usize = 12;
+const WAL_ENTRY_SIZE_MAX: usize = 64 * 1024 * 1024;
+
+const SuperblockRecord = struct {
+    copy: u16,
+    sequence: u64,
+    arena_size: u64,
+    wal_size: u64,
+    document_count: u64,
+    schema_count: u32,
+    parent_crc32: u32,
+    record_crc32: u32,
+};
+
+fn crc32(bytes: []const u8) u32 {
+    var hasher = std.hash.Crc32.init();
+    hasher.update(bytes);
+    return hasher.final();
+}
+
+fn encodeSuperblockRecord(record: SuperblockRecord) [SUPERBLOCK_RECORD_SIZE]u8 {
+    var out = std.mem.zeroes([SUPERBLOCK_RECORD_SIZE]u8);
+    std.mem.writeInt(u32, out[0..4], SUPERBLOCK_MAGIC, .little);
+    std.mem.writeInt(u16, out[4..6], SUPERBLOCK_VERSION, .little);
+    std.mem.writeInt(u16, out[6..8], record.copy, .little);
+    std.mem.writeInt(u64, out[8..16], record.sequence, .little);
+    std.mem.writeInt(u64, out[16..24], record.arena_size, .little);
+    std.mem.writeInt(u64, out[24..32], record.wal_size, .little);
+    std.mem.writeInt(u64, out[32..40], record.document_count, .little);
+    std.mem.writeInt(u32, out[40..44], record.schema_count, .little);
+    std.mem.writeInt(u32, out[44..48], 0, .little); // reserved
+    std.mem.writeInt(u32, out[48..52], record.parent_crc32, .little);
+    const record_crc = crc32(out[0..52]);
+    std.mem.writeInt(u32, out[52..56], record_crc, .little);
+    return out;
+}
+
+fn decodeSuperblockRecord(buf: []const u8) ?SuperblockRecord {
+    if (buf.len < SUPERBLOCK_RECORD_SIZE) return null;
+    const magic = std.mem.readInt(u32, buf[0..4], .little);
+    if (magic != SUPERBLOCK_MAGIC) return null;
+    const version = std.mem.readInt(u16, buf[4..6], .little);
+    if (version != SUPERBLOCK_VERSION) return null;
+    const copy = std.mem.readInt(u16, buf[6..8], .little);
+    if (copy >= SUPERBLOCK_COPIES) return null;
+    const sequence = std.mem.readInt(u64, buf[8..16], .little);
+    const arena_size = std.mem.readInt(u64, buf[16..24], .little);
+    const wal_size = std.mem.readInt(u64, buf[24..32], .little);
+    const document_count = std.mem.readInt(u64, buf[32..40], .little);
+    const schema_count = std.mem.readInt(u32, buf[40..44], .little);
+    const parent_crc32 = std.mem.readInt(u32, buf[48..52], .little);
+    const record_crc32 = std.mem.readInt(u32, buf[52..56], .little);
+    const computed = crc32(buf[0..52]);
+    if (computed != record_crc32) return null;
+    return .{
+        .copy = copy,
+        .sequence = sequence,
+        .arena_size = arena_size,
+        .wal_size = wal_size,
+        .document_count = document_count,
+        .schema_count = schema_count,
+        .parent_crc32 = parent_crc32,
+        .record_crc32 = record_crc32,
+    };
+}
+
+fn openFileRWCreate(path: []const u8) !std.fs.File {
+    const cwd = std.fs.cwd();
+    return cwd.openFile(path, .{ .mode = .read_write }) catch |err| switch (err) {
+        error.FileNotFound => try cwd.createFile(path, .{ .read = true, .truncate = false }),
+        else => err,
+    };
+}
+
+/// Recover best superblock record.
+/// Returns:
+/// - 1 if a valid record was found (outputs populated)
+/// - 0 if no usable superblock exists
+/// - negative error code on failure (strict failures return OWL_ERR_CORRUPTED_DATA)
+export fn owl_superblock_recover(
+    path: [*:0]const u8,
+    strict: bool,
+    out_sequence: ?*u64,
+    out_arena_size: ?*u64,
+    out_wal_size: ?*u64,
+    out_document_count: ?*u64,
+    out_schema_count: ?*u32,
+    out_record_crc32: ?*u32,
+) c_int {
+    const path_slice = std.mem.span(path);
+    const file = std.fs.cwd().openFile(path_slice, .{ .mode = .read_only }) catch |err| switch (err) {
+        error.FileNotFound => return 0,
+        else => return OWL_ERR_STORAGE_ERROR,
+    };
+    defer file.close();
+
+    const file_size = file.getEndPos() catch return OWL_ERR_STORAGE_ERROR;
+    if (file_size < SUPERBLOCK_RECORD_SIZE) return 0;
+
+    const readable_copies = @min(SUPERBLOCK_COPIES, @as(usize, @intCast(file_size / SUPERBLOCK_RECORD_SIZE)));
+    var records: [SUPERBLOCK_COPIES]SuperblockRecord = undefined;
+    var record_count: usize = 0;
+
+    var copy: usize = 0;
+    while (copy < readable_copies) : (copy += 1) {
+        var buf: [SUPERBLOCK_RECORD_SIZE]u8 = undefined;
+        _ = file.preadAll(&buf, copy * SUPERBLOCK_RECORD_SIZE) catch break;
+        if (decodeSuperblockRecord(&buf)) |rec| {
+            records[record_count] = rec;
+            record_count += 1;
+        }
+    }
+
+    if (record_count == 0) return 0;
+
+    var quorum_found = false;
+    var winner: SuperblockRecord = records[0];
+    var winner_votes: usize = 0;
+    var i: usize = 0;
+    while (i < record_count) : (i += 1) {
+        var count: usize = 0;
+        var j: usize = 0;
+        while (j < record_count) : (j += 1) {
+            if (records[j].sequence == records[i].sequence and records[j].record_crc32 == records[i].record_crc32) {
+                count += 1;
+            }
+        }
+        if (count >= 2 and (!quorum_found or records[i].sequence > winner.sequence or (records[i].sequence == winner.sequence and count > winner_votes))) {
+            quorum_found = true;
+            winner = records[i];
+            winner_votes = count;
+        }
+    }
+
+    if (quorum_found) {
+        if (strict and winner.sequence > 1) {
+            var has_parent = false;
+            i = 0;
+            while (i < record_count) : (i += 1) {
+                if (records[i].sequence + 1 == winner.sequence and records[i].record_crc32 == winner.parent_crc32) {
+                    has_parent = true;
+                    break;
+                }
+            }
+            if (!has_parent) return OWL_ERR_CORRUPTED_DATA;
+        }
+    } else {
+        if (strict) return OWL_ERR_CORRUPTED_DATA;
+        i = 1;
+        while (i < record_count) : (i += 1) {
+            if (records[i].sequence > winner.sequence) winner = records[i];
+        }
+    }
+
+    if (out_sequence) |ptr| ptr.* = winner.sequence;
+    if (out_arena_size) |ptr| ptr.* = winner.arena_size;
+    if (out_wal_size) |ptr| ptr.* = winner.wal_size;
+    if (out_document_count) |ptr| ptr.* = winner.document_count;
+    if (out_schema_count) |ptr| ptr.* = winner.schema_count;
+    if (out_record_crc32) |ptr| ptr.* = winner.record_crc32;
+    return 1;
+}
+
+/// Persist superblock record copyset.
+/// `initial_full=true` writes all 4 copies; otherwise writes two rotating copies.
+export fn owl_superblock_persist(
+    path: [*:0]const u8,
+    sequence: u64,
+    parent_crc32: u32,
+    arena_size: u64,
+    wal_size: u64,
+    document_count: u64,
+    schema_count: u32,
+    initial_full: bool,
+    out_record_crc32: ?*u32,
+) c_int {
+    const path_slice = std.mem.span(path);
+    var file = openFileRWCreate(path_slice) catch return OWL_ERR_STORAGE_ERROR;
+    defer file.close();
+
+    const min_size = SUPERBLOCK_RECORD_SIZE * SUPERBLOCK_COPIES;
+    file.setEndPos(min_size) catch return OWL_ERR_STORAGE_ERROR;
+
+    var last_crc = parent_crc32;
+    if (initial_full or sequence == 1) {
+        var copy: usize = 0;
+        while (copy < SUPERBLOCK_COPIES) : (copy += 1) {
+            const record = SuperblockRecord{
+                .copy = @as(u16, @intCast(copy)),
+                .sequence = sequence,
+                .arena_size = arena_size,
+                .wal_size = wal_size,
+                .document_count = document_count,
+                .schema_count = schema_count,
+                .parent_crc32 = parent_crc32,
+                .record_crc32 = 0,
+            };
+            const encoded = encodeSuperblockRecord(record);
+            file.pwriteAll(&encoded, copy * SUPERBLOCK_RECORD_SIZE) catch return OWL_ERR_STORAGE_ERROR;
+            last_crc = std.mem.readInt(u32, encoded[52..56], .little);
+        }
+    } else {
+        const a = @as(usize, @intCast(sequence % SUPERBLOCK_COPIES));
+        const b = (a + 1) % SUPERBLOCK_COPIES;
+        const copies = [_]usize{ a, b };
+        for (copies) |copy| {
+            const record = SuperblockRecord{
+                .copy = @as(u16, @intCast(copy)),
+                .sequence = sequence,
+                .arena_size = arena_size,
+                .wal_size = wal_size,
+                .document_count = document_count,
+                .schema_count = schema_count,
+                .parent_crc32 = parent_crc32,
+                .record_crc32 = 0,
+            };
+            const encoded = encodeSuperblockRecord(record);
+            file.pwriteAll(&encoded, copy * SUPERBLOCK_RECORD_SIZE) catch return OWL_ERR_STORAGE_ERROR;
+            last_crc = std.mem.readInt(u32, encoded[52..56], .little);
+        }
+    }
+
+    file.sync() catch return OWL_ERR_STORAGE_ERROR;
+    if (out_record_crc32) |ptr| ptr.* = last_crc;
+    return OWL_OK;
+}
+
+/// Append a framed WAL record (TigerBeetle-style framing + CRC).
+export fn owl_wal_append_framed(
+    path: [*:0]const u8,
+    payload: ?[*]const u8,
+    payload_len: usize,
+) c_int {
+    if (payload_len == 0 or payload_len > WAL_ENTRY_SIZE_MAX) return OWL_ERR_INVALID_SIZE;
+    const payload_slice = (payload orelse return OWL_ERR_INVALID_REF)[0..payload_len];
+
+    const path_slice = std.mem.span(path);
+    var file = openFileRWCreate(path_slice) catch return OWL_ERR_STORAGE_ERROR;
+    defer file.close();
+
+    const end_pos = file.getEndPos() catch return OWL_ERR_STORAGE_ERROR;
+    file.seekTo(end_pos) catch return OWL_ERR_STORAGE_ERROR;
+
+    var frame_meta: [WAL_FRAME_META_SIZE]u8 = std.mem.zeroes([WAL_FRAME_META_SIZE]u8);
+    frame_meta[0] = WAL_VERSION;
+    frame_meta[1] = 0; // flags
+    std.mem.writeInt(u16, frame_meta[2..4], 0, .little); // reserved
+    std.mem.writeInt(u32, frame_meta[4..8], @as(u32, @intCast(payload_len)), .little);
+    std.mem.writeInt(u32, frame_meta[8..12], crc32(payload_slice), .little);
+
+    var magic_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &magic_bytes, WAL_MAGIC, .little);
+    file.writeAll(&magic_bytes) catch return OWL_ERR_STORAGE_ERROR;
+    file.writeAll(&frame_meta) catch return OWL_ERR_STORAGE_ERROR;
+    file.writeAll(payload_slice) catch return OWL_ERR_STORAGE_ERROR;
+    file.sync() catch return OWL_ERR_STORAGE_ERROR;
+    return OWL_OK;
+}
 
 /// Create a new arena
 /// Returns null on failure
@@ -210,6 +478,292 @@ export fn owl_arena_colocation_metrics(
     if (out_failed) |ptr| ptr.* = metrics.failed_colocations.load(.seq_cst);
     if (out_success_rate) |ptr| ptr.* = metrics.successRate();
     return OWL_OK;
+}
+
+/// Create a B-tree index handle.
+export fn owl_btree_create(order: u32, shard_id: u32) ?*BTree {
+    if (order < 2) return null;
+    const config = BTreeConfig{ .order = @as(usize, @intCast(order)) };
+    return BTree.init(gpa, config, shard_id) catch null;
+}
+
+/// Destroy a B-tree index handle.
+export fn owl_btree_destroy(btree: ?*BTree) void {
+    if (btree) |tree| {
+        tree.deinit();
+    }
+}
+
+/// Insert key/value into B-tree.
+export fn owl_btree_insert(
+    btree: ?*BTree,
+    key: u64,
+    value_offset: u64,
+) c_int {
+    const tree = btree orelse return OWL_ERR_INVALID_REF;
+    tree.insert(key, ObjRef.init(value_offset)) catch |err| {
+        return switch (err) {
+            error.OutOfMemory => OWL_ERR_OUT_OF_MEMORY,
+            else => OWL_ERR_UNKNOWN,
+        };
+    };
+    return OWL_OK;
+}
+
+/// Search key in B-tree.
+export fn owl_btree_search(
+    btree: ?*BTree,
+    key: u64,
+    out_value_offset: ?*u64,
+    out_found: ?*bool,
+) c_int {
+    const tree = btree orelse return OWL_ERR_INVALID_REF;
+    const found = tree.search(key);
+    if (out_found) |ptr| ptr.* = (found != null);
+    if (found) |objref| {
+        if (out_value_offset) |ptr| ptr.* = objref.getOffset();
+    }
+    return OWL_OK;
+}
+
+/// Delete key from B-tree.
+export fn owl_btree_delete(
+    btree: ?*BTree,
+    key: u64,
+    out_deleted: ?*bool,
+) c_int {
+    const tree = btree orelse return OWL_ERR_INVALID_REF;
+    const deleted = tree.delete(key) catch return OWL_ERR_UNKNOWN;
+    if (out_deleted) |ptr| ptr.* = deleted;
+    return OWL_OK;
+}
+
+/// Range query for key interval [start_key, end_key].
+/// If `out_value_offsets` is null, only `out_count` is written.
+/// If `out_value_offsets` is non-null and `capacity` is too small,
+/// returns `OWL_ERR_INSUFFICIENT_SPACE` and writes required count.
+export fn owl_btree_range_query(
+    btree: ?*BTree,
+    start_key: u64,
+    end_key: u64,
+    out_value_offsets: ?[*]u64,
+    capacity: usize,
+    out_count: ?*usize,
+) c_int {
+    const tree = btree orelse return OWL_ERR_INVALID_REF;
+    const results = tree.rangeQuery(start_key, end_key, gpa) catch |err| {
+        return switch (err) {
+            error.OutOfMemory => OWL_ERR_OUT_OF_MEMORY,
+        };
+    };
+    defer gpa.free(results);
+
+    if (out_count) |ptr| ptr.* = results.len;
+
+    if (out_value_offsets == null) return OWL_OK;
+    if (capacity < results.len) return OWL_ERR_INSUFFICIENT_SPACE;
+
+    const out = out_value_offsets.?;
+    for (results, 0..) |objref, i| {
+        out[i] = objref.getOffset();
+    }
+    return OWL_OK;
+}
+
+/// Exact top-k vector search over a dense row-major f32 matrix.
+///
+/// Metric encoding:
+/// - 0: cosine similarity (higher is better)
+/// - 1: negative L2 distance (higher is better)
+/// - 2: dot product (higher is better)
+export fn owl_vector_topk_f32(
+    vectors_ptr: ?[*]const f32,
+    vector_count: usize,
+    dimension: usize,
+    query_ptr: ?[*]const f32,
+    metric: u32,
+    k: usize,
+    out_indices: ?[*]u32,
+    out_scores: ?[*]f32,
+    out_count: ?*usize,
+) c_int {
+    if (vector_count == 0 or dimension == 0 or k == 0) {
+        if (out_count) |ptr| ptr.* = 0;
+        return OWL_OK;
+    }
+
+    const vectors = vectors_ptr orelse return OWL_ERR_INVALID_REF;
+    const query = query_ptr orelse return OWL_ERR_INVALID_REF;
+    const indices_out = out_indices orelse return OWL_ERR_INVALID_REF;
+    const scores_out = out_scores orelse return OWL_ERR_INVALID_REF;
+    if (out_count == null) return OWL_ERR_INVALID_REF;
+
+    const top_k = @min(k, vector_count);
+    const count_out = out_count.?;
+    count_out.* = top_k;
+
+    const total_values = vector_count * dimension;
+    const matrix = vectors[0..total_values];
+    const query_vec = query[0..dimension];
+
+    const ScoredIndex = struct {
+        idx: u32,
+        score: f32,
+    };
+
+    var scored = gpa.alloc(ScoredIndex, vector_count) catch return OWL_ERR_OUT_OF_MEMORY;
+    defer gpa.free(scored);
+
+    for (0..vector_count) |row| {
+        const start = row * dimension;
+        const vec = matrix[start .. start + dimension];
+
+        var dot: f64 = 0;
+        var norm_vec: f64 = 0;
+        var norm_query: f64 = 0;
+        var sq_dist: f64 = 0;
+
+        for (0..dimension) |i| {
+            const a = @as(f64, vec[i]);
+            const b = @as(f64, query_vec[i]);
+            dot += a * b;
+            norm_vec += a * a;
+            norm_query += b * b;
+            const d = a - b;
+            sq_dist += d * d;
+        }
+
+        const score: f32 = switch (metric) {
+            0 => blk: {
+                if (norm_vec <= 0 or norm_query <= 0) break :blk 0.0;
+                break :blk @floatCast(dot / (std.math.sqrt(norm_vec) * std.math.sqrt(norm_query)));
+            },
+            1 => @floatCast(-std.math.sqrt(sq_dist)),
+            2 => @floatCast(dot),
+            else => return OWL_ERR_INVALID_SIZE,
+        };
+
+        scored[row] = .{
+            .idx = @intCast(row),
+            .score = score,
+        };
+    }
+
+    std.mem.sort(ScoredIndex, scored, {}, struct {
+        fn lessThan(_: void, a: ScoredIndex, b: ScoredIndex) bool {
+            return a.score > b.score;
+        }
+    }.lessThan);
+
+    for (0..top_k) |i| {
+        indices_out[i] = scored[i].idx;
+        scores_out[i] = scored[i].score;
+    }
+
+    return OWL_OK;
+}
+
+/// Create a new HNSW index handle.
+export fn owl_hnsw_index_create(
+    dimension: u32,
+    m: u32,
+    ef_construction: u32,
+) ?*HnswIndex {
+    if (dimension == 0) return null;
+    const index = gpa.create(HnswIndex) catch return null;
+    index.* = HnswIndex.init(gpa, dimension, m, ef_construction);
+    return index;
+}
+
+/// Destroy an HNSW index handle.
+export fn owl_hnsw_index_destroy(index: ?*HnswIndex) void {
+    if (index) |idx| {
+        idx.deinit();
+        gpa.destroy(idx);
+    }
+}
+
+/// Add a single vector to the HNSW index.
+export fn owl_hnsw_index_add_vector(
+    index: ?*HnswIndex,
+    id: u64,
+    vector_ptr: ?[*]const f32,
+    vector_len: usize,
+) c_int {
+    const idx = index orelse return OWL_ERR_INVALID_REF;
+    const vector = (vector_ptr orelse return OWL_ERR_INVALID_REF)[0..vector_len];
+    idx.addVector(id, vector) catch |err| {
+        return switch (err) {
+            error.OutOfMemory => OWL_ERR_OUT_OF_MEMORY,
+            error.InvalidDimension => OWL_ERR_INVALID_SIZE,
+        };
+    };
+    return OWL_OK;
+}
+
+/// Search the HNSW index.
+export fn owl_hnsw_index_search(
+    index: ?*HnswIndex,
+    query_ptr: ?[*]const f32,
+    query_len: usize,
+    k: usize,
+    ef: usize,
+    out_ids: ?[*]u64,
+    out_scores: ?[*]f32,
+    out_count: ?*usize,
+) c_int {
+    const idx = index orelse return OWL_ERR_INVALID_REF;
+    if (k == 0) {
+        if (out_count) |ptr| ptr.* = 0;
+        return OWL_OK;
+    }
+
+    const query = (query_ptr orelse return OWL_ERR_INVALID_REF)[0..query_len];
+    const ids = out_ids orelse return OWL_ERR_INVALID_REF;
+    const scores = out_scores orelse return OWL_ERR_INVALID_REF;
+    const count_out = out_count orelse return OWL_ERR_INVALID_REF;
+
+    const hits = idx.search(query, k, ef, gpa) catch |err| {
+        return switch (err) {
+            error.OutOfMemory => OWL_ERR_OUT_OF_MEMORY,
+            error.InvalidDimension => OWL_ERR_INVALID_SIZE,
+        };
+    };
+    defer gpa.free(hits);
+
+    count_out.* = hits.len;
+    for (hits, 0..) |hit, i| {
+        ids[i] = hit.id;
+        scores[i] = hit.score;
+    }
+    return OWL_OK;
+}
+
+/// Persist HNSW index to disk.
+export fn owl_hnsw_index_save(
+    index: ?*HnswIndex,
+    path: [*:0]const u8,
+) c_int {
+    const idx = index orelse return OWL_ERR_INVALID_REF;
+    const path_slice = std.mem.span(path);
+    idx.saveToFile(path_slice) catch |err| {
+        return switch (err) {
+            error.AccessDenied, error.FileNotFound, error.PathAlreadyExists => OWL_ERR_STORAGE_ERROR,
+            else => OWL_ERR_UNKNOWN,
+        };
+    };
+    return OWL_OK;
+}
+
+/// Load HNSW index from disk.
+export fn owl_hnsw_index_load(path: [*:0]const u8) ?*HnswIndex {
+    const path_slice = std.mem.span(path);
+    const idx = gpa.create(HnswIndex) catch return null;
+    idx.* = HnswIndex.loadFromFile(gpa, path_slice) catch {
+        gpa.destroy(idx);
+        return null;
+    };
+    return idx;
 }
 
 /// Get the base pointer for swizzling (advanced usage)

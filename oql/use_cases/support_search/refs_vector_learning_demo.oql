@@ -1,0 +1,153 @@
+// Refs + nested data + vector nearest demo
+// Use this as a learning script for OQL modeling and vector retrieval.
+
+schema organizations {
+  id: String,
+  name: String,
+  profile: Object
+}
+
+schema teams {
+  id: String,
+  org: Ref(organizations),
+  name: String,
+  settings: Object
+}
+
+schema kb_articles {
+  id: String,
+  team: Ref(teams),
+  title: String,
+  status: String,
+  tags: List(String),
+  body: String,
+  meta: Object,
+  embedding: Vector(4)
+}
+
+schema incidents {
+  id: String,
+  org: Ref(organizations),
+  title: String,
+  severity: String,
+  details: Object
+}
+
+fn is_live_article(a: kb_articles) -> Bool {
+  a.status == "published"
+}
+
+organizations.insert [
+  { id: "org_1", name: "Northwind", profile: { region: "west", tier: "enterprise" } },
+  { id: "org_2", name: "Contoso", profile: { region: "east", tier: "growth" } }
+]
+
+teams.insert [
+  { id: "team_1", org: "org_1", name: "Payments", settings: { timezone: "UTC" } },
+  { id: "team_2", org: "org_1", name: "Infra", settings: { timezone: "UTC+1" } },
+  { id: "team_3", org: "org_2", name: "Commerce", settings: { timezone: "UTC-5" } }
+]
+
+kb_articles.insert [
+  {
+    id: "kb_1",
+    team: "team_1",
+    title: "Chargeback dispute flow",
+    status: "published",
+    tags: ["payments", "risk"],
+    body: "Steps to dispute a chargeback and gather evidence.",
+    meta: { priority: 9, lang: "en" },
+    embedding: [0.92, 0.04, 0.10, 0.02]
+  },
+  {
+    id: "kb_2",
+    team: "team_1",
+    title: "Refund processing policy",
+    status: "published",
+    tags: ["payments", "refunds"],
+    body: "How to process partial and full refunds.",
+    meta: { priority: 7, lang: "en" },
+    embedding: [0.88, 0.08, 0.05, 0.01]
+  },
+  {
+    id: "kb_3",
+    team: "team_2",
+    title: "Kubernetes node pressure runbook",
+    status: "published",
+    tags: ["infra", "kubernetes"],
+    body: "Diagnose memory pressure and pod eviction events.",
+    meta: { priority: 8, lang: "en" },
+    embedding: [0.06, 0.90, 0.15, 0.04]
+  },
+  {
+    id: "kb_4",
+    team: "team_3",
+    title: "Catalog indexing lag playbook",
+    status: "draft",
+    tags: ["search", "commerce"],
+    body: "Handling delayed product indexing and stale search results.",
+    meta: { priority: 6, lang: "en" },
+    embedding: [0.15, 0.22, 0.83, 0.11]
+  }
+]
+
+incidents.insert [
+  {
+    id: "inc_1",
+    org: "org_1",
+    title: "Spike in payment disputes",
+    severity: "high",
+    details: { source: "alerts", owner: "oncall_payments" }
+  },
+  {
+    id: "inc_2",
+    org: "org_2",
+    title: "Search stale results",
+    severity: "medium",
+    details: { source: "support", owner: "oncall_commerce" }
+  }
+]
+
+// Normal query using refs + nested fields.
+kb_articles.where { is_live_article(*) }.select {
+  id,
+  title,
+  team_name: .team.name,
+  org_name: .team.org.name,
+  org_tier: .team.org.profile.tier,
+  priority: .meta.priority
+}
+
+// Aggregation query (non-vector).
+incidents.group_by { .org.id, .org.name, .severity }.select {
+  org_id: .org.id,
+  org_name: .org.name,
+  severity,
+  total: count()
+}
+
+// Vector nearest for "payments/risk-like" intent.
+kb_articles.where { .status == "published" }.nearest {
+  field: .embedding,
+  query: [0.95, 0.05, 0.08, 0.01],
+  metric: "cosine",
+  k: 3
+}.select {
+  id,
+  title,
+  team_name: .team.name,
+  org_name: .team.org.name,
+  score: ._score
+}
+
+// Vector nearest for "infra runbook-like" intent.
+kb_articles.where { .status == "published" }.nearest {
+  field: .embedding,
+  query: [0.05, 0.94, 0.14, 0.04],
+  metric: "cosine",
+  k: 2
+}.select {
+  id,
+  title,
+  score: ._score
+}

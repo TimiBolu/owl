@@ -10,7 +10,7 @@ use crate::storage::Storage;
 use std::cmp::Ordering;
 
 /// Sequential scan operator
-/// 
+///
 /// Scans all documents in a collection sequentially.
 pub struct SeqScanExec {
     schema: String,
@@ -37,7 +37,7 @@ impl PhysicalOperatorExec for SeqScanExec {
         self.position = 0;
         Ok(())
     }
-    
+
     fn next(&mut self) -> OQLResult<Option<Document>> {
         if self.position < self.documents.len() {
             let doc = self.documents[self.position].clone();
@@ -47,13 +47,13 @@ impl PhysicalOperatorExec for SeqScanExec {
             Ok(None)
         }
     }
-    
+
     fn close(&mut self) -> OQLResult<()> {
         self.documents.clear();
         self.storage = None;
         Ok(())
     }
-    
+
     fn reset(&mut self) -> OQLResult<()> {
         self.position = 0;
         Ok(())
@@ -61,7 +61,7 @@ impl PhysicalOperatorExec for SeqScanExec {
 }
 
 /// Filter operator
-/// 
+///
 /// Filters documents based on a condition.
 pub struct FilterExec {
     condition: FilterCondition,
@@ -72,10 +72,14 @@ impl FilterExec {
     pub fn new(condition: FilterCondition, input: Box<dyn PhysicalOperatorExec>) -> Self {
         Self { condition, input }
     }
-    
+
     fn evaluate_condition(&self, doc: &Document) -> OQLResult<bool> {
         match &self.condition {
-            FilterCondition::Comparison { left, operator, right } => {
+            FilterCondition::Comparison {
+                left,
+                operator,
+                right,
+            } => {
                 let left_val = self.evaluate_expression(doc, left)?;
                 let right_val = self.evaluate_expression(doc, right)?;
                 Ok(self.compare_values(&left_val, operator, &right_val))
@@ -96,10 +100,18 @@ impl FilterExec {
             }
         }
     }
-    
-    fn evaluate_filter_condition(&self, doc: &Document, condition: &FilterCondition) -> OQLResult<bool> {
+
+    fn evaluate_filter_condition(
+        &self,
+        doc: &Document,
+        condition: &FilterCondition,
+    ) -> OQLResult<bool> {
         match condition {
-            FilterCondition::Comparison { left, operator, right } => {
+            FilterCondition::Comparison {
+                left,
+                operator,
+                right,
+            } => {
                 let left_val = self.evaluate_expression(doc, left)?;
                 let right_val = self.evaluate_expression(doc, right)?;
                 Ok(self.compare_values(&left_val, operator, &right_val))
@@ -120,14 +132,16 @@ impl FilterExec {
             }
         }
     }
-    
+
     fn evaluate_expression(&self, doc: &Document, expr: &Expression) -> OQLResult<Value> {
         match expr {
             Expression::Literal(lit) => Ok(Self::literal_to_value(lit)),
-            Expression::FieldAccess(field_access) => {
-                self.evaluate_field_access(doc, field_access)
-            }
-            Expression::BinaryOp { left, operator, right } => {
+            Expression::FieldAccess(field_access) => self.evaluate_field_access(doc, field_access),
+            Expression::BinaryOp {
+                left,
+                operator,
+                right,
+            } => {
                 let left_val = self.evaluate_expression(doc, left)?;
                 let right_val = self.evaluate_expression(doc, right)?;
                 self.evaluate_binary_op(&left_val, operator, &right_val)
@@ -135,7 +149,7 @@ impl FilterExec {
             _ => Err(OQLError::generic("Unsupported expression in filter")),
         }
     }
-    
+
     fn literal_to_value(lit: &Literal) -> Value {
         match lit {
             Literal::String(s) => Value::String(s.clone()),
@@ -144,16 +158,22 @@ impl FilterExec {
             Literal::Boolean(b) => Value::Boolean(*b),
         }
     }
-    
-    fn evaluate_field_access(&self, doc: &Document, field_access: &FieldAccess) -> OQLResult<Value> {
+
+    fn evaluate_field_access(
+        &self,
+        doc: &Document,
+        field_access: &FieldAccess,
+    ) -> OQLResult<Value> {
         if field_access.path.is_empty() {
             return Ok(Value::Null);
         }
-        
-        let mut current_val = doc.fields.get(&field_access.path[0])
+
+        let mut current_val = doc
+            .fields
+            .get(&field_access.path[0])
             .cloned()
             .unwrap_or(Value::Null);
-        
+
         for segment in &field_access.path[1..] {
             match &current_val {
                 Value::Object(obj) => {
@@ -162,11 +182,16 @@ impl FilterExec {
                 _ => return Ok(Value::Null),
             }
         }
-        
+
         Ok(current_val)
     }
-    
-    fn evaluate_binary_op(&self, left: &Value, operator: &BinaryOperator, right: &Value) -> OQLResult<Value> {
+
+    fn evaluate_binary_op(
+        &self,
+        left: &Value,
+        operator: &BinaryOperator,
+        right: &Value,
+    ) -> OQLResult<Value> {
         match operator {
             BinaryOperator::Add => match (left, right) {
                 (Value::Integer(a), Value::Integer(b)) => Ok(Value::Integer(a + b)),
@@ -206,27 +231,25 @@ impl FilterExec {
             },
         }
     }
-    
+
     fn compare_values(&self, left: &Value, operator: &ComparisonOperator, right: &Value) -> bool {
         match operator {
             ComparisonOperator::Equal => left == right,
             ComparisonOperator::NotEqual => left != right,
             ComparisonOperator::LessThan => self.value_less_than(left, right),
-            ComparisonOperator::LessEqual => {
-                left == right || self.value_less_than(left, right)
-            }
+            ComparisonOperator::LessEqual => left == right || self.value_less_than(left, right),
             ComparisonOperator::GreaterThan => self.value_less_than(right, left),
-            ComparisonOperator::GreaterEqual => {
-                left == right || self.value_less_than(right, left)
-            }
-            ComparisonOperator::Contains | ComparisonOperator::StartsWith | 
-            ComparisonOperator::EndsWith | ComparisonOperator::In => {
+            ComparisonOperator::GreaterEqual => left == right || self.value_less_than(right, left),
+            ComparisonOperator::Contains
+            | ComparisonOperator::StartsWith
+            | ComparisonOperator::EndsWith
+            | ComparisonOperator::In => {
                 // String operations - simplified for now
                 false
             }
         }
     }
-    
+
     fn value_less_than(&self, left: &Value, right: &Value) -> bool {
         match (left, right) {
             (Value::Integer(a), Value::Integer(b)) => a < b,
@@ -242,7 +265,7 @@ impl PhysicalOperatorExec for FilterExec {
     fn open(&mut self, storage: Storage) -> OQLResult<()> {
         self.input.open(storage)
     }
-    
+
     fn next(&mut self) -> OQLResult<Option<Document>> {
         loop {
             match self.input.next()? {
@@ -256,18 +279,18 @@ impl PhysicalOperatorExec for FilterExec {
             }
         }
     }
-    
+
     fn close(&mut self) -> OQLResult<()> {
         self.input.close()
     }
-    
+
     fn reset(&mut self) -> OQLResult<()> {
         self.input.reset()
     }
 }
 
 /// Project operator
-/// 
+///
 /// Projects specific fields from documents.
 pub struct ProjectExec {
     projections: Vec<ProjectionField>,
@@ -278,17 +301,19 @@ impl ProjectExec {
     pub fn new(projections: Vec<ProjectionField>, input: Box<dyn PhysicalOperatorExec>) -> Self {
         Self { projections, input }
     }
-    
+
     fn project_document(&self, doc: &Document) -> OQLResult<Document> {
         let mut projected_fields = std::collections::HashMap::new();
-        
+
         for proj in &self.projections {
             let value = self.evaluate_expression(doc, &proj.expression)?;
-            let field_name = proj.alias.clone()
+            let field_name = proj
+                .alias
+                .clone()
                 .unwrap_or_else(|| self.expression_to_field_name(&proj.expression));
             projected_fields.insert(field_name, value);
         }
-        
+
         Ok(Document {
             id: doc.id.clone(),
             schema: doc.schema.clone(),
@@ -298,26 +323,30 @@ impl ProjectExec {
             version: doc.version,
         })
     }
-    
+
     fn evaluate_expression(&self, doc: &Document, expr: &Expression) -> OQLResult<Value> {
         match expr {
             Expression::Literal(lit) => Ok(FilterExec::literal_to_value(lit)),
-            Expression::FieldAccess(field_access) => {
-                self.evaluate_field_access(doc, field_access)
-            }
+            Expression::FieldAccess(field_access) => self.evaluate_field_access(doc, field_access),
             _ => Err(OQLError::generic("Unsupported expression in projection")),
         }
     }
-    
-    fn evaluate_field_access(&self, doc: &Document, field_access: &FieldAccess) -> OQLResult<Value> {
+
+    fn evaluate_field_access(
+        &self,
+        doc: &Document,
+        field_access: &FieldAccess,
+    ) -> OQLResult<Value> {
         if field_access.path.is_empty() {
             return Ok(Value::Null);
         }
-        
-        let mut current_val = doc.fields.get(&field_access.path[0])
+
+        let mut current_val = doc
+            .fields
+            .get(&field_access.path[0])
             .cloned()
             .unwrap_or(Value::Null);
-        
+
         for segment in &field_access.path[1..] {
             match &current_val {
                 Value::Object(obj) => {
@@ -326,15 +355,13 @@ impl ProjectExec {
                 _ => return Ok(Value::Null),
             }
         }
-        
+
         Ok(current_val)
     }
-    
+
     fn expression_to_field_name(&self, expr: &Expression) -> String {
         match expr {
-            Expression::FieldAccess(field_access) => {
-                field_access.path.join(".")
-            }
+            Expression::FieldAccess(field_access) => field_access.path.join("."),
             _ => "expr".to_string(),
         }
     }
@@ -344,25 +371,25 @@ impl PhysicalOperatorExec for ProjectExec {
     fn open(&mut self, storage: Storage) -> OQLResult<()> {
         self.input.open(storage)
     }
-    
+
     fn next(&mut self) -> OQLResult<Option<Document>> {
         match self.input.next()? {
             Some(doc) => Ok(Some(self.project_document(&doc)?)),
             None => Ok(None),
         }
     }
-    
+
     fn close(&mut self) -> OQLResult<()> {
         self.input.close()
     }
-    
+
     fn reset(&mut self) -> OQLResult<()> {
         self.input.reset()
     }
 }
 
 /// Sort operator
-/// 
+///
 /// Sorts documents based on sort specifications.
 pub struct SortExec {
     sort_specs: Vec<SortSpec>,
@@ -380,7 +407,7 @@ impl SortExec {
             position: 0,
         }
     }
-    
+
     fn eval_expr_static(doc: &Document, expr: &Expression) -> OQLResult<Value> {
         match expr {
             Expression::Literal(lit) => Ok(FilterExec::literal_to_value(lit)),
@@ -388,19 +415,21 @@ impl SortExec {
                 if field_access.path.is_empty() {
                     Ok(Value::Null)
                 } else {
-                    Ok(doc.fields.get(&field_access.path[0]).cloned().unwrap_or(Value::Null))
+                    Ok(doc
+                        .fields
+                        .get(&field_access.path[0])
+                        .cloned()
+                        .unwrap_or(Value::Null))
                 }
             }
             _ => Err(OQLError::generic("Unsupported expression in sort")),
         }
     }
-    
+
     fn compare_values_static(a: &Value, b: &Value) -> Ordering {
         match (a, b) {
             (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
-            (Value::Float(x), Value::Float(y)) => {
-                x.partial_cmp(y).unwrap_or(Ordering::Equal)
-            }
+            (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
             (Value::String(x), Value::String(y)) => x.cmp(y),
             (Value::Boolean(x), Value::Boolean(y)) => x.cmp(y),
             (Value::Null, Value::Null) => Ordering::Equal,
@@ -414,20 +443,20 @@ impl SortExec {
 impl PhysicalOperatorExec for SortExec {
     fn open(&mut self, storage: Storage) -> OQLResult<()> {
         self.input.open(storage)?;
-        
+
         // Collect all documents
         self.sorted_documents.clear();
         while let Some(doc) = self.input.next()? {
             self.sorted_documents.push(doc);
         }
-        
+
         // Sort them - clone sort_specs to avoid borrow issues
         let sort_specs = self.sort_specs.clone();
         self.sorted_documents.sort_by(|a, b| {
             for spec in &sort_specs {
                 let a_val = SortExec::eval_expr_static(a, &spec.expression).unwrap_or(Value::Null);
                 let b_val = SortExec::eval_expr_static(b, &spec.expression).unwrap_or(Value::Null);
-                
+
                 let cmp = SortExec::compare_values_static(&a_val, &b_val);
                 if cmp != Ordering::Equal {
                     return match spec.direction {
@@ -439,10 +468,10 @@ impl PhysicalOperatorExec for SortExec {
             Ordering::Equal
         });
         self.position = 0;
-        
+
         Ok(())
     }
-    
+
     fn next(&mut self) -> OQLResult<Option<Document>> {
         if self.position < self.sorted_documents.len() {
             let doc = self.sorted_documents[self.position].clone();
@@ -452,12 +481,12 @@ impl PhysicalOperatorExec for SortExec {
             Ok(None)
         }
     }
-    
+
     fn close(&mut self) -> OQLResult<()> {
         self.sorted_documents.clear();
         self.input.close()
     }
-    
+
     fn reset(&mut self) -> OQLResult<()> {
         self.position = 0;
         Ok(())
@@ -465,7 +494,7 @@ impl PhysicalOperatorExec for SortExec {
 }
 
 /// Limit operator
-/// 
+///
 /// Limits the number of documents returned.
 pub struct LimitExec {
     limit: u64,
@@ -489,12 +518,12 @@ impl PhysicalOperatorExec for LimitExec {
         self.count = 0;
         Ok(())
     }
-    
+
     fn next(&mut self) -> OQLResult<Option<Document>> {
         if self.count >= self.limit {
             return Ok(None);
         }
-        
+
         match self.input.next()? {
             Some(doc) => {
                 self.count += 1;
@@ -503,11 +532,11 @@ impl PhysicalOperatorExec for LimitExec {
             None => Ok(None),
         }
     }
-    
+
     fn close(&mut self) -> OQLResult<()> {
         self.input.close()
     }
-    
+
     fn reset(&mut self) -> OQLResult<()> {
         self.count = 0;
         self.input.reset()

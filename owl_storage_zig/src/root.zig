@@ -25,9 +25,16 @@ pub const WALEntry = @import("wal.zig").WALEntry;
 pub const LSN = @import("wal.zig").LSN;
 pub const EntryType = @import("wal.zig").EntryType;
 pub const WALStats = @import("wal.zig").WALStats;
+pub const GroupCommitConfig = @import("wal.zig").GroupCommitConfig;
 
 // Lock-Free WAL exports (Task 9.4)
 pub const LockFreeWAL = @import("lockfree_wal.zig").LockFreeWAL;
+pub const WalIntentRingWAL = @import("wal_intent_ring.zig").WalIntentRingWAL;
+pub const WalIntentRingConfig = @import("wal_intent_ring.zig").WalIntentRingConfig;
+pub const WalIntentDurabilityClass = @import("wal_intent_ring.zig").DurabilityClass;
+pub const WalIntentCompletionStatus = @import("wal_intent_ring.zig").CompletionStatus;
+pub const WalIntentProducerHandle = @import("wal_intent_ring.zig").ProducerHandle;
+pub const WalIntentSubmissionToken = @import("wal_intent_ring.zig").SubmissionToken;
 
 // Transaction exports
 pub const Transaction = @import("transaction.zig").Transaction;

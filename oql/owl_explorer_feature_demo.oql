@@ -1,0 +1,37 @@
+schema users {
+  id: String,
+  name: String,
+  profile: Object,
+  tags: List(String)
+}
+
+schema orders {
+  id: String,
+  user: users,
+  amount: Float,
+  meta: Object
+}
+
+users.insert [
+  { id: "u1", name: "Ada", profile: { city: "Lagos", prefs: { theme: "light", alerts: true } }, tags: ["pro", "beta"] },
+  { id: "u2", name: "Mina", profile: { city: "Abuja", prefs: { theme: "dark", alerts: false } }, tags: ["starter"] }
+]
+
+orders.insert [
+  { id: "o1", user: "u1", amount: 320.5, meta: { channel: "web", item_count: 3 } },
+  { id: "o2", user: "u1", amount: 120.0, meta: { channel: "mobile", item_count: 1 } },
+  { id: "o3", user: "u2", amount: 80.0, meta: { channel: "web", item_count: 2 } }
+]
+
+orders.group_by { .user }.select {
+  user_ref,
+  total_orders: count(),
+  total_amount: sum(.amount),
+  avg_amount: avg(.amount)
+}
+
+users.where { .profile.prefs.alerts == true }.select {
+  id,
+  name,
+  city: .profile.city
+}

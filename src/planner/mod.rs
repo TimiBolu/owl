@@ -6,6 +6,6 @@ pub mod operators;
 pub mod physical;
 pub mod types;
 
-pub use logical::{LogicalPlanner, LogicalPlan};
-pub use physical::{PhysicalPlanner, PhysicalPlan, Statistics};
+pub use logical::{LogicalPlan, LogicalPlanner};
+pub use physical::{PhysicalPlan, PhysicalPlanner, Statistics};
 pub use types::{PlanNode, PlanType};
