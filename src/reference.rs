@@ -468,14 +468,14 @@ pub fn create_reference_id(schema: &str, document_id: &str) -> String {
 mod tests {
     use super::*;
     use crate::document::Document;
-    use crate::storage::zig_adapter::ZigStore;
+    use crate::storage::RustStore;
     use std::collections::HashMap;
     use tempfile::TempDir;
 
-    fn create_test_resolver() -> (ReferenceResolver<ZigStore>, TempDir) {
+    fn create_test_resolver() -> (ReferenceResolver<RustStore>, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("test.owl");
-        let store = Arc::new(ZigStore::new(path.to_str().unwrap(), 10 * 1024 * 1024).unwrap());
+        let store = Arc::new(RustStore::new(path.to_str().unwrap(), 10 * 1024 * 1024).unwrap());
         let resolver = ReferenceResolver::new(store);
         (resolver, temp_dir)
     }

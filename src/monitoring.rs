@@ -81,6 +81,7 @@ impl QueryMetrics {
             crate::parser::Operation::Select(_) => "select".to_string(),
             crate::parser::Operation::Insert(_) => "insert".to_string(),
             crate::parser::Operation::InsertMany(_) => "batch_insert".to_string(),
+            crate::parser::Operation::Upsert(_) => "upsert".to_string(),
             crate::parser::Operation::Update(_) => "update".to_string(),
             crate::parser::Operation::Delete => "delete".to_string(),
             crate::parser::Operation::GroupBy(_) => "aggregate".to_string(),
@@ -92,6 +93,9 @@ impl QueryMetrics {
             crate::parser::Operation::Max(_) => "aggregate".to_string(),
             crate::parser::Operation::Sort(_) => "sort".to_string(),
             crate::parser::Operation::Limit(_) => "limit".to_string(),
+            crate::parser::Operation::Offset(_) => "offset".to_string(),
+            crate::parser::Operation::First => "select".to_string(),
+            crate::parser::Operation::Exists => "aggregate".to_string(),
             crate::parser::Operation::Nearest(_) => "vector_search".to_string(),
             crate::parser::Operation::FunctionDef(_) => "function".to_string(),
         }

@@ -712,8 +712,46 @@ orders
     customer_id,
     status,
     total: count()
+}
+```
+
+### Filtering groups with `having`
+
+`having` filters materialized groups and may use the same aggregate expressions
+available in grouped projection.
+
+```oql
+orders
+  .group_by { .status }
+  .having { count() >= 10 && sum(.amount) > 1000 }
+  .select {
+    status,
+    total_orders: count(),
+    total_amount: sum(.amount)
   }
 ```
+
+Aggregate calls may also participate in larger expressions:
+
+```oql
+.having { sum(.amount) / count(.amount) >= 100 }
+```
+
+The same composability applies without grouping:
+
+```oql
+orders.select {
+  average_amount: sum(.amount) / count(.amount),
+  healthy: if avg(.amount) >= 100 then true else false
+}
+```
+
+An aggregate call does not become a restricted projection mode. It remains an
+ordinary scalar expression derived from the current collection.
+
+`count()` counts group rows. `count(field)` counts resolved, non-null field
+values. `sum`, `avg`, `min`, and `max` ignore null or unresolved inputs;
+`avg`, `min`, and `max` return `null` when no usable input exists.
 
 ### Aggregation philosophy
 
@@ -789,10 +827,7 @@ users.where { .inactive == true }.delete()
 
 ### Upsert
 
-Upsert is important enough to deserve first-class support, but it should read in Owl's
-own style.
-
-A good target surface is:
+Upsert is a first-class collection mutation and reads in Owl's own style:
 
 ```oql
 users.upsert on id {
@@ -808,6 +843,11 @@ This says exactly what matters:
 - the key that determines identity
 - the shape to insert or update
 
+The named key must occur exactly once in the document block. If no document has
+that key value, Owl inserts the document. If exactly one matches, Owl updates that
+document while preserving fields omitted from the block. More than one match is a
+data-integrity error; Owl must not choose one arbitrarily.
+
 ## Partial And Nested Updates
 
 Owl should support updating only part of a document without forcing a second update
@@ -821,6 +861,10 @@ users.where { .id == "u1" }.update {
   profile.country: "NG"
 }
 ```
+
+For object paths, Owl creates a missing intermediate only when the schema declares
+the root as `Object` (possibly optional). It does not replace an explicit `null` or
+scalar with an object, and it never synthesizes or mutates through a reference.
 
 For repeated fields, Owl should again try to reuse collection semantics rather than jump
 immediately to a special operator language.
@@ -849,7 +893,8 @@ new mutation language.
 wallets.where { .id == "w1" }.update { balance += 100 }
 ```
 
-This is acceptable because it is a thin shorthand over a normal field update.
+This is a thin shorthand for `balance: .balance + 100`. The same lowering applies
+to `-=`, `*=`, and `/=`.
 
 ## Transactions
 
@@ -1041,6 +1086,7 @@ query_op
    | "first" "(" ")"
    | "nearest" block_expr
    | "insert" object_or_array
+   | "upsert" "on" IDENT object_expr
    | "update" block_expr
    | "delete" "(" ")"
 

@@ -249,7 +249,7 @@ impl BatchExecutor {
                 .iter()
                 .map(|(k, v)| k.len() + self.estimate_value_size(v))
                 .sum(),
-            Value::Reference(_) => 8, // ObjRef size
+            Value::Reference(_) => 8,        // ObjRef size
             Value::GlobalReference(_) => 16, // GlobalObjRef size
             Value::DateTime(_) => 8,
         }

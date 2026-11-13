@@ -2,7 +2,7 @@
 // Tests automatic index updates on insert/update/delete operations
 
 use owl_db::index_manager::IndexManager;
-use owl_storage_zig::ObjRef;
+use owl_db::document::ObjRef;
 use std::collections::HashMap;
 
 #[test]

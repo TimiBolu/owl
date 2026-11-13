@@ -36,11 +36,11 @@ fn test_real_clock_dependency_injection() {
 
 #[test]
 fn test_query_executor_with_simulated_clock() {
-    use owl_db::storage::zig_adapter::ZigStore;
+    use owl_db::storage::RustStore;
     
     let temp_dir = TempDir::new().unwrap();
     let path = temp_dir.path().join("test.owl");
-    let store = Arc::new(ZigStore::new(path.to_str().unwrap(), 10 * 1024 * 1024).unwrap());
+    let store = Arc::new(RustStore::new(path.to_str().unwrap(), 10 * 1024 * 1024).unwrap());
     
     // Create executor with simulated clock
     let sim_clock = Arc::new(SimulatedClock::new(42));

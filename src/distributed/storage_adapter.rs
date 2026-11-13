@@ -296,7 +296,12 @@ impl DistributedStorage {
             .shard_manager
             .list_shards()?
             .into_iter()
-            .filter(|shard| !matches!(shard.status, crate::distributed::shard_manager::ShardStatus::Offline))
+            .filter(|shard| {
+                !matches!(
+                    shard.status,
+                    crate::distributed::shard_manager::ShardStatus::Offline
+                )
+            })
             .map(|shard| shard.shard_id)
             .collect();
 
@@ -676,16 +681,17 @@ mod tests {
     use crate::document::Value;
     use crate::executor::QueryExecutor;
     use crate::parser::parse_oql;
-    use crate::storage::create_storage;
     use crate::simulation::RealClock;
-    use std::sync::Arc;
+    use crate::storage::create_storage;
     use std::collections::HashMap;
+    use std::sync::Arc;
 
     /// Mock network implementation for testing
     struct MockNetwork {
         documents: Arc<RwLock<HashMap<(ShardId, String, DocumentId), Document>>>,
         schemas: Arc<RwLock<HashMap<(ShardId, String), Schema>>>,
-        reverse_refs: Arc<RwLock<HashMap<(ShardId, String, DocumentId), Vec<ReverseReferenceEntry>>>>,
+        reverse_refs:
+            Arc<RwLock<HashMap<(ShardId, String, DocumentId), Vec<ReverseReferenceEntry>>>>,
     }
 
     impl MockNetwork {
@@ -769,7 +775,11 @@ mod tests {
             Ok(docs.remove(&key).is_some())
         }
 
-        fn scan_documents_remote(&self, shard_id: ShardId, schema: &str) -> OQLResult<Vec<Document>> {
+        fn scan_documents_remote(
+            &self,
+            shard_id: ShardId,
+            schema: &str,
+        ) -> OQLResult<Vec<Document>> {
             let docs = self.documents.read().unwrap();
             Ok(docs
                 .iter()
@@ -803,7 +813,13 @@ mod tests {
             let schemas = self.schemas.read().unwrap();
             let mut names: Vec<String> = schemas
                 .keys()
-                .filter_map(|(sid, name)| if *sid == shard_id { Some(name.clone()) } else { None })
+                .filter_map(|(sid, name)| {
+                    if *sid == shard_id {
+                        Some(name.clone())
+                    } else {
+                        None
+                    }
+                })
                 .collect();
             names.sort();
             names.dedup();
@@ -843,11 +859,7 @@ mod tests {
     fn id_for_shard(manager: &ShardManager, target_shard: ShardId, prefix: &str) -> String {
         for i in 0..10_000 {
             let candidate = format!("{}_{}", prefix, i);
-            if manager
-                .get_shard_for_object(&candidate)
-                .unwrap()
-                == Some(target_shard)
-            {
+            if manager.get_shard_for_object(&candidate).unwrap() == Some(target_shard) {
                 return candidate;
             }
         }
@@ -966,8 +978,12 @@ mod tests {
         let local_shard = shard_manager.create_shard("node1").unwrap();
         let remote_shard = shard_manager.create_shard("node2").unwrap();
 
-        let dist_storage =
-            DistributedStorage::new(local_shard, local_storage.clone(), shard_manager, network.clone());
+        let dist_storage = DistributedStorage::new(
+            local_shard,
+            local_storage.clone(),
+            shard_manager,
+            network.clone(),
+        );
 
         let local_doc = create_test_document("user_local", "Alice");
         local_storage.put_document(&local_doc).unwrap();
@@ -1002,15 +1018,22 @@ mod tests {
         dist_storage.put_schema(&schema).unwrap();
 
         assert!(dist_storage.get_schema("users").unwrap().is_some());
-        assert!(network.get_schema_remote(remote_shard, "users").unwrap().is_some());
-        assert_eq!(dist_storage.list_schemas().unwrap(), vec!["users".to_string()]);
+        assert!(network
+            .get_schema_remote(remote_shard, "users")
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            dist_storage.list_schemas().unwrap(),
+            vec!["users".to_string()]
+        );
 
         std::fs::remove_file("test_dist_schema.owl").ok();
     }
 
     #[test]
     fn test_distributed_get_schema_falls_back_to_remote_shard() {
-        let local_storage = create_storage("test_dist_schema_remote.owl", 10 * 1024 * 1024).unwrap();
+        let local_storage =
+            create_storage("test_dist_schema_remote.owl", 10 * 1024 * 1024).unwrap();
         let shard_manager = Arc::new(ShardManager::new());
         let network = Arc::new(MockNetwork::new());
 
@@ -1042,8 +1065,12 @@ mod tests {
         let local_shard = shard_manager.create_shard("node1").unwrap();
         let remote_shard = shard_manager.create_shard("node2").unwrap();
 
-        let dist_storage =
-            DistributedStorage::new(local_shard, local_storage.clone(), shard_manager, network.clone());
+        let dist_storage = DistributedStorage::new(
+            local_shard,
+            local_storage.clone(),
+            shard_manager,
+            network.clone(),
+        );
 
         let local_ref_doc = Document::with_id(
             "note_local".to_string(),
@@ -1071,7 +1098,12 @@ mod tests {
         );
 
         let refs = dist_storage
-            .list_references_to("accounts", &"acct_1".to_string(), Some("notes"), Some("account"))
+            .list_references_to(
+                "accounts",
+                &"acct_1".to_string(),
+                Some("notes"),
+                Some("account"),
+            )
             .unwrap();
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].source_id, "note_remote");
@@ -1111,8 +1143,7 @@ mod tests {
         ));
         let executor = QueryExecutor::new(dist_storage, Arc::new(RealClock::new()));
 
-        let query =
-            parse_oql(r#"users.where { .name == "Bob" }.select { id, name }"#).unwrap();
+        let query = parse_oql(r#"users.where { .name == "Bob" }.select { id, name }"#).unwrap();
         let results = executor.execute_query(&query).unwrap();
 
         assert_eq!(results.len(), 1);
@@ -1156,7 +1187,9 @@ mod tests {
 
         local_storage.put_schema(&organizations).unwrap();
         local_storage.put_schema(&companies).unwrap();
-        network.put_schema_remote(remote_shard, &organizations).unwrap();
+        network
+            .put_schema_remote(remote_shard, &organizations)
+            .unwrap();
         network.put_schema_remote(remote_shard, &companies).unwrap();
 
         let local_org = Document::with_id(
@@ -1200,10 +1233,8 @@ mod tests {
         ));
         let executor = QueryExecutor::new(dist_storage, Arc::new(RealClock::new()));
 
-        let query = parse_oql(
-            r#"companies.where { .org.id == "org_1" }.select { id, name }"#,
-        )
-        .unwrap();
+        let query =
+            parse_oql(r#"companies.where { .org.id == "org_1" }.select { id, name }"#).unwrap();
         let results = executor.execute_query(&query).unwrap();
 
         assert_eq!(results.len(), 1);
@@ -1217,7 +1248,8 @@ mod tests {
 
     #[test]
     fn test_query_executor_resolves_global_reference_across_shards() {
-        let local_storage = create_storage("test_dist_exec_global_refs.owl", 10 * 1024 * 1024).unwrap();
+        let local_storage =
+            create_storage("test_dist_exec_global_refs.owl", 10 * 1024 * 1024).unwrap();
         let shard_manager = Arc::new(ShardManager::new());
         let network = Arc::new(MockNetwork::new());
 
@@ -1251,7 +1283,9 @@ mod tests {
 
         local_storage.put_schema(&organizations).unwrap();
         local_storage.put_schema(&companies).unwrap();
-        network.put_schema_remote(remote_shard, &organizations).unwrap();
+        network
+            .put_schema_remote(remote_shard, &organizations)
+            .unwrap();
         network.put_schema_remote(remote_shard, &companies).unwrap();
 
         let local_org = Document::with_id(
@@ -1276,7 +1310,10 @@ mod tests {
             HashMap::from([
                 ("id".to_string(), Value::String("c_global".to_string())),
                 ("name".to_string(), Value::String("Remote Co".to_string())),
-                ("org".to_string(), Value::GlobalReference(local_global_org_ref)),
+                (
+                    "org".to_string(),
+                    Value::GlobalReference(local_global_org_ref),
+                ),
             ]),
         );
         network.add_document(remote_shard, remote_company);
@@ -1306,7 +1343,8 @@ mod tests {
 
     #[test]
     fn test_distributed_put_document_normalizes_reference_fields_to_global_refs() {
-        let local_storage = create_storage("test_dist_normalize_refs.owl", 10 * 1024 * 1024).unwrap();
+        let local_storage =
+            create_storage("test_dist_normalize_refs.owl", 10 * 1024 * 1024).unwrap();
         let shard_manager = Arc::new(ShardManager::new());
         let network = Arc::new(MockNetwork::new());
 

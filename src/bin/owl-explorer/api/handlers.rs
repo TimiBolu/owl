@@ -10,15 +10,15 @@ use std::time::Instant;
 use owl_db::distributed::GlobalObjRef;
 use owl_db::index_manager::{IndexBackendKind, IndexManager};
 use owl_db::parser::{
-    parse_oql, parse_oql_file, resolve_query_with_bindings, schema_definition_to_schema,
-    OQLFileStatement,
+    parse_oql, parse_oql_file, resolve_query_with_bindings, resolve_query_with_value_bindings,
+    resolve_value_with_bindings, schema_definition_to_schema, Expression, OQLFileStatement,
 };
 use owl_db::planner::physical::Statistics as PlannerStatistics;
 use owl_db::planner::{LogicalPlanner, PhysicalPlanner};
 use owl_db::schema::{CheckOperator, FieldType, Schema, SchemaConstraint, SchemaRegistry};
 use owl_db::simulation::RealClock;
 use owl_db::storage::{
-    create_storage, zig_adapter::ZigStore, DocumentStore, VectorIndexDefinition, VectorIndexState,
+    create_storage, DocumentStore, RustStore, VectorIndexDefinition, VectorIndexState,
     VectorIndexType, VectorMetricType,
 };
 use owl_db::{Document, QueryExecutor, Value};
@@ -398,7 +398,7 @@ fn check_constraint_holds(observed: &Value, op: &CheckOperator, expected: &Value
     }
 }
 
-fn reference_matches_document(store: &ZigStore, observed: &Value, target: &Document) -> bool {
+fn reference_matches_document(store: &RustStore, observed: &Value, target: &Document) -> bool {
     match observed {
         Value::String(id) => &target.id == id || target.fields.get("id") == Some(observed),
         Value::Reference(objref) => store
@@ -413,7 +413,7 @@ fn reference_matches_document(store: &ZigStore, observed: &Value, target: &Docum
 }
 
 fn validate_document_constraints_for_store(
-    store: &ZigStore,
+    store: &RustStore,
     schema: &Schema,
     document: &Document,
     current_document_id: Option<&String>,
@@ -819,7 +819,7 @@ pub fn execute_query(db: &DatabaseEntry, query: &str) -> Result<serde_json::Valu
     let db_path = resolve_db_path(&db.path);
     let db_path_str = db_path.to_string_lossy().to_string();
     let store = Arc::new(
-        ZigStore::new(&db_path_str, size)
+        RustStore::new(&db_path_str, size)
             .map_err(|e| format!("{} (path: {})", e, db_path.display()))?,
     );
     let executor = QueryExecutor::new_with_real_clock(store);
@@ -886,6 +886,8 @@ pub fn execute_query(db: &DatabaseEntry, query: &str) -> Result<serde_json::Valu
             let mut total_scanned = 0usize;
             let mut query_bindings: std::collections::HashMap<String, owl_db::parser::OQLQuery> =
                 std::collections::HashMap::new();
+            let mut value_bindings: std::collections::HashMap<String, Expression> =
+                std::collections::HashMap::new();
 
             for stmt in &file.statements {
                 match stmt {
@@ -914,10 +916,17 @@ pub fn execute_query(db: &DatabaseEntry, query: &str) -> Result<serde_json::Valu
                         success_count += 1;
                         summary.push(json!({"type": "binding", "value": binding.name}));
                     }
+                    OQLFileStatement::ValueBinding(binding) => {
+                        binding_count += 1;
+                        let value = resolve_value_with_bindings(&binding.value, &value_bindings);
+                        value_bindings.insert(binding.name.clone(), value);
+                        success_count += 1;
+                        summary.push(json!({"type": "binding", "value": binding.name}));
+                    }
                     OQLFileStatement::Query(q) => {
                         query_count += 1;
                         let resolved_query = match resolve_query_with_bindings(q, &query_bindings) {
-                            Ok(rq) => rq,
+                            Ok(rq) => resolve_query_with_value_bindings(&rq, &value_bindings),
                             Err(e) => {
                                 let msg = format!("Binding resolution failed: {}", e);
                                 summary.push(json!({"type": "error", "value": msg}));
@@ -930,6 +939,30 @@ pub fn execute_query(db: &DatabaseEntry, query: &str) -> Result<serde_json::Valu
                             .scan_documents(&resolved_query.collection)
                             .map(|docs| docs.len())
                             .unwrap_or(0);
+                        if let Some(source) = value_bindings.get(&resolved_query.collection) {
+                            match script_executor.evaluate_script_expression(
+                                &Expression::CollectionExpression {
+                                    source: Box::new(source.clone()),
+                                    operations: resolved_query.operations.clone(),
+                                },
+                            ) {
+                                Ok(value) => {
+                                    let count = match &value {
+                                        Value::List(values) => values.len(),
+                                        Value::Null => 0,
+                                        _ => 1,
+                                    };
+                                    success_count += 1;
+                                    summary.push(json!({"type": "query", "value": count}));
+                                    query_results.push(json!({
+                                        "count": count,
+                                        "value": value_to_json(&value),
+                                    }));
+                                }
+                                Err(error) => errors.push(error.to_string()),
+                            }
+                            continue;
+                        }
                         match script_executor.execute_query(&resolved_query) {
                             Ok(docs) => {
                                 success_count += 1;
@@ -950,12 +983,12 @@ pub fn execute_query(db: &DatabaseEntry, query: &str) -> Result<serde_json::Valu
                     OQLFileStatement::Transaction(tx_statements) => {
                         let snapshot = snapshot_script_store(script_executor.store().as_ref())?;
                         let mut active_txn_id = None;
-                        if let Some(zig_store) = script_executor
+                        if let Some(rust_store) = script_executor
                             .store()
                             .as_any()
-                            .downcast_ref::<owl_db::storage::zig_adapter::ZigStore>(
-                        ) {
-                            let tx_id = zig_store
+                            .downcast_ref::<owl_db::storage::RustStore>()
+                        {
+                            let tx_id = rust_store
                                 .begin_local_transaction()
                                 .map_err(|e| e.to_string())?;
                             active_txn_id = Some(tx_id);
@@ -964,6 +997,7 @@ pub fn execute_query(db: &DatabaseEntry, query: &str) -> Result<serde_json::Valu
                         let mut tx_summary = Vec::new();
                         let mut tx_query_results = Vec::new();
                         let mut tx_bindings = query_bindings.clone();
+                        let mut tx_value_bindings = value_bindings.clone();
                         let mut tx_scanned = 0usize;
 
                         for tx_stmt in tx_statements {
@@ -992,11 +1026,25 @@ pub fn execute_query(db: &DatabaseEntry, query: &str) -> Result<serde_json::Valu
                                     tx_summary
                                         .push(json!({"type": "binding", "value": binding.name}));
                                 }
+                                OQLFileStatement::ValueBinding(binding) => {
+                                    binding_count += 1;
+                                    let value = resolve_value_with_bindings(
+                                        &binding.value,
+                                        &tx_value_bindings,
+                                    );
+                                    tx_value_bindings.insert(binding.name.clone(), value);
+                                    success_count += 1;
+                                    tx_summary
+                                        .push(json!({"type": "binding", "value": binding.name}));
+                                }
                                 OQLFileStatement::Query(q) => {
                                     query_count += 1;
                                     let resolved_query =
                                         match resolve_query_with_bindings(q, &tx_bindings) {
-                                            Ok(rq) => rq,
+                                            Ok(rq) => resolve_query_with_value_bindings(
+                                                &rq,
+                                                &tx_value_bindings,
+                                            ),
                                             Err(e) => {
                                                 tx_errors.push(format!(
                                                     "Binding resolution failed: {}",
@@ -1005,6 +1053,33 @@ pub fn execute_query(db: &DatabaseEntry, query: &str) -> Result<serde_json::Valu
                                                 continue;
                                             }
                                         };
+                                    if let Some(source) =
+                                        tx_value_bindings.get(&resolved_query.collection)
+                                    {
+                                        match script_executor.evaluate_script_expression(
+                                            &Expression::CollectionExpression {
+                                                source: Box::new(source.clone()),
+                                                operations: resolved_query.operations.clone(),
+                                            },
+                                        ) {
+                                            Ok(value) => {
+                                                let count = match &value {
+                                                    Value::List(values) => values.len(),
+                                                    Value::Null => 0,
+                                                    _ => 1,
+                                                };
+                                                success_count += 1;
+                                                tx_summary
+                                                    .push(json!({"type": "query", "value": count}));
+                                                tx_query_results.push(json!({
+                                                    "count": count,
+                                                    "value": value_to_json(&value),
+                                                }));
+                                            }
+                                            Err(e) => tx_errors.push(e.to_string()),
+                                        }
+                                        continue;
+                                    }
                                     tx_scanned += executor
                                         .store()
                                         .scan_documents(&resolved_query.collection)
@@ -1036,17 +1111,18 @@ pub fn execute_query(db: &DatabaseEntry, query: &str) -> Result<serde_json::Valu
 
                         if tx_errors.is_empty() {
                             if let Some(tx_id) = active_txn_id {
-                                if let Some(zig_store) = script_executor
+                                if let Some(rust_store) = script_executor
                                     .store()
                                     .as_any()
-                                    .downcast_ref::<owl_db::storage::zig_adapter::ZigStore>(
+                                    .downcast_ref::<owl_db::storage::RustStore>(
                                 ) {
-                                    zig_store
+                                    rust_store
                                         .commit_local_transaction(tx_id)
                                         .map_err(|e| e.to_string())?;
                                 }
                             }
                             query_bindings = tx_bindings;
+                            value_bindings = tx_value_bindings;
                             total_scanned += tx_scanned;
                             summary.extend(tx_summary);
                             query_results.extend(tx_query_results);
@@ -1054,12 +1130,12 @@ pub fn execute_query(db: &DatabaseEntry, query: &str) -> Result<serde_json::Valu
                             summary.push(json!({"type": "transaction", "value": "committed"}));
                         } else {
                             if let Some(tx_id) = active_txn_id {
-                                if let Some(zig_store) = script_executor
+                                if let Some(rust_store) = script_executor
                                     .store()
                                     .as_any()
-                                    .downcast_ref::<owl_db::storage::zig_adapter::ZigStore>(
+                                    .downcast_ref::<owl_db::storage::RustStore>(
                                 ) {
-                                    let _ = zig_store.rollback_local_transaction(tx_id);
+                                    let _ = rust_store.rollback_local_transaction(tx_id);
                                 }
                             }
                             restore_script_store(script_executor.store().as_ref(), &snapshot)?;
@@ -1126,7 +1202,7 @@ pub fn explain_query(db: &DatabaseEntry, query: &str) -> Result<serde_json::Valu
     let db_path = resolve_db_path(&db.path);
     let db_path_str = db_path.to_string_lossy().to_string();
     let store = Arc::new(
-        ZigStore::new(&db_path_str, size)
+        RustStore::new(&db_path_str, size)
             .map_err(|e| format!("{} (path: {})", e, db_path.display()))?,
     );
 
@@ -1148,8 +1224,10 @@ pub fn explain_query(db: &DatabaseEntry, query: &str) -> Result<serde_json::Valu
 
     let logical_planner = LogicalPlanner::with_schema_registry(registry.clone());
     let logical_plan = logical_planner.plan(&parsed).map_err(|e| e.to_string())?;
-    let physical_planner =
-        PhysicalPlanner::with_schema_registry(registry.clone()).with_statistics(stats);
+    let physical_planner = PhysicalPlanner::with_schema_registry(registry.clone())
+        .with_statistics(stats)
+        .with_storage_catalog(store.as_ref())
+        .map_err(|e| e.to_string())?;
     let physical_plan = physical_planner
         .plan(&logical_plan)
         .map_err(|e| e.to_string())?;
@@ -1163,7 +1241,7 @@ pub fn explain_query(db: &DatabaseEntry, query: &str) -> Result<serde_json::Valu
         "query": query,
         "collection": parsed.collection,
         "logical_plan": logical_plan.root,
-        "physical_plan": format!("{:?}", physical_plan.root),
+        "physical_plan": physical_plan.root.explain(),
         "estimated_cost": estimated_cost,
         "graph_native_prefilter": {
             "eligible": !reverse_ref_prefilter.is_empty(),
@@ -1176,7 +1254,7 @@ pub fn load_schemas(db: &DatabaseEntry) -> Result<Vec<String>, String> {
     let size = db_size_bytes(db.size_mb);
     let db_path = resolve_db_path(&db.path);
     let db_path_str = db_path.to_string_lossy().to_string();
-    let store = ZigStore::new(&db_path_str, size)
+    let store = RustStore::new(&db_path_str, size)
         .map_err(|e| format!("{} (path: {})", e, db_path.display()))?;
     store.list_schemas().map_err(|e| e.to_string())
 }
@@ -1185,7 +1263,7 @@ pub fn load_schema_detail(db: &DatabaseEntry, schema: &str) -> Result<serde_json
     let size = db_size_bytes(db.size_mb);
     let db_path = resolve_db_path(&db.path);
     let db_path_str = db_path.to_string_lossy().to_string();
-    let store = ZigStore::new(&db_path_str, size)
+    let store = RustStore::new(&db_path_str, size)
         .map_err(|e| format!("{} (path: {})", e, db_path.display()))?;
     let schema_obj = store
         .get_schema(schema)
@@ -1227,7 +1305,7 @@ pub fn load_documents(
     let size = db_size_bytes(db.size_mb);
     let db_path = resolve_db_path(&db.path);
     let db_path_str = db_path.to_string_lossy().to_string();
-    let store = ZigStore::new(&db_path_str, size)
+    let store = RustStore::new(&db_path_str, size)
         .map_err(|e| format!("{} (path: {})", e, db_path.display()))?;
     let mut docs = store.scan_documents(schema).map_err(|e| e.to_string())?;
 
@@ -1280,7 +1358,7 @@ pub fn upsert_collection_schema(
     let size = db_size_bytes(db.size_mb);
     let db_path = resolve_db_path(&db.path);
     let db_path_str = db_path.to_string_lossy().to_string();
-    let store = ZigStore::new(&db_path_str, size)
+    let store = RustStore::new(&db_path_str, size)
         .map_err(|e| format!("{} (path: {})", e, db_path.display()))?;
 
     let collection_name = req.name.trim();
@@ -1347,7 +1425,7 @@ pub fn load_collection_summaries(db: &DatabaseEntry) -> Result<Vec<serde_json::V
     let size = db_size_bytes(db.size_mb);
     let db_path = resolve_db_path(&db.path);
     let db_path_str = db_path.to_string_lossy().to_string();
-    let store = ZigStore::new(&db_path_str, size)
+    let store = RustStore::new(&db_path_str, size)
         .map_err(|e| format!("{} (path: {})", e, db_path.display()))?;
     let mut schema_names = store.list_schemas().map_err(|e| e.to_string())?;
     schema_names.sort();
@@ -1395,11 +1473,11 @@ pub fn rebuild_indexes(
         .to_ascii_lowercase()
         .as_str()
     {
-        "zig" => IndexBackendKind::Zig,
+        "rust" => IndexBackendKind::Rust,
         "memory" | "inmemory" => IndexBackendKind::InMemory,
         other => {
             return Err(format!(
-                "unsupported backend '{}'; use zig or memory",
+                "unsupported backend '{}'; use rust or memory",
                 other
             ));
         }
@@ -1443,7 +1521,7 @@ pub fn list_vector_indexes(
     let size = db_size_bytes(db.size_mb);
     let db_path = resolve_db_path(&db.path);
     let db_path_str = db_path.to_string_lossy().to_string();
-    let store = ZigStore::new(&db_path_str, size)
+    let store = RustStore::new(&db_path_str, size)
         .map_err(|e| format!("{} (path: {})", e, db_path.display()))?;
     let indexes = store
         .list_vector_indexes(req.schema.as_deref())
@@ -1469,7 +1547,7 @@ pub fn upsert_vector_index(
     let size = db_size_bytes(db.size_mb);
     let db_path = resolve_db_path(&db.path);
     let db_path_str = db_path.to_string_lossy().to_string();
-    let store = ZigStore::new(&db_path_str, size)
+    let store = RustStore::new(&db_path_str, size)
         .map_err(|e| format!("{} (path: {})", e, db_path.display()))?;
 
     let schema = store
@@ -1533,7 +1611,7 @@ pub fn delete_vector_index(
     let size = db_size_bytes(db.size_mb);
     let db_path = resolve_db_path(&db.path);
     let db_path_str = db_path.to_string_lossy().to_string();
-    let store = ZigStore::new(&db_path_str, size)
+    let store = RustStore::new(&db_path_str, size)
         .map_err(|e| format!("{} (path: {})", e, db_path.display()))?;
     let deleted = store
         .delete_vector_index(&req.schema, &req.name)
@@ -1560,7 +1638,7 @@ pub fn vector_index_status(
     let size = db_size_bytes(db.size_mb);
     let db_path = resolve_db_path(&db.path);
     let db_path_str = db_path.to_string_lossy().to_string();
-    let store = ZigStore::new(&db_path_str, size)
+    let store = RustStore::new(&db_path_str, size)
         .map_err(|e| format!("{} (path: {})", e, db_path.display()))?;
 
     let status = store
@@ -1599,7 +1677,7 @@ pub fn build_vector_index(
     let size = db_size_bytes(db.size_mb);
     let db_path = resolve_db_path(&db.path);
     let db_path_str = db_path.to_string_lossy().to_string();
-    let store = ZigStore::new(&db_path_str, size)
+    let store = RustStore::new(&db_path_str, size)
         .map_err(|e| format!("{} (path: {})", e, db_path.display()))?;
     let force = req.force.unwrap_or(false);
     let report = store
@@ -1626,7 +1704,7 @@ pub fn update_document(
     let size = db_size_bytes(db.size_mb);
     let db_path = resolve_db_path(&db.path);
     let db_path_str = db_path.to_string_lossy().to_string();
-    let store = ZigStore::new(&db_path_str, size)
+    let store = RustStore::new(&db_path_str, size)
         .map_err(|e| format!("{} (path: {})", e, db_path.display()))?;
 
     let schema = store
@@ -1676,7 +1754,7 @@ pub fn duplicate_document(
     let size = db_size_bytes(db.size_mb);
     let db_path = resolve_db_path(&db.path);
     let db_path_str = db_path.to_string_lossy().to_string();
-    let store = ZigStore::new(&db_path_str, size)
+    let store = RustStore::new(&db_path_str, size)
         .map_err(|e| format!("{} (path: {})", e, db_path.display()))?;
 
     let source = store
@@ -1707,7 +1785,7 @@ pub fn delete_document(db: &DatabaseEntry, req: DeleteDocumentRequest) -> Result
     let size = db_size_bytes(db.size_mb);
     let db_path = resolve_db_path(&db.path);
     let db_path_str = db_path.to_string_lossy().to_string();
-    let store = ZigStore::new(&db_path_str, size)
+    let store = RustStore::new(&db_path_str, size)
         .map_err(|e| format!("{} (path: {})", e, db_path.display()))?;
     let deleted = store
         .delete_document(&req.schema, &req.id)
@@ -1735,7 +1813,7 @@ pub fn delete_all_documents(
     let size = db_size_bytes(db.size_mb);
     let db_path = resolve_db_path(&db.path);
     let db_path_str = db_path.to_string_lossy().to_string();
-    let store = ZigStore::new(&db_path_str, size)
+    let store = RustStore::new(&db_path_str, size)
         .map_err(|e| format!("{} (path: {})", e, db_path.display()))?;
     let docs = store
         .scan_documents(&req.schema)
@@ -1769,7 +1847,7 @@ pub fn delete_collection(
     let size = db_size_bytes(db.size_mb);
     let db_path = resolve_db_path(&db.path);
     let db_path_str = db_path.to_string_lossy().to_string();
-    let store = ZigStore::new(&db_path_str, size)
+    let store = RustStore::new(&db_path_str, size)
         .map_err(|e| format!("{} (path: {})", e, db_path.display()))?;
 
     if store
@@ -1816,7 +1894,7 @@ pub fn import_data(
     let size = db_size_bytes(db.size_mb);
     let db_path = resolve_db_path(&db.path);
     let db_path_str = db_path.to_string_lossy().to_string();
-    let store = ZigStore::new(&db_path_str, size)
+    let store = RustStore::new(&db_path_str, size)
         .map_err(|e| format!("{} (path: {})", e, db_path.display()))?;
 
     let schema_name = req.schema.trim();
@@ -1903,7 +1981,7 @@ pub fn seed_feature_demo(db: &DatabaseEntry) -> Result<serde_json::Value, String
     let db_path = resolve_db_path(&db.path);
     let db_path_str = db_path.to_string_lossy().to_string();
     let store = Arc::new(
-        ZigStore::new(&db_path_str, size)
+        RustStore::new(&db_path_str, size)
             .map_err(|e| format!("{} (path: {})", e, db_path.display()))?,
     );
     let executor = QueryExecutor::new_with_real_clock(store.clone());

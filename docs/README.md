@@ -18,12 +18,14 @@ Welcome to the Owl Database documentation! This directory contains comprehensive
 ### Architecture
 
 - **[OQL Architecture](../owl_design_and_architecture/OQL_ARCHITECTURE.md)** - Query language and execution pipeline
-- **[Storage Engine Design](../owl_storage_design.md)** - Zig-based storage layer architecture
+- **[OQL Language Contract](OWL_LANGUAGE_DESCRIPTION.md)** - Canonical syntax and semantics
+- **[OQL Implementation Status](OQL_IMPLEMENTATION_STATUS.md)** - Executable single-node coverage and deliberate boundaries
+- **[Storage Engine Design](STORAGE_ENGINE_ARCHITECTURE.md)** - Canonical Rust storage architecture and roadmap
 - **[Deterministic Simulation Testing](../owl_design_and_architecture/DST_INDEX.md)** - Testing methodology
 
 ### Advanced Topics
 
-- **[RocksDB Deprecation](ROCKSDB_DEPRECATION.md)** - Migration from RocksDB to Zig storage engine
+- **[Historical Storage Migration](OWL_STORAGE_ENGINE_MIGRATION.md)** - Compatibility status of removed prototype formats
 - **[Performance Tuning](OPERATIONS.md#performance-tuning)** - Optimization techniques
 - **[Capacity Planning](OPERATIONS.md#capacity-planning)** - Scaling strategies
 

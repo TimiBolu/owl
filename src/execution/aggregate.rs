@@ -286,7 +286,7 @@ impl AggregateExec {
                                     maxs.insert(field_key.clone(), value.clone());
                                 }
                             }
-                            AggregateFunction::Count => {
+                            AggregateFunction::Count | AggregateFunction::Exists => {
                                 // Count is handled separately
                             }
                         }
@@ -306,6 +306,7 @@ impl AggregateExec {
 
             let value = match spec.function {
                 AggregateFunction::Count => Value::Integer(count),
+                AggregateFunction::Exists => Value::Boolean(count > 0),
                 AggregateFunction::Sum => {
                     if let Some(field) = &spec.field {
                         let field_key = field.path.join(".");

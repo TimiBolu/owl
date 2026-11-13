@@ -13,86 +13,11 @@ use crate::document::{Document, DocumentId, ObjRef};
 use crate::error::{OQLError, OQLResult};
 use crate::simulation::filesystem::FileSystem;
 use crate::storage::DocumentStore;
-use owl_storage_zig::{Arena, ObjRef as ZigObjRef};
+use crate::storage_engine::Arena;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
-
-/// Adapter between simulation::FileSystem and owl_storage_zig::FileSystem
-struct ArenaFileSystemAdapter {
-    inner: Arc<dyn crate::simulation::filesystem::FileSystem>,
-}
-
-impl ArenaFileSystemAdapter {
-    fn new(inner: Arc<dyn crate::simulation::filesystem::FileSystem>) -> Self {
-        Self { inner }
-    }
-}
-
-impl owl_storage_zig::FileSystem for ArenaFileSystemAdapter {
-    fn create(&self, path: &Path) -> std::io::Result<Box<dyn owl_storage_zig::FileHandle>> {
-        let handle = self.inner.create(path)?;
-        Ok(Box::new(ArenaFileHandleAdapter { inner: handle }))
-    }
-
-    fn open(&self, path: &Path) -> std::io::Result<Box<dyn owl_storage_zig::FileHandle>> {
-        let handle = self.inner.open(path)?;
-        Ok(Box::new(ArenaFileHandleAdapter { inner: handle }))
-    }
-
-    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
-        self.inner.remove(path)
-    }
-
-    fn exists(&self, path: &Path) -> bool {
-        self.inner.exists(path)
-    }
-
-    fn file_size(&self, path: &Path) -> std::io::Result<u64> {
-        self.inner.file_size(path)
-    }
-
-    fn mmap(&self, path: &Path, size: usize) -> std::io::Result<(*mut u8, usize)> {
-        let mmap = self.inner.mmap(path, size)?;
-        let slice = mmap.as_slice();
-        Ok((slice.as_ptr() as *mut u8, slice.len()))
-    }
-
-    fn munmap(&self, _ptr: *mut u8, _size: usize) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    fn sync(&self, _path: &Path) -> std::io::Result<()> {
-        self.inner.sync_all()
-    }
-}
-
-struct ArenaFileHandleAdapter {
-    inner: Box<dyn crate::simulation::filesystem::FileHandle>,
-}
-
-impl owl_storage_zig::FileHandle for ArenaFileHandleAdapter {
-    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        self.inner.write(data)
-    }
-
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        self.inner.read(buffer)
-    }
-
-    fn seek(&mut self, pos: u64) -> std::io::Result<u64> {
-        self.inner.seek(std::io::SeekFrom::Start(pos))
-    }
-
-    fn sync(&mut self) -> std::io::Result<()> {
-        self.inner.sync()
-    }
-
-    fn size(&self) -> std::io::Result<u64> {
-        self.inner.size()
-    }
-}
 
 /// Reservation for atomic operations
 #[derive(Debug, Clone)]
@@ -173,10 +98,10 @@ impl WALFirstStorage {
         filesystem: Arc<dyn FileSystem>,
     ) -> OQLResult<Self> {
         // Create arena with filesystem dependency injection.
-        let arena_fs = Arc::new(ArenaFileSystemAdapter::new(filesystem.clone()));
-        let arena = Arena::create_with_fs(&arena_path, arena_size, arena_fs).map_err(|e| {
-            OQLError::storage_error(&format!("Failed to create arena: {:?}", e), None)
-        })?;
+        let arena =
+            Arena::create_with_fs(&arena_path, arena_size, filesystem.clone()).map_err(|e| {
+                OQLError::storage_error(&format!("Failed to create arena: {:?}", e), None)
+            })?;
 
         // Create distributed WAL
         let wal = DistributedWAL::new(shard_id, &wal_path, filesystem.clone())?;
@@ -199,12 +124,12 @@ impl WALFirstStorage {
     /// Reserve space for an object (step 1 of atomic write)
     pub fn reserve(&self, size: u32) -> OQLResult<Reservation> {
         // Allocate space in arena but don't write yet
-        let zig_objref = self.arena.alloc(size).map_err(|e| {
+        let object_ref = self.arena.alloc(size).map_err(|e| {
             OQLError::storage_error(&format!("Failed to allocate space: {:?}", e), None)
         })?;
 
         // Convert to GlobalObjRef via document::ObjRef
-        let local_objref = ObjRef::new(zig_objref.offset());
+        let local_objref = ObjRef::new(object_ref.offset());
         let global_objref = GlobalObjRef::from_local(local_objref, self.shard_id);
 
         // Generate reservation ID
@@ -359,8 +284,7 @@ impl WALFirstStorage {
 
         // Mark old version as deleted (best effort)
         let local_objref = current_objref.to_local();
-        let zig_objref = ZigObjRef::new(local_objref.offset());
-        let _ = self.arena.delete(zig_objref); // Ignore errors for cleanup
+        let _ = self.arena.delete(local_objref); // Ignore errors for cleanup
 
         Ok(reservation.objref)
     }
@@ -402,8 +326,7 @@ impl WALFirstStorage {
 
             // Mark as deleted in arena
             let local_objref = objref.to_local();
-            let zig_objref = ZigObjRef::new(local_objref.offset());
-            self.arena.delete(zig_objref).map_err(|e| {
+            self.arena.delete(local_objref).map_err(|e| {
                 OQLError::storage_error(&format!("Failed to delete from arena: {:?}", e), None)
             })?;
 
@@ -488,8 +411,7 @@ impl WALFirstStorage {
                         index.remove(&(delete_payload.schema, delete_payload.id));
                     }
                     let local_objref = entry.objref.to_local();
-                    let zig_objref = ZigObjRef::new(local_objref.offset());
-                    let _ = self.arena.delete(zig_objref); // Best effort
+                    let _ = self.arena.delete(local_objref); // Best effort
                 }
                 WALEntryType::TxnBegin | WALEntryType::TxnCommit | WALEntryType::TxnRollback => {
                     // Transaction markers - no action needed for recovery

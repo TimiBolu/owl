@@ -19,6 +19,8 @@ pub enum PlanType {
     Sort,
     /// Limit number of documents
     Limit,
+    /// Skip a number of documents
+    Offset,
     /// Group documents by fields
     GroupBy,
     /// Filter grouped documents
@@ -63,6 +65,8 @@ pub struct PlanMetadata {
     pub sort_specs: Vec<SortSpec>,
     /// Limit value (for Limit nodes)
     pub limit: Option<u64>,
+    /// Rows to skip (for Offset nodes)
+    pub offset: Option<u64>,
     /// Group by fields (for GroupBy nodes)
     pub group_by_fields: Vec<String>,
     /// Aggregate functions (for Aggregate nodes)
@@ -96,6 +100,7 @@ impl Default for PlanMetadata {
             projections: Vec::new(),
             sort_specs: Vec::new(),
             limit: None,
+            offset: None,
             group_by_fields: Vec::new(),
             aggregates: Vec::new(),
             field_updates: HashMap::new(),
@@ -162,6 +167,7 @@ pub struct AggregateSpec {
 /// Aggregate function types
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum AggregateFunction {
+    Exists,
     Count,
     Sum,
     Avg,
@@ -212,6 +218,11 @@ impl PlanNode {
     /// Set limit
     pub fn with_limit(mut self, limit: u64) -> Self {
         self.metadata.limit = Some(limit);
+        self
+    }
+
+    pub fn with_offset(mut self, offset: u64) -> Self {
+        self.metadata.offset = Some(offset);
         self
     }
 

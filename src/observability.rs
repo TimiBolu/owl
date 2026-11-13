@@ -32,7 +32,7 @@ lazy_static! {
         &["schema"]
     ).unwrap();
 
-    // Storage metrics (from Zig layer)
+    // Storage metrics
     pub static ref STORAGE_ALLOCATIONS: Counter = Counter::new(
         "oql_storage_allocations_total",
         "Total number of storage allocations"
@@ -263,11 +263,6 @@ impl ObservabilitySystem {
         init_prometheus_metrics()?;
         init_tracing(&service_name)?;
 
-        // Initialize Zig metrics
-        unsafe {
-            owl_storage_zig::owl_metrics_init();
-        }
-
         Ok(Self {
             monitoring,
             service_name,
@@ -294,88 +289,12 @@ impl ObservabilitySystem {
         let _ = self.monitoring.record_query_metrics(metrics.clone());
     }
 
-    /// Update storage metrics from Zig layer
+    /// Refresh storage metrics.
+    ///
+    /// The Rust engine will publish snapshots directly once its metrics registry
+    /// lands. Counters are already available for direct instrumentation.
     pub fn update_storage_metrics(&self) {
-        unsafe {
-            let mut snapshot = std::mem::MaybeUninit::uninit();
-            owl_storage_zig::owl_metrics_get_snapshot(snapshot.as_mut_ptr());
-            let snapshot = snapshot.assume_init();
-
-            // Update Prometheus metrics
-            STORAGE_ALLOCATIONS.inc_by(snapshot.allocations_total as f64);
-            STORAGE_BYTES_ALLOCATED.inc_by(snapshot.bytes_allocated as f64);
-
-            STORAGE_NAVIGATIONS
-                .with_label_values(&["local"])
-                .inc_by(snapshot.navigations_local as f64);
-            STORAGE_NAVIGATIONS
-                .with_label_values(&["remote"])
-                .inc_by(snapshot.navigations_remote as f64);
-
-            STORAGE_IO_OPS
-                .with_label_values(&["read"])
-                .inc_by(snapshot.reads_total as f64);
-            STORAGE_IO_OPS
-                .with_label_values(&["write"])
-                .inc_by(snapshot.writes_total as f64);
-            STORAGE_IO_OPS
-                .with_label_values(&["sync"])
-                .inc_by(snapshot.syncs_total as f64);
-
-            STORAGE_IO_BYTES
-                .with_label_values(&["read"])
-                .inc_by(snapshot.bytes_read as f64);
-            STORAGE_IO_BYTES
-                .with_label_values(&["write"])
-                .inc_by(snapshot.bytes_written as f64);
-
-            WAL_OPERATIONS
-                .with_label_values(&["append"])
-                .inc_by(snapshot.wal_appends as f64);
-            WAL_OPERATIONS
-                .with_label_values(&["sync"])
-                .inc_by(snapshot.wal_syncs as f64);
-
-            BTREE_OPERATIONS
-                .with_label_values(&["insert"])
-                .inc_by(snapshot.btree_inserts as f64);
-            BTREE_OPERATIONS
-                .with_label_values(&["delete"])
-                .inc_by(snapshot.btree_deletes as f64);
-            BTREE_OPERATIONS
-                .with_label_values(&["lookup"])
-                .inc_by(snapshot.btree_lookups as f64);
-
-            COMPRESSION_OPERATIONS
-                .with_label_values(&["compress"])
-                .inc_by(snapshot.compressions_total as f64);
-            COMPRESSION_OPERATIONS
-                .with_label_values(&["decompress"])
-                .inc_by(snapshot.decompressions_total as f64);
-
-            COMPRESSION_BYTES_SAVED.inc_by(snapshot.compression_bytes_saved as f64);
-
-            ARENA_SIZE.set(snapshot.arena_size_bytes as f64);
-            ARENA_USED.set(snapshot.arena_used_bytes as f64);
-            ARENA_FRAGMENTATION.set(snapshot.arena_fragmentation_percent as f64);
-
-            CACHE_OPERATIONS
-                .with_label_values(&["hit"])
-                .inc_by(snapshot.cache_hits as f64);
-            CACHE_OPERATIONS
-                .with_label_values(&["miss"])
-                .inc_by(snapshot.cache_misses as f64);
-
-            let total_cache = snapshot.cache_hits + snapshot.cache_misses;
-            if total_cache > 0 {
-                let hit_rate = snapshot.cache_hits as f64 / total_cache as f64;
-                CACHE_HIT_RATE.set(hit_rate);
-            }
-
-            ERROR_COUNTER
-                .with_label_values(&["storage"])
-                .inc_by(snapshot.errors_total as f64);
-        }
+        // Intentionally empty until RustStore exposes a monotonic snapshot.
     }
 
     /// Export Prometheus metrics
@@ -439,62 +358,6 @@ impl Drop for TracedOperation {
             duration_ms = duration.as_millis(),
             "Operation completed (auto)"
         );
-    }
-}
-
-// FFI declarations for Zig metrics
-mod owl_storage_zig {
-
-    #[repr(C)]
-    pub struct MetricsSnapshot {
-        pub allocations_total: u64,
-        pub allocations_failed: u64,
-        pub bytes_allocated: u64,
-        pub bytes_freed: u64,
-
-        pub navigations_local: u64,
-        pub navigations_remote: u64,
-        pub navigation_time_ns_total: u64,
-
-        pub reads_total: u64,
-        pub writes_total: u64,
-        pub syncs_total: u64,
-        pub bytes_read: u64,
-        pub bytes_written: u64,
-        pub io_time_ns_total: u64,
-
-        pub wal_appends: u64,
-        pub wal_syncs: u64,
-        pub wal_bytes_written: u64,
-        pub wal_replay_count: u64,
-
-        pub btree_inserts: u64,
-        pub btree_deletes: u64,
-        pub btree_lookups: u64,
-        pub btree_splits: u64,
-        pub btree_merges: u64,
-
-        pub compressions_total: u64,
-        pub decompressions_total: u64,
-        pub compression_bytes_saved: u64,
-        pub compression_time_ns_total: u64,
-
-        pub arena_size_bytes: u64,
-        pub arena_used_bytes: u64,
-        pub arena_fragmentation_percent: u64,
-
-        pub cache_hits: u64,
-        pub cache_misses: u64,
-        pub cache_evictions: u64,
-
-        pub errors_total: u64,
-        pub corruption_detected: u64,
-        pub recovery_attempts: u64,
-    }
-
-    extern "C" {
-        pub fn owl_metrics_init();
-        pub fn owl_metrics_get_snapshot(out: *mut MetricsSnapshot);
     }
 }
 

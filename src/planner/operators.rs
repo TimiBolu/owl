@@ -3,6 +3,7 @@
 
 use crate::parser::Expression;
 use crate::planner::types::{AggregateSpec, FilterCondition, ProjectionField, SortSpec};
+use crate::storage::ScalarIndexDirection;
 use crate::storage::VectorMetricType;
 use std::collections::HashMap;
 
@@ -11,8 +12,12 @@ use std::collections::HashMap;
 pub enum PhysicalOperator {
     /// Sequential scan of a collection
     SeqScan(SeqScanOperator),
+    /// Storage-owned predicate evaluation and final-field materialization.
+    StorageScan(StorageScanOperator),
     /// Index scan of a collection
     IndexScan(IndexScanOperator),
+    /// Deduplicating union of independently indexable predicate branches.
+    IndexUnion(IndexUnionOperator),
     /// Filter rows based on a condition
     Filter(FilterOperator),
     /// Project specific fields
@@ -21,6 +26,8 @@ pub enum PhysicalOperator {
     Sort(SortOperator),
     /// Limit number of rows
     Limit(LimitOperator),
+    /// Skip rows
+    Offset(OffsetOperator),
     /// Group rows by fields
     GroupBy(GroupByOperator),
     /// Filter grouped rows
@@ -50,6 +57,16 @@ pub struct SeqScanOperator {
     pub estimated_rows: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct StorageScanOperator {
+    pub schema: String,
+    pub filters: Vec<FilterCondition>,
+    /// `None` materializes complete matching documents; `Some([])` preserves
+    /// only identity and system metadata.
+    pub projection: Option<Vec<String>>,
+    pub estimated_rows: u64,
+}
+
 /// Index scan operator
 #[derive(Debug, Clone)]
 pub struct IndexScanOperator {
@@ -61,6 +78,35 @@ pub struct IndexScanOperator {
     pub key_conditions: Vec<FilterCondition>,
     /// Estimated number of rows
     pub estimated_rows: u64,
+    pub access: IndexAccessKind,
+    /// Authoritative ordered key fields for native indexes.
+    pub key_fields: Vec<String>,
+    /// Optional selective index whose postings are intersected before records
+    /// are decoded from the ordered access path.
+    pub prefilter_index: Option<String>,
+    /// Planner-proven safe row limit to apply inside the postings scan.
+    pub pushed_limit: Option<u64>,
+    /// Top-level fields required while decoding indexed records.
+    pub pushed_projection: Vec<String>,
+    /// Physical traversal direction through the ordered key space.
+    pub direction: ScalarIndexDirection,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexUnionOperator {
+    pub inputs: Vec<PhysicalOperator>,
+    pub estimated_rows: u64,
+    /// Planner-proven common result order for every branch.
+    pub order_fields: Vec<String>,
+    pub direction: ScalarIndexDirection,
+    /// Global row goal. Each ordered branch may safely receive the same goal.
+    pub pushed_limit: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexAccessKind {
+    NativeTyped,
+    CompatibilityHashed,
 }
 
 /// Filter operator
@@ -98,6 +144,12 @@ pub struct LimitOperator {
     /// Maximum number of rows
     pub limit: u64,
     /// Input operator
+    pub input: Box<PhysicalOperator>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OffsetOperator {
+    pub offset: u64,
     pub input: Box<PhysicalOperator>,
 }
 
@@ -189,6 +241,150 @@ pub struct HashJoinOperator {
 }
 
 impl PhysicalOperator {
+    pub fn explain(&self) -> String {
+        let mut output = String::new();
+        self.explain_into(0, &mut output);
+        output
+    }
+
+    fn explain_into(&self, depth: usize, output: &mut String) {
+        use std::fmt::Write;
+        let indent = "  ".repeat(depth);
+        match self {
+            PhysicalOperator::SeqScan(operator) => {
+                let _ = writeln!(
+                    output,
+                    "{indent}SeqScan collection={} estimated_rows={}",
+                    operator.schema, operator.estimated_rows
+                );
+            }
+            PhysicalOperator::StorageScan(operator) => {
+                let _ = writeln!(
+                    output,
+                    "{indent}StorageScan collection={} filters={} projection={:?} estimated_rows={}",
+                    operator.schema,
+                    operator.filters.len(),
+                    operator.projection,
+                    operator.estimated_rows
+                );
+            }
+            PhysicalOperator::IndexScan(operator) => {
+                let _ = writeln!(
+                    output,
+                    "{indent}IndexScan collection={} index={} access={:?} direction={:?} key_fields={:?} prefilter_index={:?} pushed_limit={:?} pushed_projection={:?} estimated_rows={} conditions={:?}",
+                    operator.schema,
+                    operator.index_name,
+                    operator.access,
+                    operator.direction,
+                    operator.key_fields,
+                    operator.prefilter_index,
+                    operator.pushed_limit,
+                    operator.pushed_projection,
+                    operator.estimated_rows,
+                    operator.key_conditions
+                );
+            }
+            PhysicalOperator::IndexUnion(operator) => {
+                let _ = writeln!(
+                    output,
+                    "{indent}IndexUnion branches={} order_fields={:?} direction={:?} pushed_limit={:?} estimated_rows={}",
+                    operator.inputs.len(),
+                    operator.order_fields,
+                    operator.direction,
+                    operator.pushed_limit,
+                    operator.estimated_rows
+                );
+                for input in &operator.inputs {
+                    input.explain_into(depth + 1, output);
+                }
+            }
+            PhysicalOperator::Filter(operator) => {
+                let _ = writeln!(
+                    output,
+                    "{indent}Filter selectivity={}",
+                    operator.selectivity
+                );
+                operator.input.explain_into(depth + 1, output);
+            }
+            PhysicalOperator::Project(operator) => {
+                let _ = writeln!(
+                    output,
+                    "{indent}Project fields={}",
+                    operator.projections.len()
+                );
+                operator.input.explain_into(depth + 1, output);
+            }
+            PhysicalOperator::Sort(operator) => {
+                let _ = writeln!(output, "{indent}Sort keys={}", operator.sort_specs.len());
+                operator.input.explain_into(depth + 1, output);
+            }
+            PhysicalOperator::Limit(operator) => {
+                let _ = writeln!(output, "{indent}Limit rows={}", operator.limit);
+                operator.input.explain_into(depth + 1, output);
+            }
+            PhysicalOperator::Offset(operator) => {
+                let _ = writeln!(output, "{indent}Offset rows={}", operator.offset);
+                operator.input.explain_into(depth + 1, output);
+            }
+            PhysicalOperator::GroupBy(operator) => {
+                let _ = writeln!(
+                    output,
+                    "{indent}GroupBy fields={}",
+                    operator.group_by_fields.join(",")
+                );
+                operator.input.explain_into(depth + 1, output);
+            }
+            PhysicalOperator::Having(operator) => {
+                let _ = writeln!(output, "{indent}Having");
+                operator.input.explain_into(depth + 1, output);
+            }
+            PhysicalOperator::Aggregate(operator) => {
+                let _ = writeln!(
+                    output,
+                    "{indent}Aggregate expressions={}",
+                    operator.aggregates.len()
+                );
+                operator.input.explain_into(depth + 1, output);
+            }
+            PhysicalOperator::Insert(operator) => {
+                let _ = writeln!(output, "{indent}Insert collection={}", operator.schema);
+            }
+            PhysicalOperator::Update(operator) => {
+                let _ = writeln!(
+                    output,
+                    "{indent}Update fields={}",
+                    operator.field_updates.len()
+                );
+                operator.input.explain_into(depth + 1, output);
+            }
+            PhysicalOperator::Delete(operator) => {
+                let _ = writeln!(output, "{indent}Delete");
+                operator.input.explain_into(depth + 1, output);
+            }
+            PhysicalOperator::VectorKnn(operator) => {
+                let _ = writeln!(
+                    output,
+                    "{indent}VectorKnn collection={} field={} k={} candidates={:?}",
+                    operator.schema,
+                    operator.field_path.join("."),
+                    operator.k,
+                    operator.num_candidates
+                );
+                operator.input.explain_into(depth + 1, output);
+            }
+            PhysicalOperator::NestedLoopJoin(operator) => {
+                let _ = writeln!(output, "{indent}NestedLoopJoin");
+                operator.left.explain_into(depth + 1, output);
+                operator.right.explain_into(depth + 1, output);
+            }
+            PhysicalOperator::HashJoin(operator) => {
+                let _ = writeln!(output, "{indent}HashJoin");
+                operator.left.explain_into(depth + 1, output);
+                operator.right.explain_into(depth + 1, output);
+            }
+        }
+    }
+
     /// Estimate the cost of executing this operator
     pub fn estimate_cost(&self) -> f64 {
         match self {
@@ -196,9 +392,17 @@ impl PhysicalOperator {
                 // Cost is proportional to number of rows
                 op.estimated_rows as f64
             }
+            PhysicalOperator::StorageScan(op) => op.estimated_rows as f64 * 0.5,
             PhysicalOperator::IndexScan(op) => {
                 // Index scan is cheaper than seq scan
                 (op.estimated_rows as f64) * 0.1
+            }
+            PhysicalOperator::IndexUnion(op) => {
+                op.inputs
+                    .iter()
+                    .map(PhysicalOperator::estimate_cost)
+                    .sum::<f64>()
+                    + op.estimated_rows as f64 * 0.01
             }
             PhysicalOperator::Filter(op) => {
                 // Cost of input plus filtering cost
@@ -216,6 +420,9 @@ impl PhysicalOperator {
             PhysicalOperator::Limit(op) => {
                 // Limit is cheap, just stops early
                 op.input.estimate_cost() * 0.1
+            }
+            PhysicalOperator::Offset(op) => {
+                op.input.estimate_cost() + (op.offset.min(op.input.estimate_rows()) as f64 * 0.001)
             }
             PhysicalOperator::GroupBy(op) => {
                 // Grouping requires hash table
@@ -272,13 +479,16 @@ impl PhysicalOperator {
     pub fn estimate_rows(&self) -> u64 {
         match self {
             PhysicalOperator::SeqScan(op) => op.estimated_rows,
+            PhysicalOperator::StorageScan(op) => op.estimated_rows,
             PhysicalOperator::IndexScan(op) => op.estimated_rows,
+            PhysicalOperator::IndexUnion(op) => op.estimated_rows,
             PhysicalOperator::Filter(op) => {
                 (op.input.estimate_rows() as f64 * op.selectivity) as u64
             }
             PhysicalOperator::Project(op) => op.input.estimate_rows(),
             PhysicalOperator::Sort(op) => op.input.estimate_rows(),
             PhysicalOperator::Limit(op) => op.limit.min(op.input.estimate_rows()),
+            PhysicalOperator::Offset(op) => op.input.estimate_rows().saturating_sub(op.offset),
             PhysicalOperator::GroupBy(op) => {
                 // Grouping typically reduces rows
                 op.input.estimate_rows() / 10
@@ -307,11 +517,14 @@ impl PhysicalOperator {
     pub fn operator_type(&self) -> &str {
         match self {
             PhysicalOperator::SeqScan(_) => "SeqScan",
+            PhysicalOperator::StorageScan(_) => "StorageScan",
             PhysicalOperator::IndexScan(_) => "IndexScan",
+            PhysicalOperator::IndexUnion(_) => "IndexUnion",
             PhysicalOperator::Filter(_) => "Filter",
             PhysicalOperator::Project(_) => "Project",
             PhysicalOperator::Sort(_) => "Sort",
             PhysicalOperator::Limit(_) => "Limit",
+            PhysicalOperator::Offset(_) => "Offset",
             PhysicalOperator::GroupBy(_) => "GroupBy",
             PhysicalOperator::Having(_) => "Having",
             PhysicalOperator::Aggregate(_) => "Aggregate",

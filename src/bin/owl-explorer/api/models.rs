@@ -188,7 +188,7 @@ pub struct MetricsRequest {
 #[derive(Debug, Deserialize)]
 pub struct RebuildIndexesRequest {
     pub database: String,
-    pub backend: Option<String>, // zig | memory
+    pub backend: Option<String>, // rust | memory
 }
 
 #[derive(Debug, Deserialize)]

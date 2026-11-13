@@ -233,7 +233,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn display_query_results(
-    runner: &owl_db::OQLRunner<owl_db::storage::zig_adapter::ZigStore>,
+    runner: &owl_db::OQLRunner<owl_db::storage::RustStore>,
     query: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Get the executor to access the store
