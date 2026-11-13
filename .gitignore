@@ -1,44 +1,75 @@
-# Rust
+# ---------------------------------------------------------------------------
+# Build artifacts
+# ---------------------------------------------------------------------------
 target/
 **/target/
-# Note: Cargo.lock should be tracked for applications, ignored for libraries
-# Keeping it tracked since this is an application
-
-# Zig build artifacts
 zig-out/
 zig-cache/
 .zig-cache/
 owl_storage_zig/zig-out/
 owl_storage_zig/zig-cache/
+owl_storage_zig/dat
+criterion/
+*.criterion
 
-# Database files
-*.db
+# ---------------------------------------------------------------------------
+# Archives (reference source dumps, not part of Owl)
+# ---------------------------------------------------------------------------
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+
+# ---------------------------------------------------------------------------
+# Database files (generated at runtime, not source)
+# ---------------------------------------------------------------------------
 *.owl
-oql_db_data/
-*.log
+*.owl.sb
+*.owl.wal
+*.owlb
+*.db
+*.sbg
 *.sst
 *.ldb
+*.wal
+*.sb
+databases/
+temp_oql_db/
+oql_db_data/
 
-# Test files
+# ---------------------------------------------------------------------------
+# Vendor / reference source trees (not part of Owl)
+# ---------------------------------------------------------------------------
+stream_db/
+vector_db/
+vendor/
+ringmpsc-main/
+
+# ---------------------------------------------------------------------------
+# Pre-built binaries (not tracked)
+# ---------------------------------------------------------------------------
+binaries/
+
+# ---------------------------------------------------------------------------
+# Logs
+# ---------------------------------------------------------------------------
+*.log
+logs/
+
+# ---------------------------------------------------------------------------
+# Test data and scratch files
+# ---------------------------------------------------------------------------
 test_*.owl
 *_test.owl
 *.test.owl
+oql_test_suite/
+comprehensive_test.oql
+improved_syntax.oql
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-.DS_Store
-
-# Kiro IDE (keep specs, ignore other generated files if they exist)
-.kiro/settings/
-.kiro/cache/
-.kiro/logs/
-.kiro/temp/
-
-# Task summaries and working documents
+# ---------------------------------------------------------------------------
+# Working notes and temporary docs
+# ---------------------------------------------------------------------------
 TASK_*_SUMMARY.md
 TASK_*_COMPLETE.md
 *_SUMMARY.md
@@ -47,63 +78,55 @@ TASK_*_COMPLETE.md
 NEXT_STEPS.md
 PROTOTYPE_*.md
 SPEC_DRIVEN_*.md
-
-# Comparison documents (working notes)
 *_comparison.md
-
-# Working prototypes and examples
-owl_storage_prototype/
+owl_architecture.md
+owl_storage_design.md
 simple_owl_storage.md
+owl_storage_prototype/
 ZIG_PROTOTYPE_EXAMPLE.zig
 ZIG_REWRITE_*.md
 
-# Test suites and data
-oql_test_suite/
-comprehensive_test.oql
-improved_syntax.oql
+# ---------------------------------------------------------------------------
+# Explorer / generated web assets
+# ---------------------------------------------------------------------------
+owl_explorer/dist
+owl_explorer/node_modules
 
-# Temporary architecture documents (keep main ones in owl_design_and_architecture/)
-owl_architecture.md
-owl_storage_design.md
+# ---------------------------------------------------------------------------
+# Apple system analytics exports
+# ---------------------------------------------------------------------------
+*.ips.ca.txt
 
-# Benchmark results
-criterion/
-*.criterion
-
-# OS
+# ---------------------------------------------------------------------------
+# IDE and OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
 .DS_Store
 Thumbs.db
 
-# Logs
-*.log
-logs/
+# ---------------------------------------------------------------------------
+# Kiro IDE (keep specs, ignore generated files)
+# ---------------------------------------------------------------------------
+.kiro/settings/
+.kiro/cache/
+.kiro/logs/
+.kiro/temp/
 
+# ---------------------------------------------------------------------------
 # Temporary files
+# ---------------------------------------------------------------------------
 *.tmp
 *.temp
 *.bak
 *.backup
 
-# Large backup test files (can be 16-33GB each!)
-*.owlb
-owl_storage_zig/.zig-cache/tmp/*.owlb
-binaries
-databases
-owl_explorer/dist
-owl_explorer/node_modules
-owl_storage_zig/dat
+# ---------------------------------------------------------------------------
+# Reference query datasets (large, external)
+# ---------------------------------------------------------------------------
 docs/reference_queries/sql/dsb/
 docs/reference_queries/sql/jaffle-shop/
 docs/reference_queries/sql/join-order-benchmark/
-
-*.sbg
-*.wal
-*.sb
-
-temp_oql_db
-vector_db
-vendor
-
-
-stream_db
-ringmpsc-main
