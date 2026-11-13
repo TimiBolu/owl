@@ -4,94 +4,7 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::distributed::GlobalObjRef;
-
-// Import ObjRef from the Zig storage bindings
-#[cfg(feature = "zig-storage")]
-use owl_storage_zig::ObjRef;
-
-// Add helper methods for zig-storage ObjRef
-#[cfg(feature = "zig-storage")]
-impl ObjRef {
-    pub fn from_string(s: &str) -> Option<Self> {
-        // Parse string reference ID to ObjRef
-        // For backward compatibility, we'll use a simple hash
-        if s.is_empty() {
-            return Some(Self::null());
-        }
-        // Use a simple hash of the string as the offset
-        let hash = s
-            .bytes()
-            .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-        Some(Self::new(hash))
-    }
-
-    pub fn to_string_id(&self) -> String {
-        if self.is_null() {
-            String::new()
-        } else {
-            format!("ref_{:016x}", self.offset())
-        }
-    }
-}
-
-// For backward compatibility when zig-storage is not enabled
-#[cfg(not(feature = "zig-storage"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[repr(transparent)]
-pub struct ObjRef(u64);
-
-#[cfg(not(feature = "zig-storage"))]
-impl ObjRef {
-    pub const fn new(offset: u64) -> Self {
-        Self(offset)
-    }
-
-    pub const fn null() -> Self {
-        Self(0)
-    }
-
-    pub const fn is_null(self) -> bool {
-        self.0 == 0
-    }
-
-    pub const fn offset(self) -> u64 {
-        self.0
-    }
-
-    pub const fn page_id(self) -> u32 {
-        (self.0 / 4096) as u32
-    }
-
-    pub const fn slot_id(self) -> u16 {
-        ((self.0 % 4096) / 64) as u16
-    }
-
-    pub const fn from_page_slot(page_id: u32, slot_id: u16) -> Self {
-        let offset = (page_id as u64 * 4096) + (slot_id as u64 * 64);
-        Self(offset)
-    }
-
-    pub fn from_string(s: &str) -> Option<Self> {
-        // Parse string reference ID to ObjRef
-        // For backward compatibility, we'll use a simple hash
-        if s.is_empty() {
-            return Some(Self::null());
-        }
-        // Use a simple hash of the string as the offset
-        let hash = s
-            .bytes()
-            .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-        Some(Self::new(hash))
-    }
-
-    pub fn to_string_id(&self) -> String {
-        if self.is_null() {
-            String::new()
-        } else {
-            format!("ref_{:016x}", self.0)
-        }
-    }
-}
+pub use crate::storage_engine::ObjRef;
 
 /// Unique identifier for documents
 pub type DocumentId = String;
@@ -176,6 +89,19 @@ impl Document {
             version: self.version + 1,
         }
     }
+
+    /// Preserve document identity and metadata while replacing the visible
+    /// field set for a query projection.
+    pub fn with_projected_fields(&self, fields: HashMap<String, Value>) -> Self {
+        Self {
+            id: self.id.clone(),
+            schema: self.schema.clone(),
+            fields,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            version: self.version,
+        }
+    }
 }
 
 /// Value types supported in OQL documents
@@ -186,7 +112,7 @@ pub enum Value {
     Float(f64),
     Boolean(bool),
     DateTime(DateTime<Utc>),
-    Reference(ObjRef), // Physical pointer to referenced document
+    Reference(ObjRef),             // Physical pointer to referenced document
     GlobalReference(GlobalObjRef), // Shard-aware physical pointer for distributed traversal
     List(Vec<Value>),
     Object(HashMap<String, Value>), // Nested objects for schema evolution

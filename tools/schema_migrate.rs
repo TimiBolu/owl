@@ -2,7 +2,7 @@ use owl_db::error::OQLResult;
 use owl_db::schema::{Schema, FieldType, SchemaRegistry};
 use owl_db::schema::evolution::{SchemaVersion, SchemaEvolution, CompatibilityLevel};
 use owl_db::schema::migration::{Migration, MigrationPlan, MigrationExecutor};
-use owl_db::storage::ZigStore;
+use owl_db::storage::RustStore;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use clap::{Parser, Subcommand};
@@ -224,7 +224,7 @@ fn execute_migration(
     }
 
     // Create store
-    let store = ZigStore::new(db_path.to_str().unwrap(), 100_000_000)?;
+    let store = RustStore::new(db_path.to_str().unwrap(), 100_000_000)?;
     
     // Create migration plan
     let old_schema = create_sample_schema(schema_name, from_version);

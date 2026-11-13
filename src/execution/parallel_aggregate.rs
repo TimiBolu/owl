@@ -216,7 +216,7 @@ impl ParallelAggregateExec {
                                     partial.maxs.insert(field_key.clone(), value.clone());
                                 }
                             }
-                            AggregateFunction::Count => {
+                            AggregateFunction::Count | AggregateFunction::Exists => {
                                 // Count is handled by partial.count
                             }
                         }
@@ -238,6 +238,7 @@ impl ParallelAggregateExec {
                 .unwrap_or_else(|| format!("{:?}", spec.function));
 
             let value = match spec.function {
+                AggregateFunction::Exists => Value::Boolean(aggregate.count > 0),
                 AggregateFunction::Count => Value::Integer(aggregate.count),
                 AggregateFunction::Sum => {
                     if let Some(field) = &spec.field {

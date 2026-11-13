@@ -74,7 +74,7 @@ fn oql_examples_execute_script_smoke() {
         let db_path = temp_dir
             .path()
             .join(format!("{}.owl", file_name.replace(".oql", "")));
-        let store = match owl_db::storage::zig_adapter::ZigStore::new(
+        let store = match owl_db::storage::RustStore::new(
             db_path.to_str().expect("db path str"),
             10 * 1024 * 1024,
         ) {

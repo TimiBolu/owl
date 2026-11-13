@@ -17,8 +17,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("=========================================");
 
         // Create OQL runner with temporary database
-        use owl_db::storage::zig_adapter::ZigStore;
-        let store = std::sync::Arc::new(ZigStore::new("./demo_db", 1024 * 1024 * 100)?);
+        use owl_db::storage::RustStore;
+        let store = std::sync::Arc::new(RustStore::new("./demo_db", 1024 * 1024 * 100)?);
         let runner = OQLRunner::new(store);
 
         // Execute embedded OQL content

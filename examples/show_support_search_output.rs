@@ -1,9 +1,10 @@
 use owl_db::parser::{
-    parse_oql_file, resolve_query_with_bindings, schema_definition_to_schema, OQLFileStatement,
+    parse_oql_file, resolve_query_with_bindings, resolve_query_with_value_bindings,
+    resolve_value_with_bindings, schema_definition_to_schema, Expression, OQLFileStatement,
     OQLQuery,
 };
 use owl_db::schema::SchemaRegistry;
-use owl_db::storage::zig_adapter::ZigStore;
+use owl_db::storage::RustStore;
 use owl_db::{execute_oql_file, DocumentStore, QueryExecutor};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -34,7 +35,7 @@ fn print_documents(docs: &[owl_db::Document], max_docs: usize) {
 }
 
 fn run_script_with_output(
-    executor: &mut QueryExecutor<ZigStore>,
+    executor: &mut QueryExecutor<RustStore>,
     script_path: &PathBuf,
     title: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -60,6 +61,7 @@ fn run_script_with_output(
     }
 
     let mut bindings: HashMap<String, OQLQuery> = HashMap::new();
+    let mut value_bindings: HashMap<String, Expression> = HashMap::new();
     let mut query_no = 0usize;
 
     for statement in file.statements {
@@ -72,12 +74,29 @@ fn run_script_with_output(
                 bindings.insert(binding.name.clone(), binding.query.clone());
                 println!("binding: {}", binding.name);
             }
+            OQLFileStatement::ValueBinding(binding) => {
+                let value = resolve_value_with_bindings(&binding.value, &value_bindings);
+                value_bindings.insert(binding.name.clone(), value);
+                println!("binding: {}", binding.name);
+            }
             OQLFileStatement::Query(query) => {
                 query_no += 1;
-                let resolved = resolve_query_with_bindings(&query, &bindings)?;
+                let resolved = resolve_query_with_value_bindings(
+                    &resolve_query_with_bindings(&query, &bindings)?,
+                    &value_bindings,
+                );
                 println!("\n[query {}] {}", query_no, describe_query(&resolved));
-                let docs = executor.execute_query(&resolved)?;
-                print_documents(&docs, 3);
+                if let Some(source) = value_bindings.get(&resolved.collection) {
+                    let value =
+                        executor.evaluate_script_expression(&Expression::CollectionExpression {
+                            source: Box::new(source.clone()),
+                            operations: resolved.operations.clone(),
+                        })?;
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                } else {
+                    let docs = executor.execute_query(&resolved)?;
+                    print_documents(&docs, 3);
+                }
             }
             OQLFileStatement::Transaction(statements) => {
                 println!(
@@ -94,7 +113,7 @@ fn run_script_with_output(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut db_path = std::env::temp_dir();
     db_path.push(format!("support_search_demo_{}.owl", std::process::id()));
-    let store = Arc::new(ZigStore::new(
+    let store = Arc::new(RustStore::new(
         db_path.to_str().ok_or("invalid temp path")?,
         64 * 1024 * 1024,
     )?);

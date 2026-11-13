@@ -232,32 +232,9 @@ fn test_reference_in_list() {
 }
 
 #[test]
-fn test_objref_page_and_slot_calculation() {
-    // Test page and slot ID calculation
-    let objref = ObjRef::new(4096 + 128); // Page 1, slot 2
-    assert_eq!(objref.page_id(), 1);
-    assert_eq!(objref.slot_id(), 2);
-    
-    // Test page 0, slot 0
-    let objref0 = ObjRef::new(0);
-    assert_eq!(objref0.page_id(), 0);
-    assert_eq!(objref0.slot_id(), 0);
-    
-    // Test last slot of page 0
-    let objref_last = ObjRef::new(4096 - 64);
-    assert_eq!(objref_last.page_id(), 0);
-    assert_eq!(objref_last.slot_id(), 63);
-}
-
-#[test]
-fn test_objref_from_page_slot() {
-    let page_id = 5;
-    let slot_id = 10;
-    
-    let objref = ObjRef::from_page_slot(page_id, slot_id);
-    assert_eq!(objref.page_id(), page_id);
-    assert_eq!(objref.slot_id(), slot_id);
-    
-    let expected_offset = (page_id as u64 * 4096) + (slot_id as u64 * 64);
-    assert_eq!(objref.offset(), expected_offset);
+fn test_objref_identity_parts() {
+    let objref = ObjRef::from_parts(5, 10, 2);
+    assert_eq!(objref.collection_id(), 5);
+    assert_eq!(objref.object_id(), 10);
+    assert_eq!(objref.generation(), 2);
 }

@@ -3,16 +3,23 @@
 use crate::distributed::GlobalObjRef;
 use crate::document::{Document, ObjRef, Value};
 use crate::error::{OQLError, OQLResult};
-use crate::functions::FunctionRegistry;
-use crate::hot_path_optimizations::{
-    get_pooled_document_vec, optimized_get_field, return_pooled_document_vec,
+use crate::execution::{
+    build_profiled_read_executor, build_read_executor, DataChunk, OperatorExecutionStats,
+    PhysicalOperatorCollect,
 };
+use crate::functions::FunctionRegistry;
+use crate::hot_path_optimizations::optimized_get_field;
 use crate::profile_call;
 // use crate::optimizer::QueryOptimizer; // TODO: Re-enable after optimizer module
 use crate::parser::{
     ComparisonOperator, Condition, Expression, FieldAccess, GroupByBlock, HavingBlock, InsertBlock,
-    Literal, NearestBlock, OQLQuery, Operation, SelectBlock, SortBlock, UpdateBlock, VectorMetric,
+    Literal, NearestBlock, OQLQuery, Operation, SelectBlock, SortBlock, UpdateBlock, UpsertBlock,
+    VectorMetric,
 };
+use crate::planner::operators::{IndexAccessKind, PhysicalOperator};
+use crate::planner::{LogicalPlanner, PhysicalPlan, PhysicalPlanner};
+use crate::schema::DocumentSystemField;
+use crate::schema::SchemaRegistry;
 use crate::schema::{CheckOperator, Schema, SchemaConstraint};
 use crate::simulation::Clock;
 use crate::storage::DocumentStore;
@@ -23,6 +30,7 @@ use crate::streaming::{
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Query execution engine for OQL with dependency injection
 #[allow(dead_code)]
@@ -47,6 +55,14 @@ struct ReverseReferenceStep {
     field_path: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum PathState {
+    Present(Value),
+    Null,
+    Missing,
+    BrokenReference,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ReverseReferenceExplainStep {
     pub source_schema: String,
@@ -61,7 +77,68 @@ pub struct ReverseReferenceExplainPlan {
     pub steps: Vec<ReverseReferenceExplainStep>,
 }
 
+/// Documents returned by a query together with the physical plan that was
+/// actually executed. A missing plan means the general OQL executor handled
+/// the query.
+#[derive(Debug)]
+pub struct QueryExecution {
+    pub documents: Vec<Document>,
+    pub physical_plan: Option<String>,
+    pub operator_profile: Option<OperatorExecutionStats>,
+    pub planning_elapsed: Duration,
+    /// Time spent in storage and physical operators, excluding conversion of
+    /// column-major result batches into public `Document` values.
+    pub execution_elapsed: Duration,
+    pub materialization_elapsed: Duration,
+}
+
+/// Batch-native query output.
+///
+/// Safe physical reads preserve projected storage batches here instead of
+/// constructing one `HashMap`-backed public document per row. Call
+/// [`BatchQueryExecution::into_documents`] only at compatibility boundaries
+/// that explicitly require the legacy document representation.
+#[derive(Debug)]
+pub struct BatchQueryExecution {
+    pub chunks: Vec<DataChunk>,
+    pub physical_plan: Option<String>,
+    pub planning_elapsed: Duration,
+    pub execution_elapsed: Duration,
+}
+
+impl BatchQueryExecution {
+    pub fn len(&self) -> usize {
+        self.chunks.iter().map(DataChunk::len).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.chunks.iter().all(DataChunk::is_empty)
+    }
+
+    pub fn projected_chunk_count(&self) -> usize {
+        self.chunks
+            .iter()
+            .filter(|chunk| chunk.is_projected())
+            .count()
+    }
+
+    pub fn into_documents(self) -> Vec<Document> {
+        let capacity = self.len();
+        let mut documents = Vec::with_capacity(capacity);
+        for chunk in self.chunks {
+            documents.extend(chunk.into_documents());
+        }
+        documents
+    }
+}
+
 impl<S: DocumentStore> QueryExecutor<S> {
+    pub fn evaluate_script_expression(&self, expression: &Expression) -> OQLResult<Value> {
+        self.evaluate_expression(
+            &Document::with_id("$script".to_string(), "$script".to_string(), HashMap::new()),
+            expression,
+        )
+    }
     /// Create a new query executor with dependency injection
     pub fn new(store: Arc<S>, clock: Arc<dyn Clock>) -> Self {
         let streaming_executor = StreamingExecutor::new_with_clock(store.clone(), clock.clone());
@@ -178,43 +255,288 @@ impl<S: DocumentStore> QueryExecutor<S> {
     /// Execute an OQL query and return matching documents
     pub fn execute_query(&self, query: &OQLQuery) -> OQLResult<Vec<Document>> {
         profile_call!("execute_query", {
-            // Use pooled vector to reduce allocations
-            let mut documents = get_pooled_document_vec();
-            let mut is_insert_only = false;
-
-            // Check if this is an INSERT-only operation
-            if query.operations.len() == 1 {
-                match &query.operations[0] {
-                    Operation::Insert(_) | Operation::InsertMany(_) => {
-                        is_insert_only = true;
-                    }
-                    _ => {}
-                }
+            if let Some(plan) = self.try_plan_safe_read(query)? {
+                return self.execute_read_plan(&plan);
             }
 
-            // For non-INSERT operations, start by scanning the collection
-            if !is_insert_only {
-                let scanned_docs =
-                    if let Some(prefiltered) = self.prefilter_documents_for_query(query)? {
-                        prefiltered
-                    } else {
-                        self.scan_collection(&query.collection)?
-                    };
-                documents.extend(scanned_docs);
-            }
-
-            // Apply operations in sequence
-            for operation in &query.operations {
-                let temp_docs = std::mem::take(&mut documents);
-                documents = self.apply_operation(temp_docs, operation, &query.collection)?;
-            }
-
-            // Convert to owned Vec before returning (pooled vec will be returned)
-            let result = documents.clone();
-            return_pooled_document_vec(documents);
-
-            Ok(result)
+            self.execute_general_query(query)
         })
+    }
+
+    /// Execute a read while retaining Owl's batch-native result representation.
+    ///
+    /// This is the preferred boundary for broad projections and streaming
+    /// consumers. Queries outside the safe physical-read subset remain fully
+    /// supported by wrapping their established document output in chunks.
+    pub fn execute_query_batches(&self, query: &OQLQuery) -> OQLResult<BatchQueryExecution> {
+        let planning_started = Instant::now();
+        let plan = self.try_plan_safe_read(query)?;
+        let planning_elapsed = planning_started.elapsed();
+
+        if let Some(plan) = plan {
+            let physical_plan = plan.root.explain();
+            let execution_started = Instant::now();
+            let chunks = self.execute_read_plan_batches(&plan)?;
+            return Ok(BatchQueryExecution {
+                chunks,
+                physical_plan: Some(physical_plan),
+                planning_elapsed,
+                execution_elapsed: execution_started.elapsed(),
+            });
+        }
+
+        let execution_started = Instant::now();
+        let documents = self.execute_general_query(query)?;
+        Ok(BatchQueryExecution {
+            chunks: (!documents.is_empty())
+                .then(|| DataChunk::new(documents))
+                .into_iter()
+                .collect(),
+            physical_plan: None,
+            planning_elapsed,
+            execution_elapsed: execution_started.elapsed(),
+        })
+    }
+
+    /// Execute a query and report the physical plan that was actually used.
+    /// Planning and execution share one plan, so observability does not cause
+    /// a second planner pass or risk describing a different execution.
+    pub fn execute_query_with_plan(&self, query: &OQLQuery) -> OQLResult<QueryExecution> {
+        profile_call!("execute_query_with_plan", {
+            let planning_started = Instant::now();
+            let plan = self.try_plan_safe_read(query)?;
+            let planning_elapsed = planning_started.elapsed();
+
+            if let Some(plan) = plan {
+                let physical_plan = plan.root.explain();
+                let execution_started = Instant::now();
+                let (documents, operator_profile, materialization_elapsed) =
+                    self.execute_read_plan_profiled(&plan)?;
+                let total_execution = execution_started.elapsed();
+                return Ok(QueryExecution {
+                    documents,
+                    physical_plan: Some(physical_plan),
+                    operator_profile: Some(operator_profile),
+                    planning_elapsed,
+                    execution_elapsed: total_execution.saturating_sub(materialization_elapsed),
+                    materialization_elapsed,
+                });
+            }
+
+            let execution_started = Instant::now();
+            Ok(QueryExecution {
+                documents: self.execute_general_query(query)?,
+                physical_plan: None,
+                operator_profile: None,
+                planning_elapsed,
+                execution_elapsed: execution_started.elapsed(),
+                materialization_elapsed: Duration::ZERO,
+            })
+        })
+    }
+
+    fn execute_general_query(&self, query: &OQLQuery) -> OQLResult<Vec<Document>> {
+        let mut documents = Vec::new();
+        let mut is_insert_only = false;
+
+        // Check if this is an INSERT-only operation
+        if query.operations.len() == 1 {
+            match &query.operations[0] {
+                Operation::Insert(_) | Operation::InsertMany(_) => {
+                    is_insert_only = true;
+                }
+                _ => {}
+            }
+        }
+
+        // For non-INSERT operations, start by scanning the collection
+        if !is_insert_only {
+            let scanned_docs =
+                if let Some(prefiltered) = self.prefilter_documents_for_query(query)? {
+                    prefiltered
+                } else {
+                    self.scan_collection(&query.collection)?
+                };
+            documents.extend(scanned_docs);
+        }
+
+        // Apply operations in sequence
+        for operation in &query.operations {
+            let temp_docs = std::mem::take(&mut documents);
+            documents = self.apply_operation(temp_docs, operation, &query.collection)?;
+        }
+
+        Ok(documents)
+    }
+
+    /// Explain the native indexed read plan selected for this query. `None`
+    /// means the query remains on the established general-purpose executor.
+    pub fn explain_indexed_read(&self, query: &OQLQuery) -> OQLResult<Option<String>> {
+        Ok(self.try_plan_safe_read(query)?.and_then(|plan| {
+            Self::contains_native_index_scan(&plan.root).then(|| plan.root.explain())
+        }))
+    }
+
+    fn execute_read_plan(&self, plan: &PhysicalPlan) -> OQLResult<Vec<Document>> {
+        let mut executor = build_read_executor(&plan.root)?;
+        let storage: crate::storage::Storage = self.store.clone();
+        executor.open(storage)?;
+        let result = executor.collect_all();
+        let close_result = executor.close();
+        match (result, close_result) {
+            (Ok(documents), Ok(())) => Ok(documents),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    fn execute_read_plan_batches(&self, plan: &PhysicalPlan) -> OQLResult<Vec<DataChunk>> {
+        let mut executor = build_read_executor(&plan.root)?;
+        let storage: crate::storage::Storage = self.store.clone();
+        executor.open(storage)?;
+        let result = executor.collect_chunks();
+        let close_result = executor.close();
+        match (result, close_result) {
+            (Ok(chunks), Ok(())) => Ok(chunks),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    fn execute_read_plan_profiled(
+        &self,
+        plan: &PhysicalPlan,
+    ) -> OQLResult<(Vec<Document>, OperatorExecutionStats, Duration)> {
+        let (mut executor, profile) = build_profiled_read_executor(&plan.root)?;
+        let storage: crate::storage::Storage = self.store.clone();
+        executor.open(storage)?;
+        let result = executor.collect_all_timed();
+        let close_result = executor.close();
+        match (result, close_result) {
+            (Ok((documents, materialization)), Ok(())) => {
+                Ok((documents, profile.snapshot(), materialization))
+            }
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    fn try_plan_safe_read(&self, query: &OQLQuery) -> OQLResult<Option<PhysicalPlan>> {
+        if !Self::is_pipeline_safe_read(query) {
+            return Ok(None);
+        }
+        // Committed scalar indexes do not contain transaction-local writes.
+        // The general executor overlays them and is therefore authoritative
+        // until commit publishes both records and index maintenance.
+        if self.store.has_pending_writes()? {
+            return Ok(None);
+        }
+
+        // Requiring a schema gives the logical planner enough information to
+        // reject comparisons whose literal type does not match the indexed
+        // field. That avoids changing OQL's coercion behavior at this boundary.
+        let Some(schema) = self.store.get_schema(&query.collection)? else {
+            return Ok(None);
+        };
+        let registry = SchemaRegistry::new();
+        registry.register(schema)?;
+        let logical = match LogicalPlanner::with_schema_registry(registry).plan(query) {
+            Ok(plan) => plan,
+            Err(_) => return Ok(None),
+        };
+        let physical = PhysicalPlanner::new()
+            .with_storage_catalog(self.store.as_ref())?
+            .plan(&logical)?;
+
+        Ok(Some(physical))
+    }
+
+    fn is_pipeline_safe_read(query: &OQLQuery) -> bool {
+        let mut has_where = false;
+        for operation in &query.operations {
+            match operation {
+                Operation::Where(block) => {
+                    has_where = true;
+                    if !Self::is_pipeline_safe_condition(&block.condition) {
+                        return false;
+                    }
+                }
+                Operation::Select(block) => {
+                    if block
+                        .fields
+                        .iter()
+                        .any(|field| !Self::is_pipeline_safe_expression(&field.expression))
+                    {
+                        return false;
+                    }
+                }
+                Operation::Sort(block) => {
+                    if block
+                        .fields
+                        .iter()
+                        .any(|field| !Self::is_pipeline_safe_expression(&field.expression))
+                    {
+                        return false;
+                    }
+                }
+                Operation::Limit(_) => {}
+                Operation::Offset(_) | Operation::First => {}
+                _ => return false,
+            }
+        }
+        has_where
+    }
+
+    fn is_pipeline_safe_expression(expression: &Expression) -> bool {
+        match expression {
+            Expression::Literal(_) => true,
+            Expression::FieldAccess(FieldAccess { path }) => path.len() == 1,
+            _ => false,
+        }
+    }
+
+    fn is_pipeline_safe_condition(condition: &Condition) -> bool {
+        match condition {
+            Condition::Comparison {
+                left: Expression::FieldAccess(FieldAccess { path }),
+                operator,
+                right: Expression::Literal(_),
+            } => {
+                path.len() == 1
+                    && matches!(
+                        operator,
+                        ComparisonOperator::Equal
+                            | ComparisonOperator::LessThan
+                            | ComparisonOperator::LessEqual
+                            | ComparisonOperator::GreaterThan
+                            | ComparisonOperator::GreaterEqual
+                    )
+            }
+            Condition::And(left, right) => {
+                Self::is_pipeline_safe_condition(left) && Self::is_pipeline_safe_condition(right)
+            }
+            Condition::Or(left, right) => {
+                Self::is_pipeline_safe_condition(left) && Self::is_pipeline_safe_condition(right)
+            }
+            _ => false,
+        }
+    }
+
+    fn contains_native_index_scan(operator: &PhysicalOperator) -> bool {
+        match operator {
+            PhysicalOperator::IndexScan(scan) => scan.access == IndexAccessKind::NativeTyped,
+            PhysicalOperator::IndexUnion(union) => {
+                union.inputs.iter().all(Self::contains_native_index_scan)
+            }
+            PhysicalOperator::Filter(operator) => Self::contains_native_index_scan(&operator.input),
+            PhysicalOperator::Project(operator) => {
+                Self::contains_native_index_scan(&operator.input)
+            }
+            PhysicalOperator::Sort(operator) => Self::contains_native_index_scan(&operator.input),
+            PhysicalOperator::Limit(operator) => Self::contains_native_index_scan(&operator.input),
+            PhysicalOperator::Offset(operator) => Self::contains_native_index_scan(&operator.input),
+            _ => false,
+        }
     }
 
     /// Scan all documents in a collection
@@ -441,6 +763,9 @@ impl<S: DocumentStore> QueryExecutor<S> {
             Operation::InsertMany(insert_blocks) => {
                 self.apply_insert_many_operation(collection, insert_blocks)
             }
+            Operation::Upsert(upsert_block) => {
+                self.apply_upsert_operation(documents, collection, upsert_block)
+            }
             Operation::Update(update_block) => self.apply_update_operation(documents, update_block),
             Operation::Delete => self.apply_delete_operation(documents),
             Operation::GroupBy(group_by_block) => {
@@ -457,6 +782,16 @@ impl<S: DocumentStore> QueryExecutor<S> {
             Operation::Max(field_access) => self.apply_max_operation(documents, field_access),
             Operation::Sort(sort_block) => self.apply_sort_operation(documents, sort_block),
             Operation::Limit(limit_value) => self.apply_limit_operation(documents, *limit_value),
+            Operation::Offset(offset) => Ok(documents.into_iter().skip(*offset as usize).collect()),
+            Operation::First => Ok(documents.into_iter().take(1).collect()),
+            Operation::Exists => {
+                let exists = !documents.is_empty();
+                Ok(vec![Document::with_id(
+                    "exists_result".to_string(),
+                    "aggregate".to_string(),
+                    HashMap::from([("exists".to_string(), Value::Boolean(exists))]),
+                )])
+            }
             Operation::FunctionDef(_) => {
                 let context = crate::error::ErrorContext::new("apply_operation")
                     .with_location("query_executor")
@@ -607,7 +942,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 ) {
                     Ok(Some(hits)) => hits
                         .into_iter()
-                        .map(|h| owl_storage_zig::vector::VectorHit {
+                        .map(|h| crate::storage_engine::vector::VectorHit {
                             index: h.index as u32,
                             score: h.score,
                         })
@@ -722,11 +1057,11 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
     }
 
-    fn metric_to_ffi(metric: &VectorMetric) -> owl_storage_zig::vector::VectorMetric {
+    fn metric_to_ffi(metric: &VectorMetric) -> crate::storage_engine::vector::VectorMetric {
         match metric {
-            VectorMetric::Cosine => owl_storage_zig::vector::VectorMetric::Cosine,
-            VectorMetric::L2 => owl_storage_zig::vector::VectorMetric::L2,
-            VectorMetric::Dot => owl_storage_zig::vector::VectorMetric::Dot,
+            VectorMetric::Cosine => crate::storage_engine::vector::VectorMetric::Cosine,
+            VectorMetric::L2 => crate::storage_engine::vector::VectorMetric::L2,
+            VectorMetric::Dot => crate::storage_engine::vector::VectorMetric::Dot,
         }
     }
 
@@ -756,7 +1091,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
             projected_rows.extend_from_slice(&vec[..projection_dim]);
         }
         let projected_query = query_vector[..projection_dim].to_vec();
-        let coarse = owl_storage_zig::vector::vector_topk_f32(
+        let coarse = crate::storage_engine::vector::vector_topk_f32(
             &projected_rows,
             full_vectors.len(),
             projection_dim,
@@ -782,7 +1117,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
         metric: &VectorMetric,
         candidate_indices: &[usize],
         k: usize,
-    ) -> OQLResult<Vec<owl_storage_zig::vector::VectorHit>> {
+    ) -> OQLResult<Vec<crate::storage_engine::vector::VectorHit>> {
         if candidate_indices.is_empty() {
             return Ok(Vec::new());
         }
@@ -794,7 +1129,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 .ok_or_else(|| OQLError::generic("invalid candidate index"))?;
             candidate_rows.extend_from_slice(vec);
         }
-        let reranked = owl_storage_zig::vector::vector_topk_f32(
+        let reranked = crate::storage_engine::vector::vector_topk_f32(
             &candidate_rows,
             candidate_indices.len(),
             dim,
@@ -811,7 +1146,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
             let original = *candidate_indices
                 .get(hit.index as usize)
                 .ok_or_else(|| OQLError::generic("invalid rerank index"))?;
-            remapped.push(owl_storage_zig::vector::VectorHit {
+            remapped.push(crate::storage_engine::vector::VectorHit {
                 index: original as u32,
                 score: hit.score,
             });
@@ -855,6 +1190,12 @@ impl<S: DocumentStore> QueryExecutor<S> {
         expression: &Expression,
     ) -> OQLResult<Value> {
         match expression {
+            Expression::Identifier(name) => self.get_field_value(
+                document,
+                &FieldAccess {
+                    path: vec![name.clone()],
+                },
+            ),
             Expression::FieldAccess(field_access) => self.get_field_value(document, field_access),
             Expression::Literal(literal) => Ok(self.literal_to_value(literal)),
             Expression::FunctionCall { name, args } => {
@@ -953,7 +1294,140 @@ impl<S: DocumentStore> QueryExecutor<S> {
             Expression::QueryExpression { query } => {
                 self.evaluate_query_expression(document, query)
             }
+            Expression::CollectionExpression { source, operations } => {
+                self.evaluate_collection_expression(document, source, operations)
+            }
         }
+    }
+
+    fn evaluate_collection_expression(
+        &self,
+        scope_document: &Document,
+        source: &Expression,
+        operations: &[Operation],
+    ) -> OQLResult<Value> {
+        let reverse_documents = match source {
+            Expression::FieldAccess(field) => {
+                self.resolve_reverse_collection_source(scope_document, &field.path)?
+            }
+            _ => None,
+        };
+        let collection_scope = match source {
+            Expression::FieldAccess(field) => field
+                .path
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "$collection".to_string()),
+            Expression::Identifier(name) => name.clone(),
+            _ => "$collection".to_string(),
+        };
+        let (mut documents, source_was_object) = if let Some(documents) = reverse_documents {
+            (documents, false)
+        } else {
+            let source_value = self.evaluate_expression(scope_document, source)?;
+            let source_was_object = matches!(source_value, Value::Object(_));
+            let values = match source_value {
+                Value::List(values) => values,
+                Value::Object(object) => vec![Value::Object(object)],
+                Value::Null => Vec::new(),
+                scalar => vec![scalar],
+            };
+            let mut documents = Vec::with_capacity(values.len());
+            for (index, value) in values.into_iter().enumerate() {
+                let fields = match value {
+                    Value::Object(fields) => fields,
+                    scalar => HashMap::from([("value".to_string(), scalar)]),
+                };
+                documents.push(Document::with_id(
+                    index.to_string(),
+                    collection_scope.clone(),
+                    fields,
+                ));
+            }
+            (documents, source_was_object)
+        };
+
+        for operation in operations {
+            let materialized = self.materialize_operation_with_scope(operation, scope_document)?;
+            documents = self.apply_operation(documents, &materialized, &collection_scope)?;
+        }
+
+        let aggregate_field = match operations.last() {
+            Some(Operation::Count) => Some("count"),
+            Some(Operation::Sum(_)) => Some("sum"),
+            Some(Operation::Avg(_)) => Some("avg"),
+            Some(Operation::Min(_)) => Some("min"),
+            Some(Operation::Max(_)) => Some("max"),
+            Some(Operation::Exists) => Some("exists"),
+            _ => None,
+        };
+        if let Some(field) = aggregate_field {
+            return Ok(documents
+                .first()
+                .and_then(|document| document.fields.get(field))
+                .cloned()
+                .unwrap_or(Value::Null));
+        }
+
+        let mut rows = documents
+            .into_iter()
+            .map(|document| {
+                if document.fields.len() == 1 {
+                    if let Some(value) = document.fields.get("value") {
+                        return value.clone();
+                    }
+                }
+                Value::Object(document.fields)
+            })
+            .collect::<Vec<_>>();
+        if matches!(operations.last(), Some(Operation::First)) {
+            Ok(rows.into_iter().next().unwrap_or(Value::Null))
+        } else if source_was_object {
+            Ok(rows.pop().unwrap_or(Value::Null))
+        } else {
+            Ok(Value::List(rows))
+        }
+    }
+
+    fn resolve_reverse_collection_source(
+        &self,
+        scope_document: &Document,
+        path: &[String],
+    ) -> OQLResult<Option<Vec<Document>>> {
+        let Some((reverse_name, forward_path)) = path.split_last() else {
+            return Ok(None);
+        };
+        let mut target = scope_document.clone();
+        for segment in forward_path {
+            let Some(value) = target.get_field(segment).cloned() else {
+                return Ok(Some(Vec::new()));
+            };
+            target = match value {
+                Value::Reference(reference) => {
+                    let Some(document) = self.resolve_objref_target(&reference)? else {
+                        return Ok(Some(Vec::new()));
+                    };
+                    document
+                }
+                Value::GlobalReference(reference) => {
+                    let Some(document) = self.store.navigate_global_reference(&reference)? else {
+                        return Ok(Some(Vec::new()));
+                    };
+                    document
+                }
+                _ => return Ok(None),
+            };
+        }
+
+        if target.get_field(reverse_name).is_some() {
+            return Ok(None);
+        }
+        Ok(Some(self.store.scan_referencing_documents(
+            &target.schema,
+            &target.id,
+            Some(reverse_name),
+            None,
+        )?))
     }
 
     fn evaluate_query_expression(
@@ -963,16 +1437,22 @@ impl<S: DocumentStore> QueryExecutor<S> {
     ) -> OQLResult<Value> {
         let materialized_query = self.materialize_query_with_scope(query, scope_document)?;
         let docs = self.execute_query(&materialized_query)?;
-        if matches!(
-            materialized_query.operations.last(),
-            Some(crate::parser::Operation::Count)
-        ) {
-            let count_value = docs
+        let aggregate_field = match materialized_query.operations.last() {
+            Some(Operation::Count) => Some("count"),
+            Some(Operation::Sum(_)) => Some("sum"),
+            Some(Operation::Avg(_)) => Some("avg"),
+            Some(Operation::Min(_)) => Some("min"),
+            Some(Operation::Max(_)) => Some("max"),
+            Some(Operation::Exists) => Some("exists"),
+            _ => None,
+        };
+        if let Some(field) = aggregate_field {
+            let value = docs
                 .first()
-                .and_then(|doc| doc.fields.get("count"))
+                .and_then(|doc| doc.fields.get(field))
                 .cloned()
-                .unwrap_or(Value::Integer(0));
-            return Ok(count_value);
+                .unwrap_or(Value::Null);
+            return Ok(value);
         }
 
         let mut rows = Vec::with_capacity(docs.len());
@@ -985,7 +1465,11 @@ impl<S: DocumentStore> QueryExecutor<S> {
             }
             rows.push(Value::Object(object_fields));
         }
-        Ok(Value::List(rows))
+        if matches!(materialized_query.operations.last(), Some(Operation::First)) {
+            Ok(rows.into_iter().next().unwrap_or(Value::Null))
+        } else {
+            Ok(Value::List(rows))
+        }
     }
 
     fn materialize_query_with_scope(
@@ -1143,9 +1627,23 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
 
         Ok(match expr {
-            Expression::FieldAccess(_)
+            Expression::Identifier(_)
+            | Expression::FieldAccess(_)
             | Expression::Literal(_)
             | Expression::QueryExpression { .. } => expr.clone(),
+            Expression::CollectionExpression { source, operations } => {
+                Expression::CollectionExpression {
+                    source: Box::new(
+                        self.materialize_expression_with_scope(source, scope_document)?,
+                    ),
+                    operations: operations
+                        .iter()
+                        .map(|operation| {
+                            self.materialize_operation_with_scope(operation, scope_document)
+                        })
+                        .collect::<OQLResult<Vec<_>>>()?,
+                }
+            }
             Expression::FunctionCall { name, args } => Expression::FunctionCall {
                 name: name.clone(),
                 args: args
@@ -1246,6 +1744,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
 
     fn extract_scoped_path(expr: &Expression, immediate_scope: &str) -> Option<Vec<String>> {
         match expr {
+            Expression::Identifier(name) if name == immediate_scope => Some(Vec::new()),
             Expression::FieldAccess(field_access)
                 if field_access.path.len() == 1 && field_access.path[0] == immediate_scope =>
             {
@@ -1507,25 +2006,11 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 let field_name = &field_access.path[0];
 
                 // Handle special fields
-                match field_name.as_str() {
-                    // Prefer logical/business id field when present; fallback to internal document id.
-                    "id" => {
-                        if let Some(value) = optimized_get_field(document, field_name) {
-                            return Ok(value);
-                        }
-                        return Ok(Value::String(document.id.clone()));
-                    }
-                    "schema" => return Ok(Value::String(document.schema.clone())),
-                    "created_at" => return Ok(Value::DateTime(document.created_at)),
-                    "updated_at" => return Ok(Value::DateTime(document.updated_at)),
-                    _ => {
-                        // Use optimized field access with caching
-                        return match optimized_get_field(document, field_name) {
-                            Some(value) => Ok(value),
-                            None => Ok(Value::Null), // Implicit null handling - no errors!
-                        };
-                    }
+                if let Some(system_field) = DocumentSystemField::from_name(field_name) {
+                    return Ok(system_field.value(document));
                 }
+                // Use optimized field access with caching.
+                return Ok(optimized_get_field(document, field_name).unwrap_or(Value::Null));
             }
 
             // Grouped rows flatten grouped key paths into underscore-separated fields
@@ -1543,6 +2028,80 @@ impl<S: DocumentStore> QueryExecutor<S> {
         })
     }
 
+    fn resolve_path_state(&self, document: &Document, path: &[String]) -> OQLResult<PathState> {
+        if path.is_empty() {
+            return Ok(PathState::Missing);
+        }
+
+        let value = match DocumentSystemField::from_name(&path[0]) {
+            Some(system_field) => Some(system_field.value(document)),
+            None => document.get_field(&path[0]).cloned(),
+        };
+        let Some(value) = value else {
+            return Ok(PathState::Missing);
+        };
+        self.resolve_value_path_state(value, &path[1..])
+    }
+
+    fn resolve_object_path_state(
+        &self,
+        object: &HashMap<String, Value>,
+        path: &[String],
+    ) -> OQLResult<PathState> {
+        if path.is_empty() {
+            return Ok(PathState::Present(Value::Object(object.clone())));
+        }
+        let Some(value) = object.get(&path[0]).cloned() else {
+            return Ok(PathState::Missing);
+        };
+        self.resolve_value_path_state(value, &path[1..])
+    }
+
+    fn resolve_value_path_state(&self, value: Value, remaining: &[String]) -> OQLResult<PathState> {
+        match value {
+            Value::Null if remaining.is_empty() => Ok(PathState::Null),
+            Value::Null => Ok(PathState::Missing),
+            Value::Object(object) => self.resolve_object_path_state(&object, remaining),
+            Value::Reference(reference) => {
+                let Some(target) = self.resolve_objref_target(&reference)? else {
+                    return Ok(PathState::BrokenReference);
+                };
+                if remaining.is_empty() {
+                    Ok(PathState::Present(Value::Reference(reference)))
+                } else {
+                    self.resolve_path_state(&target, remaining)
+                }
+            }
+            Value::GlobalReference(reference) => {
+                if reference.is_null() {
+                    return Ok(PathState::BrokenReference);
+                }
+                let Some(target) = self.store.navigate_global_reference(&reference)? else {
+                    return Ok(PathState::BrokenReference);
+                };
+                if remaining.is_empty() {
+                    Ok(PathState::Present(Value::GlobalReference(reference)))
+                } else {
+                    self.resolve_path_state(&target, remaining)
+                }
+            }
+            other if remaining.is_empty() => Ok(PathState::Present(other)),
+            _ => Ok(PathState::Missing),
+        }
+    }
+
+    fn resolve_objref_target(&self, reference: &ObjRef) -> OQLResult<Option<Document>> {
+        if let Some(document) = self.try_fast_navigation(reference)? {
+            return Ok(Some(document));
+        }
+
+        let reference_id = reference.to_string_id();
+        let Some((schema, document_id)) = reference_id.split_once('#') else {
+            return Ok(None);
+        };
+        self.store.get_document(schema, &document_id.to_string())
+    }
+
     /// Resolve nested field path with implicit null handling at every level
     /// This enables migration-free schema evolution by never throwing errors for missing fields
     fn resolve_nested_field_path(&self, document: &Document, path: &[String]) -> OQLResult<Value> {
@@ -1554,17 +2113,9 @@ impl<S: DocumentStore> QueryExecutor<S> {
         let remaining_path = &path[1..];
 
         // Get the field value from the current document
-        let field_value = match field_name.as_str() {
-            // Handle special document fields
-            // Prefer logical/business id field when present; fallback to internal document id.
-            "id" => document
-                .get_field("id")
-                .cloned()
-                .unwrap_or_else(|| Value::String(document.id.clone())),
-            "schema" => Value::String(document.schema.clone()),
-            "created_at" => Value::DateTime(document.created_at),
-            "updated_at" => Value::DateTime(document.updated_at),
-            _ => {
+        let field_value = match DocumentSystemField::from_name(field_name) {
+            Some(system_field) => system_field.value(document),
+            None => {
                 // Regular field access - return null if field doesn't exist
                 match document.get_field(field_name) {
                     Some(value) => value.clone(),
@@ -1707,7 +2258,9 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
 
         match self.store.navigate_global_reference(objref) {
-            Ok(Some(referenced_doc)) => self.resolve_nested_field_path(&referenced_doc, remaining_path),
+            Ok(Some(referenced_doc)) => {
+                self.resolve_nested_field_path(&referenced_doc, remaining_path)
+            }
             Ok(None) | Err(_) => Ok(Value::Null),
         }
     }
@@ -1742,6 +2295,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
             Literal::Integer(i) => Value::Integer(*i),
             Literal::Float(f) => Value::Float(*f),
             Literal::Boolean(b) => Value::Boolean(*b),
+            Literal::Null => Value::Null,
         }
     }
 
@@ -1881,18 +2435,10 @@ impl<S: DocumentStore> QueryExecutor<S> {
         select_block: &SelectBlock,
     ) -> OQLResult<Vec<Document>> {
         // Check if any field is an aggregation function
-        let has_aggregation = select_block.fields.iter().any(|field| {
-            match &field.expression {
-                Expression::FunctionCall { name, args } => {
-                    match name.as_str() {
-                        "count" | "sum" | "avg" => true,
-                        "min" | "max" => args.len() == 1, // Only aggregation if single argument
-                        _ => false,
-                    }
-                }
-                _ => false,
-            }
-        });
+        let has_aggregation = select_block
+            .fields
+            .iter()
+            .any(|field| Self::expression_contains_aggregate(&field.expression));
 
         // Check if we're dealing with grouped data (documents with schema "group")
         let is_grouped_data = documents.iter().any(|doc| doc.schema == "group");
@@ -1915,40 +2461,10 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     },
                 };
 
-                let value = match &select_field.expression {
-                    Expression::FunctionCall { name, args } => {
-                        // Handle aggregation function
-                        let field_path = if args.is_empty() {
-                            Vec::new() // For count()
-                        } else {
-                            match &args[0] {
-                                Expression::FieldAccess(field_access) => {
-                                    // Handle count(*) case
-                                    if field_access.path.len() == 1 && field_access.path[0] == "*" {
-                                        Vec::new() // Treat count(*) same as count()
-                                    } else {
-                                        field_access.path.clone()
-                                    }
-                                }
-                                _ => return Err(OQLError::Generic {
-                                    message:
-                                        "Aggregation functions only support field access arguments"
-                                            .to_string(),
-                                }),
-                            }
-                        };
-
-                        self.execute_aggregation(&documents, name, &field_path)?
-                    }
-                    _ => {
-                        // Non-aggregation expression - use first document or error
-                        if documents.is_empty() {
-                            Value::Null
-                        } else {
-                            self.evaluate_expression(&documents[0], &select_field.expression)?
-                        }
-                    }
-                };
+                let value = self.evaluate_collection_aggregate_expression(
+                    &documents,
+                    &select_field.expression,
+                )?;
 
                 projected_fields.insert(field_name, value);
             }
@@ -1984,40 +2500,12 @@ impl<S: DocumentStore> QueryExecutor<S> {
                         }
                     };
 
-                    let value = match &select_field.expression {
-                        Expression::FunctionCall { name, args } if is_grouped_data => {
-                            // Handle aggregation function on grouped data
-                            let field_path = if args.is_empty() {
-                                Vec::new() // For count()
-                            } else {
-                                match &args[0] {
-                                    Expression::FieldAccess(field_access) => {
-                                        // Handle count(*) case
-                                        if field_access.path.len() == 1 && field_access.path[0] == "*" {
-                                            Vec::new() // Treat count(*) same as count()
-                                        } else {
-                                            field_access.path.clone()
-                                        }
-                                    },
-                                    _ => return Err(OQLError::Generic {
-                                        message: "Aggregation functions only support field access arguments".to_string(),
-                                    }),
-                                }
-                            };
-
-                            self.execute_group_aggregation(&document, name, &field_path)?
-                        }
-                        _ => self.evaluate_expression(&document, &select_field.expression)?,
-                    };
+                    let value = self.evaluate_expression(&document, &select_field.expression)?;
 
                     projected_fields.insert(field_name, value);
                 }
 
-                let projected_doc = Document::with_id(
-                    document.id.clone(),
-                    document.schema.clone(),
-                    projected_fields,
-                );
+                let projected_doc = document.with_projected_fields(projected_fields);
 
                 projected_documents.push(projected_doc);
             }
@@ -2112,16 +2600,108 @@ impl<S: DocumentStore> QueryExecutor<S> {
             documents.push(document);
         }
 
-        // Validate constraints and store sequentially so UNIQUE catches same-batch duplicates.
-        for document in &documents {
-            if let Some(ref schema) = schema {
-                self.validate_document_constraints(schema, document, None)?;
-            }
-            self.store.put_document(document)?;
+        if let Some(ref schema) = schema {
+            self.validate_insert_batch_constraints(schema, &documents)?;
         }
+
+        // RustStore commits this as one WAL frame and one sync. Compatibility
+        // stores retain the DocumentStore default while they migrate.
+        self.store.put_documents(&documents)?;
 
         // Return all created documents
         Ok(documents)
+    }
+
+    fn apply_upsert_operation(
+        &self,
+        documents: Vec<Document>,
+        collection: &str,
+        upsert: &UpsertBlock,
+    ) -> OQLResult<Vec<Document>> {
+        let insert = InsertBlock {
+            fields: upsert.fields.clone(),
+        };
+        let schema = self.store.get_schema(collection).ok().flatten();
+        let temp_doc = Document::new(collection.to_string(), HashMap::new());
+        let mut values = HashMap::with_capacity(upsert.fields.len());
+        for field in &upsert.fields {
+            let mut value = self.evaluate_expression(&temp_doc, &field.value)?;
+            if let Some(field_type) = schema
+                .as_ref()
+                .and_then(|schema| schema.get_field_type(&field.name))
+            {
+                value = self.convert_to_schema_type(value, field_type, collection)?;
+            }
+            values.insert(field.name.clone(), value);
+        }
+        let key_value = values.get(&upsert.key).ok_or_else(|| OQLError::Generic {
+            message: format!("Upsert document is missing key '{}'", upsert.key),
+        })?;
+        let mut matches = documents.into_iter().filter(|document| {
+            let existing = document
+                .get_field(&upsert.key)
+                .cloned()
+                .or_else(|| (upsert.key == "id").then_some(Value::String(document.id.clone())));
+            existing.is_some_and(|existing| self.values_equal(&existing, key_value))
+        });
+        let matched = matches.next();
+        if matches.next().is_some() {
+            return Err(OQLError::SchemaValidation {
+                message: format!(
+                    "Upsert key '{}={}' matched more than one '{}' document",
+                    upsert.key,
+                    key_value.to_string_repr(),
+                    collection
+                ),
+            });
+        }
+
+        let Some(mut document) = matched else {
+            return self.apply_insert_operation(collection, &insert);
+        };
+        for (name, value) in values {
+            document.set_field(name, value);
+        }
+        if let Some(schema) = schema {
+            schema.validate_document(&document.fields)?;
+            self.validate_document_constraints(&schema, &document, Some(&document.id))?;
+        }
+        self.store.put_documents(std::slice::from_ref(&document))?;
+        Ok(vec![document])
+    }
+
+    fn validate_insert_batch_constraints(
+        &self,
+        schema: &Schema,
+        documents: &[Document],
+    ) -> OQLResult<()> {
+        for document in documents {
+            self.validate_document_constraints(schema, document, None)?;
+        }
+        for constraint in &schema.constraints {
+            let SchemaConstraint::Unique { fields, name } = constraint else {
+                continue;
+            };
+            for left_index in 0..documents.len() {
+                for right_index in left_index + 1..documents.len() {
+                    let same = fields.iter().all(|field| {
+                        self.extract_field_path_value(&documents[left_index].fields, field)
+                            == self.extract_field_path_value(&documents[right_index].fields, field)
+                    });
+                    if same {
+                        return Err(OQLError::SchemaValidation {
+                            message: format!(
+                                "Unique constraint '{}' violated within insert batch on schema '{}' fields {:?}",
+                                name.clone().unwrap_or_else(|| "unnamed_unique".to_string()),
+                                schema.name,
+                                fields
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Convert a value to match the expected schema type
@@ -2146,7 +2726,9 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     if let Some(Value::String(doc_id)) = doc.fields.get("id") {
                         if doc_id == &ref_id {
                             // Found the document! Get its ObjRef
-                            if let Some(objref) = self.store.get_global_objref(target_schema, &doc.id)? {
+                            if let Some(objref) =
+                                self.store.get_global_objref(target_schema, &doc.id)?
+                            {
                                 return Ok(Value::GlobalReference(objref));
                             }
                             if let Some(objref) = self.store.get_objref(target_schema, &doc.id)? {
@@ -2187,15 +2769,10 @@ impl<S: DocumentStore> QueryExecutor<S> {
         documents: Vec<Document>,
         update_block: &UpdateBlock,
     ) -> OQLResult<Vec<Document>> {
-        let mut updated_documents = Vec::new();
-
-        for document in documents {
-            let document = self.materialize_updated_document(document, update_block)?;
-            // Store the updated document
-            self.store.put_document(&document)?;
-            updated_documents.push(document);
-        }
-
+        let updated_documents = self.materialize_updated_documents(documents, update_block)?;
+        // Materialize and validate the whole update set before publishing any
+        // document. RustStore persists the batch in one WAL frame.
+        self.store.put_documents(&updated_documents)?;
         Ok(updated_documents)
     }
 
@@ -2220,13 +2797,29 @@ impl<S: DocumentStore> QueryExecutor<S> {
 
         for update_field in &update_block.fields {
             let mut new_value = self.evaluate_expression(&document, &update_field.value)?;
-            if let Some(ref schema) = schema {
-                if let Some(field_type) = schema.get_field_type(&update_field.name) {
-                    new_value =
-                        self.convert_to_schema_type(new_value, field_type, &document.schema)?;
+            let path: Vec<&str> = update_field.name.split('.').collect();
+            if path.len() == 1 {
+                if let Some(ref schema) = schema {
+                    if let Some(field_type) = schema.get_field_type(&update_field.name) {
+                        new_value =
+                            self.convert_to_schema_type(new_value, field_type, &document.schema)?;
+                    }
                 }
+                document.set_field(update_field.name.clone(), new_value);
+            } else {
+                let root = path[0];
+                let root_may_be_created = schema
+                    .as_ref()
+                    .and_then(|schema| schema.get_field_type(root))
+                    .is_some_and(Self::field_type_is_object);
+                Self::set_nested_update_value(
+                    &mut document.fields,
+                    &path,
+                    new_value,
+                    root_may_be_created,
+                    &update_field.name,
+                )?;
             }
-            document.set_field(update_field.name.clone(), new_value);
         }
 
         if let Some(schema) = schema {
@@ -2235,6 +2828,67 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
 
         Ok(document)
+    }
+
+    fn field_type_is_object(field_type: &crate::schema::FieldType) -> bool {
+        match field_type {
+            crate::schema::FieldType::Object => true,
+            crate::schema::FieldType::Optional(inner) => Self::field_type_is_object(inner),
+            _ => false,
+        }
+    }
+
+    fn set_nested_update_value(
+        object: &mut HashMap<String, Value>,
+        path: &[&str],
+        value: Value,
+        allow_missing_here: bool,
+        full_path: &str,
+    ) -> OQLResult<()> {
+        let Some((head, tail)) = path.split_first() else {
+            return Err(OQLError::Generic {
+                message: "Update path cannot be empty".to_string(),
+            });
+        };
+        if tail.is_empty() {
+            object.insert((*head).to_string(), value);
+            return Ok(());
+        }
+
+        if !object.contains_key(*head) {
+            if !allow_missing_here {
+                return Err(OQLError::SchemaValidation {
+                    message: format!(
+                        "Cannot update '{}': missing intermediate object '{}'",
+                        full_path, head
+                    ),
+                });
+            }
+            object.insert((*head).to_string(), Value::Object(HashMap::new()));
+        }
+
+        match object.get_mut(*head) {
+            Some(Value::Object(nested)) => {
+                Self::set_nested_update_value(nested, tail, value, true, full_path)
+            }
+            Some(Value::Reference(_)) | Some(Value::GlobalReference(_)) => {
+                Err(OQLError::SchemaValidation {
+                    message: format!(
+                        "Cannot update '{}': writes cannot traverse reference '{}'",
+                        full_path, head
+                    ),
+                })
+            }
+            Some(other) => Err(OQLError::SchemaValidation {
+                message: format!(
+                    "Cannot update '{}': '{}' is {}, not an object",
+                    full_path,
+                    head,
+                    other.type_name()
+                ),
+            }),
+            None => unreachable!("missing nested update entry was handled above"),
+        }
     }
 
     fn validate_document_constraints(
@@ -2469,9 +3123,36 @@ impl<S: DocumentStore> QueryExecutor<S> {
         name: &str,
         args: &[Expression],
     ) -> OQLResult<Value> {
+        if document.schema == "group" {
+            if let Some(field_path) = Self::aggregate_field_path(name, args)? {
+                return self.execute_group_aggregation(document, name, &field_path);
+            }
+        }
+
         // Handle aggregation functions specially (they need document context)
         // But only if they have the right number of arguments for aggregation
         match name {
+            "exists" | "is_null" | "is_missing" | "is_broken_ref" => {
+                if args.len() != 1 {
+                    return Err(OQLError::FunctionError {
+                        message: format!("{} expects exactly one path argument", name),
+                    });
+                }
+                let Expression::FieldAccess(path) = &args[0] else {
+                    return Err(OQLError::FunctionError {
+                        message: format!("{} expects a field path", name),
+                    });
+                };
+                let state = self.resolve_path_state(document, &path.path)?;
+                let result = match name {
+                    "exists" => matches!(state, PathState::Present(_) | PathState::Null),
+                    "is_null" => matches!(state, PathState::Null),
+                    "is_missing" => matches!(state, PathState::Missing),
+                    "is_broken_ref" => matches!(state, PathState::BrokenReference),
+                    _ => unreachable!(),
+                };
+                Ok(Value::Boolean(result))
+            }
             "count" => self.evaluate_count_function(document, args),
             "sum" if args.len() == 1 => self.evaluate_sum_function(document, args),
             "avg" if args.len() == 1 => self.evaluate_avg_function(document, args),
@@ -2497,6 +3178,299 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     })
                 }
             }
+        }
+    }
+
+    fn aggregate_field_path(name: &str, args: &[Expression]) -> OQLResult<Option<Vec<String>>> {
+        let is_aggregate = matches!(name, "count" | "sum" | "avg" | "min" | "max");
+        if !is_aggregate {
+            return Ok(None);
+        }
+        if name == "count" && args.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        if args.len() != 1 {
+            return Err(OQLError::FunctionError {
+                message: format!(
+                    "{} expects {}",
+                    name,
+                    if name == "count" {
+                        "zero or one field argument"
+                    } else {
+                        "exactly one field argument"
+                    }
+                ),
+            });
+        }
+        match &args[0] {
+            Expression::FieldAccess(field) if field.path.len() == 1 && field.path[0] == "*" => {
+                if name == "count" {
+                    Ok(Some(Vec::new()))
+                } else {
+                    Err(OQLError::FunctionError {
+                        message: format!("{} does not accept '*'", name),
+                    })
+                }
+            }
+            Expression::FieldAccess(field) => Ok(Some(field.path.clone())),
+            _ => Err(OQLError::FunctionError {
+                message: format!("{} expects a field path argument", name),
+            }),
+        }
+    }
+
+    fn expression_contains_aggregate(expression: &Expression) -> bool {
+        match expression {
+            Expression::FunctionCall { name, args } => {
+                matches!(name.as_str(), "count" | "sum" | "avg" | "min" | "max")
+                    || args.iter().any(Self::expression_contains_aggregate)
+            }
+            Expression::IfThenElse {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                Self::condition_contains_aggregate(condition)
+                    || Self::expression_contains_aggregate(then_expr)
+                    || Self::expression_contains_aggregate(else_expr)
+            }
+            Expression::Match { expr, arms } => {
+                Self::expression_contains_aggregate(expr)
+                    || arms.iter().any(|arm| {
+                        arm.guard
+                            .as_ref()
+                            .is_some_and(Self::condition_contains_aggregate)
+                            || Self::expression_contains_aggregate(&arm.body)
+                    })
+            }
+            Expression::LogicalAnd(left, right)
+            | Expression::LogicalOr(left, right)
+            | Expression::BinaryOp { left, right, .. } => {
+                Self::expression_contains_aggregate(left)
+                    || Self::expression_contains_aggregate(right)
+            }
+            Expression::LogicalNot(inner) => Self::expression_contains_aggregate(inner),
+            Expression::ArrayAccess { array, index } => {
+                Self::expression_contains_aggregate(array)
+                    || Self::expression_contains_aggregate(index)
+            }
+            Expression::ChainedAccess { base, .. } => Self::expression_contains_aggregate(base),
+            Expression::Block(expressions) | Expression::ArrayLiteral(expressions) => {
+                expressions.iter().any(Self::expression_contains_aggregate)
+            }
+            Expression::ObjectLiteral(fields) => fields
+                .iter()
+                .any(|field| Self::expression_contains_aggregate(&field.value)),
+            Expression::ConditionExpr(condition) => Self::condition_contains_aggregate(condition),
+            // Collection/query expressions have their own row scope. Their
+            // terminal aggregates are correlated values, not aggregates over
+            // the surrounding select input.
+            Expression::QueryExpression { .. }
+            | Expression::CollectionExpression { .. }
+            | Expression::Identifier(_)
+            | Expression::FieldAccess(_)
+            | Expression::Literal(_) => false,
+        }
+    }
+
+    fn condition_contains_aggregate(condition: &Condition) -> bool {
+        match condition {
+            Condition::Comparison { left, right, .. } => {
+                Self::expression_contains_aggregate(left)
+                    || Self::expression_contains_aggregate(right)
+            }
+            Condition::And(left, right) | Condition::Or(left, right) => {
+                Self::condition_contains_aggregate(left)
+                    || Self::condition_contains_aggregate(right)
+            }
+            Condition::Not(inner) => Self::condition_contains_aggregate(inner),
+        }
+    }
+
+    fn evaluate_collection_aggregate_expression(
+        &self,
+        documents: &[Document],
+        expression: &Expression,
+    ) -> OQLResult<Value> {
+        if let Expression::FunctionCall { name, args } = expression {
+            if let Some(field_path) = Self::aggregate_field_path(name, args)? {
+                return self.execute_aggregation(documents, name, &field_path);
+            }
+        }
+
+        match expression {
+            Expression::BinaryOp {
+                left,
+                operator,
+                right,
+            } => {
+                let left = self.evaluate_collection_aggregate_expression(documents, left)?;
+                let right = self.evaluate_collection_aggregate_expression(documents, right)?;
+                self.evaluate_binary_operation(&left, operator, &right)
+            }
+            Expression::LogicalAnd(left, right) => {
+                let left = self.evaluate_collection_aggregate_expression(documents, left)?;
+                if !self.value_to_bool(&left)? {
+                    return Ok(Value::Boolean(false));
+                }
+                let right = self.evaluate_collection_aggregate_expression(documents, right)?;
+                Ok(Value::Boolean(self.value_to_bool(&right)?))
+            }
+            Expression::LogicalOr(left, right) => {
+                let left = self.evaluate_collection_aggregate_expression(documents, left)?;
+                if self.value_to_bool(&left)? {
+                    return Ok(Value::Boolean(true));
+                }
+                let right = self.evaluate_collection_aggregate_expression(documents, right)?;
+                Ok(Value::Boolean(self.value_to_bool(&right)?))
+            }
+            Expression::LogicalNot(inner) => Ok(Value::Boolean(!self.value_to_bool(
+                &self.evaluate_collection_aggregate_expression(documents, inner)?,
+            )?)),
+            Expression::IfThenElse {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                if self.evaluate_collection_aggregate_condition(documents, condition)? {
+                    self.evaluate_collection_aggregate_expression(documents, then_expr)
+                } else {
+                    self.evaluate_collection_aggregate_expression(documents, else_expr)
+                }
+            }
+            Expression::Match { expr, arms } => {
+                let value = self.evaluate_collection_aggregate_expression(documents, expr)?;
+                for arm in arms {
+                    if self.pattern_matches(&arm.pattern, &value)?
+                        && match &arm.guard {
+                            Some(guard) => {
+                                self.evaluate_collection_aggregate_condition(documents, guard)?
+                            }
+                            None => true,
+                        }
+                    {
+                        return self.evaluate_collection_aggregate_expression(documents, &arm.body);
+                    }
+                }
+                Err(OQLError::Generic {
+                    message: "No matching pattern found in aggregate expression".to_string(),
+                })
+            }
+            Expression::ArrayAccess { array, index } => {
+                let array = self.evaluate_collection_aggregate_expression(documents, array)?;
+                let index = self.evaluate_collection_aggregate_expression(documents, index)?;
+                self.evaluate_array_access(&array, &index)
+            }
+            Expression::ChainedAccess { base, field } => {
+                let base = self.evaluate_collection_aggregate_expression(documents, base)?;
+                self.get_field_from_value(&base, field)
+            }
+            Expression::Block(expressions) => {
+                let mut value = Value::Null;
+                for expression in expressions {
+                    value = self.evaluate_collection_aggregate_expression(documents, expression)?;
+                }
+                Ok(value)
+            }
+            Expression::ArrayLiteral(expressions) => expressions
+                .iter()
+                .map(|expression| {
+                    self.evaluate_collection_aggregate_expression(documents, expression)
+                })
+                .collect::<OQLResult<Vec<_>>>()
+                .map(Value::List),
+            Expression::ObjectLiteral(fields) => fields
+                .iter()
+                .map(|field| {
+                    Ok((
+                        field.name.clone(),
+                        self.evaluate_collection_aggregate_expression(documents, &field.value)?,
+                    ))
+                })
+                .collect::<OQLResult<HashMap<_, _>>>()
+                .map(Value::Object),
+            Expression::ConditionExpr(condition) => Ok(Value::Boolean(
+                self.evaluate_collection_aggregate_condition(documents, condition)?,
+            )),
+            Expression::FunctionCall { name, args }
+                if args.iter().any(Self::expression_contains_aggregate) =>
+            {
+                let context = documents
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| Document::new("$aggregate".to_string(), HashMap::new()));
+                let materialized_args = args
+                    .iter()
+                    .map(|arg| {
+                        self.evaluate_collection_aggregate_expression(documents, arg)
+                            .and_then(Self::value_as_expression)
+                    })
+                    .collect::<OQLResult<Vec<_>>>()?;
+                self.evaluate_function_call(&context, name, &materialized_args)
+            }
+            _ => match documents.first() {
+                Some(document) => self.evaluate_expression(document, expression),
+                None => match expression {
+                    Expression::Literal(literal) => Ok(self.literal_to_value(literal)),
+                    _ => Ok(Value::Null),
+                },
+            },
+        }
+    }
+
+    fn evaluate_collection_aggregate_condition(
+        &self,
+        documents: &[Document],
+        condition: &Condition,
+    ) -> OQLResult<bool> {
+        match condition {
+            Condition::Comparison {
+                left,
+                operator,
+                right,
+            } => {
+                let left = self.evaluate_collection_aggregate_expression(documents, left)?;
+                let right = self.evaluate_collection_aggregate_expression(documents, right)?;
+                self.compare_values(&left, operator, &right)
+            }
+            Condition::And(left, right) => Ok(self
+                .evaluate_collection_aggregate_condition(documents, left)?
+                && self.evaluate_collection_aggregate_condition(documents, right)?),
+            Condition::Or(left, right) => Ok(self
+                .evaluate_collection_aggregate_condition(documents, left)?
+                || self.evaluate_collection_aggregate_condition(documents, right)?),
+            Condition::Not(inner) => {
+                Ok(!self.evaluate_collection_aggregate_condition(documents, inner)?)
+            }
+        }
+    }
+
+    fn value_as_expression(value: Value) -> OQLResult<Expression> {
+        match value {
+            Value::String(value) => Ok(Expression::Literal(Literal::String(value))),
+            Value::Integer(value) => Ok(Expression::Literal(Literal::Integer(value))),
+            Value::Float(value) => Ok(Expression::Literal(Literal::Float(value))),
+            Value::Boolean(value) => Ok(Expression::Literal(Literal::Boolean(value))),
+            Value::Null => Ok(Expression::Literal(Literal::Null)),
+            Value::List(values) => values
+                .into_iter()
+                .map(Self::value_as_expression)
+                .collect::<OQLResult<Vec<_>>>()
+                .map(Expression::ArrayLiteral),
+            Value::Object(fields) => fields
+                .into_iter()
+                .map(|(name, value)| {
+                    Ok(crate::parser::ObjectField {
+                        name,
+                        value: Self::value_as_expression(value)?,
+                    })
+                })
+                .collect::<OQLResult<Vec<_>>>()
+                .map(Expression::ObjectLiteral),
+            other => Err(OQLError::TypeError {
+                expected: "literal-compatible aggregate result".to_string(),
+                actual: other.type_name().to_string(),
+            }),
         }
     }
 
@@ -2790,20 +3764,23 @@ impl<S: DocumentStore> QueryExecutor<S> {
         use std::collections::BTreeMap;
 
         // Group documents by the specified fields
-        let mut groups: BTreeMap<String, (Vec<Value>, Vec<Document>)> = BTreeMap::new();
+        let mut groups: BTreeMap<Vec<u8>, (Vec<Value>, Vec<Document>)> = BTreeMap::new();
 
         for document in documents {
             // Create group key by concatenating field values
-            let mut group_key_parts = Vec::new();
             let mut group_values = Vec::new();
 
             for field_access in &group_by_block.fields {
                 let value = self.get_field_value(&document, field_access)?;
-                group_key_parts.push(value.to_string_repr());
                 group_values.push(value);
             }
 
-            let group_key = group_key_parts.join("|"); // Use | as separator
+            // A typed composite encoding cannot collide when strings contain a
+            // delimiter and keeps Integer(1) distinct from String("1").
+            let group_key =
+                bincode::serialize(&group_values).map_err(|error| OQLError::Generic {
+                    message: format!("Failed to encode group key: {}", error),
+                })?;
             groups
                 .entry(group_key)
                 .or_insert_with(|| (group_values, Vec::new()))
@@ -2845,12 +3822,17 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 .unwrap_or_default();
             fields.insert("_group_schema".to_string(), Value::String(group_schema));
 
-            // Store the original documents as a special field for aggregation
-            // We'll serialize the document IDs and store them for later aggregation
-            let doc_ids: Vec<String> = group_documents.iter().map(|d| d.id.clone()).collect();
+            // Carry the exact source rows with the ephemeral grouped row. This
+            // avoids rescanning the source collection for every aggregate and
+            // preserves read-your-writes inside transactions.
             fields.insert(
-                "_group_document_ids".to_string(),
-                Value::String(doc_ids.join(",")),
+                "_group_documents".to_string(),
+                Value::List(
+                    group_documents
+                        .iter()
+                        .map(Self::encode_group_source_document)
+                        .collect(),
+                ),
             );
 
             // Create group document
@@ -3027,39 +4009,96 @@ impl<S: DocumentStore> QueryExecutor<S> {
         function_name: &str,
         field_path: &[String],
     ) -> OQLResult<Value> {
-        // Get the original document IDs from the group
-        let doc_ids_str = match group_doc.get_field("_group_document_ids") {
-            Some(Value::String(ids)) => ids,
+        let documents = match group_doc.get_field("_group_documents") {
+            Some(Value::List(documents)) => documents
+                .iter()
+                .map(Self::decode_group_source_document)
+                .collect::<OQLResult<Vec<_>>>()?,
             _ => {
                 return Err(OQLError::Generic {
-                    message: "Group document missing document IDs".to_string(),
+                    message: "Group document missing source rows".to_string(),
                 })
             }
         };
-        let group_schema = match group_doc.get_field("_group_schema") {
-            Some(Value::String(schema)) => schema.as_str(),
-            _ => {
-                return Err(OQLError::Generic {
-                    message: "Group document missing group schema".to_string(),
-                })
-            }
-        };
-
-        // Retrieve the original documents
-        let doc_ids: Vec<&str> = doc_ids_str.split(',').collect();
-        let mut documents = Vec::new();
-
-        // Scan the grouped schema and filter by IDs.
-        let all_docs = self.scan_collection(group_schema)?;
-
-        for doc in all_docs {
-            if doc_ids.contains(&doc.id.as_str()) {
-                documents.push(doc);
-            }
-        }
-
-        // Now execute aggregation on the original documents
         self.execute_aggregation(&documents, function_name, field_path)
+    }
+
+    fn encode_group_source_document(document: &Document) -> Value {
+        Value::Object(HashMap::from([
+            ("id".to_string(), Value::String(document.id.clone())),
+            ("schema".to_string(), Value::String(document.schema.clone())),
+            ("fields".to_string(), Value::Object(document.fields.clone())),
+            (
+                "created_at".to_string(),
+                Value::DateTime(document.created_at),
+            ),
+            (
+                "updated_at".to_string(),
+                Value::DateTime(document.updated_at),
+            ),
+            (
+                "version".to_string(),
+                Value::Integer(document.version as i64),
+            ),
+        ]))
+    }
+
+    fn decode_group_source_document(value: &Value) -> OQLResult<Document> {
+        let Value::Object(envelope) = value else {
+            return Err(OQLError::Generic {
+                message: "Grouped source row is not an object".to_string(),
+            });
+        };
+        let get_string = |name: &str| match envelope.get(name) {
+            Some(Value::String(value)) => Ok(value.clone()),
+            _ => Err(OQLError::Generic {
+                message: format!("Grouped source row is missing '{}'", name),
+            }),
+        };
+        let fields = match envelope.get("fields") {
+            Some(Value::Object(fields)) => fields.clone(),
+            _ => {
+                return Err(OQLError::Generic {
+                    message: "Grouped source row is missing 'fields'".to_string(),
+                })
+            }
+        };
+        let created_at = match envelope.get("created_at") {
+            Some(Value::DateTime(value)) => *value,
+            _ => {
+                return Err(OQLError::Generic {
+                    message: "Grouped source row is missing 'created_at'".to_string(),
+                })
+            }
+        };
+        let updated_at = match envelope.get("updated_at") {
+            Some(Value::DateTime(value)) => *value,
+            _ => {
+                return Err(OQLError::Generic {
+                    message: "Grouped source row is missing 'updated_at'".to_string(),
+                })
+            }
+        };
+        let version = match envelope.get("version") {
+            Some(Value::Integer(value)) => {
+                u64::try_from(*value).map_err(|_| OQLError::Generic {
+                    message: "Grouped source row has an invalid version".to_string(),
+                })?
+            }
+            _ => {
+                return Err(OQLError::Generic {
+                    message: "Grouped source row is missing 'version'".to_string(),
+                })
+            }
+        };
+        Ok(Document {
+            id: get_string("id")?,
+            schema: get_string("schema")?,
+            fields,
+            created_at,
+            updated_at,
+            version,
+        })
     }
 
     /// Apply SORT operation to documents
@@ -3204,6 +4243,18 @@ impl<S: DocumentStore> QueryExecutor<S> {
     ) -> OQLResult<Value> {
         match expr {
             Expression::Literal(literal) => Ok(self.literal_to_value(literal)),
+            Expression::Identifier(name) => {
+                if let Some(value) = context.get(name) {
+                    Ok(value.clone())
+                } else {
+                    self.get_field_value(
+                        document,
+                        &FieldAccess {
+                            path: vec![name.clone()],
+                        },
+                    )
+                }
+            }
             Expression::FieldAccess(field_access) => {
                 // Check if this is a parameter reference
                 if field_access.path.len() == 1 {
@@ -3320,6 +4371,9 @@ impl<S: DocumentStore> QueryExecutor<S> {
             Expression::QueryExpression { query } => {
                 self.evaluate_query_expression(document, query)
             }
+            Expression::CollectionExpression { source, operations } => {
+                self.evaluate_collection_expression(document, source, operations)
+            }
         }
     }
 
@@ -3355,14 +4409,14 @@ mod tests {
     use super::*;
     use crate::document::Document;
     use crate::parser::parse_oql;
-    use crate::storage::zig_adapter::ZigStore;
+    use crate::storage::RustStore;
     use std::collections::HashMap;
     use tempfile::TempDir;
 
-    fn create_test_executor() -> (QueryExecutor<ZigStore>, TempDir) {
+    fn create_test_executor() -> (QueryExecutor<RustStore>, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("test.owl");
-        let store = Arc::new(ZigStore::new(path.to_str().unwrap(), 10 * 1024 * 1024).unwrap());
+        let store = Arc::new(RustStore::new(path.to_str().unwrap(), 10 * 1024 * 1024).unwrap());
         let executor = QueryExecutor::new_with_real_clock(store);
         (executor, temp_dir)
     }
@@ -3434,6 +4488,786 @@ mod tests {
             results[0].get_field("name"),
             Some(&Value::String("Alice".to_string()))
         );
+    }
+
+    #[test]
+    fn indexed_read_pipeline_executes_where_sort_select_and_limit() {
+        use crate::schema::FieldType;
+        use crate::storage::ScalarIndexDefinition;
+
+        let (executor, _temp_dir) = create_test_executor();
+        executor
+            .store
+            .put_schema(&Schema::new(
+                "events".to_string(),
+                HashMap::from([
+                    ("level".to_string(), FieldType::String),
+                    ("message".to_string(), FieldType::String),
+                    ("ts".to_string(), FieldType::Integer),
+                ]),
+            ))
+            .unwrap();
+        executor
+            .store
+            .upsert_scalar_index(ScalarIndexDefinition {
+                name: "events_by_level".to_string(),
+                schema: "events".to_string(),
+                fields: vec!["level".to_string()],
+                unique: false,
+            })
+            .unwrap();
+
+        for (id, level, message, ts) in [
+            ("e1", "error", "older", 10),
+            ("e2", "info", "ignored", 30),
+            ("e3", "error", "newer", 20),
+        ] {
+            executor
+                .store
+                .put_document(&Document::with_id(
+                    id.to_string(),
+                    "events".to_string(),
+                    HashMap::from([
+                        ("level".to_string(), Value::String(level.to_string())),
+                        ("message".to_string(), Value::String(message.to_string())),
+                        ("ts".to_string(), Value::Integer(ts)),
+                    ]),
+                ))
+                .unwrap();
+        }
+
+        let query = parse_oql(
+            r#"events.where { .level == "error" }.sort { .ts.desc }.select { level, message, ts }.limit 1"#,
+        )
+        .unwrap();
+        let explain = executor
+            .explain_indexed_read(&query)
+            .unwrap()
+            .expect("native indexed plan");
+        assert!(explain.contains("index=events_by_level"), "{explain}");
+        assert!(explain.contains("access=NativeTyped"), "{explain}");
+        assert!(explain.contains("pushed_limit=None"), "{explain}");
+        assert!(
+            explain.contains("pushed_projection=[\"level\", \"message\", \"ts\"]"),
+            "{explain}"
+        );
+
+        let results = executor.execute_query(&query).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "e3");
+        assert_eq!(
+            results[0].get_field("message"),
+            Some(&Value::String("newer".to_string()))
+        );
+        assert_eq!(results[0].fields.len(), 3);
+
+        let fallback_query = parse_oql(
+            r#"events.where { .level == "error" or .message == "ignored" }.sort { .ts }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            executor.explain_indexed_read(&fallback_query).unwrap(),
+            None
+        );
+        let fallback_results = executor.execute_query(&fallback_query).unwrap();
+        assert_eq!(fallback_results.len(), 3);
+
+        let pushed_query =
+            parse_oql(r#"events.where { .level == "error" }.select { message }.limit 1"#).unwrap();
+        let pushed_explain = executor
+            .explain_indexed_read(&pushed_query)
+            .unwrap()
+            .expect("pushdown plan");
+        assert!(
+            pushed_explain.contains("pushed_limit=Some(1)"),
+            "{pushed_explain}"
+        );
+        assert!(
+            pushed_explain.contains("pushed_projection=[\"message\"]"),
+            "{pushed_explain}"
+        );
+        let pushed_results = executor.execute_query(&pushed_query).unwrap();
+        assert_eq!(pushed_results.len(), 1);
+        assert_eq!(pushed_results[0].fields.len(), 1);
+        assert!(pushed_results[0].fields.contains_key("message"));
+
+        let profiled = executor.execute_query_with_plan(&pushed_query).unwrap();
+        let profile = profiled
+            .operator_profile
+            .expect("indexed execution profile");
+        assert_eq!(profile.operator, "IndexScan");
+        assert_eq!(profile.actual_rows, 1);
+        fn find_operator<'a>(
+            profile: &'a crate::execution::OperatorExecutionStats,
+            name: &str,
+        ) -> Option<&'a crate::execution::OperatorExecutionStats> {
+            (profile.operator == name).then_some(profile).or_else(|| {
+                profile
+                    .children
+                    .iter()
+                    .find_map(|child| find_operator(child, name))
+            })
+        }
+        let index = find_operator(&profile, "IndexScan").expect("index profile");
+        assert_eq!(index.actual_rows, 1);
+        assert_eq!(index.metrics["records_decoded"], 1);
+        assert!(index.metrics["index_entries_examined"] >= 1);
+    }
+
+    #[test]
+    fn sequential_read_pipeline_projects_before_materializing_rows() {
+        use crate::schema::FieldType;
+
+        let (executor, _temp_dir) = create_test_executor();
+        executor
+            .store
+            .put_schema(&Schema::new(
+                "logs".to_string(),
+                HashMap::from([
+                    ("level".to_string(), FieldType::String),
+                    ("message".to_string(), FieldType::String),
+                    ("payload".to_string(), FieldType::String),
+                    ("ts".to_string(), FieldType::Integer),
+                ]),
+            ))
+            .unwrap();
+
+        for (id, level, message, ts) in [
+            ("l1", "error", "older", 10),
+            ("l2", "info", "ignored", 30),
+            ("l3", "error", "newer", 20),
+        ] {
+            executor
+                .store
+                .put_document(&Document::with_id(
+                    id.to_string(),
+                    "logs".to_string(),
+                    HashMap::from([
+                        ("level".to_string(), Value::String(level.to_string())),
+                        ("message".to_string(), Value::String(message.to_string())),
+                        ("payload".to_string(), Value::String("x".repeat(64 * 1024))),
+                        ("ts".to_string(), Value::Integer(ts)),
+                    ]),
+                ))
+                .unwrap();
+        }
+
+        let query = parse_oql(
+            r#"logs.where { .level == "error" }.sort { .ts.desc }.select { id, message }.limit 1"#,
+        )
+        .unwrap();
+        assert_eq!(executor.explain_indexed_read(&query).unwrap(), None);
+
+        let execution = executor.execute_query_with_plan(&query).unwrap();
+        let plan = execution.physical_plan.expect("sequential physical plan");
+        assert!(plan.contains("StorageScan collection=logs"), "{plan}");
+        assert!(plan.contains("filters=1"), "{plan}");
+        assert!(
+            plan.contains("projection=Some([\"id\", \"message\", \"ts\"])"),
+            "{plan}"
+        );
+        assert_eq!(execution.documents.len(), 1);
+        assert_eq!(execution.documents[0].id, "l3");
+        assert_eq!(
+            execution.documents[0].get_field("message"),
+            Some(&Value::String("newer".to_string()))
+        );
+        assert!(!execution.documents[0].fields.contains_key("payload"));
+
+        let profile = execution.operator_profile.expect("sequential profile");
+        fn find_operator<'a>(
+            profile: &'a crate::execution::OperatorExecutionStats,
+            name: &str,
+        ) -> Option<&'a crate::execution::OperatorExecutionStats> {
+            (profile.operator == name).then_some(profile).or_else(|| {
+                profile
+                    .children
+                    .iter()
+                    .find_map(|child| find_operator(child, name))
+            })
+        }
+        assert_eq!(
+            find_operator(&profile, "StorageScan")
+                .expect("storage scan profile")
+                .actual_rows,
+            2
+        );
+
+        let fused = parse_oql(r#"logs.where { .level == "error" }.select { message }"#).unwrap();
+        let fused_execution = executor.execute_query_with_plan(&fused).unwrap();
+        let fused_plan = fused_execution.physical_plan.expect("fused scan plan");
+        assert!(
+            fused_plan.starts_with("StorageScan collection=logs"),
+            "{fused_plan}"
+        );
+        assert!(!fused_plan.contains("Filter "), "{fused_plan}");
+        assert!(!fused_plan.contains("Project "), "{fused_plan}");
+        assert!(fused_plan.contains("projection=Some([\"message\"])"));
+        assert_eq!(fused_execution.documents.len(), 2);
+        assert!(fused_execution
+            .documents
+            .iter()
+            .all(|document| document.fields.len() == 1));
+        let fused_profile = fused_execution
+            .operator_profile
+            .as_ref()
+            .expect("fused columnar profile");
+        let storage_scan =
+            find_operator(fused_profile, "StorageScan").expect("fused storage scan profile");
+        assert_eq!(storage_scan.metrics["columnar_rows"], 2);
+        assert_eq!(storage_scan.metrics["columnar_batches"], 1);
+
+        let batched = executor.execute_query_batches(&fused).unwrap();
+        assert_eq!(batched.len(), 2);
+        assert_eq!(batched.projected_chunk_count(), 1);
+        let batched_documents = batched.into_documents();
+        assert!(batched_documents
+            .iter()
+            .all(|document| document.fields.len() == 1));
+        assert!(batched_documents
+            .iter()
+            .all(|document| document.fields.contains_key("message")));
+
+        let system_projection =
+            parse_oql(r#"logs.where { .level == "error" }.select { id, message }"#).unwrap();
+        let system_plan = executor
+            .execute_query_with_plan(&system_projection)
+            .unwrap()
+            .physical_plan
+            .expect("system projection plan");
+        assert!(system_plan.starts_with("Project fields=2"), "{system_plan}");
+        assert!(
+            system_plan.contains("StorageScan collection=logs"),
+            "{system_plan}"
+        );
+    }
+
+    #[test]
+    fn index_union_executes_or_branches_and_deduplicates_overlaps() {
+        use crate::schema::FieldType;
+        use crate::storage::ScalarIndexDefinition;
+
+        let (executor, _temp_dir) = create_test_executor();
+        executor
+            .store
+            .put_schema(&Schema::new(
+                "events".to_string(),
+                HashMap::from([
+                    ("level".to_string(), FieldType::String),
+                    ("message".to_string(), FieldType::String),
+                    ("ts".to_string(), FieldType::Integer),
+                ]),
+            ))
+            .unwrap();
+        for (name, field) in [
+            ("events_by_level", "level"),
+            ("events_by_message", "message"),
+        ] {
+            executor
+                .store
+                .upsert_scalar_index(ScalarIndexDefinition {
+                    name: name.to_string(),
+                    schema: "events".to_string(),
+                    fields: vec![field.to_string()],
+                    unique: false,
+                })
+                .unwrap();
+        }
+        for (id, level, message, ts) in [
+            ("e1", "error", "older", 10),
+            ("e2", "info", "ignored", 30),
+            ("e3", "error", "newer", 20),
+        ] {
+            executor
+                .store
+                .put_document(&Document::with_id(
+                    id.to_string(),
+                    "events".to_string(),
+                    HashMap::from([
+                        ("level".to_string(), Value::String(level.to_string())),
+                        ("message".to_string(), Value::String(message.to_string())),
+                        ("ts".to_string(), Value::Integer(ts)),
+                    ]),
+                ))
+                .unwrap();
+        }
+
+        let query = parse_oql(
+            r#"events.where { .level == "error" or .message == "newer" }.sort { .ts }.select { message, ts }"#,
+        )
+        .unwrap();
+        let explain = executor
+            .explain_indexed_read(&query)
+            .unwrap()
+            .expect("index union plan");
+        assert!(explain.contains("IndexUnion branches=2"), "{explain}");
+        assert!(explain.contains("index=events_by_level"), "{explain}");
+        assert!(explain.contains("index=events_by_message"), "{explain}");
+        assert_eq!(
+            explain
+                .matches("pushed_projection=[\"message\", \"ts\"]")
+                .count(),
+            2
+        );
+
+        let execution = executor.execute_query_with_plan(&query).unwrap();
+        let messages = execution
+            .documents
+            .iter()
+            .map(|document| document.get_field("message").cloned().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            vec![
+                Value::String("older".to_string()),
+                Value::String("newer".to_string())
+            ]
+        );
+        let profile = execution.operator_profile.expect("union profile");
+        fn find_operator<'a>(
+            profile: &'a crate::execution::OperatorExecutionStats,
+            name: &str,
+        ) -> Option<&'a crate::execution::OperatorExecutionStats> {
+            (profile.operator == name).then_some(profile).or_else(|| {
+                profile
+                    .children
+                    .iter()
+                    .find_map(|child| find_operator(child, name))
+            })
+        }
+        assert_eq!(
+            find_operator(&profile, "IndexUnion")
+                .expect("index union profile")
+                .actual_rows,
+            2
+        );
+
+        let transaction = executor.store.begin_local_transaction().unwrap();
+        executor
+            .store
+            .put_document(&Document::with_id(
+                "e4".to_string(),
+                "events".to_string(),
+                HashMap::from([
+                    ("level".to_string(), Value::String("error".to_string())),
+                    (
+                        "message".to_string(),
+                        Value::String("transaction-local".to_string()),
+                    ),
+                    ("ts".to_string(), Value::Integer(40)),
+                ]),
+            ))
+            .unwrap();
+        assert_eq!(executor.explain_indexed_read(&query).unwrap(), None);
+        let transactional = executor.execute_query_with_plan(&query).unwrap();
+        assert!(transactional.physical_plan.is_none());
+        assert_eq!(transactional.documents.len(), 3);
+        assert_eq!(
+            transactional.documents[2].get_field("message"),
+            Some(&Value::String("transaction-local".to_string()))
+        );
+        executor
+            .store
+            .rollback_local_transaction(transaction)
+            .unwrap();
+    }
+
+    #[test]
+    fn ordered_index_union_pushes_a_bounded_global_top_k() {
+        use crate::schema::FieldType;
+        use crate::storage::ScalarIndexDefinition;
+
+        let (executor, _temp_dir) = create_test_executor();
+        executor
+            .store
+            .put_schema(&Schema::new(
+                "events".to_string(),
+                HashMap::from([
+                    ("level".to_string(), FieldType::String),
+                    ("message".to_string(), FieldType::String),
+                    ("ts".to_string(), FieldType::Integer),
+                ]),
+            ))
+            .unwrap();
+        executor
+            .store
+            .upsert_scalar_index(ScalarIndexDefinition {
+                name: "events_by_level_ts".to_string(),
+                schema: "events".to_string(),
+                fields: vec!["level".to_string(), "ts".to_string()],
+                unique: false,
+            })
+            .unwrap();
+        for (id, level, ts) in [
+            ("e1", "error", 10),
+            ("e2", "info", 30),
+            ("e3", "error", 20),
+            ("e4", "debug", 40),
+        ] {
+            executor
+                .store
+                .put_document(&Document::with_id(
+                    id.to_string(),
+                    "events".to_string(),
+                    HashMap::from([
+                        ("level".to_string(), Value::String(level.to_string())),
+                        ("message".to_string(), Value::String(id.to_string())),
+                        ("ts".to_string(), Value::Integer(ts)),
+                    ]),
+                ))
+                .unwrap();
+        }
+
+        let query = parse_oql(
+            r#"events.where { .level == "error" or .level == "info" }.sort { .ts.desc }.select { message }.limit 2"#,
+        )
+        .unwrap();
+        let explain = executor
+            .explain_indexed_read(&query)
+            .unwrap()
+            .expect("ordered index union");
+        assert!(explain.contains("IndexUnion branches=2"), "{explain}");
+        assert!(explain.contains("order_fields=[\"ts\"]"), "{explain}");
+        assert!(explain.contains("direction=Descending"), "{explain}");
+        assert!(explain.contains("pushed_limit=Some(2)"), "{explain}");
+        assert!(!explain.contains("Sort keys="), "{explain}");
+        assert_eq!(explain.matches("pushed_limit=Some(2)").count(), 3);
+
+        let documents = executor.execute_query(&query).unwrap();
+        let messages = documents
+            .iter()
+            .map(|document| document.get_field("message").cloned().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            vec![
+                Value::String("e2".to_string()),
+                Value::String("e3".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn composite_index_order_eliminates_sort_and_pushes_top_k_limit() {
+        use crate::schema::FieldType;
+        use crate::storage::ScalarIndexDefinition;
+
+        let (executor, _temp_dir) = create_test_executor();
+        executor
+            .store
+            .put_schema(&Schema::new(
+                "events".to_string(),
+                HashMap::from([
+                    ("app".to_string(), FieldType::String),
+                    ("message".to_string(), FieldType::String),
+                    ("timestamp".to_string(), FieldType::Integer),
+                ]),
+            ))
+            .unwrap();
+        executor
+            .store
+            .upsert_scalar_index(ScalarIndexDefinition {
+                name: "events_by_app_time".to_string(),
+                schema: "events".to_string(),
+                fields: vec!["app".to_string(), "timestamp".to_string()],
+                unique: false,
+            })
+            .unwrap();
+        for (id, app, timestamp) in [
+            ("old", "api", 10),
+            ("new", "api", 30),
+            ("middle", "api", 20),
+            ("other-app", "web", 100),
+        ] {
+            executor
+                .store
+                .put_document(&Document::with_id(
+                    id.to_string(),
+                    "events".to_string(),
+                    HashMap::from([
+                        ("app".to_string(), Value::String(app.to_string())),
+                        ("message".to_string(), Value::String(id.to_string())),
+                        ("timestamp".to_string(), Value::Integer(timestamp)),
+                    ]),
+                ))
+                .unwrap();
+        }
+
+        let query = parse_oql(
+            r#"events.where { .app == "api" and .timestamp >= 15 }.sort { .timestamp.desc }.select { message }.limit 2"#,
+        )
+        .unwrap();
+        let explain = executor
+            .explain_indexed_read(&query)
+            .unwrap()
+            .expect("ordered index plan");
+        assert!(!explain.contains("Sort keys="), "{explain}");
+        assert!(explain.contains("direction=Descending"), "{explain}");
+        assert!(explain.contains("pushed_limit=Some(2)"), "{explain}");
+        assert!(
+            explain.contains("pushed_projection=[\"message\"]"),
+            "{explain}"
+        );
+
+        let results = executor.execute_query(&query).unwrap();
+        let messages = results
+            .iter()
+            .map(|document| document.get_field("message").cloned().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            messages,
+            vec![Value::String("new".into()), Value::String("middle".into())]
+        );
+
+        let ascending = parse_oql(
+            r#"events.where { .app == "api" }.sort { .timestamp.asc }.select { message }.limit 2"#,
+        )
+        .unwrap();
+        let ascending_explain = executor
+            .explain_indexed_read(&ascending)
+            .unwrap()
+            .expect("ascending ordered plan");
+        assert!(
+            !ascending_explain.contains("Sort keys="),
+            "{ascending_explain}"
+        );
+        assert!(
+            ascending_explain.contains("direction=Ascending"),
+            "{ascending_explain}"
+        );
+        let ascending_messages = executor
+            .execute_query(&ascending)
+            .unwrap()
+            .into_iter()
+            .map(|document| document.get_field("message").cloned().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ascending_messages,
+            vec![Value::String("old".into()), Value::String("middle".into())]
+        );
+
+        let unrelated_sort =
+            parse_oql(r#"events.where { .app == "api" }.sort { .message.desc }.limit 2"#).unwrap();
+        let unrelated_explain = executor
+            .explain_indexed_read(&unrelated_sort)
+            .unwrap()
+            .expect("indexed plan with explicit sort");
+        assert!(
+            unrelated_explain.contains("Sort keys=1"),
+            "{unrelated_explain}"
+        );
+        assert!(
+            unrelated_explain.contains("pushed_limit=None"),
+            "{unrelated_explain}"
+        );
+    }
+
+    #[test]
+    fn indexed_projection_supports_all_document_system_fields() {
+        use crate::schema::FieldType;
+        use crate::storage::ScalarIndexDefinition;
+
+        let (executor, _temp_dir) = create_test_executor();
+        executor
+            .store
+            .put_schema(&Schema::new(
+                "events".to_string(),
+                HashMap::from([
+                    ("app".to_string(), FieldType::String),
+                    ("message".to_string(), FieldType::String),
+                    ("timestamp".to_string(), FieldType::Integer),
+                ]),
+            ))
+            .unwrap();
+        executor
+            .store
+            .upsert_scalar_index(ScalarIndexDefinition {
+                name: "events_by_app_time".to_string(),
+                schema: "events".to_string(),
+                fields: vec!["app".to_string(), "timestamp".to_string()],
+                unique: false,
+            })
+            .unwrap();
+
+        let mut source = Document::with_id(
+            "event-42".to_string(),
+            "events".to_string(),
+            HashMap::from([
+                ("app".to_string(), Value::String("api".to_string())),
+                ("message".to_string(), Value::String("failed".to_string())),
+                ("timestamp".to_string(), Value::Integer(42)),
+            ]),
+        );
+        source.version = 7;
+        source.updated_at = source.created_at + chrono::Duration::seconds(5);
+        executor.store.put_document(&source).unwrap();
+
+        let query = parse_oql(
+            r#"events.where { .app == "api" }.sort { .timestamp desc }.select { id, schema, created_at, updated_at, version, message }.limit 1"#,
+        )
+        .unwrap();
+        let explain = executor
+            .explain_indexed_read(&query)
+            .unwrap()
+            .expect("document system fields must retain the indexed path");
+        assert!(explain.contains("index=events_by_app_time"), "{explain}");
+        assert!(explain.contains("access=NativeTyped"), "{explain}");
+
+        let result = executor.execute_query(&query).unwrap();
+        assert_eq!(result.len(), 1);
+        let projected = &result[0];
+        assert_eq!(projected.id, source.id);
+        assert_eq!(projected.schema, source.schema);
+        assert_eq!(projected.created_at, source.created_at);
+        assert_eq!(projected.updated_at, source.updated_at);
+        assert_eq!(projected.version, source.version);
+        assert_eq!(projected.fields.get("id"), Some(&Value::String(source.id)));
+        assert_eq!(
+            projected.fields.get("schema"),
+            Some(&Value::String("events".to_string()))
+        );
+        assert_eq!(
+            projected.fields.get("created_at"),
+            Some(&Value::DateTime(source.created_at))
+        );
+        assert_eq!(
+            projected.fields.get("updated_at"),
+            Some(&Value::DateTime(source.updated_at))
+        );
+        assert_eq!(projected.fields.get("version"), Some(&Value::Integer(7)));
+    }
+
+    #[test]
+    fn ordered_index_intersection_stops_at_qualifying_row_goal() {
+        use crate::schema::FieldType;
+        use crate::storage::ScalarIndexDefinition;
+
+        let (executor, _temp_dir) = create_test_executor();
+        executor
+            .store
+            .put_schema(&Schema::new(
+                "events".to_string(),
+                HashMap::from([
+                    ("application".to_string(), FieldType::String),
+                    ("environment".to_string(), FieldType::String),
+                    ("level_rank".to_string(), FieldType::Integer),
+                    ("occurred_at".to_string(), FieldType::Integer),
+                    ("message".to_string(), FieldType::String),
+                ]),
+            ))
+            .unwrap();
+        for (name, fields) in [
+            (
+                "events_by_application_time",
+                vec!["application", "environment", "occurred_at", "id"],
+            ),
+            (
+                "events_by_level_time",
+                vec![
+                    "application",
+                    "environment",
+                    "level_rank",
+                    "occurred_at",
+                    "id",
+                ],
+            ),
+        ] {
+            executor
+                .store
+                .upsert_scalar_index(ScalarIndexDefinition {
+                    name: name.to_string(),
+                    schema: "events".to_string(),
+                    fields: fields.into_iter().map(str::to_string).collect(),
+                    unique: false,
+                })
+                .unwrap();
+        }
+        for (id, rank, occurred_at) in [
+            ("new-info", 30, 60),
+            ("new-error", 50, 50),
+            ("middle-info", 30, 40),
+            ("middle-error", 50, 30),
+            ("old-error", 50, 20),
+        ] {
+            executor
+                .store
+                .put_document(&Document::with_id(
+                    id.to_string(),
+                    "events".to_string(),
+                    HashMap::from([
+                        ("application".to_string(), Value::String("api".into())),
+                        ("environment".to_string(), Value::String("prod".into())),
+                        ("level_rank".to_string(), Value::Integer(rank)),
+                        ("occurred_at".to_string(), Value::Integer(occurred_at)),
+                        ("message".to_string(), Value::String(id.to_string())),
+                    ]),
+                ))
+                .unwrap();
+        }
+
+        let query = parse_oql(
+            r#"events.where { .application == "api" && .environment == "prod" && .level_rank >= 50 }.sort { .occurred_at desc }.select { id, message }.limit 2"#,
+        )
+        .unwrap();
+        let explain = executor
+            .explain_indexed_read(&query)
+            .unwrap()
+            .expect("native indexed plan");
+        assert!(
+            explain.contains("index=events_by_application_time"),
+            "{explain}"
+        );
+        assert!(
+            explain.contains("prefilter_index=Some(\"events_by_level_time\")"),
+            "{explain}"
+        );
+        assert!(explain.contains("pushed_limit=Some(2)"), "{explain}");
+        assert!(!explain.contains("Sort keys="), "{explain}");
+
+        let results = executor.execute_query(&query).unwrap();
+        let ids = results
+            .into_iter()
+            .map(|document| document.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["new-error", "middle-error"]);
+
+        executor
+            .store
+            .upsert_scalar_index(ScalarIndexDefinition {
+                name: "events_by_application_time".to_string(),
+                schema: "events".to_string(),
+                fields: [
+                    "application",
+                    "environment",
+                    "occurred_at",
+                    "level_rank",
+                    "id",
+                ]
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+                unique: false,
+            })
+            .unwrap();
+        let covering_explain = executor
+            .explain_indexed_read(&query)
+            .unwrap()
+            .expect("covering ordered plan");
+        assert!(
+            covering_explain.contains("index=events_by_application_time"),
+            "{covering_explain}"
+        );
+        assert!(
+            covering_explain.contains("prefilter_index=Some(\"events_by_level_time\")"),
+            "{covering_explain}"
+        );
+        let covering_ids = executor
+            .execute_query(&query)
+            .unwrap()
+            .into_iter()
+            .map(|document| document.id)
+            .collect::<Vec<_>>();
+        assert_eq!(covering_ids, vec!["new-error", "middle-error"]);
     }
 
     #[test]
@@ -3573,6 +5407,71 @@ mod tests {
             .unwrap();
         assert!(stored_doc.is_some());
         assert_eq!(stored_doc.unwrap(), *inserted_doc);
+    }
+
+    #[test]
+    fn insert_many_commits_one_atomic_wal_batch() {
+        use crate::schema::FieldType;
+
+        let (executor, _temp_dir) = create_test_executor();
+        executor
+            .store
+            .put_schema(&Schema::new(
+                "events".to_string(),
+                HashMap::from([
+                    ("id".to_string(), FieldType::String),
+                    ("message".to_string(), FieldType::String),
+                ]),
+            ))
+            .unwrap();
+        let before = executor.store.committed_lsn();
+        let query = parse_oql(
+            r#"events.insert [
+                { id: "e1", message: "one" },
+                { id: "e2", message: "two" },
+                { id: "e3", message: "three" }
+            ]"#,
+        )
+        .unwrap();
+
+        let inserted = executor.execute_query(&query).unwrap();
+        assert_eq!(inserted.len(), 3);
+        assert_eq!(executor.store.committed_lsn(), before + 1);
+        assert_eq!(executor.store.scan_documents("events").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn insert_many_rejects_same_batch_unique_duplicates_without_partial_commit() {
+        use crate::schema::FieldType;
+
+        let (executor, _temp_dir) = create_test_executor();
+        executor
+            .store
+            .put_schema(&Schema::new_with_constraints(
+                "events".to_string(),
+                HashMap::from([
+                    ("fingerprint".to_string(), FieldType::String),
+                    ("message".to_string(), FieldType::String),
+                ]),
+                vec![SchemaConstraint::Unique {
+                    fields: vec!["fingerprint".to_string()],
+                    name: Some("unique_fingerprint".to_string()),
+                }],
+            ))
+            .unwrap();
+        let before = executor.store.committed_lsn();
+        let query = parse_oql(
+            r#"events.insert [
+                { fingerprint: "same", message: "one" },
+                { fingerprint: "same", message: "two" }
+            ]"#,
+        )
+        .unwrap();
+
+        let error = executor.execute_query(&query).unwrap_err();
+        assert!(error.to_string().contains("unique_fingerprint"));
+        assert_eq!(executor.store.committed_lsn(), before);
+        assert!(executor.store.scan_documents("events").unwrap().is_empty());
     }
 
     #[test]
@@ -3800,14 +5699,10 @@ mod tests {
             .unwrap();
 
         executor
-            .execute_query(
-                &parse_oql(r#"organizations.insert { id: "org_1" }"#).unwrap(),
-            )
+            .execute_query(&parse_oql(r#"organizations.insert { id: "org_1" }"#).unwrap())
             .unwrap();
         executor
-            .execute_query(
-                &parse_oql(r#"organizations.insert { id: "org_2" }"#).unwrap(),
-            )
+            .execute_query(&parse_oql(r#"organizations.insert { id: "org_2" }"#).unwrap())
             .unwrap();
         executor
             .execute_query(&parse_oql(r#"companies.insert { id: "c1", org: "org_1" }"#).unwrap())

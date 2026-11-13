@@ -15,7 +15,7 @@ use owl_db::error::{OQLError, OQLResult};
 use owl_db::executor::QueryExecutor;
 use owl_db::parser::parse_oql;
 use owl_db::simulation::{Clock, Network, SimulatedClock, SimulatedNetwork, Simulation};
-use owl_db::storage::zig_adapter::ZigStore;
+use owl_db::storage::RustStore;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -25,7 +25,7 @@ use tempfile::TempDir;
 struct DistributedOQLExecutor {
     shard_manager: Arc<ShardManager>,
     hash_ring: Arc<ConsistentHashRing>,
-    local_executors: HashMap<u32, Arc<QueryExecutor<ZigStore>>>,
+    local_executors: HashMap<u32, Arc<QueryExecutor<RustStore>>>,
     query_planner: Arc<DistributedQueryPlanner>,
     clock: Arc<SimulatedClock>,
     network: Arc<SimulatedNetwork>,
@@ -56,7 +56,7 @@ impl DistributedOQLExecutor {
     /// Add a shard with its local executor
     fn add_shard(&mut self, shard_id: u32, temp_dir: &TempDir) -> Result<(), OQLError> {
         let path = temp_dir.path().join(format!("shard_{}.owl", shard_id));
-        let store = Arc::new(ZigStore::new(path, 10 * 1024 * 1024)?);
+        let store = Arc::new(RustStore::new(path, 10 * 1024 * 1024)?);
         let executor = Arc::new(QueryExecutor::new(store, self.clock.clone()));
         
         self.local_executors.insert(shard_id, executor);

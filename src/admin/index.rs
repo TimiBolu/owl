@@ -92,10 +92,10 @@ impl IndexAdmin {
 
 fn parse_backend_kind(input: &str) -> Result<IndexBackendKind> {
     match input.to_ascii_lowercase().as_str() {
-        "zig" => Ok(IndexBackendKind::Zig),
+        "rust" => Ok(IndexBackendKind::Rust),
         "memory" | "inmemory" => Ok(IndexBackendKind::InMemory),
         other => Err(anyhow!(
-            "unsupported backend '{}'; use zig or memory",
+            "unsupported backend '{}'; use rust or memory",
             other
         )),
     }

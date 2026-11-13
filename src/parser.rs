@@ -18,10 +18,14 @@ pub enum Token {
     Where,
     Select,
     Insert,
+    Upsert,
     Update,
     Delete,
     Sort,
     Limit,
+    Offset,
+    First,
+    Exists,
     GroupBy,
     Having,
     Nearest,
@@ -30,6 +34,7 @@ pub enum Token {
     Fn,
     Arrow, // ->
     Let,
+    On,
 
     // Aggregation functions
     Count,
@@ -68,6 +73,7 @@ pub enum Token {
     IntegerLiteral(i64),
     FloatLiteral(f64),
     BooleanLiteral(bool),
+    NullLiteral,
 
     // Identifiers and field access
     Identifier(String),       // collection names, variable names
@@ -88,6 +94,7 @@ pub enum Token {
     Minus,        // -
     Slash,        // /
     Percent,      // %
+    Assign,       // =
 
     // Special
     Whitespace,
@@ -132,6 +139,7 @@ impl Tokenizer {
             Self::parse_string_literal,
             Self::parse_number,
             Self::parse_boolean,
+            Self::parse_null,
             Self::parse_field_access,
             Self::parse_keyword,
             Self::parse_identifier,
@@ -159,10 +167,14 @@ impl Tokenizer {
                 tag("where"),
                 tag("select"),
                 tag("insert"),
+                tag("upsert"),
                 tag("update"),
                 tag("delete"),
                 tag("sort"),
                 tag("limit"),
+                tag("offset"),
+                tag("first"),
+                tag("exists"),
             )),
             alt((
                 tag("count"),
@@ -177,6 +189,7 @@ impl Tokenizer {
             alt((
                 tag("fn"),
                 tag("let"),
+                tag("on"),
                 tag("if"),
                 tag("then"),
                 tag("else"),
@@ -209,10 +222,14 @@ impl Tokenizer {
             "where" => Token::Where,
             "select" => Token::Select,
             "insert" => Token::Insert,
+            "upsert" => Token::Upsert,
             "update" => Token::Update,
             "delete" => Token::Delete,
             "sort" => Token::Sort,
             "limit" => Token::Limit,
+            "offset" => Token::Offset,
+            "first" => Token::First,
+            "exists" => Token::Exists,
             "count" => Token::Count,
             "sum" => Token::Sum,
             "avg" => Token::Avg,
@@ -223,6 +240,7 @@ impl Tokenizer {
             "not" => Token::Not,
             "fn" => Token::Fn,
             "let" => Token::Let,
+            "on" => Token::On,
             "if" => Token::If,
             "then" => Token::Then,
             "else" => Token::Else,
@@ -246,6 +264,7 @@ impl Tokenizer {
             map(tag("!="), |_| Token::NotEqual),
             map(tag("<="), |_| Token::LessEqual),
             map(tag(">="), |_| Token::GreaterEqual),
+            map(tag("="), |_| Token::Assign),
             map(tag("<"), |_| Token::LessThan),
             map(tag(">"), |_| Token::GreaterThan),
             map(tag("+"), |_| Token::Plus),
@@ -292,6 +311,21 @@ impl Tokenizer {
         ))(input)
     }
 
+    fn parse_null(input: &str) -> IResult<&str, Token> {
+        let (rest, _) = tag("null")(input)?;
+        if rest
+            .chars()
+            .next()
+            .is_some_and(|next| next.is_ascii_alphanumeric() || next == '_')
+        {
+            return Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Tag,
+            )));
+        }
+        Ok((rest, Token::NullLiteral))
+    }
+
     fn parse_field_access(input: &str) -> IResult<&str, Token> {
         let (input, _) = char('.')(input)?;
 
@@ -307,7 +341,7 @@ impl Tokenizer {
 
         let (input, first_field) = Self::parse_identifier_name(input)?;
         let (input, additional_fields) =
-            many0(preceded(char('.'), Self::parse_identifier_name))(input)?;
+            many0(preceded(char('.'), Self::parse_non_keyword_identifier_name))(input)?;
 
         let mut path = vec![first_field];
         path.extend(additional_fields);
@@ -325,6 +359,16 @@ impl Tokenizer {
             many0(alt((alphanumeric1, tag("_")))),
         ))(input)?;
         Ok((input, name.to_string()))
+    }
+
+    fn parse_non_keyword_identifier_name(input: &str) -> IResult<&str, String> {
+        if Self::parse_keyword(input).is_ok() {
+            return Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Tag,
+            )));
+        }
+        Self::parse_identifier_name(input)
     }
 
     fn parse_punctuation(input: &str) -> IResult<&str, Token> {
@@ -523,10 +567,14 @@ pub enum Operation {
     Select(SelectBlock),
     Insert(InsertBlock),
     InsertMany(Vec<InsertBlock>), // Batch insert multiple documents
+    Upsert(UpsertBlock),
     Update(UpdateBlock),
     Delete,
     Sort(SortBlock),
     Limit(u64),
+    Offset(u64),
+    First,
+    Exists,
     Nearest(NearestBlock),
     GroupBy(GroupByBlock),
     Having(HavingBlock),
@@ -583,6 +631,12 @@ pub struct InsertField {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UpsertBlock {
+    pub key: String,
+    pub fields: Vec<InsertField>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObjectField {
     pub name: String,
     pub value: Expression,
@@ -628,6 +682,9 @@ pub struct HavingBlock {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Expression {
+    /// A bare name. Resolution decides whether it is a script binding,
+    /// block-local value, function parameter, or collection scope anchor.
+    Identifier(String),
     FieldAccess(FieldAccess),
     Literal(Literal),
     FunctionCall {
@@ -665,6 +722,12 @@ pub enum Expression {
     ConditionExpr(Box<Condition>),
     QueryExpression {
         query: OQLQuery,
+    },
+    /// Collection operations rooted in a value expression, such as
+    /// `.items.where { ... }` or `.findings.count()`.
+    CollectionExpression {
+        source: Box<Expression>,
+        operations: Vec<Operation>,
     },
 }
 
@@ -729,6 +792,7 @@ pub enum Literal {
     Integer(i64),
     Float(f64),
     Boolean(bool),
+    Null,
 }
 
 // Parser implementation for OQL method-chaining syntax
@@ -901,11 +965,21 @@ impl Parser {
         use crate::schema::FieldType;
 
         match expr {
+            Expression::Identifier(name) => self.infer_expression_type(
+                &Expression::FieldAccess(FieldAccess {
+                    path: vec![name.clone()],
+                }),
+                schema_name,
+            ),
             Expression::Literal(lit) => Ok(match lit {
                 Literal::String(_) => FieldType::String,
                 Literal::Integer(_) => FieldType::Integer,
                 Literal::Float(_) => FieldType::Float,
                 Literal::Boolean(_) => FieldType::Boolean,
+                // Null has no standalone schema type. This placeholder is
+                // only used for projected null values; comparisons and writes
+                // handle null explicitly below.
+                Literal::Null => FieldType::Optional(Box::new(FieldType::Object)),
             }),
 
             Expression::FieldAccess(field_access) => {
@@ -972,6 +1046,7 @@ impl Parser {
                         }
                     }
                     "length" | "len" => Ok(FieldType::Integer),
+                    "exists" | "is_null" | "is_missing" | "is_broken_ref" => Ok(FieldType::Boolean),
                     "upper" | "lower" | "trim" => Ok(FieldType::String),
                     "now" => Ok(FieldType::DateTime),
                     _ => Err(ParseError::TypeError {
@@ -1063,6 +1138,22 @@ impl Parser {
                 operator,
                 right,
             } => {
+                if matches!(
+                    (left, right),
+                    (
+                        Expression::Literal(Literal::Null),
+                        Expression::Literal(Literal::Null)
+                    ) | (Expression::Literal(Literal::Null), _)
+                        | (_, Expression::Literal(Literal::Null))
+                ) {
+                    return match operator {
+                        ComparisonOperator::Equal | ComparisonOperator::NotEqual => Ok(()),
+                        _ => Err(ParseError::TypeError {
+                            message: "null only supports == and != comparisons".to_string(),
+                        }),
+                    };
+                }
+
                 // Infer types of both sides
                 let left_type = self.infer_expression_type(left, schema_name)?;
                 let right_type = self.infer_expression_type(right, schema_name)?;
@@ -1227,6 +1318,14 @@ impl Parser {
         schema_name: &str,
     ) -> Result<(), ParseError> {
         match expr {
+            Expression::Identifier(name) => {
+                self.validate_field_exists(
+                    &FieldAccess {
+                        path: vec![name.clone()],
+                    },
+                    schema_name,
+                )?;
+            }
             Expression::FieldAccess(field_access) => {
                 self.validate_field_exists(field_access, schema_name)?;
             }
@@ -1291,6 +1390,22 @@ impl Parser {
             }
             Expression::QueryExpression { query } => {
                 self.validate_query_expression(query)?;
+            }
+            Expression::CollectionExpression { source, operations } => {
+                self.validate_expression_fields(source, schema_name)?;
+                for operation in operations {
+                    match operation {
+                        Operation::Where(block) => {
+                            self.validate_condition_fields(&block.condition, schema_name)?
+                        }
+                        Operation::Select(block) => {
+                            for field in &block.fields {
+                                self.validate_expression_fields(&field.expression, schema_name)?;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
             }
             Expression::Literal(_) => {
                 // Literals don't have fields to validate
@@ -1441,6 +1556,17 @@ impl Parser {
                 if !args.is_empty() {
                     return Err(ParseError::TypeError {
                         message: "Function 'now' takes no arguments".to_string(),
+                    });
+                }
+                Ok(())
+            }
+            "exists" | "is_null" | "is_missing" | "is_broken_ref" => {
+                if args.len() != 1 {
+                    return Err(ParseError::TypeError {
+                        message: format!(
+                            "Function '{}' requires exactly one path argument",
+                            function_name
+                        ),
                     });
                 }
                 Ok(())
@@ -1615,6 +1741,12 @@ impl Parser {
             }
         }
 
+        // Scoped blocks and chained queries deliberately lower to the same
+        // ordered operation list. There is one semantic query model.
+        if matches!(self.current_token(), Some(Token::LeftBrace)) {
+            return self.parse_scoped_query(collection);
+        }
+
         // Parse method chain (e.g., ".where { ... }.select { ... }")
         let mut operations = Vec::new();
 
@@ -1637,6 +1769,359 @@ impl Parser {
             collection,
             operations,
         })
+    }
+
+    fn parse_scoped_query(&mut self, collection: String) -> Result<OQLQuery, ParseError> {
+        self.expect_token(Token::LeftBrace)?;
+
+        let mut operations = Vec::new();
+        let mut locals: std::collections::HashMap<String, Expression> =
+            std::collections::HashMap::new();
+        let mut saw_select = false;
+
+        while !matches!(self.current_token(), Some(Token::RightBrace)) {
+            if matches!(self.current_token(), Some(Token::EOF) | None) {
+                return Err(ParseError::UnexpectedEndOfInput);
+            }
+
+            // A block-local definition is syntactically `name = expression`.
+            // It is expanded into the canonical expression tree here. This
+            // keeps scoped and chained forms on one planner/executor path.
+            if let (Some(Token::Identifier(name)), Some(Token::Assign)) =
+                (self.current_token(), self.tokens.get(self.position + 1))
+            {
+                let name = name.clone();
+                if name == collection {
+                    return Err(ParseError::InvalidSyntax(format!(
+                        "Scoped binding '{}' cannot shadow the root collection",
+                        name
+                    )));
+                }
+                if locals.contains_key(&name) {
+                    return Err(ParseError::InvalidSyntax(format!(
+                        "Scoped binding '{}' is already defined",
+                        name
+                    )));
+                }
+
+                self.advance();
+                self.expect_token(Token::Assign)?;
+                let value = self.parse_expression()?;
+                let value = Self::substitute_scoped_locals_expression(&value, &locals);
+                locals.insert(name, value);
+                continue;
+            }
+
+            if saw_select {
+                return Err(ParseError::InvalidSyntax(
+                    "select must be the final entry in a scoped query block".to_string(),
+                ));
+            }
+
+            let operation = self.parse_operation()?;
+            let operation = Self::substitute_scoped_locals_operation(&operation, &locals);
+            self.validate_parsed_operation(&operation, &collection)?;
+            saw_select = matches!(operation, Operation::Select(_));
+            operations.push(operation);
+        }
+
+        self.expect_token(Token::RightBrace)?;
+        if !saw_select {
+            return Err(ParseError::InvalidSyntax(
+                "A scoped query block must end in exactly one select".to_string(),
+            ));
+        }
+        if !matches!(self.current_token(), Some(Token::EOF) | None) {
+            return Err(ParseError::UnexpectedToken(format!(
+                "Expected end of query, found {:?}",
+                self.current_token()
+            )));
+        }
+
+        Ok(OQLQuery {
+            collection,
+            operations,
+        })
+    }
+
+    fn substitute_scoped_locals_operation(
+        operation: &Operation,
+        locals: &std::collections::HashMap<String, Expression>,
+    ) -> Operation {
+        match operation {
+            Operation::Where(block) => Operation::Where(WhereBlock {
+                condition: Self::substitute_scoped_locals_condition(&block.condition, locals),
+            }),
+            Operation::Select(block) => Operation::Select(SelectBlock {
+                fields: block
+                    .fields
+                    .iter()
+                    .map(|field| SelectField {
+                        alias: field.alias.clone(),
+                        expression: Self::substitute_scoped_locals_expression(
+                            &field.expression,
+                            locals,
+                        ),
+                    })
+                    .collect(),
+            }),
+            Operation::Insert(block) => Operation::Insert(InsertBlock {
+                fields: block
+                    .fields
+                    .iter()
+                    .map(|field| InsertField {
+                        name: field.name.clone(),
+                        value: Self::substitute_scoped_locals_expression(&field.value, locals),
+                    })
+                    .collect(),
+            }),
+            Operation::InsertMany(blocks) => Operation::InsertMany(
+                blocks
+                    .iter()
+                    .map(|block| InsertBlock {
+                        fields: block
+                            .fields
+                            .iter()
+                            .map(|field| InsertField {
+                                name: field.name.clone(),
+                                value: Self::substitute_scoped_locals_expression(
+                                    &field.value,
+                                    locals,
+                                ),
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            ),
+            Operation::Upsert(block) => Operation::Upsert(UpsertBlock {
+                key: block.key.clone(),
+                fields: block
+                    .fields
+                    .iter()
+                    .map(|field| InsertField {
+                        name: field.name.clone(),
+                        value: Self::substitute_scoped_locals_expression(&field.value, locals),
+                    })
+                    .collect(),
+            }),
+            Operation::Update(block) => Operation::Update(UpdateBlock {
+                fields: block
+                    .fields
+                    .iter()
+                    .map(|field| UpdateField {
+                        name: field.name.clone(),
+                        value: Self::substitute_scoped_locals_expression(&field.value, locals),
+                    })
+                    .collect(),
+            }),
+            Operation::Sort(block) => Operation::Sort(SortBlock {
+                fields: block
+                    .fields
+                    .iter()
+                    .map(|field| SortField {
+                        expression: Self::substitute_scoped_locals_expression(
+                            &field.expression,
+                            locals,
+                        ),
+                        direction: field.direction.clone(),
+                    })
+                    .collect(),
+            }),
+            Operation::Having(block) => Operation::Having(HavingBlock {
+                condition: Self::substitute_scoped_locals_condition(&block.condition, locals),
+            }),
+            Operation::Nearest(block) => Operation::Nearest(NearestBlock {
+                field: block.field.clone(),
+                query: Self::substitute_scoped_locals_expression(&block.query, locals),
+                metric: block.metric.clone(),
+                k: block.k,
+                num_candidates: block.num_candidates,
+                exact: block.exact,
+            }),
+            other => other.clone(),
+        }
+    }
+
+    fn substitute_scoped_locals_condition(
+        condition: &Condition,
+        locals: &std::collections::HashMap<String, Expression>,
+    ) -> Condition {
+        match condition {
+            Condition::Comparison {
+                left,
+                operator,
+                right,
+            } => Condition::Comparison {
+                left: Self::substitute_scoped_locals_expression(left, locals),
+                operator: operator.clone(),
+                right: Self::substitute_scoped_locals_expression(right, locals),
+            },
+            Condition::And(left, right) => Condition::And(
+                Box::new(Self::substitute_scoped_locals_condition(left, locals)),
+                Box::new(Self::substitute_scoped_locals_condition(right, locals)),
+            ),
+            Condition::Or(left, right) => Condition::Or(
+                Box::new(Self::substitute_scoped_locals_condition(left, locals)),
+                Box::new(Self::substitute_scoped_locals_condition(right, locals)),
+            ),
+            Condition::Not(inner) => Condition::Not(Box::new(
+                Self::substitute_scoped_locals_condition(inner, locals),
+            )),
+        }
+    }
+
+    fn substitute_scoped_locals_expression(
+        expression: &Expression,
+        locals: &std::collections::HashMap<String, Expression>,
+    ) -> Expression {
+        match expression {
+            Expression::Identifier(name) if locals.contains_key(name) => locals[name].clone(),
+            Expression::FieldAccess(field)
+                if field.path.len() == 1 && locals.contains_key(&field.path[0]) =>
+            {
+                locals[&field.path[0]].clone()
+            }
+            Expression::QueryExpression { query } => {
+                if let Some(bound) = locals.get(&query.collection) {
+                    let appended_operations = query
+                        .operations
+                        .iter()
+                        .map(|operation| {
+                            Self::substitute_scoped_locals_operation(operation, locals)
+                        })
+                        .collect::<Vec<_>>();
+                    match bound {
+                        Expression::QueryExpression { query: bound_query } => {
+                            let mut lowered = bound_query.clone();
+                            lowered.operations.extend(appended_operations);
+                            return Expression::QueryExpression { query: lowered };
+                        }
+                        Expression::CollectionExpression { source, operations } => {
+                            let mut lowered = operations.clone();
+                            lowered.extend(appended_operations);
+                            return Expression::CollectionExpression {
+                                source: source.clone(),
+                                operations: lowered,
+                            };
+                        }
+                        source => {
+                            return Expression::CollectionExpression {
+                                source: Box::new(source.clone()),
+                                operations: appended_operations,
+                            };
+                        }
+                    }
+                }
+                Expression::QueryExpression {
+                    query: OQLQuery {
+                        collection: query.collection.clone(),
+                        operations: query
+                            .operations
+                            .iter()
+                            .map(|operation| {
+                                Self::substitute_scoped_locals_operation(operation, locals)
+                            })
+                            .collect(),
+                    },
+                }
+            }
+            Expression::CollectionExpression { source, operations } => {
+                Expression::CollectionExpression {
+                    source: Box::new(Self::substitute_scoped_locals_expression(source, locals)),
+                    operations: operations
+                        .iter()
+                        .map(|operation| {
+                            Self::substitute_scoped_locals_operation(operation, locals)
+                        })
+                        .collect(),
+                }
+            }
+            Expression::FunctionCall { name, args } => Expression::FunctionCall {
+                name: name.clone(),
+                args: args
+                    .iter()
+                    .map(|arg| Self::substitute_scoped_locals_expression(arg, locals))
+                    .collect(),
+            },
+            Expression::IfThenElse {
+                condition,
+                then_expr,
+                else_expr,
+            } => Expression::IfThenElse {
+                condition: Box::new(Self::substitute_scoped_locals_condition(condition, locals)),
+                then_expr: Box::new(Self::substitute_scoped_locals_expression(then_expr, locals)),
+                else_expr: Box::new(Self::substitute_scoped_locals_expression(else_expr, locals)),
+            },
+            Expression::Match { expr, arms } => Expression::Match {
+                expr: Box::new(Self::substitute_scoped_locals_expression(expr, locals)),
+                arms: arms
+                    .iter()
+                    .map(|arm| MatchArm {
+                        pattern: arm.pattern.clone(),
+                        guard: arm
+                            .guard
+                            .as_ref()
+                            .map(|guard| Self::substitute_scoped_locals_condition(guard, locals)),
+                        body: Self::substitute_scoped_locals_expression(&arm.body, locals),
+                    })
+                    .collect(),
+            },
+            Expression::LogicalAnd(left, right) => Expression::LogicalAnd(
+                Box::new(Self::substitute_scoped_locals_expression(left, locals)),
+                Box::new(Self::substitute_scoped_locals_expression(right, locals)),
+            ),
+            Expression::LogicalOr(left, right) => Expression::LogicalOr(
+                Box::new(Self::substitute_scoped_locals_expression(left, locals)),
+                Box::new(Self::substitute_scoped_locals_expression(right, locals)),
+            ),
+            Expression::LogicalNot(inner) => Expression::LogicalNot(Box::new(
+                Self::substitute_scoped_locals_expression(inner, locals),
+            )),
+            Expression::BinaryOp {
+                left,
+                operator,
+                right,
+            } => Expression::BinaryOp {
+                left: Box::new(Self::substitute_scoped_locals_expression(left, locals)),
+                operator: operator.clone(),
+                right: Box::new(Self::substitute_scoped_locals_expression(right, locals)),
+            },
+            Expression::ArrayAccess { array, index } => Expression::ArrayAccess {
+                array: Box::new(Self::substitute_scoped_locals_expression(array, locals)),
+                index: Box::new(Self::substitute_scoped_locals_expression(index, locals)),
+            },
+            Expression::ChainedAccess { base, field } => Expression::ChainedAccess {
+                base: Box::new(Self::substitute_scoped_locals_expression(base, locals)),
+                field: field.clone(),
+            },
+            Expression::Block(expressions) => Expression::Block(
+                expressions
+                    .iter()
+                    .map(|expr| Self::substitute_scoped_locals_expression(expr, locals))
+                    .collect(),
+            ),
+            Expression::ArrayLiteral(elements) => Expression::ArrayLiteral(
+                elements
+                    .iter()
+                    .map(|expr| Self::substitute_scoped_locals_expression(expr, locals))
+                    .collect(),
+            ),
+            Expression::ObjectLiteral(fields) => Expression::ObjectLiteral(
+                fields
+                    .iter()
+                    .map(|field| ObjectField {
+                        name: field.name.clone(),
+                        value: Self::substitute_scoped_locals_expression(&field.value, locals),
+                    })
+                    .collect(),
+            ),
+            Expression::ConditionExpr(condition) => Expression::ConditionExpr(Box::new(
+                Self::substitute_scoped_locals_condition(condition, locals),
+            )),
+            Expression::Identifier(_) | Expression::FieldAccess(_) | Expression::Literal(_) => {
+                expression.clone()
+            }
+        }
     }
 
     /// Parse operation with type validation
@@ -1700,6 +2185,29 @@ impl Parser {
                     let insert_block = self.parse_insert_block_with_validation(schema_name)?;
                     Ok(Operation::Insert(insert_block))
                 }
+            }
+            Some(Token::Upsert) => {
+                self.advance();
+                let upsert = self.parse_upsert_block()?;
+                if let Some(registry) = &self.schema_registry {
+                    if registry
+                        .get_field_type(schema_name, &upsert.key)
+                        .map_err(|e| ParseError::SchemaError {
+                            message: e.to_string(),
+                        })?
+                        .is_none()
+                        && crate::schema::DocumentSystemField::from_name(&upsert.key).is_none()
+                    {
+                        return Err(ParseError::SchemaError {
+                            message: format!(
+                                "Upsert key '{}' not found in schema '{}'",
+                                upsert.key, schema_name
+                            ),
+                        });
+                    }
+                    self.validate_insert_fields(&upsert.fields, schema_name)?;
+                }
+                Ok(Operation::Upsert(upsert))
             }
             Some(Token::Update) => {
                 self.advance();
@@ -1864,10 +2372,18 @@ impl Parser {
         schema_name: &str,
     ) -> Result<InsertBlock, ParseError> {
         let insert_block = self.parse_insert_block()?;
+        self.validate_insert_fields(&insert_block.fields, schema_name)?;
+        Ok(insert_block)
+    }
 
+    fn validate_insert_fields(
+        &self,
+        fields: &[InsertField],
+        schema_name: &str,
+    ) -> Result<(), ParseError> {
         // Validate field existence and types if schema registry is available
         if let Some(registry) = &self.schema_registry {
-            for field in &insert_block.fields {
+            for field in fields {
                 // Check field exists in schema
                 let field_type = registry
                     .get_field_type(schema_name, &field.name)
@@ -1889,8 +2405,7 @@ impl Parser {
                 self.validate_type_compatibility(&field_type, &value_type)?;
             }
         }
-
-        Ok(insert_block)
+        Ok(())
     }
 
     /// Parse update block with type validation
@@ -1899,33 +2414,135 @@ impl Parser {
         schema_name: &str,
     ) -> Result<UpdateBlock, ParseError> {
         let update_block = self.parse_update_block()?;
+        self.validate_update_fields(&update_block.fields, schema_name)?;
+        Ok(update_block)
+    }
 
+    fn validate_update_fields(
+        &self,
+        fields: &[UpdateField],
+        schema_name: &str,
+    ) -> Result<(), ParseError> {
         // Validate field existence and types if schema registry is available
         if let Some(registry) = &self.schema_registry {
-            for field in &update_block.fields {
-                // Check field exists in schema
+            for field in fields {
+                let root_name = field.name.split('.').next().unwrap_or(&field.name);
                 let field_type = registry
-                    .get_field_type(schema_name, &field.name)
+                    .get_field_type(schema_name, root_name)
                     .map_err(|e| ParseError::SchemaError {
                         message: e.to_string(),
                     })?
                     .ok_or_else(|| ParseError::SchemaError {
                         message: format!(
                             "Field '{}' not found in schema '{}'",
-                            field.name, schema_name
+                            root_name, schema_name
                         ),
                     })?;
 
                 // Validate field existence in value expression
                 self.validate_expression_fields(&field.value, schema_name)?;
 
-                // Validate value type matches field type
-                let value_type = self.infer_expression_type(&field.value, schema_name)?;
-                self.validate_type_compatibility(&field_type, &value_type)?;
+                if field.name.contains('.') {
+                    let mut container_type = &field_type;
+                    while let crate::schema::FieldType::Optional(inner) = container_type {
+                        container_type = inner;
+                    }
+                    if !matches!(container_type, crate::schema::FieldType::Object) {
+                        return Err(ParseError::TypeError {
+                            message: format!(
+                                "Nested update path '{}' must begin at an Object field",
+                                field.name
+                            ),
+                        });
+                    }
+                } else {
+                    let value_type = self.infer_expression_type(&field.value, schema_name)?;
+                    self.validate_type_compatibility(&field_type, &value_type)?;
+                }
             }
         }
+        Ok(())
+    }
 
-        Ok(update_block)
+    fn validate_parsed_operation(
+        &self,
+        operation: &Operation,
+        schema_name: &str,
+    ) -> Result<(), ParseError> {
+        if self.schema_registry.is_none() {
+            return Ok(());
+        }
+        match operation {
+            Operation::Where(block) => {
+                self.validate_condition_fields(&block.condition, schema_name)?;
+                self.validate_condition_types(&block.condition, schema_name)
+            }
+            Operation::Select(block) => {
+                for field in &block.fields {
+                    self.validate_expression_fields(&field.expression, schema_name)?;
+                    let _ = self.infer_expression_type(&field.expression, schema_name)?;
+                }
+                Ok(())
+            }
+            Operation::Insert(block) => self.validate_insert_fields(&block.fields, schema_name),
+            Operation::InsertMany(blocks) => {
+                for block in blocks {
+                    self.validate_insert_fields(&block.fields, schema_name)?;
+                }
+                Ok(())
+            }
+            Operation::Upsert(block) => {
+                let registry = self.schema_registry.as_ref().unwrap();
+                if registry
+                    .get_field_type(schema_name, &block.key)
+                    .map_err(|e| ParseError::SchemaError {
+                        message: e.to_string(),
+                    })?
+                    .is_none()
+                    && crate::schema::DocumentSystemField::from_name(&block.key).is_none()
+                {
+                    return Err(ParseError::SchemaError {
+                        message: format!(
+                            "Upsert key '{}' not found in schema '{}'",
+                            block.key, schema_name
+                        ),
+                    });
+                }
+                self.validate_insert_fields(&block.fields, schema_name)
+            }
+            Operation::Update(block) => self.validate_update_fields(&block.fields, schema_name),
+            Operation::Sort(block) => {
+                for field in &block.fields {
+                    self.validate_expression_fields(&field.expression, schema_name)?;
+                }
+                Ok(())
+            }
+            Operation::GroupBy(block) => {
+                for field in &block.fields {
+                    self.validate_field_exists(field, schema_name)?;
+                }
+                Ok(())
+            }
+            Operation::Having(block) => {
+                self.validate_condition_fields(&block.condition, schema_name)?;
+                self.validate_condition_types(&block.condition, schema_name)
+            }
+            Operation::Sum(field)
+            | Operation::Avg(field)
+            | Operation::Min(field)
+            | Operation::Max(field) => self.validate_field_exists(field, schema_name),
+            Operation::Nearest(block) => {
+                self.validate_field_exists(&block.field, schema_name)?;
+                self.validate_expression_fields(&block.query, schema_name)
+            }
+            Operation::Delete
+            | Operation::Limit(_)
+            | Operation::Offset(_)
+            | Operation::First
+            | Operation::Exists
+            | Operation::Count
+            | Operation::FunctionDef(_) => Ok(()),
+        }
     }
 
     /// Parse having block with type validation
@@ -1961,6 +2578,10 @@ impl Parser {
                 let insert_block = self.parse_insert_block()?;
                 Ok(Operation::Insert(insert_block))
             }
+            Some(Token::Upsert) => {
+                self.advance();
+                Ok(Operation::Upsert(self.parse_upsert_block()?))
+            }
             Some(Token::Update) => {
                 self.advance();
                 let update_block = self.parse_update_block()?;
@@ -1968,6 +2589,10 @@ impl Parser {
             }
             Some(Token::Delete) => {
                 self.advance();
+                if matches!(self.current_token(), Some(Token::LeftParen)) {
+                    self.advance();
+                    self.expect_token(Token::RightParen)?;
+                }
                 Ok(Operation::Delete)
             }
             Some(Token::GroupBy) => {
@@ -2029,6 +2654,22 @@ impl Parser {
                 self.advance();
                 let limit_value = self.parse_limit_value()?;
                 Ok(Operation::Limit(limit_value))
+            }
+            Some(Token::Offset) => {
+                self.advance();
+                Ok(Operation::Offset(self.parse_limit_value()?))
+            }
+            Some(Token::First) => {
+                self.advance();
+                self.expect_token(Token::LeftParen)?;
+                self.expect_token(Token::RightParen)?;
+                Ok(Operation::First)
+            }
+            Some(Token::Exists) => {
+                self.advance();
+                self.expect_token(Token::LeftParen)?;
+                self.expect_token(Token::RightParen)?;
+                Ok(Operation::Exists)
             }
             Some(token) => Err(ParseError::UnexpectedToken(format!(
                 "Expected operation method, found {:?}",
@@ -2167,6 +2808,39 @@ impl Parser {
         Ok(InsertBlock { fields })
     }
 
+    fn parse_upsert_block(&mut self) -> Result<UpsertBlock, ParseError> {
+        self.expect_token(Token::On)?;
+        let key = match self.current_token() {
+            Some(Token::Identifier(name)) => {
+                let name = name.clone();
+                self.advance();
+                name
+            }
+            token => {
+                return Err(ParseError::UnexpectedToken(format!(
+                    "Expected an upsert key after 'on', found {:?}",
+                    token
+                )));
+            }
+        };
+        let insert = self.parse_insert_block()?;
+        let key_count = insert
+            .fields
+            .iter()
+            .filter(|field| field.name == key)
+            .count();
+        if key_count != 1 {
+            return Err(ParseError::InvalidSyntax(format!(
+                "Upsert on '{}' requires exactly one '{}' field in its document",
+                key, key
+            )));
+        }
+        Ok(UpsertBlock {
+            key,
+            fields: insert.fields,
+        })
+    }
+
     fn parse_insert_field(&mut self) -> Result<InsertField, ParseError> {
         // Parse field name
         let name = match self.current_token() {
@@ -2222,8 +2896,7 @@ impl Parser {
     }
 
     fn parse_update_field(&mut self) -> Result<UpdateField, ParseError> {
-        // Parse field name
-        let name = match self.current_token() {
+        let first_name = match self.current_token() {
             Some(Token::Identifier(name)) => {
                 let field_name = name.clone();
                 self.advance();
@@ -2243,13 +2916,80 @@ impl Parser {
             None => return Err(ParseError::UnexpectedEndOfInput),
         };
 
-        // Expect colon
-        self.expect_token(Token::Colon)?;
+        let mut path = vec![first_name];
+        loop {
+            match self.current_token() {
+                Some(Token::FieldAccess(segments)) => {
+                    path.extend(segments.clone());
+                    self.advance();
+                }
+                Some(Token::Dot) => {
+                    self.advance();
+                    match self.current_token() {
+                        Some(Token::Identifier(name)) => {
+                            path.push(name.clone());
+                            self.advance();
+                        }
+                        token => {
+                            return Err(ParseError::UnexpectedToken(format!(
+                                "Expected field name after '.' in update path, found {:?}",
+                                token
+                            )));
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
 
-        // Parse expression
-        let value = self.parse_expression()?;
+        let arithmetic_operator = match self.current_token() {
+            Some(Token::Colon) => {
+                self.advance();
+                None
+            }
+            Some(Token::Plus) => {
+                self.advance();
+                self.expect_token(Token::Assign)?;
+                Some(BinaryOperator::Add)
+            }
+            Some(Token::Minus) => {
+                self.advance();
+                self.expect_token(Token::Assign)?;
+                Some(BinaryOperator::Subtract)
+            }
+            Some(Token::Star) => {
+                self.advance();
+                self.expect_token(Token::Assign)?;
+                Some(BinaryOperator::Multiply)
+            }
+            Some(Token::Slash) => {
+                self.advance();
+                self.expect_token(Token::Assign)?;
+                Some(BinaryOperator::Divide)
+            }
+            token => {
+                return Err(ParseError::UnexpectedToken(format!(
+                    "Expected ':', '+=', '-=', '*=', or '/=' after update path, found {:?}",
+                    token
+                )));
+            }
+        };
 
-        Ok(UpdateField { name, value })
+        let right = self.parse_expression()?;
+        let value = if let Some(operator) = arithmetic_operator {
+            Expression::BinaryOp {
+                left: Box::new(Expression::FieldAccess(FieldAccess { path: path.clone() })),
+                operator,
+                right: Box::new(right),
+            }
+        } else {
+            right
+        };
+
+        Ok(UpdateField {
+            name: path.join("."),
+            value,
+        })
     }
 
     fn parse_group_by_block(&mut self) -> Result<GroupByBlock, ParseError> {
@@ -2473,8 +3213,27 @@ impl Parser {
 
     fn parse_sort_field(&mut self) -> Result<SortField, ParseError> {
         // Parse expression (which can include null coalescing)
-        let expression = self.parse_expression()?;
+        let mut expression = self.parse_expression()?;
         let mut direction = SortDirection::Asc;
+
+        // The tokenizer represents `.created_at.desc` as one field-access
+        // token. Treat the final path component as the documented direction
+        // modifier instead of accidentally sorting by `created_at.desc`.
+        if let Expression::FieldAccess(field) = &mut expression {
+            if field.path.len() > 1 {
+                match field.path.last().map(String::as_str) {
+                    Some("asc") => {
+                        field.path.pop();
+                        direction = SortDirection::Asc;
+                    }
+                    Some("desc") => {
+                        field.path.pop();
+                        direction = SortDirection::Desc;
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         // Check for optional direction (.asc or .desc)
         if matches!(self.current_token(), Some(Token::Dot)) {
@@ -2493,6 +3252,19 @@ impl Parser {
                     // Put back the dot, it's not a direction modifier
                     self.position -= 1;
                 }
+            }
+        } else if let Some(Token::Identifier(dir_name)) = self.current_token() {
+            // Also accept the readable `.created_at desc` spelling.
+            match dir_name.as_str() {
+                "asc" => {
+                    self.advance();
+                    direction = SortDirection::Asc;
+                }
+                "desc" => {
+                    self.advance();
+                    direction = SortDirection::Desc;
+                }
+                _ => {}
             }
         }
 
@@ -2661,10 +3433,30 @@ impl Parser {
                     // Handle chained field access like .field after array access
                     self.advance(); // consume '.'
                     if self.is_operation_token(self.current_token()) {
-                        let mut query = self.expression_to_query(&expr)?;
                         let operation = self.parse_operation()?;
-                        query.operations.push(operation);
-                        expr = Expression::QueryExpression { query };
+                        expr = match expr {
+                            Expression::Identifier(collection) => Expression::QueryExpression {
+                                query: OQLQuery {
+                                    collection,
+                                    operations: vec![operation],
+                                },
+                            },
+                            Expression::QueryExpression { mut query } => {
+                                query.operations.push(operation);
+                                Expression::QueryExpression { query }
+                            }
+                            Expression::CollectionExpression {
+                                source,
+                                mut operations,
+                            } => {
+                                operations.push(operation);
+                                Expression::CollectionExpression { source, operations }
+                            }
+                            source => Expression::CollectionExpression {
+                                source: Box::new(source),
+                                operations: vec![operation],
+                            },
+                        };
                     } else if let Some(Token::Identifier(field_name)) = self.current_token() {
                         let field_name = field_name.clone();
                         self.advance();
@@ -2753,10 +3545,14 @@ impl Parser {
             Some(Token::Where)
                 | Some(Token::Select)
                 | Some(Token::Insert)
+                | Some(Token::Upsert)
                 | Some(Token::Update)
                 | Some(Token::Delete)
                 | Some(Token::Sort)
                 | Some(Token::Limit)
+                | Some(Token::Offset)
+                | Some(Token::First)
+                | Some(Token::Exists)
                 | Some(Token::Nearest)
                 | Some(Token::GroupBy)
                 | Some(Token::Having)
@@ -2766,19 +3562,6 @@ impl Parser {
                 | Some(Token::Min)
                 | Some(Token::Max)
         )
-    }
-
-    fn expression_to_query(&self, expr: &Expression) -> Result<OQLQuery, ParseError> {
-        match expr {
-            Expression::FieldAccess(FieldAccess { path }) if path.len() == 1 => Ok(OQLQuery {
-                collection: path[0].clone(),
-                operations: Vec::new(),
-            }),
-            Expression::QueryExpression { query } => Ok(query.clone()),
-            _ => Err(ParseError::InvalidSyntax(
-                "Query chain must start from a collection or query binding name".to_string(),
-            )),
-        }
     }
 
     fn parse_if_then_else_expression(&mut self) -> Result<Expression, ParseError> {
@@ -2950,8 +3733,7 @@ impl Parser {
 
                     Ok(Expression::FunctionCall { name, args })
                 } else {
-                    // This is a simple field access
-                    Ok(Expression::FieldAccess(FieldAccess { path: vec![name] }))
+                    Ok(Expression::Identifier(name))
                 }
             }
             // Handle aggregation function tokens
@@ -2979,6 +3761,10 @@ impl Parser {
                 let name = "max".to_string();
                 self.advance();
                 self.parse_function_call(name)
+            }
+            Some(Token::Exists) => {
+                self.advance();
+                self.parse_function_call("exists".to_string())
             }
             Some(Token::Star) => {
                 // Handle * as a special identifier for count(*)
@@ -3287,6 +4073,10 @@ impl Parser {
                 self.advance();
                 Ok(literal)
             }
+            Some(Token::NullLiteral) => {
+                self.advance();
+                Ok(Literal::Null)
+            }
             Some(token) => Err(ParseError::UnexpectedToken(format!(
                 "Expected literal value, found {:?}",
                 token
@@ -3348,6 +4138,7 @@ impl std::error::Error for ParseError {}
 
 fn expression_uses_legacy_outer(expr: &Expression) -> bool {
     match expr {
+        Expression::Identifier(name) => name == "outer",
         Expression::FieldAccess(field_access) => field_access
             .path
             .first()
@@ -3391,6 +4182,10 @@ fn expression_uses_legacy_outer(expr: &Expression) -> bool {
             .any(|field| expression_uses_legacy_outer(&field.value)),
         Expression::ConditionExpr(condition) => condition_uses_legacy_outer(condition),
         Expression::QueryExpression { query } => query_uses_legacy_outer(query),
+        Expression::CollectionExpression { source, operations } => {
+            expression_uses_legacy_outer(source)
+                || operations.iter().any(operation_uses_legacy_outer)
+        }
         Expression::Literal(_) => false,
     }
 }
@@ -3412,7 +4207,11 @@ fn query_uses_legacy_outer(query: &OQLQuery) -> bool {
         return true;
     }
 
-    query.operations.iter().any(|operation| match operation {
+    query.operations.iter().any(operation_uses_legacy_outer)
+}
+
+fn operation_uses_legacy_outer(operation: &Operation) -> bool {
+    match operation {
         Operation::Where(block) => condition_uses_legacy_outer(&block.condition),
         Operation::Select(block) => block
             .fields
@@ -3428,6 +4227,10 @@ fn query_uses_legacy_outer(query: &OQLQuery) -> bool {
                 .iter()
                 .any(|field| expression_uses_legacy_outer(&field.value))
         }),
+        Operation::Upsert(block) => block
+            .fields
+            .iter()
+            .any(|field| expression_uses_legacy_outer(&field.value)),
         Operation::Update(block) => block
             .fields
             .iter()
@@ -3455,8 +4258,13 @@ fn query_uses_legacy_outer(query: &OQLQuery) -> bool {
         | Operation::Min(field)
         | Operation::Max(field) => field.path.first().map(|p| p == "outer").unwrap_or(false),
         Operation::FunctionDef(func) => expression_uses_legacy_outer(&func.body),
-        Operation::Delete | Operation::Limit(_) | Operation::Count => false,
-    })
+        Operation::Delete
+        | Operation::Limit(_)
+        | Operation::Offset(_)
+        | Operation::First
+        | Operation::Exists
+        | Operation::Count => false,
+    }
 }
 
 fn reject_legacy_outer(statement: &OQLStatement) -> Result<(), ParseError> {
@@ -4180,9 +4988,7 @@ mod parser_tests {
         match &query.operations[0] {
             Operation::Where(where_block) => match &where_block.condition {
                 Condition::Comparison { left, .. } => match left {
-                    Expression::FieldAccess(field) => {
-                        assert_eq!(field.path, vec!["name"]);
-                    }
+                    Expression::Identifier(name) => assert_eq!(name, "name"),
                     _ => panic!("Expected field access"),
                 },
                 _ => panic!("Expected comparison condition"),
@@ -4239,6 +5045,7 @@ pub struct OQLFile {
 pub enum OQLFileStatement {
     Schema(SchemaDefinition),
     QueryBinding(QueryBinding),
+    ValueBinding(ValueBinding),
     Query(OQLQuery),
     FunctionDef(FunctionDefinition),
     Transaction(Vec<OQLFileStatement>),
@@ -4248,6 +5055,12 @@ pub enum OQLFileStatement {
 pub struct QueryBinding {
     pub name: String,
     pub query: OQLQuery,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ValueBinding {
+    pub name: String,
+    pub value: Expression,
 }
 
 /// Represents a schema definition in OQL syntax
@@ -4289,11 +5102,11 @@ pub fn parse_oql_file(content: &str) -> Result<OQLFile, Box<dyn std::error::Erro
                 }
                 _ => return Err("Expected function definition".into()),
             }
-        } else if trimmed.starts_with("transaction") {
+        } else if is_transaction_statement_start(trimmed) {
             let tx_statements = parse_transaction_statement(&statement)?;
             parsed_statements.push(OQLFileStatement::Transaction(tx_statements));
-        } else if let Some(binding) = parse_query_binding_statement(&statement)? {
-            parsed_statements.push(OQLFileStatement::QueryBinding(binding));
+        } else if let Some(binding) = parse_binding_statement(&statement)? {
+            parsed_statements.push(binding);
         } else {
             // Parse as query
             let query = parse_oql(&statement)?;
@@ -4423,7 +5236,7 @@ fn extract_statements(content: &str) -> Result<Vec<String>, Box<dyn std::error::
 fn looks_like_statement_start(trimmed: &str) -> bool {
     if trimmed.starts_with("schema ")
         || trimmed.starts_with("fn ")
-        || trimmed.starts_with("transaction")
+        || is_transaction_statement_start(trimmed)
     {
         return true;
     }
@@ -4448,22 +5261,34 @@ fn looks_like_statement_start(trimmed: &str) -> bool {
     matches!(
         op,
         "insert"
+            | "upsert"
             | "where"
             | "select"
             | "update"
             | "delete"
             | "sort"
             | "limit"
+            | "offset"
+            | "first"
+            | "exists"
             | "group_by"
             | "having"
+            | "nearest"
     )
+}
+
+fn is_transaction_statement_start(trimmed: &str) -> bool {
+    let Some(rest) = trimmed.strip_prefix("transaction") else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with(char::is_whitespace) || rest.starts_with('{')
 }
 
 fn parse_transaction_statement(
     statement: &str,
 ) -> Result<Vec<OQLFileStatement>, Box<dyn std::error::Error>> {
     let trimmed = statement.trim();
-    if !trimmed.starts_with("transaction") {
+    if !is_transaction_statement_start(trimmed) {
         return Err("Invalid transaction statement".into());
     }
 
@@ -4501,9 +5326,9 @@ fn is_valid_identifier(name: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-fn parse_query_binding_statement(
+fn parse_binding_statement(
     statement: &str,
-) -> Result<Option<QueryBinding>, Box<dyn std::error::Error>> {
+) -> Result<Option<OQLFileStatement>, Box<dyn std::error::Error>> {
     let mut meaningful_lines: Vec<&str> = statement
         .lines()
         .map(|l| l.trim_end())
@@ -4535,11 +5360,27 @@ fn parse_query_binding_statement(
     if rhs.is_empty() {
         return Err(format!("Binding '{}' has empty query expression", name).into());
     }
-    let query = parse_oql(&rhs)?;
-    Ok(Some(QueryBinding {
+    if let Ok(query) = parse_oql(&rhs) {
+        return Ok(Some(OQLFileStatement::QueryBinding(QueryBinding {
+            name: name.to_string(),
+            query,
+        })));
+    }
+
+    let tokens = Tokenizer::tokenize(&rhs)?;
+    let mut parser = Parser::new(tokens);
+    let value = parser.parse_expression()?;
+    if !matches!(parser.current_token(), Some(Token::EOF) | None) {
+        return Err(format!(
+            "Binding '{}' has trailing tokens after its value expression",
+            name
+        )
+        .into());
+    }
+    Ok(Some(OQLFileStatement::ValueBinding(ValueBinding {
         name: name.to_string(),
-        query,
-    }))
+        value,
+    })))
 }
 
 pub fn resolve_query_with_bindings(
@@ -4588,6 +5429,27 @@ pub fn resolve_query_with_bindings(
     })
 }
 
+pub fn resolve_query_with_value_bindings(
+    query: &OQLQuery,
+    bindings: &std::collections::HashMap<String, Expression>,
+) -> OQLQuery {
+    OQLQuery {
+        collection: query.collection.clone(),
+        operations: query
+            .operations
+            .iter()
+            .map(|operation| Parser::substitute_scoped_locals_operation(operation, bindings))
+            .collect(),
+    }
+}
+
+pub fn resolve_value_with_bindings(
+    value: &Expression,
+    bindings: &std::collections::HashMap<String, Expression>,
+) -> Expression {
+    Parser::substitute_scoped_locals_expression(value, bindings)
+}
+
 fn resolve_operation_bindings(
     operation: &Operation,
     bindings: &std::collections::HashMap<String, OQLQuery>,
@@ -4630,6 +5492,19 @@ fn resolve_operation_bindings(
             }
             Ok(Operation::InsertMany(out))
         }
+        Operation::Upsert(block) => Ok(Operation::Upsert(UpsertBlock {
+            key: block.key.clone(),
+            fields: block
+                .fields
+                .iter()
+                .map(|field| {
+                    Ok(InsertField {
+                        name: field.name.clone(),
+                        value: resolve_expression_bindings(&field.value, bindings)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?,
+        })),
         Operation::Update(block) => {
             let mut fields = Vec::with_capacity(block.fields.len());
             for field in &block.fields {
@@ -4690,7 +5565,9 @@ fn resolve_expression_bindings(
     bindings: &std::collections::HashMap<String, OQLQuery>,
 ) -> Result<Expression, String> {
     match expr {
-        Expression::FieldAccess(_) | Expression::Literal(_) => Ok(expr.clone()),
+        Expression::Identifier(_) | Expression::FieldAccess(_) | Expression::Literal(_) => {
+            Ok(expr.clone())
+        }
         Expression::FunctionCall { name, args } => {
             let mut resolved_args = Vec::with_capacity(args.len());
             for arg in args {
@@ -4786,6 +5663,15 @@ fn resolve_expression_bindings(
         Expression::QueryExpression { query } => Ok(Expression::QueryExpression {
             query: resolve_query_with_bindings(query, bindings)?,
         }),
+        Expression::CollectionExpression { source, operations } => {
+            Ok(Expression::CollectionExpression {
+                source: Box::new(resolve_expression_bindings(source, bindings)?),
+                operations: operations
+                    .iter()
+                    .map(|operation| resolve_operation_bindings(operation, bindings))
+                    .collect::<Result<Vec<_>, _>>()?,
+            })
+        }
     }
 }
 
@@ -4864,6 +5750,8 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
     let mut errors = Vec::new();
     let mut query_bindings: std::collections::HashMap<String, OQLQuery> =
         std::collections::HashMap::new();
+    let mut value_bindings: std::collections::HashMap<String, Expression> =
+        std::collections::HashMap::new();
 
     // Create a schema registry for type resolution
     let registry = crate::schema::SchemaRegistry::new();
@@ -4916,11 +5804,19 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
                 success_count += 1;
                 results.push(StatementResult::Binding(binding.name.clone()));
             }
+            OQLFileStatement::ValueBinding(binding) => {
+                binding_count += 1;
+                let value =
+                    Parser::substitute_scoped_locals_expression(&binding.value, &value_bindings);
+                value_bindings.insert(binding.name.clone(), value);
+                success_count += 1;
+                results.push(StatementResult::Binding(binding.name.clone()));
+            }
             OQLFileStatement::Query(query) => {
                 query_count += 1;
                 let start_time = std::time::Instant::now();
                 let resolved_query = match resolve_query_with_bindings(query, &query_bindings) {
-                    Ok(q) => q,
+                    Ok(q) => resolve_query_with_value_bindings(&q, &value_bindings),
                     Err(e) => {
                         let error_msg = format!("Binding resolution failed: {}", e);
                         println!("❌ {}", error_msg);
@@ -4929,8 +5825,25 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
                         continue;
                     }
                 };
-                match script_executor.execute_query(&resolved_query) {
-                    Ok(documents) => {
+                let execution = if let Some(source) = value_bindings.get(&resolved_query.collection)
+                {
+                    script_executor
+                        .evaluate_script_expression(&Expression::CollectionExpression {
+                            source: Box::new(source.clone()),
+                            operations: resolved_query.operations.clone(),
+                        })
+                        .map(|value| match value {
+                            crate::document::Value::List(values) => values.len(),
+                            crate::document::Value::Null => 0,
+                            _ => 1,
+                        })
+                } else {
+                    script_executor
+                        .execute_query(&resolved_query)
+                        .map(|documents| documents.len())
+                };
+                match execution {
+                    Ok(document_count) => {
                         let elapsed = start_time.elapsed();
                         success_count += 1;
                         let query_str = format!(
@@ -4946,10 +5859,10 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
                         println!(
                             "✅ {} -> {} documents ({:.3}ms)",
                             query_str.chars().take(50).collect::<String>(),
-                            documents.len(),
+                            document_count,
                             elapsed.as_secs_f64() * 1000.0
                         );
-                        results.push(StatementResult::Query(documents.len()));
+                        results.push(StatementResult::Query(document_count));
                     }
                     Err(e) => {
                         let elapsed = start_time.elapsed();
@@ -4980,17 +5893,18 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
                 transaction_count += 1;
                 let snapshot = snapshot_store(script_executor.store().as_ref())?;
                 let mut active_txn_id = None;
-                if let Some(zig_store) = script_executor
+                if let Some(rust_store) = script_executor
                     .store()
                     .as_any()
-                    .downcast_ref::<crate::storage::zig_adapter::ZigStore>()
+                    .downcast_ref::<crate::storage::RustStore>()
                 {
-                    let tx_id = zig_store.begin_local_transaction()?;
+                    let tx_id = rust_store.begin_local_transaction()?;
                     active_txn_id = Some(tx_id);
                 }
                 let mut tx_errors = Vec::new();
                 let mut tx_results = Vec::new();
                 let mut tx_bindings = query_bindings.clone();
+                let mut tx_value_bindings = value_bindings.clone();
                 let mut tx_success = 0usize;
 
                 for tx_stmt in tx_statements {
@@ -5019,20 +5933,50 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
                             tx_success += 1;
                             tx_results.push(StatementResult::Binding(binding.name.clone()));
                         }
+                        OQLFileStatement::ValueBinding(binding) => {
+                            binding_count += 1;
+                            let value = Parser::substitute_scoped_locals_expression(
+                                &binding.value,
+                                &tx_value_bindings,
+                            );
+                            tx_value_bindings.insert(binding.name.clone(), value);
+                            tx_success += 1;
+                            tx_results.push(StatementResult::Binding(binding.name.clone()));
+                        }
                         OQLFileStatement::Query(query) => {
                             query_count += 1;
                             let resolved_query =
                                 match resolve_query_with_bindings(query, &tx_bindings) {
-                                    Ok(q) => q,
+                                    Ok(q) => {
+                                        resolve_query_with_value_bindings(&q, &tx_value_bindings)
+                                    }
                                     Err(e) => {
                                         tx_errors.push(format!("Binding resolution failed: {}", e));
                                         continue;
                                     }
                                 };
-                            match script_executor.execute_query(&resolved_query) {
-                                Ok(documents) => {
+                            let execution = if let Some(source) =
+                                tx_value_bindings.get(&resolved_query.collection)
+                            {
+                                script_executor
+                                    .evaluate_script_expression(&Expression::CollectionExpression {
+                                        source: Box::new(source.clone()),
+                                        operations: resolved_query.operations.clone(),
+                                    })
+                                    .map(|value| match value {
+                                        crate::document::Value::List(values) => values.len(),
+                                        crate::document::Value::Null => 0,
+                                        _ => 1,
+                                    })
+                            } else {
+                                script_executor
+                                    .execute_query(&resolved_query)
+                                    .map(|documents| documents.len())
+                            };
+                            match execution {
+                                Ok(document_count) => {
                                     tx_success += 1;
-                                    tx_results.push(StatementResult::Query(documents.len()));
+                                    tx_results.push(StatementResult::Query(document_count));
                                 }
                                 Err(e) => {
                                     tx_errors.push(format!("Execution failed: {}", e));
@@ -5048,15 +5992,16 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
 
                 if tx_errors.is_empty() {
                     if let Some(tx_id) = active_txn_id {
-                        if let Some(zig_store) = script_executor
+                        if let Some(rust_store) = script_executor
                             .store()
                             .as_any()
-                            .downcast_ref::<crate::storage::zig_adapter::ZigStore>(
-                        ) {
-                            zig_store.commit_local_transaction(tx_id)?;
+                            .downcast_ref::<crate::storage::RustStore>()
+                        {
+                            rust_store.commit_local_transaction(tx_id)?;
                         }
                     }
                     query_bindings = tx_bindings;
+                    value_bindings = tx_value_bindings;
                     success_count += tx_success + 1;
                     results.extend(tx_results);
                     results.push(StatementResult::Transaction("committed".to_string()));
@@ -5066,12 +6011,12 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
                     );
                 } else {
                     if let Some(tx_id) = active_txn_id {
-                        if let Some(zig_store) = script_executor
+                        if let Some(rust_store) = script_executor
                             .store()
                             .as_any()
-                            .downcast_ref::<crate::storage::zig_adapter::ZigStore>(
-                        ) {
-                            let _ = zig_store.rollback_local_transaction(tx_id);
+                            .downcast_ref::<crate::storage::RustStore>()
+                        {
+                            let _ = rust_store.rollback_local_transaction(tx_id);
                         }
                     }
                     restore_store(script_executor.store().as_ref(), &snapshot)?;
@@ -5092,7 +6037,7 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
     println!(
         "\n📊 Summary: {}/{} statements executed successfully",
         success_count,
-        schema_count + query_count + function_count + binding_count
+        schema_count + query_count + function_count + binding_count + transaction_count
     );
     println!("   - {} schemas", schema_count);
     println!("   - {} bindings", binding_count);
@@ -5217,7 +6162,7 @@ fn parse_field_type(
 #[cfg(test)]
 mod file_parser_regression_tests {
     use super::*;
-    use crate::storage::zig_adapter::ZigStore;
+    use crate::storage::RustStore;
     use crate::QueryExecutor;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -5378,7 +6323,7 @@ transaction {
 
     #[test]
     fn test_execute_improved_syntax_file_smoke() {
-        use crate::storage::zig_adapter::ZigStore;
+        use crate::storage::RustStore;
         use crate::QueryExecutor;
         use std::sync::Arc;
         use tempfile::TempDir;
@@ -5388,8 +6333,9 @@ transaction {
 
         let temp_dir = TempDir::new().expect("temp dir");
         let path = temp_dir.path().join("improved_syntax_test.owl");
-        let store =
-            Arc::new(ZigStore::new(path.to_str().expect("path"), 10 * 1024 * 1024).expect("store"));
+        let store = Arc::new(
+            RustStore::new(path.to_str().expect("path"), 10 * 1024 * 1024).expect("store"),
+        );
         let executor = QueryExecutor::new_with_real_clock(store);
         let result = execute_oql_file(&file, &executor).expect("execute improved_syntax");
 
@@ -5404,7 +6350,7 @@ transaction {
 
     #[test]
     fn test_execute_functions_litmus_file_smoke() {
-        use crate::storage::zig_adapter::ZigStore;
+        use crate::storage::RustStore;
         use crate::QueryExecutor;
         use std::sync::Arc;
         use tempfile::TempDir;
@@ -5414,8 +6360,9 @@ transaction {
 
         let temp_dir = TempDir::new().expect("temp dir");
         let path = temp_dir.path().join("functions_litmus_test.owl");
-        let store =
-            Arc::new(ZigStore::new(path.to_str().expect("path"), 10 * 1024 * 1024).expect("store"));
+        let store = Arc::new(
+            RustStore::new(path.to_str().expect("path"), 10 * 1024 * 1024).expect("store"),
+        );
         let executor = QueryExecutor::new_with_real_clock(store);
         let result = execute_oql_file(&file, &executor).expect("execute functions_litmus_test");
 
@@ -5431,7 +6378,7 @@ transaction {
 
     #[test]
     fn test_execute_phase1_acceptance_file_smoke() {
-        use crate::storage::zig_adapter::ZigStore;
+        use crate::storage::RustStore;
         use crate::QueryExecutor;
         use std::sync::Arc;
         use tempfile::TempDir;
@@ -5441,8 +6388,9 @@ transaction {
 
         let temp_dir = TempDir::new().expect("temp dir");
         let path = temp_dir.path().join("phase1_acceptance_test.owl");
-        let store =
-            Arc::new(ZigStore::new(path.to_str().expect("path"), 10 * 1024 * 1024).expect("store"));
+        let store = Arc::new(
+            RustStore::new(path.to_str().expect("path"), 10 * 1024 * 1024).expect("store"),
+        );
         let executor = QueryExecutor::new_with_real_clock(store);
         let result = execute_oql_file(&file, &executor).expect("execute phase1_acceptance");
 
@@ -5472,8 +6420,9 @@ transaction {
         let file = parse_oql_file(script).expect("parse script");
         let temp_dir = TempDir::new().expect("temp dir");
         let path = temp_dir.path().join("tx_rollback.owl");
-        let store =
-            Arc::new(ZigStore::new(path.to_str().expect("path"), 10 * 1024 * 1024).expect("store"));
+        let store = Arc::new(
+            RustStore::new(path.to_str().expect("path"), 10 * 1024 * 1024).expect("store"),
+        );
         let executor = QueryExecutor::new_with_real_clock(store);
         let result = execute_oql_file(&file, &executor).expect("execute file");
 
@@ -5516,7 +6465,7 @@ transaction {
                 });
                 continue;
             }
-            if parse_query_binding_statement(statement)
+            if parse_binding_statement(statement)
                 .expect("binding parse attempt")
                 .is_some()
             {
@@ -5550,8 +6499,9 @@ transaction {
     fn test_execute_oql_file_function_def_registers_successfully() {
         let temp_dir = TempDir::new().expect("temp dir");
         let path = temp_dir.path().join("test.owl");
-        let store =
-            Arc::new(ZigStore::new(path.to_str().expect("path"), 10 * 1024 * 1024).expect("store"));
+        let store = Arc::new(
+            RustStore::new(path.to_str().expect("path"), 10 * 1024 * 1024).expect("store"),
+        );
         let executor = QueryExecutor::new_with_real_clock(store);
         let file = OQLFile {
             statements: vec![OQLFileStatement::FunctionDef(FunctionDefinition {
@@ -5607,5 +6557,23 @@ transaction {
         )
         .expect_err("metric should fail");
         assert!(err.to_string().contains("Unsupported nearest metric"));
+    }
+
+    #[test]
+    fn sort_direction_is_not_part_of_the_field_path() {
+        for source in [
+            "events.sort { .timestamp.desc }",
+            "events.sort { .timestamp desc }",
+        ] {
+            let query = parse_oql(source).expect("parse descending sort");
+            let Operation::Sort(block) = &query.operations[0] else {
+                panic!("expected sort operation");
+            };
+            assert_eq!(block.fields[0].direction, SortDirection::Desc);
+            let Expression::FieldAccess(field) = &block.fields[0].expression else {
+                panic!("expected field access");
+            };
+            assert_eq!(field.path, ["timestamp"]);
+        }
     }
 }

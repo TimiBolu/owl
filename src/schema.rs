@@ -1,4 +1,4 @@
-use crate::document::Value;
+use crate::document::{Document, Value};
 use crate::error::{OQLError, OQLResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -246,6 +246,72 @@ pub enum FieldType {
     Optional(Box<FieldType>),
 }
 
+/// Metadata fields present on every Owl document independently of its
+/// user-declared schema fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocumentSystemField {
+    Id,
+    Schema,
+    CreatedAt,
+    UpdatedAt,
+    Version,
+}
+
+impl DocumentSystemField {
+    pub const ALL: [Self; 5] = [
+        Self::Id,
+        Self::Schema,
+        Self::CreatedAt,
+        Self::UpdatedAt,
+        Self::Version,
+    ];
+
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "id" => Some(Self::Id),
+            "schema" => Some(Self::Schema),
+            "created_at" => Some(Self::CreatedAt),
+            "updated_at" => Some(Self::UpdatedAt),
+            "version" => Some(Self::Version),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Id => "id",
+            Self::Schema => "schema",
+            Self::CreatedAt => "created_at",
+            Self::UpdatedAt => "updated_at",
+            Self::Version => "version",
+        }
+    }
+
+    pub fn field_type(self) -> FieldType {
+        match self {
+            Self::Id | Self::Schema => FieldType::String,
+            Self::CreatedAt | Self::UpdatedAt => FieldType::DateTime,
+            Self::Version => FieldType::Integer,
+        }
+    }
+
+    pub fn value(self, document: &Document) -> Value {
+        match self {
+            Self::Id => document
+                .fields
+                .get("id")
+                .cloned()
+                .unwrap_or_else(|| Value::String(document.id.clone())),
+            Self::Schema => Value::String(document.schema.clone()),
+            Self::CreatedAt => Value::DateTime(document.created_at),
+            Self::UpdatedAt => Value::DateTime(document.updated_at),
+            Self::Version => i64::try_from(document.version)
+                .map(Value::Integer)
+                .unwrap_or(Value::Null),
+        }
+    }
+}
+
 /// Reference type with metadata for validation and navigation
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ReferenceType {
@@ -423,15 +489,16 @@ impl SchemaRegistry {
         }
 
         let field_name = &field_path[0];
-        let field_type =
-            schema
-                .get_field_type(field_name)
-                .ok_or_else(|| OQLError::SchemaValidation {
-                    message: format!(
-                        "Field '{}' not found in schema '{}'",
-                        field_name, schema_name
-                    ),
-                })?;
+        let field_type = schema
+            .get_field_type(field_name)
+            .cloned()
+            .or_else(|| DocumentSystemField::from_name(field_name).map(|field| field.field_type()))
+            .ok_or_else(|| OQLError::SchemaValidation {
+                message: format!(
+                    "Field '{}' not found in schema '{}'",
+                    field_name, schema_name
+                ),
+            })?;
 
         // If there are more fields in the path, validate nested access
         if field_path.len() > 1 {
@@ -466,7 +533,8 @@ impl SchemaRegistry {
         Ok(schemas
             .get(schema_name)
             .and_then(|schema| schema.get_field_type(field_name))
-            .cloned())
+            .cloned()
+            .or_else(|| DocumentSystemField::from_name(field_name).map(|field| field.field_type())))
     }
 
     /// Validate a reference target exists
@@ -781,6 +849,33 @@ mod tests {
         assert!(registry
             .validate_field("nonexistent", &["name".to_string()])
             .is_err());
+    }
+
+    #[test]
+    fn registry_exposes_typed_document_system_fields() {
+        let registry = SchemaRegistry::new();
+        registry
+            .register(Schema::new(
+                "events".to_string(),
+                HashMap::from([("message".to_string(), FieldType::String)]),
+            ))
+            .unwrap();
+
+        for (name, expected) in [
+            ("id", FieldType::String),
+            ("schema", FieldType::String),
+            ("created_at", FieldType::DateTime),
+            ("updated_at", FieldType::DateTime),
+            ("version", FieldType::Integer),
+        ] {
+            assert_eq!(
+                registry.get_field_type("events", name).unwrap(),
+                Some(expected)
+            );
+            registry
+                .validate_field("events", &[name.to_string()])
+                .unwrap();
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 // OQL File Runner - Execute OQL files using the database engine
 
-use crate::storage::{zig_adapter::ZigStore, DocumentStore};
+use crate::storage::{DocumentStore, RustStore};
 use crate::{execute_oql_file, parse_oql_file, QueryExecutor};
 use std::fs;
 use std::path::Path;
@@ -43,8 +43,8 @@ impl<S: DocumentStore> OQLRunner<S> {
 /// Create a new OQL runner with default storage (Zig)
 pub fn create_oql_runner<P: AsRef<Path>>(
     db_path: P,
-) -> Result<OQLRunner<ZigStore>, Box<dyn std::error::Error>> {
-    let store = Arc::new(ZigStore::new(
+) -> Result<OQLRunner<RustStore>, Box<dyn std::error::Error>> {
+    let store = Arc::new(RustStore::new(
         db_path.as_ref().to_str().unwrap(),
         1024 * 1024 * 1024,
     )?);

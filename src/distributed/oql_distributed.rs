@@ -92,10 +92,7 @@ impl DocumentStore for QueryExecutorStoreAdapter {
             .list_references_to(target_schema, target_id, source_schema, field_path)
     }
 
-    fn upsert_vector_index(
-        &self,
-        index: crate::storage::VectorIndexDefinition,
-    ) -> OQLResult<()> {
+    fn upsert_vector_index(&self, index: crate::storage::VectorIndexDefinition) -> OQLResult<()> {
         self.inner.upsert_vector_index(index)
     }
 
@@ -143,10 +140,7 @@ impl DocumentStore for QueryExecutorStoreAdapter {
         self.inner.navigate_reference(objref)
     }
 
-    fn navigate_global_reference(
-        &self,
-        objref: &GlobalObjRef,
-    ) -> OQLResult<Option<Document>> {
+    fn navigate_global_reference(&self, objref: &GlobalObjRef) -> OQLResult<Option<Document>> {
         self.inner.navigate_global_reference(objref)
     }
 
@@ -247,7 +241,9 @@ impl DistributedExecutionStore for DistributedStorage {
     ) -> OQLResult<GlobalObjRef> {
         self.put_document(document)?;
         self.get_global_objref(&document.schema, &document.id)?
-            .ok_or_else(|| OQLError::generic("distributed update did not return a global reference"))
+            .ok_or_else(|| {
+                OQLError::generic("distributed update did not return a global reference")
+            })
     }
 
     fn delete_atomic(
@@ -433,6 +429,7 @@ impl DistributedOQLEngine {
                 operation,
                 Operation::Insert(_)
                     | Operation::InsertMany(_)
+                    | Operation::Upsert(_)
                     | Operation::Update(_)
                     | Operation::Delete
             )
@@ -455,6 +452,11 @@ impl DistributedOQLEngine {
                     affected_count += count;
                     object_refs.extend(refs);
                 }
+                Operation::Upsert(_) => {
+                    return Err(OQLError::generic(
+                        "upsert is currently supported by the single-node executor only",
+                    ));
+                }
                 Operation::Update(update_block) => {
                     let target_documents =
                         self.select_target_documents_for_write(&query, op_index)?;
@@ -471,6 +473,9 @@ impl DistributedOQLEngine {
                 | Operation::Select(_)
                 | Operation::Sort(_)
                 | Operation::Limit(_)
+                | Operation::Offset(_)
+                | Operation::First
+                | Operation::Exists
                 | Operation::Nearest(_)
                 | Operation::GroupBy(_)
                 | Operation::Having(_)
@@ -512,6 +517,7 @@ impl DistributedOQLEngine {
                 operation,
                 Operation::Insert(_)
                     | Operation::InsertMany(_)
+                    | Operation::Upsert(_)
                     | Operation::Update(_)
                     | Operation::Delete
                     | Operation::FunctionDef(_)
@@ -538,9 +544,12 @@ impl DistributedOQLEngine {
                 Operation::Where(_)
                 | Operation::Sort(_)
                 | Operation::Limit(_)
+                | Operation::Offset(_)
+                | Operation::First
                 | Operation::Nearest(_) => selection_operations.push(operation.clone()),
                 Operation::Insert(_)
                 | Operation::InsertMany(_)
+                | Operation::Upsert(_)
                 | Operation::Update(_)
                 | Operation::Delete
                 | Operation::FunctionDef(_) => {
@@ -551,6 +560,7 @@ impl DistributedOQLEngine {
                 Operation::Select(_)
                 | Operation::GroupBy(_)
                 | Operation::Having(_)
+                | Operation::Exists
                 | Operation::Count
                 | Operation::Sum(_)
                 | Operation::Avg(_)
@@ -685,12 +695,8 @@ impl DistributedOQLEngine {
             };
 
             if target_shard == self.shard_id {
-                self.storage.update_atomic(
-                    &schema,
-                    &document.id,
-                    &document,
-                    txn_id,
-                )?;
+                self.storage
+                    .update_atomic(&schema, &document.id, &document, txn_id)?;
                 updated_count += 1;
             } else {
                 // Remote update - would need to implement remote update protocol
@@ -836,6 +842,7 @@ impl DistributedOQLEngine {
             Literal::Integer(i) => Value::Integer(*i),
             Literal::Float(f) => Value::Float(*f),
             Literal::Boolean(b) => Value::Boolean(*b),
+            Literal::Null => Value::Null,
         }
     }
 
@@ -1135,7 +1142,11 @@ mod tests {
             _txn_id: Option<TxnId>,
         ) -> OQLResult<GlobalObjRef> {
             self.put_document(document)?;
-            Ok(GlobalObjRef::new(0, self.docs.lock().unwrap().len() as u64, 0))
+            Ok(GlobalObjRef::new(
+                0,
+                self.docs.lock().unwrap().len() as u64,
+                0,
+            ))
         }
 
         fn update_atomic(
@@ -1146,7 +1157,11 @@ mod tests {
             _txn_id: Option<TxnId>,
         ) -> OQLResult<GlobalObjRef> {
             self.put_document(document)?;
-            Ok(GlobalObjRef::new(0, self.docs.lock().unwrap().len() as u64, 0))
+            Ok(GlobalObjRef::new(
+                0,
+                self.docs.lock().unwrap().len() as u64,
+                0,
+            ))
         }
 
         fn delete_atomic(
@@ -1266,10 +1281,19 @@ mod tests {
 
         assert!(result.success);
         assert_eq!(result.affected_count, 1);
-        let alice = storage.get_document("User", &"u1".to_string()).unwrap().unwrap();
-        let bob = storage.get_document("User", &"u2".to_string()).unwrap().unwrap();
+        let alice = storage
+            .get_document("User", &"u1".to_string())
+            .unwrap()
+            .unwrap();
+        let bob = storage
+            .get_document("User", &"u2".to_string())
+            .unwrap()
+            .unwrap();
         assert_eq!(alice.fields.get("role"), None);
-        assert_eq!(bob.fields.get("role"), Some(&Value::String("admin".to_string())));
+        assert_eq!(
+            bob.fields.get("role"),
+            Some(&Value::String("admin".to_string()))
+        );
     }
 
     #[test]
@@ -1290,7 +1314,10 @@ mod tests {
 
         assert!(result.success);
         assert_eq!(result.affected_count, 1);
-        let bob = storage.get_document("User", &"u1".to_string()).unwrap().unwrap();
+        let bob = storage
+            .get_document("User", &"u1".to_string())
+            .unwrap()
+            .unwrap();
         assert_eq!(
             bob.fields.get("greeting"),
             Some(&Value::String("Bob".to_string()))
@@ -1322,8 +1349,14 @@ mod tests {
 
         assert!(result.success);
         assert_eq!(result.affected_count, 1);
-        assert!(storage.get_document("User", &"u1".to_string()).unwrap().is_some());
-        assert!(storage.get_document("User", &"u2".to_string()).unwrap().is_none());
+        assert!(storage
+            .get_document("User", &"u1".to_string())
+            .unwrap()
+            .is_some());
+        assert!(storage
+            .get_document("User", &"u2".to_string())
+            .unwrap()
+            .is_none());
     }
 
     #[test]

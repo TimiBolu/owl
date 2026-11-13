@@ -94,11 +94,37 @@ impl CostModel {
     pub fn estimate_cost(&self, operator: &PhysicalOperator) -> CostEstimate {
         match operator {
             PhysicalOperator::SeqScan(op) => self.cost_seq_scan(op),
+            PhysicalOperator::StorageScan(op) => CostEstimate {
+                startup_cost: 0.0,
+                total_cost: op.estimated_rows as f64 * self.params.cpu_tuple_cost,
+                rows: op.estimated_rows,
+                width: self.params.avg_tuple_size,
+            },
             PhysicalOperator::IndexScan(op) => self.cost_index_scan(op),
+            PhysicalOperator::IndexUnion(op) => {
+                let estimates = op
+                    .inputs
+                    .iter()
+                    .map(|input| self.estimate_cost(input))
+                    .collect::<Vec<_>>();
+                CostEstimate {
+                    startup_cost: estimates.iter().map(|cost| cost.startup_cost).sum(),
+                    total_cost: estimates.iter().map(|cost| cost.total_cost).sum::<f64>()
+                        + op.estimated_rows as f64 * self.params.cpu_operator_cost,
+                    rows: op.estimated_rows,
+                    width: estimates.first().map(|cost| cost.width).unwrap_or_default(),
+                }
+            }
             PhysicalOperator::Filter(op) => self.cost_filter(op),
             PhysicalOperator::Project(op) => self.cost_project(op),
             PhysicalOperator::Sort(op) => self.cost_sort(op),
             PhysicalOperator::Limit(op) => self.cost_limit(op),
+            PhysicalOperator::Offset(op) => {
+                let mut estimate = self.estimate_cost(&op.input);
+                estimate.total_cost += op.offset.min(op.input.estimate_rows()) as f64 * 0.001;
+                estimate.rows = estimate.rows.saturating_sub(op.offset);
+                estimate
+            }
             PhysicalOperator::GroupBy(op) => self.cost_group_by(op),
             PhysicalOperator::Having(op) => self.cost_having(op),
             PhysicalOperator::Aggregate(op) => self.cost_aggregate(op),

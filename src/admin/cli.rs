@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 use super::{BackupManager, ClusterManager, ConfigManager, HealthChecker, IndexAdmin};
+use crate::storage_engine::RustStore;
 
 /// Owl Database Administration CLI
 #[derive(Parser)]
@@ -51,6 +52,11 @@ enum Commands {
     Index {
         #[command(subcommand)]
         action: IndexAction,
+    },
+    /// Native Rust storage-engine maintenance
+    Storage {
+        #[command(subcommand)]
+        action: StorageAction,
     },
 }
 
@@ -175,8 +181,8 @@ enum IndexAction {
         /// Path to index catalog JSON (defaults to <db_path>.indexes.json)
         #[arg(long)]
         catalog: Option<PathBuf>,
-        /// Index backend (zig|memory)
-        #[arg(long, default_value = "zig")]
+        /// Index backend (rust|memory)
+        #[arg(long, default_value = "rust")]
         backend: String,
     },
     /// List indexes from a catalog file
@@ -184,6 +190,23 @@ enum IndexAction {
         /// Path to index catalog JSON
         #[arg(short, long)]
         catalog: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum StorageAction {
+    /// Verify the authoritative checkpoint, roots, indexes, references, and WALs
+    Check {
+        /// Path to the Owl database file
+        db_path: PathBuf,
+    },
+    /// Remove files unreachable from the newest durable manifest
+    Reclaim {
+        /// Path to the Owl database file
+        db_path: PathBuf,
+        /// Maximum in-memory arena size in MB while opening the database
+        #[arg(long, default_value = "128")]
+        size_mb: usize,
     },
 }
 
@@ -209,6 +232,34 @@ impl AdminCli {
             Commands::Backup { action } => Self::handle_backup(action, &cli.config),
             Commands::Config { action } => Self::handle_config(action, &cli.config),
             Commands::Index { action } => Self::handle_index(action, &cli.config),
+            Commands::Storage { action } => Self::handle_storage(action),
+        }
+    }
+
+    fn handle_storage(action: StorageAction) -> Result<()> {
+        match action {
+            StorageAction::Check { db_path } => {
+                let report = RustStore::check_integrity(&db_path)?;
+                println!("Storage integrity: OK");
+                println!("Checkpoint sequence: {}", report.checkpoint_sequence);
+                println!("Checkpoint LSN: {}", report.checkpoint_lsn);
+                println!("Durable LSN: {}", report.durable_lsn);
+                println!("Live objects: {}", report.live_objects);
+                println!("Scalar indexes: {}", report.scalar_indexes);
+                println!("Files checked: {}", report.files_checked);
+                Ok(())
+            }
+            StorageAction::Reclaim { db_path, size_mb } => {
+                let max_size = size_mb
+                    .checked_mul(1024 * 1024)
+                    .ok_or_else(|| anyhow::anyhow!("storage size is too large"))?;
+                let store = RustStore::new(&db_path, max_size)?;
+                let report = store.reclaim_obsolete_files()?;
+                println!("Retained checkpoint sequence: {}", report.retained_sequence);
+                println!("Files removed: {}", report.files_removed);
+                println!("Bytes reclaimed: {}", report.bytes_reclaimed);
+                Ok(())
+            }
         }
     }
 

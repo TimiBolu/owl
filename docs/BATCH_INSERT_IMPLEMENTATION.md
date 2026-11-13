@@ -1,7 +1,7 @@
 # Batch Insert Implementation
 
 **Date**: November 2024  
-**Status**: ✅ Implemented and Tested
+**Status**: ✅ RustStore atomic batch path implemented and tested
 
 ## Overview
 
@@ -35,7 +35,7 @@ User.insert [
 - Added `apply_insert_many_operation()` method
 - Processes all insert blocks in a batch
 - Validates all documents against schema before insertion
-- Stores all documents sequentially
+- Commits all documents through `DocumentStore::put_documents`
 - Returns all created documents
 
 ### 3. Supporting Changes
@@ -80,17 +80,19 @@ From the demo example:
 
 | Operation | Documents | Time |
 |-----------|-----------|------|
-| 3 departments | 3 | ~1.2ms |
-| 5 employees | 5 | ~2.9ms |
-| 100 projects | 100 | ~47.6ms |
+| Individual durable inserts | 10 | ~40.8ms |
+| One atomic WAL batch | 10 | ~5.54ms |
+| Individual durable inserts | 100 | ~452ms |
+| One atomic WAL batch | 100 | ~8.11ms |
 
-**Average**: ~0.5ms per document in batch operations
+Measurements are from the local optimized `ingest_bench` run on 2026-07-22.
 
 ## Benefits
 
 1. **Cleaner Syntax** - More readable than multiple single inserts
 2. **Better Performance** - Reduced overhead per document
-3. **Atomic Operations** - All documents inserted or none (future: transaction support)
+3. **Atomic Operations** - RustStore validates and durably commits all documents
+   in one WAL frame, or publishes none
 4. **Reduced Code** - One statement instead of many
 5. **Easier Testing** - Simpler test data setup
 

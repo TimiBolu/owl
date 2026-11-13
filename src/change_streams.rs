@@ -607,14 +607,14 @@ impl<S: DocumentStore + Send + Sync + 'static> DocumentStore for ChangeTrackingS
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::zig_adapter::ZigStore;
+    use crate::storage::RustStore;
     use std::collections::HashMap;
     use tempfile::TempDir;
 
-    fn create_test_store() -> (ChangeTrackingStore<ZigStore>, TempDir) {
+    fn create_test_store() -> (ChangeTrackingStore<RustStore>, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("test.owl");
-        let store = Arc::new(ZigStore::new(path.to_str().unwrap(), 10 * 1024 * 1024).unwrap());
+        let store = Arc::new(RustStore::new(path.to_str().unwrap(), 10 * 1024 * 1024).unwrap());
         let change_store = ChangeTrackingStore::new(store);
         (change_store, temp_dir)
     }

@@ -7,13 +7,13 @@
 // - Maintains performance overhead <10%
 // - Uses in-memory B-tree for fast lookups
 //
-// Index operations are abstracted behind a backend trait so Rust orchestrates
-// while storage/index primitives can live in Zig.
+// Index operations are abstracted behind a backend trait while both orchestration
+// and physical index primitives remain owned by the Rust storage engine.
 
 use crate::document::{Document, Value};
 use crate::simulation::Clock;
 use crate::storage::{DocumentStore, ScalarIndexDefinition};
-use owl_storage_zig::{BTreeIndex, ObjRef as ZigObjRef};
+use crate::storage_engine::{BTreeIndex, ObjRef};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -21,15 +21,15 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 pub trait IndexBackend: Send + Sync {
-    fn insert(&self, key: u64, value: ZigObjRef, unique: bool, name: &str) -> Result<(), String>;
-    fn search(&self, key: u64) -> Result<Option<ZigObjRef>, String>;
+    fn insert(&self, key: u64, value: ObjRef, unique: bool, name: &str) -> Result<(), String>;
+    fn search(&self, key: u64) -> Result<Option<ObjRef>, String>;
     fn delete(&self, key: u64) -> Result<bool, String>;
-    fn range_query(&self, start_key: u64, end_key: u64) -> Result<Vec<ZigObjRef>, String>;
+    fn range_query(&self, start_key: u64, end_key: u64) -> Result<Vec<ObjRef>, String>;
 }
 
 #[derive(Debug)]
 struct InMemoryIndexBackend {
-    btree: Arc<RwLock<BTreeMap<u64, ZigObjRef>>>,
+    btree: Arc<RwLock<BTreeMap<u64, ObjRef>>>,
 }
 
 impl InMemoryIndexBackend {
@@ -41,7 +41,7 @@ impl InMemoryIndexBackend {
 }
 
 impl IndexBackend for InMemoryIndexBackend {
-    fn insert(&self, key: u64, value: ZigObjRef, unique: bool, name: &str) -> Result<(), String> {
+    fn insert(&self, key: u64, value: ObjRef, unique: bool, name: &str) -> Result<(), String> {
         let mut btree = self
             .btree
             .write()
@@ -56,7 +56,7 @@ impl IndexBackend for InMemoryIndexBackend {
         Ok(())
     }
 
-    fn search(&self, key: u64) -> Result<Option<ZigObjRef>, String> {
+    fn search(&self, key: u64) -> Result<Option<ObjRef>, String> {
         let btree = self
             .btree
             .read()
@@ -72,7 +72,7 @@ impl IndexBackend for InMemoryIndexBackend {
         Ok(btree.remove(&key).is_some())
     }
 
-    fn range_query(&self, start_key: u64, end_key: u64) -> Result<Vec<ZigObjRef>, String> {
+    fn range_query(&self, start_key: u64, end_key: u64) -> Result<Vec<ObjRef>, String> {
         let btree = self
             .btree
             .read()
@@ -81,22 +81,22 @@ impl IndexBackend for InMemoryIndexBackend {
     }
 }
 
-struct ZigIndexBackend {
+struct RustIndexBackend {
     btree: Arc<BTreeIndex>,
 }
 
-impl ZigIndexBackend {
+impl RustIndexBackend {
     fn new() -> Result<Self, String> {
-        let btree =
-            BTreeIndex::create(16, 0).map_err(|e| format!("Failed to create Zig B-tree: {}", e))?;
+        let btree = BTreeIndex::create(16, 0)
+            .map_err(|e| format!("Failed to create Rust B-tree: {}", e))?;
         Ok(Self {
             btree: Arc::new(btree),
         })
     }
 }
 
-impl IndexBackend for ZigIndexBackend {
-    fn insert(&self, key: u64, value: ZigObjRef, unique: bool, name: &str) -> Result<(), String> {
+impl IndexBackend for RustIndexBackend {
+    fn insert(&self, key: u64, value: ObjRef, unique: bool, name: &str) -> Result<(), String> {
         if unique && self.search(key)?.is_some() {
             return Err(format!(
                 "Unique constraint violation on index '{}' for key {}",
@@ -105,32 +105,32 @@ impl IndexBackend for ZigIndexBackend {
         }
         self.btree
             .insert(key, value)
-            .map_err(|e| format!("Zig index insert failed: {}", e))
+            .map_err(|e| format!("Rust index insert failed: {}", e))
     }
 
-    fn search(&self, key: u64) -> Result<Option<ZigObjRef>, String> {
+    fn search(&self, key: u64) -> Result<Option<ObjRef>, String> {
         self.btree
             .search(key)
-            .map_err(|e| format!("Zig index search failed: {}", e))
+            .map_err(|e| format!("Rust index search failed: {}", e))
     }
 
     fn delete(&self, key: u64) -> Result<bool, String> {
         self.btree
             .delete(key)
-            .map_err(|e| format!("Zig index delete failed: {}", e))
+            .map_err(|e| format!("Rust index delete failed: {}", e))
     }
 
-    fn range_query(&self, start_key: u64, end_key: u64) -> Result<Vec<ZigObjRef>, String> {
+    fn range_query(&self, start_key: u64, end_key: u64) -> Result<Vec<ObjRef>, String> {
         self.btree
             .range_query(start_key, end_key)
-            .map_err(|e| format!("Zig index range query failed: {}", e))
+            .map_err(|e| format!("Rust index range query failed: {}", e))
     }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum IndexBackendKind {
     InMemory,
-    Zig,
+    Rust,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,7 +167,7 @@ pub struct IndexDefinition {
     /// Backend implementation for index operations
     backend: Arc<dyn IndexBackend>,
     /// Mirror of index entries for persistence/recovery
-    entries: Arc<RwLock<BTreeMap<u64, ZigObjRef>>>,
+    entries: Arc<RwLock<BTreeMap<u64, ObjRef>>>,
 }
 
 impl IndexDefinition {
@@ -197,7 +197,7 @@ impl IndexDefinition {
     ) -> Result<Self, String> {
         let backend: Arc<dyn IndexBackend> = match backend_kind {
             IndexBackendKind::InMemory => Arc::new(InMemoryIndexBackend::new()),
-            IndexBackendKind::Zig => Arc::new(ZigIndexBackend::new()?),
+            IndexBackendKind::Rust => Arc::new(RustIndexBackend::new()?),
         };
         Ok(Self {
             name,
@@ -210,7 +210,7 @@ impl IndexDefinition {
     }
 
     /// Insert a key-value pair into the index
-    pub fn insert(&self, key: u64, value: ZigObjRef) -> Result<(), String> {
+    pub fn insert(&self, key: u64, value: ObjRef) -> Result<(), String> {
         self.backend.insert(key, value, self.unique, &self.name)?;
         let mut entries = self
             .entries
@@ -221,7 +221,7 @@ impl IndexDefinition {
     }
 
     /// Search for a key in the index
-    pub fn search(&self, key: u64) -> Result<Option<ZigObjRef>, String> {
+    pub fn search(&self, key: u64) -> Result<Option<ObjRef>, String> {
         self.backend.search(key)
     }
 
@@ -237,7 +237,7 @@ impl IndexDefinition {
     }
 
     /// Range query on the index
-    pub fn range_query(&self, start_key: u64, end_key: u64) -> Result<Vec<ZigObjRef>, String> {
+    pub fn range_query(&self, start_key: u64, end_key: u64) -> Result<Vec<ObjRef>, String> {
         self.backend.range_query(start_key, end_key)
     }
 
@@ -427,7 +427,7 @@ impl IndexManager {
     pub fn on_insert(
         &self,
         schema: &str,
-        objref: ZigObjRef,
+        objref: ObjRef,
         field_values: &HashMap<String, u64>,
     ) -> Result<(), String> {
         let start_time = self.clock.now();
@@ -454,7 +454,7 @@ impl IndexManager {
         Ok(())
     }
 
-    pub fn index_document(&self, document: &Document, objref: ZigObjRef) -> Result<(), String> {
+    pub fn index_document(&self, document: &Document, objref: ObjRef) -> Result<(), String> {
         let indexes = self.get_indexes(&document.schema)?;
         if indexes.is_empty() {
             return Ok(());
@@ -484,8 +484,8 @@ impl IndexManager {
     pub fn on_update(
         &self,
         schema: &str,
-        _old_objref: ZigObjRef,
-        new_objref: ZigObjRef,
+        _old_objref: ObjRef,
+        new_objref: ObjRef,
         old_field_values: &HashMap<String, u64>,
         new_field_values: &HashMap<String, u64>,
     ) -> Result<(), String> {
@@ -520,9 +520,9 @@ impl IndexManager {
     pub fn update_document(
         &self,
         old_document: &Document,
-        old_objref: ZigObjRef,
+        old_objref: ObjRef,
         new_document: &Document,
-        new_objref: ZigObjRef,
+        new_objref: ObjRef,
     ) -> Result<(), String> {
         let indexes = self.get_indexes(&new_document.schema)?;
         if indexes.is_empty() {
@@ -709,7 +709,7 @@ impl IndexManager {
         for def in definitions {
             let index = manager.create_index(&def.schema, def.fields.clone(), def.unique)?;
             for entry in def.entries {
-                index.insert(entry.key, ZigObjRef::new(entry.value_offset))?;
+                index.insert(entry.key, ObjRef::new(entry.value_offset))?;
             }
         }
         Ok(manager)
@@ -772,7 +772,7 @@ impl IndexManager {
                         if let Some(key) = self.build_index_key(&def.fields, &field_values) {
                             let indexes = self.get_indexes(&schema)?;
                             if let Some(index) = indexes.iter().find(|i| i.name == def.name) {
-                                index.insert(key, ZigObjRef::new(objref.offset()))?;
+                                index.insert(key, ObjRef::new(objref.offset()))?;
                                 report.entries_indexed += 1;
                             }
                         }
@@ -895,43 +895,43 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_zig_index_backend_insert_search_delete() {
+    fn test_rust_index_backend_insert_search_delete() {
         let index = IndexDefinition::new_with_backend(
             "idx_users_id".to_string(),
             "users".to_string(),
             vec!["id".to_string()],
             false,
-            IndexBackendKind::Zig,
+            IndexBackendKind::Rust,
         )
-        .expect("create Zig-backed index");
+        .expect("create Rust-backed index");
 
-        let value = ZigObjRef::new(4242);
-        index.insert(42, value).expect("insert into Zig index");
+        let value = ObjRef::new(4242);
+        index.insert(42, value).expect("insert into Rust index");
 
-        let found = index.search(42).expect("search in Zig index");
+        let found = index.search(42).expect("search in Rust index");
         assert_eq!(found, Some(value));
 
-        let deleted = index.delete(42).expect("delete in Zig index");
+        let deleted = index.delete(42).expect("delete in Rust index");
         assert!(deleted);
         let found_after = index.search(42).expect("search after delete");
         assert!(found_after.is_none());
     }
 
     #[test]
-    fn test_zig_index_backend_unique_constraint() {
+    fn test_rust_index_backend_unique_constraint() {
         let index = IndexDefinition::new_with_backend(
             "idx_users_email".to_string(),
             "users".to_string(),
             vec!["email".to_string()],
             true,
-            IndexBackendKind::Zig,
+            IndexBackendKind::Rust,
         )
-        .expect("create Zig-backed unique index");
+        .expect("create Rust-backed unique index");
 
         index
-            .insert(7, ZigObjRef::new(1001))
+            .insert(7, ObjRef::new(1001))
             .expect("first insert should succeed");
-        let second = index.insert(7, ZigObjRef::new(1002));
+        let second = index.insert(7, ObjRef::new(1002));
         assert!(
             second.is_err(),
             "second insert should violate unique constraint"
@@ -944,29 +944,29 @@ mod tests {
         let catalog = temp.path().join("indexes.json");
 
         let manager =
-            IndexManager::new_with_backend(Arc::new(RealClock::new()), IndexBackendKind::Zig);
+            IndexManager::new_with_backend(Arc::new(RealClock::new()), IndexBackendKind::Rust);
         let idx = manager
             .create_index("users", vec!["id".to_string()], true)
             .expect("create index");
-        idx.insert(11, ZigObjRef::new(1111)).expect("insert 11");
-        idx.insert(22, ZigObjRef::new(2222)).expect("insert 22");
+        idx.insert(11, ObjRef::new(1111)).expect("insert 11");
+        idx.insert(22, ObjRef::new(2222)).expect("insert 22");
         manager.save_catalog(&catalog).expect("save catalog");
 
         let loaded = IndexManager::load_catalog_with_backend(
             &catalog,
             Arc::new(RealClock::new()),
-            IndexBackendKind::Zig,
+            IndexBackendKind::Rust,
         )
         .expect("load catalog");
         let indexes = loaded.get_indexes("users").expect("get indexes");
         let loaded_idx = indexes.first().expect("index exists");
         assert_eq!(
             loaded_idx.search(11).expect("search 11"),
-            Some(ZigObjRef::new(1111))
+            Some(ObjRef::new(1111))
         );
         assert_eq!(
             loaded_idx.search(22).expect("search 22"),
-            Some(ZigObjRef::new(2222))
+            Some(ObjRef::new(2222))
         );
     }
 

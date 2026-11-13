@@ -485,15 +485,15 @@ mod tests {
     use super::*;
     use crate::document::Document;
     use crate::parser::OQLQuery;
-    use crate::storage::zig_adapter::ZigStore;
+    use crate::storage::RustStore;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    fn create_test_store() -> (Arc<ZigStore>, TempDir) {
+    fn create_test_store() -> (Arc<RustStore>, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("test.owl");
-        let store = Arc::new(ZigStore::new(path.to_str().unwrap(), 10 * 1024 * 1024).unwrap());
+        let store = Arc::new(RustStore::new(path.to_str().unwrap(), 10 * 1024 * 1024).unwrap());
         (store, temp_dir)
     }
 

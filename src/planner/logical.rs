@@ -129,6 +129,19 @@ impl LogicalPlanner {
             Operation::Limit(limit) => Ok(PlanNode::new(PlanType::Limit)
                 .with_child(input)
                 .with_limit(*limit)),
+            Operation::Offset(offset) => Ok(PlanNode::new(PlanType::Offset)
+                .with_child(input)
+                .with_offset(*offset)),
+            Operation::First => Ok(PlanNode::new(PlanType::Limit)
+                .with_child(input)
+                .with_limit(1)),
+            Operation::Exists => Ok(PlanNode::new(PlanType::Aggregate)
+                .with_child(input)
+                .with_aggregates(vec![AggregateSpec {
+                    function: AggregateFunction::Exists,
+                    field: None,
+                    alias: Some("exists".to_string()),
+                }])),
 
             Operation::GroupBy(group_by_block) => {
                 let fields: Vec<String> = group_by_block
@@ -290,6 +303,24 @@ impl LogicalPlanner {
                 Ok(PlanNode::new(PlanType::Insert).with_schema(schema.to_string()))
             }
 
+            Operation::Upsert(upsert) => {
+                let mut field_updates = HashMap::new();
+                for field in &upsert.fields {
+                    if let Some(registry) = &self.schema_registry {
+                        let expr_type = self.infer_expression_type(&field.value, schema)?;
+                        if let Ok(Some(field_type)) = registry.get_field_type(schema, &field.name) {
+                            self.validate_type_compatibility(&expr_type, &field_type)?;
+                        }
+                    }
+                    field_updates.insert(field.name.clone(), field.value.clone());
+                }
+                // Upsert remains on the general single-node executor. The
+                // logical write shape is insert-like for validation/explain.
+                Ok(PlanNode::new(PlanType::Insert)
+                    .with_schema(schema.to_string())
+                    .with_field_updates(field_updates))
+            }
+
             Operation::Update(update_block) => {
                 let mut field_updates = HashMap::new();
 
@@ -438,6 +469,7 @@ impl LogicalPlanner {
             Literal::Integer(_) => FieldType::Integer,
             Literal::Float(_) => FieldType::Float,
             Literal::Boolean(_) => FieldType::Boolean,
+            Literal::Null => FieldType::Optional(Box::new(FieldType::Object)),
         }
     }
 
@@ -468,6 +500,7 @@ impl LogicalPlanner {
                 }
             }
             "length" | "len" => Ok(FieldType::Integer),
+            "exists" | "is_null" | "is_missing" | "is_broken_ref" => Ok(FieldType::Boolean),
             "upper" | "lower" | "trim" => Ok(FieldType::String),
             "now" => Ok(FieldType::DateTime),
             _ => Err(OQLError::FunctionError {

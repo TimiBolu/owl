@@ -22,6 +22,9 @@ pub trait FileSystem: Send + Sync {
     /// Remove a file
     fn remove(&self, path: &Path) -> io::Result<()>;
 
+    /// Atomically move a file within the same filesystem.
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+
     /// Check if a file exists
     fn exists(&self, path: &Path) -> bool;
 
@@ -40,8 +43,18 @@ pub trait FileHandle: Send + Sync {
     /// Read data from file
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize>;
 
+    /// Read data at an absolute offset without changing the shared cursor.
+    ///
+    /// Immutable storage segments use positional reads so thousands of
+    /// logical segment handles can share one operating-system file handle
+    /// without serializing unrelated reads or exhausting descriptor limits.
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize>;
+
     /// Write data to file
     fn write(&mut self, buf: &[u8]) -> io::Result<usize>;
+
+    /// Write data at an absolute offset without changing the shared cursor.
+    fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize>;
 
     /// Flush data to storage (may not be durable until sync)
     fn flush(&mut self) -> io::Result<()>;
@@ -57,6 +70,9 @@ pub trait FileHandle: Send + Sync {
 
     /// Get file size
     fn size(&self) -> io::Result<u64>;
+
+    /// Truncate or extend the file to an exact length.
+    fn set_len(&mut self, len: u64) -> io::Result<()>;
 }
 
 /// Memory map abstraction
@@ -287,6 +303,21 @@ impl FileSystem for SimulatedFileSystem {
         Ok(())
     }
 
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        if self.is_crashed() {
+            return Err(io::Error::new(io::ErrorKind::Other, "File system crashed"));
+        }
+        if self.should_fail() {
+            return Err(io::Error::new(io::ErrorKind::Other, "Injected failure"));
+        }
+        let mut files = self.files.lock().unwrap();
+        let file = files
+            .remove(from)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "File not found"))?;
+        files.insert(to.to_path_buf(), file);
+        Ok(())
+    }
+
     fn exists(&self, path: &Path) -> bool {
         if self.is_crashed() {
             return false;
@@ -372,6 +403,18 @@ impl FileHandle for SimulatedFileHandle {
         Ok(bytes_to_read)
     }
 
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        let file = self.file.lock().unwrap();
+        let start = usize::try_from(offset)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset exceeds usize"))?;
+        let end = std::cmp::min(start.saturating_add(buf.len()), file.data.len());
+        let bytes_to_read = end.saturating_sub(start);
+        if bytes_to_read > 0 {
+            buf[..bytes_to_read].copy_from_slice(&file.data[start..end]);
+        }
+        Ok(bytes_to_read)
+    }
+
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut file = self.file.lock().unwrap();
         let start = file.position as usize;
@@ -386,6 +429,21 @@ impl FileHandle for SimulatedFileHandle {
         file.position += buf.len() as u64;
         file.is_synced = false;
 
+        Ok(buf.len())
+    }
+
+    fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+        let mut file = self.file.lock().unwrap();
+        let start = usize::try_from(offset)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset exceeds usize"))?;
+        let end = start
+            .checked_add(buf.len())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "write range overflows"))?;
+        if end > file.data.len() {
+            file.data.resize(end, 0);
+        }
+        file.data[start..end].copy_from_slice(buf);
+        file.is_synced = false;
         Ok(buf.len())
     }
 
@@ -427,6 +485,14 @@ impl FileHandle for SimulatedFileHandle {
 
     fn size(&self) -> io::Result<u64> {
         Ok(self.file.lock().unwrap().data.len() as u64)
+    }
+
+    fn set_len(&mut self, len: u64) -> io::Result<()> {
+        let mut file = self.file.lock().unwrap();
+        file.data.resize(len as usize, 0);
+        file.position = file.position.min(len);
+        file.is_synced = false;
+        Ok(())
     }
 }
 
@@ -482,12 +548,13 @@ impl Default for RealFileSystem {
 impl FileSystem for RealFileSystem {
     fn create(&self, path: &Path) -> io::Result<Box<dyn FileHandle>> {
         let file = File::create(path)?;
-        Ok(Box::new(RealFileHandle { file }))
+        sync_parent_directory(path)?;
+        Ok(Box::new(RealFileHandle { file, position: 0 }))
     }
 
     fn open(&self, path: &Path) -> io::Result<Box<dyn FileHandle>> {
         let file = File::open(path)?;
-        Ok(Box::new(RealFileHandle { file }))
+        Ok(Box::new(RealFileHandle { file, position: 0 }))
     }
 
     fn open_with_options(
@@ -504,11 +571,26 @@ impl FileSystem for RealFileSystem {
             .append(options.append);
 
         let file = open_options.open(path)?;
-        Ok(Box::new(RealFileHandle { file }))
+        let position = if options.append {
+            file.metadata()?.len()
+        } else {
+            0
+        };
+        Ok(Box::new(RealFileHandle { file, position }))
     }
 
     fn remove(&self, path: &Path) -> io::Result<()> {
-        std::fs::remove_file(path)
+        std::fs::remove_file(path)?;
+        sync_parent_directory(path)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        std::fs::rename(from, to)?;
+        sync_parent_directory(from)?;
+        if from.parent() != to.parent() {
+            sync_parent_directory(to)?;
+        }
+        Ok(())
     }
 
     fn exists(&self, path: &Path) -> bool {
@@ -536,18 +618,69 @@ impl FileSystem for RealFileSystem {
     }
 }
 
+#[cfg(unix)]
+fn sync_parent_directory(path: &Path) -> io::Result<()> {
+    File::open(path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 /// Real file handle wrapping std::fs::File
 struct RealFileHandle {
     file: File,
+    position: u64,
 }
 
 impl FileHandle for RealFileHandle {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.file.read(buf)
+        let read = self.file.read(buf)?;
+        self.position = self.position.saturating_add(read as u64);
+        Ok(read)
+    }
+
+    #[cfg(unix)]
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        std::os::unix::fs::FileExt::read_at(&self.file, buf, offset)
+    }
+
+    #[cfg(windows)]
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        std::os::windows::fs::FileExt::seek_read(&self.file, buf, offset)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn read_at(&self, _buf: &mut [u8], _offset: u64) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "positional file reads are unsupported on this platform",
+        ))
     }
 
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.file.write(buf)
+        let written = self.file.write(buf)?;
+        self.position = self.position.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    #[cfg(unix)]
+    fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+        std::os::unix::fs::FileExt::write_at(&self.file, buf, offset)
+    }
+
+    #[cfg(windows)]
+    fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
+        std::os::windows::fs::FileExt::seek_write(&self.file, buf, offset)
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn write_at(&self, _buf: &[u8], _offset: u64) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "positional file writes are unsupported on this platform",
+        ))
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -559,17 +692,22 @@ impl FileHandle for RealFileHandle {
     }
 
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.file.seek(pos)
+        let position = self.file.seek(pos)?;
+        self.position = position;
+        Ok(position)
     }
 
     fn position(&self) -> u64 {
-        // This is an approximation - real implementation would track position
-        0
+        self.position
     }
 
     fn size(&self) -> io::Result<u64> {
         let metadata = self.file.metadata()?;
         Ok(metadata.len())
+    }
+
+    fn set_len(&mut self, len: u64) -> io::Result<()> {
+        self.file.set_len(len)
     }
 }
 
@@ -596,6 +734,26 @@ mod tests {
         let bytes_read = file.read(&mut buf).unwrap();
         assert_eq!(bytes_read, 13);
         assert_eq!(&buf, b"Hello, World!");
+    }
+
+    #[test]
+    fn positional_io_does_not_move_the_shared_cursor() {
+        let fs = SimulatedFileSystem::new(43);
+        let path = Path::new("positional.txt");
+        let mut file = fs.create(path).unwrap();
+        file.write(b"abcdefgh").unwrap();
+        file.seek(SeekFrom::Start(2)).unwrap();
+
+        let mut selected = [0u8; 3];
+        assert_eq!(file.read_at(&mut selected, 4).unwrap(), 3);
+        assert_eq!(&selected, b"efg");
+        assert_eq!(file.position(), 2);
+
+        assert_eq!(file.write_at(b"XYZ", 4).unwrap(), 3);
+        assert_eq!(file.position(), 2);
+        let mut complete = [0u8; 8];
+        assert_eq!(file.read_at(&mut complete, 0).unwrap(), 8);
+        assert_eq!(&complete, b"abcdXYZh");
     }
 
     #[test]
