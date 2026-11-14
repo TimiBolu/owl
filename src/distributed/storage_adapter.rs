@@ -1174,6 +1174,9 @@ mod tests {
             "companies".to_string(),
             HashMap::from([
                 ("id".to_string(), crate::schema::FieldType::String),
+                // The query below selects it, and a query may only name
+                // declared fields.
+                ("name".to_string(), crate::schema::FieldType::String),
                 (
                     "org".to_string(),
                     crate::schema::FieldType::Reference(crate::schema::ReferenceType {
@@ -1192,23 +1195,28 @@ mod tests {
             .unwrap();
         network.put_schema_remote(remote_shard, &companies).unwrap();
 
+        // An id this shard owns, so the store finds the document where it
+        // was put; and the `id` field is the document's identity.
+        let org_id = id_for_shard(&shard_manager, local_shard, "org_doc");
         let local_org = Document::with_id(
-            "org_doc_1".to_string(),
+            org_id.clone(),
             "organizations".to_string(),
-            HashMap::from([("id".to_string(), Value::String("org_1".to_string()))]),
+            HashMap::from([("id".to_string(), Value::String(org_id.clone()))]),
         );
         local_storage.put_document(&local_org).unwrap();
         let local_org_ref = local_storage
-            .get_objref("organizations", &"org_doc_1".to_string())
+            .get_objref("organizations", &org_id)
             .unwrap()
             .expect("local org objref");
 
         let remote_company_id = id_for_shard(&shard_manager, remote_shard, "company_doc");
+        let expected_id = remote_company_id.clone();
         let remote_company = Document::with_id(
             remote_company_id.clone(),
             "companies".to_string(),
             HashMap::from([
-                ("id".to_string(), Value::String("c1".to_string())),
+                // A document's `id` field is its identity.
+                ("id".to_string(), Value::String(remote_company_id.clone())),
                 ("name".to_string(), Value::String("Remote Co".to_string())),
                 ("org".to_string(), Value::Reference(local_org_ref)),
             ]),
@@ -1217,7 +1225,7 @@ mod tests {
         network.add_reverse_reference(
             remote_shard,
             "organizations",
-            "org_doc_1",
+            &org_id,
             ReverseReferenceEntry {
                 source_schema: "companies".to_string(),
                 source_id: remote_company_id,
@@ -1233,14 +1241,16 @@ mod tests {
         ));
         let executor = QueryExecutor::new(dist_storage, Arc::new(RealClock::new()));
 
-        let query =
-            parse_oql(r#"companies.where { .org.id == "org_1" }.select { id, name }"#).unwrap();
+        let query = parse_oql(&format!(
+            r#"companies.where {{ .org.id == "{org_id}" }}.select {{ id, name }}"#
+        ))
+        .unwrap();
         let results = executor.execute_query(&query).unwrap();
 
         assert_eq!(results.len(), 1);
         assert_eq!(
             results[0].fields.get("id"),
-            Some(&Value::String("c1".to_string()))
+            Some(&Value::String(expected_id))
         );
 
         std::fs::remove_file("test_dist_exec_refs.owl").ok();

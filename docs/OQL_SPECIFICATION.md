@@ -304,7 +304,7 @@ Gaps found:
 | Gap | Status |
 |---|---|
 | `length(list)` | Works. `length` counts the characters of text and the elements of a list. |
-| Regular expression match | Proposed: `matches(text, pattern)`. One function, no operator. |
+| Regular expression match | Works: `matches(text, pattern)`. One function, no operator. The pattern is found anywhere in the text unless anchored with `^` and `$`; `(?i)` at its start ignores case. Matching time grows with the text only: there are no back-references or look-around. Null, or a value that is not text, matches nothing; a pattern that does not parse is an error. A leading `where { matches(.field, "^prefix..") }` reads only the range of the field that starts with the prefix, through an index when the field has one. |
 | `to_bool`, `to_datetime`, `days_until(from, to)`, `days_since(as_of, earlier)` | Works |
 | List helpers beyond collection operations | Out. `where`, `select`, `sort`, `count` and the rest already apply to lists. |
 

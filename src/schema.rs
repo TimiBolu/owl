@@ -382,6 +382,11 @@ impl DocumentSystemField {
     ];
 
     pub fn from_name(name: &str) -> Option<Self> {
+        // Asked for every field of every scanned row, and nearly always
+        // answered "no": settle that on the first byte.
+        if !matches!(name.as_bytes().first(), Some(b'i' | b's' | b'c' | b'u' | b'v')) {
+            return None;
+        }
         match name {
             "id" => Some(Self::Id),
             "schema" => Some(Self::Schema),
@@ -844,13 +849,13 @@ mod tests {
 
         let schema = Schema::new("orders".to_string(), fields);
 
+        // A reference is a pointer the store hands out, not text.
+        let customer = Value::Reference(crate::document::ObjRef::from_parts(1, 123, 1));
+
         // Test valid reference
         let mut doc_fields = HashMap::new();
         doc_fields.insert("name".to_string(), Value::String("Order 1".to_string()));
-        doc_fields.insert(
-            "customer".to_string(),
-            Value::reference_from_string("cust_123".to_string()),
-        );
+        doc_fields.insert("customer".to_string(), customer.clone());
         assert!(schema.validate_document(&doc_fields).is_ok());
 
         // Test null required reference (should fail)
@@ -862,10 +867,7 @@ mod tests {
         // Test null optional reference (should pass)
         let mut doc_fields = HashMap::new();
         doc_fields.insert("name".to_string(), Value::String("Order 1".to_string()));
-        doc_fields.insert(
-            "customer".to_string(),
-            Value::reference_from_string("cust_123".to_string()),
-        );
+        doc_fields.insert("customer".to_string(), customer);
         doc_fields.insert("optional_ref".to_string(), Value::Null);
         assert!(schema.validate_document(&doc_fields).is_ok());
 

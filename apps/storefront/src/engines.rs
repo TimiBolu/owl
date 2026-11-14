@@ -7,7 +7,6 @@ use owl_db::storage::RustStore;
 use owl_db::{execute_oql_file, parse_oql, parse_oql_file, QueryExecutor, Value};
 use rusqlite::types::ValueRef;
 use serde_json::{json, Map, Value as Json};
-use std::fmt::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -75,87 +74,120 @@ impl Owl {
             .map_err(|error| anyhow!("checkpoint: {error}"))
     }
 
-    /// Load through the language: each batch is one `insert [ .. ]`
-    /// statement, which Owl commits with one durable write.
+    /// Load with prepared inserts: each batch is one call that hands Owl
+    /// field values, which it types, validates and commits with one durable
+    /// write. This is what SQLite's prepared statements are compared with.
     pub fn load(&self, data: &Dataset) -> Result<()> {
+        let text = |value: &str| Value::String(value.to_string());
         let roots: Vec<_> = data.categories.iter().filter(|c| c.parent.is_none()).collect();
         let leaves: Vec<_> = data.categories.iter().filter(|c| c.parent.is_some()).collect();
-        self.insert("categories", &roots, |c, out| {
-            write!(out, "{{ id: {}, name: {} }}", text(&c.id), text(&c.name))
+        self.insert("categories", &roots, |c| {
+            vec![("id", text(&c.id)), ("name", text(&c.name))]
         })?;
-        self.insert("categories", &leaves, |c, out| {
-            write!(
-                out,
-                "{{ id: {}, name: {}, parent: {} }}",
-                text(&c.id),
-                text(&c.name),
-                text(c.parent.as_deref().unwrap_or_default())
-            )
+        self.insert("categories", &leaves, |c| {
+            vec![
+                ("id", text(&c.id)),
+                ("name", text(&c.name)),
+                ("parent", text(c.parent.as_deref().unwrap_or_default())),
+            ]
         })?;
-        self.insert("products", &data.products.iter().collect::<Vec<_>>(), |p, out| {
-            write!(
-                out,
-                "{{ id: {}, name: {}, category: {}, price: {:.2}, stock: {}, embedding: [",
-                text(&p.id),
-                text(&p.name),
-                text(&p.category),
-                p.price,
-                p.stock
-            )?;
-            for (index, component) in p.embedding.iter().enumerate() {
-                write!(out, "{}{component:.3}", if index == 0 { "" } else { ", " })?;
-            }
-            out.write_str("] }")
+        self.insert("products", &data.products.iter().collect::<Vec<_>>(), |p| {
+            vec![
+                ("id", text(&p.id)),
+                ("name", text(&p.name)),
+                ("category", text(&p.category)),
+                ("price", Value::Float(p.price)),
+                ("stock", Value::Integer(p.stock as i64)),
+                (
+                    "embedding",
+                    Value::List(
+                        p.embedding
+                            .iter()
+                            .map(|component| Value::Float(f64::from(*component)))
+                            .collect(),
+                    ),
+                ),
+            ]
         })?;
-        self.insert("customers", &data.customers.iter().collect::<Vec<_>>(), |c, out| {
-            write!(
-                out,
-                "{{ id: {}, name: {}, email: {}, tier: {}, country: {}, joined: {}, address: {{ city: {}, zip: {} }} }}",
-                text(&c.id), text(&c.name), text(&c.email), text(c.tier), text(c.country),
-                text(&c.joined), text(&c.city), text(&c.zip)
-            )
+        self.insert("customers", &data.customers.iter().collect::<Vec<_>>(), |c| {
+            vec![
+                ("id", text(&c.id)),
+                ("name", text(&c.name)),
+                ("email", text(&c.email)),
+                ("tier", text(c.tier)),
+                ("country", text(c.country)),
+                ("joined", text(&c.joined)),
+                (
+                    "address",
+                    Value::Object(
+                        [("city", text(&c.city)), ("zip", text(&c.zip))]
+                            .into_iter()
+                            .map(|(name, value)| (name.to_string(), value))
+                            .collect(),
+                    ),
+                ),
+            ]
         })?;
-        self.insert("orders", &data.orders.iter().collect::<Vec<_>>(), |o, out| {
-            write!(
-                out,
-                "{{ id: {}, customer: {}, status: {}, placed: {}, total: {:.2}, items: [",
-                text(&o.id), text(&o.customer), text(o.status), text(&o.placed), o.total
-            )?;
-            for (index, item) in o.items.iter().enumerate() {
-                write!(
-                    out,
-                    "{}{{ product: {}, qty: {}, price: {:.2} }}",
-                    if index == 0 { "" } else { ", " },
-                    text(&item.product), item.qty, item.price
-                )?;
-            }
-            out.write_str("] }")
+        self.insert("orders", &data.orders.iter().collect::<Vec<_>>(), |o| {
+            vec![
+                ("id", text(&o.id)),
+                ("customer", text(&o.customer)),
+                ("status", text(o.status)),
+                ("placed", text(&o.placed)),
+                ("total", Value::Float(o.total)),
+                (
+                    "items",
+                    Value::List(
+                        o.items
+                            .iter()
+                            .map(|item| {
+                                Value::Object(
+                                    [
+                                        ("product", text(&item.product)),
+                                        ("qty", Value::Integer(item.qty as i64)),
+                                        ("price", Value::Float(item.price)),
+                                    ]
+                                    .into_iter()
+                                    .map(|(name, value)| (name.to_string(), value))
+                                    .collect(),
+                                )
+                            })
+                            .collect(),
+                    ),
+                ),
+            ]
         })?;
-        self.insert("payments", &data.payments.iter().collect::<Vec<_>>(), |p, out| {
-            write!(
-                out,
-                "{{ id: {}, order: {}, method: {}, amount: {:.2}, paid_at: {} }}",
-                text(&p.id), text(&p.order), text(p.method), p.amount, text(&p.paid_at)
-            )
+        self.insert("payments", &data.payments.iter().collect::<Vec<_>>(), |p| {
+            vec![
+                ("id", text(&p.id)),
+                ("order", text(&p.order)),
+                ("method", text(p.method)),
+                ("amount", Value::Float(p.amount)),
+                ("paid_at", text(&p.paid_at)),
+            ]
         })?;
-        self.insert("reviews", &data.reviews.iter().collect::<Vec<_>>(), |r, out| {
-            write!(
-                out,
-                "{{ id: {}, product: {}, customer: {}, rating: {}, body: {}, written: {} }}",
-                text(&r.id), text(&r.product), text(&r.customer), r.rating, text(&r.body),
-                text(&r.written)
-            )
+        self.insert("reviews", &data.reviews.iter().collect::<Vec<_>>(), |r| {
+            vec![
+                ("id", text(&r.id)),
+                ("product", text(&r.product)),
+                ("customer", text(&r.customer)),
+                ("rating", Value::Integer(r.rating as i64)),
+                ("body", text(&r.body)),
+                ("written", text(&r.written)),
+            ]
         })?;
-        self.insert("tickets", &data.tickets.iter().collect::<Vec<_>>(), |t, out| {
-            write!(
-                out,
-                "{{ id: {}, customer: {}, status: {}, priority: {}, opened: {}",
-                text(&t.id), text(&t.customer), text(t.status), t.priority, text(&t.opened)
-            )?;
+        self.insert("tickets", &data.tickets.iter().collect::<Vec<_>>(), |t| {
+            let mut fields = vec![
+                ("id", text(&t.id)),
+                ("customer", text(&t.customer)),
+                ("status", text(t.status)),
+                ("priority", Value::Integer(t.priority as i64)),
+                ("opened", text(&t.opened)),
+            ];
             if let Some(order) = &t.order {
-                write!(out, ", order: {}", text(order))?;
+                fields.push(("order", text(order)));
             }
-            out.write_str(" }")
+            fields
         })
     }
 
@@ -163,27 +195,24 @@ impl Owl {
         &self,
         collection: &str,
         rows: &[&T],
-        render: impl Fn(&T, &mut String) -> std::fmt::Result,
+        fields: impl Fn(&T) -> Vec<(&'static str, Value)>,
     ) -> Result<()> {
         for batch in rows.chunks(BATCH) {
-            let mut statement = format!("{collection}.insert [\n");
-            for row in batch {
-                render(row, &mut statement)?;
-                statement.push_str(",\n");
-            }
-            // No separator after the last document.
-            statement.truncate(statement.len() - 2);
-            statement.push_str("\n]");
-            self.query(&statement)
-                .with_context(|| format!("loading {collection}"))?;
+            let documents = batch
+                .iter()
+                .map(|row| {
+                    fields(row)
+                        .into_iter()
+                        .map(|(name, value)| (name.to_string(), value))
+                        .collect()
+                })
+                .collect();
+            self.executor
+                .insert_documents(collection, documents)
+                .map_err(|error| anyhow!("loading {collection}: {error}"))?;
         }
         Ok(())
     }
-}
-
-/// An OQL string literal.
-fn text(value: &str) -> String {
-    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn owl_json(value: &Value) -> Json {

@@ -536,6 +536,12 @@ impl LogicalPlanner {
             (FieldType::String, ComparisonOperator::EndsWith) => Ok(()),
             (FieldType::String, ComparisonOperator::Equal) => Ok(()),
             (FieldType::String, ComparisonOperator::NotEqual) => Ok(()),
+            // Text is ordered byte by byte everywhere it is compared: by
+            // the evaluator, by storage and in index keys.
+            (FieldType::String, ComparisonOperator::LessThan) => Ok(()),
+            (FieldType::String, ComparisonOperator::GreaterThan) => Ok(()),
+            (FieldType::String, ComparisonOperator::LessEqual) => Ok(()),
+            (FieldType::String, ComparisonOperator::GreaterEqual) => Ok(()),
 
             // Numeric operators
             (FieldType::Integer, ComparisonOperator::LessThan) => Ok(()),

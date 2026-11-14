@@ -30,5 +30,5 @@ pub use object_ref::ObjRef;
 pub(crate) use record::{BorrowedRecordValue, CompiledSchema, RecordCodec, RecordView};
 pub use store::{
     AutoCheckpointPolicy, IntegrityReport, MaintenanceStatus, ReclamationReport, RustStore,
-    StorageLayoutStats, WriteOperation,
+    StorageLayoutStats, TransactionBinding, WriteOperation,
 };

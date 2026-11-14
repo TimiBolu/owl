@@ -165,17 +165,22 @@ impl PhysicalPlanner {
                 }
             }
             PhysicalOperator::Sort(mut sort) => {
-                let mut fields = required_fields.unwrap_or_default();
-                for spec in &sort.sort_specs {
-                    if let Expression::FieldAccess(field) = &spec.expression {
-                        if field.path.len() == 1 {
-                            fields.insert(field.path[0].clone());
+                // No required fields means every field: the rows are
+                // returned whole. Only a narrower set needs the sort keys
+                // added to it.
+                let mut fields = required_fields;
+                if let Some(required) = &mut fields {
+                    for spec in &sort.sort_specs {
+                        if let Expression::FieldAccess(field) = &spec.expression {
+                            if field.path.len() == 1 {
+                                required.insert(field.path[0].clone());
+                            }
                         }
                     }
                 }
                 sort.input = Box::new(Self::fuse_storage_owned_scans(
                     *sort.input,
-                    Some(fields),
+                    fields,
                     filters,
                 ));
                 PhysicalOperator::Sort(sort)

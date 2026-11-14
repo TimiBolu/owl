@@ -81,6 +81,12 @@ impl<'a> ProjectedRowRef<'a> {
             .map(|rows| (rows, rows.indices[self.index]))
     }
 
+    /// The whole stored document, when this row is backed by one that is
+    /// already in memory. It may hold more fields than were asked for.
+    pub fn document(&self) -> Option<&'a Document> {
+        self.shared()
+    }
+
     pub fn id(&self) -> &'a str {
         if let Some(document) = self.shared() {
             document.id.as_str()
@@ -687,6 +693,22 @@ pub trait DocumentStore: Send + Sync + 'static {
         Ok(documents)
     }
 
+    /// Run `work`, which reads and then writes through this store, so that
+    /// its writes apply only if what it wrote had not been changed by
+    /// someone else since it began. A store that can tell runs `work` again
+    /// when it had been, so `work` must compute its writes afresh each
+    /// time. The default runs it once, for stores with a single writer.
+    fn run_atomically(&self, work: &mut dyn FnMut() -> OQLResult<()>) -> OQLResult<()> {
+        work()
+    }
+
+    /// Whether a document with this id exists, counting what the open
+    /// transaction has written. A store answers without reading the
+    /// document when it can.
+    fn document_exists(&self, schema: &str, id: &DocumentId) -> OQLResult<bool> {
+        Ok(self.get_document(schema, id)?.is_some())
+    }
+
     /// The reference by which stored documents point at this document, when
     /// the store can say without reading it.
     fn object_ref_of(
@@ -762,6 +784,15 @@ pub trait DocumentStore: Send + Sync + 'static {
         _object_ref: &crate::document::ObjRef,
     ) -> OQLResult<Option<Document>> {
         Ok(None)
+    }
+
+    /// The document a reference points at, shared rather than copied when
+    /// the store already holds it.
+    fn navigate_reference_shared(
+        &self,
+        object_ref: &crate::document::ObjRef,
+    ) -> OQLResult<Option<Arc<Document>>> {
+        Ok(self.navigate_reference(object_ref)?.map(Arc::new))
     }
 
     fn navigate_references(
@@ -991,5 +1022,21 @@ pub fn create_storage_with_fs(
 }
 
 pub fn create_storage(path: &str, size: usize) -> OQLResult<Storage> {
+    #[cfg(test)]
+    let path = &unit_test_path(path);
     Ok(Arc::new(RustStore::new(path, size)?))
+}
+
+/// Where a unit test's database goes: a directory of this test process's
+/// own. Unit tests name their databases with fixed relative paths; opened
+/// where they stand, a file left by an earlier run, possibly in an older
+/// format, is read back as if it were this run's.
+#[cfg(test)]
+fn unit_test_path(path: &str) -> String {
+    static DIRECTORY: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    if std::path::Path::new(path).is_absolute() {
+        return path.to_string();
+    }
+    let directory = DIRECTORY.get_or_init(|| tempfile::TempDir::new().expect("a temporary directory"));
+    directory.path().join(path).to_string_lossy().into_owned()
 }
