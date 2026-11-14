@@ -1,0 +1,137 @@
+// Owl Query Language - Improved Syntax (Revised)
+// Goals:
+// 1) Prefer function-first composition over `query` declarations.
+// 2) Avoid inline `collection where ...` clauses.
+// 3) Use a more OQL-native model: refs + nested objects for deep access.
+
+// ============================================================================
+// SCHEMA DEFINITIONS (Less over-normalized, more nested + ref-aware)
+// ============================================================================
+
+schema organizations {
+    id: String,
+    name: String,
+    profile: Object,
+    settings: Object,
+    created_at: DateTime
+}
+
+schema companies {
+    id: String,
+    org: Ref(organizations),
+    legal_name: String,
+    status: String,
+    risk: Object,
+    contacts: Object,
+    timeline: Object,
+    created_at: DateTime
+}
+
+schema findings {
+    id: String,
+    company: Ref(companies),
+    category: String,
+    title: String,
+    severity: String,
+    visibility: Object,
+    workflow: Object,
+    metadata: Object,
+    created_at: DateTime,
+    updated_at: DateTime
+}
+
+schema finding_changes {
+    id: String,
+    finding: Ref(findings),
+    delta: Object,
+    actor: Object,
+    changed_at: DateTime
+}
+
+// ============================================================================
+// FUNCTION-FIRST STYLE (No `query` keyword)
+// ============================================================================
+
+fn is_active_company(c: companies) -> Bool {
+    c.status == "ASSESSMENT_REQUIRED" || c.status == "RE_ASSESSMENT_REQUIRED"
+}
+
+fn is_open_finding(f: findings) -> Bool {
+    f.workflow.status == "OPEN" || f.workflow.status == "ONGOING"
+}
+
+fn is_high_or_critical(f: findings) -> Bool {
+    f.severity == "HIGH" || f.severity == "CRITICAL"
+}
+
+fn company_display_name(c: companies) -> String {
+    c.contacts.display_name || c.legal_name
+}
+
+// ============================================================================
+// COMPOSED QUERIES (No inline `... where ...` in aggregate arguments)
+// ============================================================================
+
+openFindings = findings
+    .where { is_open_finding(*) }
+
+// 1) Top companies with open high-risk findings.
+companies
+    .where { is_active_company(*) }
+    .select {
+        id,
+        name: company_display_name(*),
+        org_name: .org.name,
+        org_region: .org.profile.region,
+        risk_level: .risk.current,
+        open_findings: openFindings.where { .company.id == companies.id }.count(),
+        high_or_critical_open: openFindings.where {
+            .company.id == companies.id && is_high_or_critical(*)
+        }.count()
+    }
+    .sort { high_or_critical_open.desc, open_findings.desc }
+    .limit(20)
+
+// 2) Findings with deep nested access through company -> organization.
+openFindings
+    .select {
+        id,
+        title,
+        severity,
+        company_name: .company.legal_name,
+        company_status: .company.status,
+        org_name: .company.org.name,
+        org_tier: .company.org.settings.tier,
+        owner_email: .company.contacts.primary.email,
+        first_seen: .metadata.lifecycle.first_seen_at
+    }
+    .sort { severity.desc, created_at.desc }
+    .limit(50)
+
+// 3) Companies currently in assessment with duration hints from nested timeline.
+companies
+    .where {
+        .status == "ASSESSMENT_REQUIRED" || .status == "RE_ASSESSMENT_REQUIRED"
+    }
+    .select {
+        id,
+        name: company_display_name(*),
+        org_id: .org.id,
+        org_name: .org.name,
+        current_status: .status,
+        entered_assessment_at: .timeline.assessment.entered_at,
+        assessment_owner: .timeline.assessment.owner,
+        days_in_assessment: (.timeline.assessment.entered_at || .created_at).days_until(now())
+    }
+    .sort { days_in_assessment.desc }
+
+// 4) Simple severity summary by organization (via nested ref traversal).
+openFindings
+    .group_by { .company.org.id, .company.org.name, .severity }
+    .select {
+        org_id: .company.org.id,
+        org_name: .company.org.name,
+        severity,
+        total: count()
+    }
+    .sort { org_name.asc, severity.desc }

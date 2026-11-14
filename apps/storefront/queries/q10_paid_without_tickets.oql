@@ -1,0 +1,4 @@
+// Customers who have paid for something and never opened a ticket
+customers
+  .where { .orders.where { .status == "paid" }.exists() && !.tickets.exists() }
+  .count()

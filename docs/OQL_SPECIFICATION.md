@@ -253,7 +253,7 @@ literal syntax, and reads and writes are symmetric.
 | Comparison `== != < <= > >=` | Works |
 | Numeric equality across `Integer` and `Float` | Works |
 | Null and mismatched types never order and never fail | Works |
-| A reference equals the id of its target | Works for `==`, `!=` and `in`: `orders.where { .user == "u1" }`. On the general executor only; the physical pipeline declines such predicates. |
+| A reference equals the id of its target | Works for `==`, `!=` and `in`: `orders.where { .user == "u1" }`. Served by the reverse-reference index when it is the leading filter, as `.user.id == "u1"` already was. |
 | `&&`, `\|\|`, `!` with short-circuit | Works |
 | `a \|\| b` yields the first present, truthy operand | Works |
 | Membership `x in [..]` | Works |
@@ -325,6 +325,7 @@ Gaps found:
 | List literal or list binding | `names = ["Ada", "Cy"]` | Works for `in`; other operations *(not probed)* |
 | A single referenced or embedded object | `.team.select { name }`, `.profile.select { city }` | Works: yields one object, and shaping can traverse onward (`.team.select { name, org: .org.name }`). |
 | A collection reached through a collection | `.teams.users`, `.teams.users.orders` on an org | Works: each step maps over the rows reached so far and flattens. |
+| A path step in a chain | `orders.where { .status == "paid" }.items.group_by { .product.id }`, `orgs.teams.users.count()` | Works, at the top level and between operations in an expression. Every row is replaced by the rows its path leads to, which is how a query reaches the line items inside its orders. |
 
 ### 6.2 Operations
 
@@ -603,9 +604,11 @@ the core (section 22). Top-k per parent is already expressible (section 8).
 A binding is a name for an expression. Using the name gives the same result
 as writing the expression in its place.
 
-Performance note for the benchmark phase: an uncorrelated nested query,
-bound or inline, is currently re-evaluated for every row it is compared
-against. It should be evaluated once.
+Within one statement a nested query runs once per distinct question. After
+the enclosing row's values are substituted, an uncorrelated nested query is
+the same for every row and runs once; a correlated one runs once per distinct
+value it is correlated on. Nothing is remembered between statements. A nested
+query that reads a function's parameters is never shared.
 
 ---
 

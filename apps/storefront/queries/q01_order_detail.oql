@@ -1,0 +1,7 @@
+// One order with its customer and line items
+orders.where { .id == "o00000042" }.select {
+  id, status, total,
+  customer: .customer.name,
+  country: .customer.country,
+  items: .items.select { product: .product.name, qty, price }
+}

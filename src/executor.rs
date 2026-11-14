@@ -259,6 +259,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
 
     /// Execute an OQL query and return matching documents
     pub fn execute_query(&self, query: &OQLQuery) -> OQLResult<Vec<Document>> {
+        let _statement = StatementGuard::enter();
         profile_call!("execute_query", {
             if let Some(plan) = self.try_plan_safe_read(query)? {
                 self.validate_declared_paths(query)?;
@@ -275,6 +276,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
     /// consumers. Queries outside the safe physical-read subset remain fully
     /// supported by wrapping their established document output in chunks.
     pub fn execute_query_batches(&self, query: &OQLQuery) -> OQLResult<BatchQueryExecution> {
+        let _statement = StatementGuard::enter();
         let planning_started = Instant::now();
         let plan = self.try_plan_safe_read(query)?;
         let planning_elapsed = planning_started.elapsed();
@@ -308,6 +310,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
     /// Planning and execution share one plan, so observability does not cause
     /// a second planner pass or risk describing a different execution.
     pub fn execute_query_with_plan(&self, query: &OQLQuery) -> OQLResult<QueryExecution> {
+        let _statement = StatementGuard::enter();
         profile_call!("execute_query_with_plan", {
             let planning_started = Instant::now();
             let plan = self.try_plan_safe_read(query)?;
@@ -367,6 +370,19 @@ impl<S: DocumentStore> QueryExecutor<S> {
             let scanned_docs =
                 if let Some(prefiltered) = self.prefilter_documents_for_query(query)? {
                     prefiltered
+                } else if let Some(fields) = self.fields_read_by(query) {
+                    // The query shapes its own output and names every field
+                    // it reads, so the rest need not be decoded.
+                    match self.store.scan_documents_filtered_projection(
+                        &query.collection,
+                        &[],
+                        Some(&fields),
+                    )? {
+                        Some(documents) => documents,
+                        None => self
+                            .store
+                            .scan_documents_projection(&query.collection, &fields)?,
+                    }
                 } else {
                     self.scan_collection(&query.collection)?
                 };
@@ -392,6 +408,44 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
 
         Ok(documents)
+    }
+
+    /// How many nested queries this thread has actually executed, as
+    /// opposed to answered from an identical one earlier in the same
+    /// statement. Intended for tests and benchmarks.
+    pub fn nested_queries_run() -> u64 {
+        NESTED_QUERIES_RUN.with(std::cell::Cell::get)
+    }
+
+    /// A collection's schema, read once per statement.
+    fn schema_of(&self, name: &str) -> OQLResult<Option<Arc<Schema>>> {
+        if !StatementGuard::active() {
+            return Ok(self.store.get_schema(name)?.map(Arc::new));
+        }
+        if let Some(known) = STATEMENT.with(|scope| scope.borrow().schemas.get(name).cloned()) {
+            return Ok(known);
+        }
+        let schema = self.store.get_schema(name)?.map(Arc::new);
+        STATEMENT.with(|scope| {
+            scope
+                .borrow_mut()
+                .schemas
+                .insert(name.to_string(), schema.clone())
+        });
+        Ok(schema)
+    }
+
+    /// The names of every collection with a schema, read once per statement.
+    fn schema_names(&self) -> OQLResult<Arc<Vec<String>>> {
+        if !StatementGuard::active() {
+            return Ok(Arc::new(self.store.list_schemas()?));
+        }
+        if let Some(known) = STATEMENT.with(|scope| scope.borrow().schema_names.clone()) {
+            return Ok(known);
+        }
+        let names = Arc::new(self.store.list_schemas()?);
+        STATEMENT.with(|scope| scope.borrow_mut().schema_names = Some(names.clone()));
+        Ok(names)
     }
 
     /// `query.explain()`: one row saying how the query would run, without
@@ -439,7 +493,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
     /// know. With a declared shape, `.nmae` cannot be a missing value; it is
     /// a mistake, and reading it as null would hide that.
     fn validate_declared_paths(&self, query: &OQLQuery) -> OQLResult<()> {
-        let Some(schema) = self.store.get_schema(&query.collection)? else {
+        let Some(schema) = self.schema_of(&query.collection)? else {
             return Ok(());
         };
         // Paths are checked up to the first operation that reshapes rows;
@@ -465,6 +519,10 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 }
                 Operation::Select(_) | Operation::AggregateExpr { .. } => {
                     checked.push(operation);
+                    break;
+                }
+                Operation::Step(path) => {
+                    direct.extend(path.path.first().cloned());
                     break;
                 }
                 Operation::Limit(_)
@@ -562,6 +620,136 @@ impl<S: DocumentStore> QueryExecutor<S> {
         row[right.len()]
     }
 
+    /// The top-level fields of the root collection that `query` can read, or
+    /// `None` when it may need whole rows.
+    ///
+    /// The answer is a superset: names from nested scopes are included,
+    /// which costs a little decoding and never an answer. `None` is returned
+    /// whenever something could observe a field that is not named: a write,
+    /// a result that returns rows unshaped, `*`, the row itself (`.`), a
+    /// bare name, or a user function, whose body may read anything.
+    fn fields_read_by(&self, query: &OQLQuery) -> Option<Vec<String>> {
+        let shapes_rows = |operation: &Operation| {
+            matches!(
+                operation,
+                Operation::Select(_)
+                    | Operation::GroupBy(_)
+                    | Operation::Count
+                    | Operation::Exists
+                    | Operation::Sum(_)
+                    | Operation::Avg(_)
+                    | Operation::Min(_)
+                    | Operation::Max(_)
+                    | Operation::AggregateExpr { .. }
+                    | Operation::Step(_)
+            )
+        };
+        let mut shaped = false;
+        for operation in &query.operations {
+            match operation {
+                Operation::Insert(_)
+                | Operation::InsertMany(_)
+                | Operation::Upsert(_)
+                | Operation::Update(_)
+                | Operation::Delete
+                | Operation::FunctionDef(_)
+                | Operation::Explain => return None,
+                // Comparing whole rows needs whole rows.
+                Operation::Distinct if !shaped => return None,
+                operation => shaped |= shapes_rows(operation),
+            }
+        }
+        if !shaped {
+            return None;
+        }
+
+        fn collect(
+            node: &serde_json::Value,
+            user_function: &dyn Fn(&str) -> bool,
+            fields: &mut HashSet<String>,
+        ) -> bool {
+            match node {
+                serde_json::Value::Object(object) => {
+                    // Any `{ path: [..] }`: a field access, an aggregate's
+                    // path, a group key, a step.
+                    if let Some(path) = object.get("path").and_then(|path| path.as_array()) {
+                        match path.first().and_then(|name| name.as_str()) {
+                            None | Some("*") => return false,
+                            Some(first) => {
+                                fields.insert(first.to_string());
+                            }
+                        }
+                    }
+                    if let Some(name) = object.get("Identifier").and_then(|name| name.as_str()) {
+                        // A bare name may be a field of the row. The marker
+                        // for "the rows in hand" is not; it only matters
+                        // when what it returns is left unshaped.
+                        if name != crate::parser::CURRENT_ROWS
+                            && name != crate::parser::OMITTED_FIELD
+                            && !name.starts_with('$')
+                        {
+                            fields.insert(name.to_string());
+                        }
+                    }
+                    if let Some(call) = object.get("FunctionCall") {
+                        if call
+                            .get("name")
+                            .and_then(|name| name.as_str())
+                            .is_some_and(user_function)
+                        {
+                            return false;
+                        }
+                    }
+                    if let Some(access) = object.get("ChainedAccess") {
+                        // `collection.field` inside a nested query reads
+                        // that field of the enclosing row.
+                        if let Some(field) = access.get("field").and_then(|field| field.as_str()) {
+                            fields.insert(field.to_string());
+                        }
+                    }
+                    if let Some(nested) = object.get("CollectionExpression") {
+                        let over_rows_in_hand = nested
+                            .get("source")
+                            .and_then(|source| source.get("Identifier"))
+                            .and_then(|name| name.as_str())
+                            == Some(crate::parser::CURRENT_ROWS);
+                        let shaped = nested
+                            .get("operations")
+                            .and_then(|operations| operations.as_array())
+                            .is_some_and(|operations| {
+                                operations.iter().any(|operation| {
+                                    [
+                                        "Select", "Count", "Exists", "Sum", "Avg", "Min", "Max",
+                                        "AggregateExpr", "Step", "GroupBy",
+                                    ]
+                                    .iter()
+                                    .any(|kind| {
+                                        operation.get(kind).is_some()
+                                            || operation.as_str() == Some(kind)
+                                    })
+                                })
+                            });
+                        if over_rows_in_hand && !shaped {
+                            return false;
+                        }
+                    }
+                    object
+                        .values()
+                        .all(|value| collect(value, user_function, fields))
+                }
+                serde_json::Value::Array(items) => items
+                    .iter()
+                    .all(|item| collect(item, user_function, fields)),
+                _ => true,
+            }
+        }
+
+        let tree = serde_json::to_value(&query.operations).ok()?;
+        let mut fields = HashSet::new();
+        let user_function = |name: &str| self.functions.get_user_function(name).is_some();
+        collect(&tree, &user_function, &mut fields).then(|| fields.into_iter().collect())
+    }
+
     /// Explain the native indexed read plan selected for this query. `None`
     /// means the query remains on the established general-purpose executor.
     pub fn explain_indexed_read(&self, query: &OQLQuery) -> OQLResult<Option<String>> {
@@ -628,7 +816,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
         // Requiring a schema gives the logical planner enough information to
         // reject comparisons whose literal type does not match the indexed
         // field. That avoids changing OQL's coercion behavior at this boundary.
-        let Some(schema) = self.store.get_schema(&query.collection)? else {
+        let Some(schema) = self.schema_of(&query.collection)? else {
             return Ok(None);
         };
         // The general executor defines what a query means. Hand the planner
@@ -640,7 +828,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
         };
         let query = &query;
         let registry = SchemaRegistry::new();
-        registry.register(schema)?;
+        registry.register(schema.as_ref().clone())?;
         let logical = match LogicalPlanner::with_schema_registry(registry).plan(query) {
             Ok(plan) => plan,
             Err(_) => return Ok(None),
@@ -851,6 +1039,38 @@ impl<S: DocumentStore> QueryExecutor<S> {
             return Ok(None);
         };
 
+        // `.id == "x"` anywhere in the leading conjunction identifies at
+        // most one document, which is stored under that id.
+        fn identified<'a>(condition: &'a Condition) -> Option<&'a Literal> {
+            match condition {
+                Condition::And(left, right) => identified(left).or_else(|| identified(right)),
+                Condition::Comparison {
+                    left: Expression::FieldAccess(FieldAccess { path }),
+                    operator: ComparisonOperator::Equal,
+                    right: Expression::Literal(literal),
+                }
+                | Condition::Comparison {
+                    left: Expression::Literal(literal),
+                    operator: ComparisonOperator::Equal,
+                    right: Expression::FieldAccess(FieldAccess { path }),
+                } if path.len() == 1 && path[0] == "id" => Some(literal),
+                _ => None,
+            }
+        }
+        if let Some(id) = identified(&where_block.condition) {
+            let id = match id {
+                Literal::String(id) => id.clone(),
+                Literal::Integer(id) => id.to_string(),
+                _ => return Ok(Some(Vec::new())),
+            };
+            return Ok(Some(
+                self.store
+                    .get_document(&query.collection, &id)?
+                    .into_iter()
+                    .collect(),
+            ));
+        }
+
         let clauses =
             self.collect_reverse_reference_clauses(&query.collection, &where_block.condition)?;
         if clauses.is_empty() {
@@ -986,15 +1206,21 @@ impl<S: DocumentStore> QueryExecutor<S> {
             Expression::Literal(Literal::String(value)) => value.clone(),
             _ => return Ok(None),
         };
-        if field_access.path.len() < 2 || field_access.path.last().map(String::as_str) != Some("id")
-        {
+        // Either `.user.id == "u1"` or `.user == "u1"`: a reference equals
+        // the id of its target, so both ask for the rows that refer to that
+        // document, which the reverse-reference index answers directly.
+        let reference_path = match field_access.path.split_last() {
+            Some((last, rest)) if last == "id" && !rest.is_empty() => rest,
+            _ => &field_access.path[..],
+        };
+        if reference_path.is_empty() {
             return Ok(None);
         }
         let mut current_schema = source_collection.to_string();
         let mut steps = Vec::new();
 
-        for segment in &field_access.path[..field_access.path.len() - 1] {
-            let Some(schema) = self.store.get_schema(&current_schema)? else {
+        for segment in reference_path {
+            let Some(schema) = self.schema_of(&current_schema)? else {
                 return Ok(None);
             };
             let Some(field_type) = schema.get_field_type(segment) else {
@@ -1030,17 +1256,9 @@ impl<S: DocumentStore> QueryExecutor<S> {
             return Ok(Some(observed_id.to_string()));
         }
 
-        let docs = self.store.scan_documents(target_schema)?;
-        Ok(docs.into_iter().find_map(|doc| {
-            if doc.id == observed_id {
-                Some(doc.id)
-            } else {
-                match doc.fields.get("id") {
-                    Some(Value::String(logical_id)) if logical_id == observed_id => Some(doc.id),
-                    _ => None,
-                }
-            }
-        }))
+        // A document is stored under its id, so there is nowhere else to
+        // look.
+        Ok(None)
     }
 
     /// Apply a single operation to a set of documents
@@ -1088,6 +1306,13 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 self.apply_limit_operation(documents, count)
             }
             Operation::Distinct => self.apply_distinct_operation(documents),
+            Operation::Step(path) => {
+                let mut reached = Vec::new();
+                for document in &documents {
+                    reached.extend(self.path_source_rows(document, &path.path)?.0);
+                }
+                Ok(reached)
+            }
             Operation::Explain => Err(OQLError::Generic {
                 message: "explain() describes a whole query, so it must be its last operation"
                     .to_string(),
@@ -1681,7 +1906,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                             .to_string(),
                     });
                 }
-                (Self::group_rows(scope_document)?, false)
+                (Self::group_rows(scope_document)?.as_ref().clone(), false)
             }
             Expression::FieldAccess(field) if field.path != ["*"] => {
                 self.path_source_rows(scope_document, &field.path)?
@@ -1876,7 +2101,30 @@ impl<S: DocumentStore> QueryExecutor<S> {
 
     /// Decide what an absent name on a stored row means.
     fn reverse_relationship(&self, schema: &str, name: &str) -> OQLResult<ReverseRelationship> {
-        let Some(declared) = self.store.get_schema(schema)? else {
+        let key = (schema.to_string(), name.to_string());
+        if let Some(known) =
+            STATEMENT.with(|scope| scope.borrow().reverse_relationships.get(&key).cloned())
+        {
+            return Ok(known);
+        }
+        let relationship = self.resolve_reverse_relationship(schema, name)?;
+        if StatementGuard::active() {
+            STATEMENT.with(|scope| {
+                scope
+                    .borrow_mut()
+                    .reverse_relationships
+                    .insert(key, relationship.clone())
+            });
+        }
+        Ok(relationship)
+    }
+
+    fn resolve_reverse_relationship(
+        &self,
+        schema: &str,
+        name: &str,
+    ) -> OQLResult<ReverseRelationship> {
+        let Some(declared) = self.schema_of(schema)? else {
             // Without a schema nothing says which fields exist, so the name
             // may be an absent field or a relationship; reading it is
             // graceful either way.
@@ -1894,8 +2142,8 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
         // A relationship named with `as` takes precedence over the name of
         // a collection.
-        for source in self.store.list_schemas()? {
-            let Some(source_schema) = self.store.get_schema(&source)? else {
+        for source in self.schema_names()?.iter().cloned() {
+            let Some(source_schema) = self.schema_of(&source)? else {
                 continue;
             };
             for (field, field_type) in &source_schema.fields {
@@ -1909,8 +2157,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
             }
         }
         let refers = self
-            .store
-            .get_schema(name)?
+            .schema_of(name)?
             .is_some_and(|source| source.fields.values().any(|field| references(field, schema)));
         Ok(if refers {
             ReverseRelationship::Declared {
@@ -1928,7 +2175,40 @@ impl<S: DocumentStore> QueryExecutor<S> {
         query: &crate::parser::OQLQuery,
     ) -> OQLResult<Value> {
         let materialized_query = self.materialize_query_with_scope(query, scope_document)?;
-        let docs = self.execute_query(&materialized_query)?;
+        // Once the enclosing row's values are substituted, the nested query
+        // is self-contained. If another row already asked the same question
+        // in this statement, the answer is the same: an uncorrelated nested
+        // query runs once, and a correlated one runs once per distinct
+        // value it is correlated on. A query that reads function parameters
+        // is not self-contained, so it is never shared.
+        let memo_key = (StatementGuard::active() && !CallFrame::any_active())
+            .then(|| serde_json::to_string(&materialized_query).ok())
+            .flatten();
+        if let Some(key) = &memo_key {
+            if let Some(known) =
+                STATEMENT.with(|scope| scope.borrow().nested_results.get(key).cloned())
+            {
+                return Ok(known);
+            }
+        }
+        let value = self.evaluate_materialized_query(&materialized_query)?;
+        if let Some(key) = memo_key {
+            STATEMENT.with(|scope| {
+                scope
+                    .borrow_mut()
+                    .nested_results
+                    .insert(key, value.clone())
+            });
+        }
+        Ok(value)
+    }
+
+    fn evaluate_materialized_query(
+        &self,
+        materialized_query: &crate::parser::OQLQuery,
+    ) -> OQLResult<Value> {
+        NESTED_QUERIES_RUN.with(|count| count.set(count.get() + 1));
+        let docs = self.execute_query(materialized_query)?;
         let aggregate_field = materialized_query
             .operations
             .last()
@@ -1951,12 +2231,10 @@ impl<S: DocumentStore> QueryExecutor<S> {
             .any(|operation| matches!(operation, Operation::Select(_) | Operation::GroupBy(_)));
         let rows: Vec<Value> = docs
             .into_iter()
-            .map(|doc| {
-                if projected {
-                    Value::Object(doc.fields)
-                } else {
-                    Self::row_as_value(&doc)
-                }
+            .map(|doc| match doc.fields.get(SCALAR_ROW_FIELD) {
+                Some(scalar) => scalar.clone(),
+                None if projected => Value::Object(doc.fields),
+                None => Self::row_as_value(&doc),
             })
             .collect();
         if materialized_query
@@ -3712,7 +3990,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
         mut document: Document,
         update_block: &UpdateBlock,
     ) -> OQLResult<Document> {
-        let schema = self.store.get_schema(&document.schema).ok().flatten();
+        let schema = self.schema_of(&document.schema).ok().flatten();
 
         for update_field in &update_block.fields {
             let mut new_value = self.evaluate_expression(&document, &update_field.value)?;
@@ -4105,8 +4383,8 @@ impl<S: DocumentStore> QueryExecutor<S> {
         {
             return Ok(());
         }
-        for source in self.store.list_schemas()? {
-            let Some(source_schema) = self.store.get_schema(&source)? else {
+        for source in self.schema_names()?.iter().cloned() {
+            let Some(source_schema) = self.schema_of(&source)? else {
                 continue;
             };
             for (field, reference) in source_schema.get_reference_fields() {
@@ -4931,18 +5209,10 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 .unwrap_or_default();
             fields.insert("_group_schema".to_string(), Value::String(group_schema));
 
-            // Carry the exact source rows with the ephemeral grouped row. This
-            // avoids rescanning the source collection for every aggregate and
-            // preserves read-your-writes inside transactions.
-            fields.insert(
-                "_group_documents".to_string(),
-                Value::List(
-                    group_documents
-                        .iter()
-                        .map(Self::encode_group_source_document)
-                        .collect(),
-                ),
-            );
+            // The group's source rows stay as they are, shared by every
+            // aggregate that reads them, and are found again by this key.
+            let rows_key = StatementScope::keep_group_rows(group_documents);
+            fields.insert("_group_rows".to_string(), Value::String(rows_key));
 
             // Create group document
             let group_doc = Document::with_id(
@@ -5108,94 +5378,18 @@ impl<S: DocumentStore> QueryExecutor<S> {
     }
 
     /// The source rows a group row stands for.
-    fn group_rows(group_doc: &Document) -> OQLResult<Vec<Document>> {
-        match group_doc.get_field("_group_documents") {
-            Some(Value::List(documents)) => documents
-                .iter()
-                .map(Self::decode_group_source_document)
-                .collect(),
+    fn group_rows(group_doc: &Document) -> OQLResult<Arc<Vec<Document>>> {
+        match group_doc.get_field("_group_rows") {
+            Some(Value::String(key)) => {
+                StatementScope::group_rows(key).ok_or_else(|| OQLError::Generic {
+                    message: "a group row was used outside the statement that produced it"
+                        .to_string(),
+                })
+            }
             _ => Err(OQLError::Generic {
                 message: "Group document missing source rows".to_string(),
             }),
         }
-    }
-
-    fn encode_group_source_document(document: &Document) -> Value {
-        Value::Object(HashMap::from([
-            ("id".to_string(), Value::String(document.id.clone())),
-            ("schema".to_string(), Value::String(document.schema.clone())),
-            ("fields".to_string(), Value::Object(document.fields.clone())),
-            (
-                "created_at".to_string(),
-                Value::DateTime(document.created_at),
-            ),
-            (
-                "updated_at".to_string(),
-                Value::DateTime(document.updated_at),
-            ),
-            (
-                "version".to_string(),
-                Value::Integer(document.version as i64),
-            ),
-        ]))
-    }
-
-    fn decode_group_source_document(value: &Value) -> OQLResult<Document> {
-        let Value::Object(envelope) = value else {
-            return Err(OQLError::Generic {
-                message: "Grouped source row is not an object".to_string(),
-            });
-        };
-        let get_string = |name: &str| match envelope.get(name) {
-            Some(Value::String(value)) => Ok(value.clone()),
-            _ => Err(OQLError::Generic {
-                message: format!("Grouped source row is missing '{}'", name),
-            }),
-        };
-        let fields = match envelope.get("fields") {
-            Some(Value::Object(fields)) => fields.clone(),
-            _ => {
-                return Err(OQLError::Generic {
-                    message: "Grouped source row is missing 'fields'".to_string(),
-                })
-            }
-        };
-        let created_at = match envelope.get("created_at") {
-            Some(Value::DateTime(value)) => *value,
-            _ => {
-                return Err(OQLError::Generic {
-                    message: "Grouped source row is missing 'created_at'".to_string(),
-                })
-            }
-        };
-        let updated_at = match envelope.get("updated_at") {
-            Some(Value::DateTime(value)) => *value,
-            _ => {
-                return Err(OQLError::Generic {
-                    message: "Grouped source row is missing 'updated_at'".to_string(),
-                })
-            }
-        };
-        let version = match envelope.get("version") {
-            Some(Value::Integer(value)) => {
-                u64::try_from(*value).map_err(|_| OQLError::Generic {
-                    message: "Grouped source row has an invalid version".to_string(),
-                })?
-            }
-            _ => {
-                return Err(OQLError::Generic {
-                    message: "Grouped source row is missing 'version'".to_string(),
-                })
-            }
-        };
-        Ok(Document {
-            id: get_string("id")?,
-            schema: get_string("schema")?,
-            fields,
-            created_at,
-            updated_at,
-            version,
-        })
     }
 
     /// Apply SORT operation to documents
@@ -5350,6 +5544,80 @@ impl<S: DocumentStore> QueryExecutor<S> {
 /// collection. It is not a legal field name, so it cannot collide with data.
 const SCALAR_ROW_FIELD: &str = "$value";
 
+thread_local! {
+    static NESTED_QUERIES_RUN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Work that can be shared by everything one statement evaluates.
+///
+/// A statement reads a consistent picture of the database: its own writes
+/// are published only once it has computed them. So within one statement a
+/// schema cannot change and a nested query with the same text has the same
+/// answer, however many rows ask for it.
+impl StatementScope {
+    /// Hold a group's source rows for the rest of the statement and return
+    /// the key they can be found under.
+    fn keep_group_rows(rows: Vec<Document>) -> String {
+        STATEMENT.with(|scope| {
+            let mut scope = scope.borrow_mut();
+            let key = format!("group-{}", scope.group_rows.len());
+            scope.group_rows.insert(key.clone(), Arc::new(rows));
+            key
+        })
+    }
+
+    fn group_rows(key: &str) -> Option<Arc<Vec<Document>>> {
+        STATEMENT.with(|scope| scope.borrow().group_rows.get(key).cloned())
+    }
+}
+
+#[derive(Default)]
+struct StatementScope {
+    /// Nested statements in progress on this thread; the scope is live
+    /// while this is non-zero.
+    depth: usize,
+    /// Results of nested queries, keyed by the query after the enclosing
+    /// row's values were substituted into it.
+    nested_results: HashMap<String, Value>,
+    schemas: HashMap<String, Option<Arc<Schema>>>,
+    schema_names: Option<Arc<Vec<String>>>,
+    /// The source rows of each group produced by `group_by`.
+    group_rows: HashMap<String, Arc<Vec<Document>>>,
+    reverse_relationships: HashMap<(String, String), ReverseRelationship>,
+}
+
+thread_local! {
+    static STATEMENT: std::cell::RefCell<StatementScope> =
+        std::cell::RefCell::new(StatementScope::default());
+}
+
+/// Keeps the statement scope alive for the duration of one statement and
+/// discards it afterwards, so nothing cached outlives the data it reflects.
+struct StatementGuard;
+
+impl StatementGuard {
+    fn enter() -> Self {
+        STATEMENT.with(|scope| scope.borrow_mut().depth += 1);
+        Self
+    }
+
+    fn active() -> bool {
+        STATEMENT.with(|scope| scope.borrow().depth > 0)
+    }
+}
+
+impl Drop for StatementGuard {
+    fn drop(&mut self) {
+        STATEMENT.with(|scope| {
+            let mut scope = scope.borrow_mut();
+            scope.depth -= 1;
+            if scope.depth == 0 {
+                *scope = StatementScope::default();
+            }
+        });
+    }
+}
+
 /// Everything a delete will do, decided before any of it is done.
 #[derive(Default)]
 struct DeletePlan {
@@ -5398,6 +5666,7 @@ impl SourceRow {
 }
 
 /// What a name means on a stored row that has no field of that name.
+#[derive(Clone)]
 enum ReverseRelationship {
     /// Documents of `source` refer to the row: through `field` when the
     /// relationship was named with `as`, or through any field when it is
@@ -5452,6 +5721,11 @@ impl CallFrame {
                 .last()
                 .and_then(|frame| frame.rows.get(name).cloned())
         })
+    }
+
+    /// Whether a user function is being evaluated on this thread.
+    fn any_active() -> bool {
+        CALL_FRAMES.with(|frames| !frames.borrow().is_empty())
     }
 
     fn is_row(name: &str) -> bool {

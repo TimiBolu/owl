@@ -1,0 +1,6 @@
+// Large orders from one country, through the customer reference
+orders
+  .where { .customer.country == "NG" && .total > 900 }
+  .sort { .total.desc, .id.asc }
+  .limit(25)
+  .select { id, total, customer: .customer.name }

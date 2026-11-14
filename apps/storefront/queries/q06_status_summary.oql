@@ -1,0 +1,5 @@
+// Order count and revenue by status
+orders
+  .group_by { .status }
+  .select { status, n: count(), revenue: sum(.total), average: avg(.total), largest: max(.total) }
+  .sort { .status.asc }

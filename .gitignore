@@ -66,6 +66,8 @@ test_*.owl
 oql_test_suite/
 comprehensive_test.oql
 improved_syntax.oql
+# ...except the tracked example that the parser's tests include.
+!oql/improved_syntax.oql
 
 # ---------------------------------------------------------------------------
 # Working notes and temporary docs

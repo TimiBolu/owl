@@ -1,0 +1,4 @@
+// Orders larger than their own customer's average order
+orders
+  .where { .total > orders.where { .customer == orders.customer }.avg(.total) }
+  .count()

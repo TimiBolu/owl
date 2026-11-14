@@ -1,0 +1,5 @@
+// Customers per country, with a conditional count
+customers
+  .group_by { .country }
+  .select { country, customers: count(), gold: where { .tier == "gold" }.count(), newest: max(.joined) }
+  .sort { .country.asc }

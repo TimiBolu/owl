@@ -1,0 +1,7 @@
+// Best-rated products with at least five reviews
+reviews
+  .group_by { .product.id }
+  .having { count() >= 5 }
+  .select { product_id, reviews: count(), rating: avg(.rating) }
+  .sort { .rating.desc, .product_id.asc }
+  .limit(20)

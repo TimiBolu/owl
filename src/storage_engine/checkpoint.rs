@@ -2849,44 +2849,57 @@ impl BaseSegmentHandle {
             .copied()
             .map(locate)
             .collect::<OQLResult<Vec<_>>>()?;
-        let Some(span_start) = located.iter().flatten().map(|entry| entry.offset).min() else {
-            return Ok(vec![None; object_refs.len()]);
-        };
-        let span_end = located
-            .iter()
-            .flatten()
-            .map(|entry| entry.offset + entry.length)
-            .max()
-            .expect("non-empty located record batch");
+        // Read the records in runs of nearby bytes. Records requested
+        // together may be adjacent (a scan) or scattered across the whole
+        // segment (an index order); reading one span from the first to the
+        // last would then read almost the entire file for every batch.
+        // Records closer than this are worth one read; farther apart, the
+        // bytes between them are skipped.
+        const MAX_GAP: usize = 16 * 1024;
+        let mut by_offset: Vec<usize> = (0..located.len())
+            .filter(|index| located[*index].is_some())
+            .collect();
+        by_offset.sort_unstable_by_key(|index| located[*index].map(|entry| entry.offset));
+
+        let mut records: Vec<Option<Arc<[u8]>>> = vec![None; object_refs.len()];
         let mut file = self
             .file
             .lock()
             .map_err(|_| OQLError::storage_error("base segment read handle lock poisoned", None))?;
-        file.seek(SeekFrom::Start((self.records_start + span_start) as u64))
-            .map_err(|error| {
-                OQLError::storage_error(&format!("seek base record batch: {error}"), None)
-            })?;
-        let span = read_exact_handle(file.as_mut(), span_end - span_start)?;
-        drop(file);
+        let mut run_start = 0;
+        while run_start < by_offset.len() {
+            let first = located[by_offset[run_start]].expect("only located records are queued");
+            let mut run_end = run_start + 1;
+            let mut span_end = first.offset + first.length;
+            while let Some(next) = by_offset
+                .get(run_end)
+                .and_then(|index| located[*index])
+                .filter(|next| next.offset <= span_end + MAX_GAP)
+            {
+                span_end = span_end.max(next.offset + next.length);
+                run_end += 1;
+            }
 
-        located
-            .into_iter()
-            .map(|entry| {
-                let Some(entry) = entry else {
-                    return Ok(None);
-                };
-                let start = entry.offset - span_start;
-                let end = start + entry.length;
-                let record = &span[start..end];
+            file.seek(SeekFrom::Start((self.records_start + first.offset) as u64))
+                .map_err(|error| {
+                    OQLError::storage_error(&format!("seek base record batch: {error}"), None)
+                })?;
+            let span = read_exact_handle(file.as_mut(), span_end - first.offset)?;
+            for index in &by_offset[run_start..run_end] {
+                let entry = located[*index].expect("only located records are queued");
+                let start = entry.offset - first.offset;
+                let record = &span[start..start + entry.length];
                 if crc32fast::hash(record) != entry.checksum {
                     return Err(OQLError::storage_error(
                         "base object record checksum mismatch",
                         None,
                     ));
                 }
-                Ok(Some(Arc::from(record)))
-            })
-            .collect()
+                records[*index] = Some(Arc::from(record));
+            }
+            run_start = run_end;
+        }
+        Ok(records)
     }
 }
 

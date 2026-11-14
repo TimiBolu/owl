@@ -2481,3 +2481,176 @@ fn remaining_expression_forms_behave() {
     let int = |value| Some(Value::Integer(value));
     assert_eq!(counts, [int(1), int(0), int(1), int(0)]);
 }
+
+// ---------------------------------------------------------------------------
+// Work shared within a statement
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_nested_query_runs_once_per_distinct_question() {
+    let mut db = Db::new();
+    let mut script = String::from(
+        "schema teams { id: String }\nschema members { id: String, team: Ref(teams), score: Integer }\nteams.insert [ { id: \"t0\" }, { id: \"t1\" }, { id: \"t2\" } ]\nmembers.insert [\n",
+    );
+    for index in 0..60 {
+        script.push_str(&format!(
+            "  {{ id: \"m{index:02}\", team: \"t{}\", score: {} }},\n",
+            index % 3,
+            index
+        ));
+    }
+    script.push_str("]\n");
+    db.script(&script);
+    let runs = |db: &Db, query: &str| {
+        let before = QueryExecutor::<RustStore>::nested_queries_run();
+        let rows = db.rows(query);
+        (rows, QueryExecutor::<RustStore>::nested_queries_run() - before)
+    };
+
+    // Uncorrelated: one question, asked by sixty rows, answered once.
+    let (rows, executed) = runs(&db, "members.where { .score > members.avg(.score) }");
+    assert_eq!(rows.len(), 30);
+    assert_eq!(executed, 1);
+
+    // Correlated on a value with three distinct settings: three answers.
+    let (rows, executed) = runs(
+        &db,
+        "members.sort { .id.asc }.select { id, teammates: members.where { .team == members.team }.count() }",
+    );
+    assert_eq!(rows.len(), 60);
+    assert!(rows.iter().all(|row| row.get_field("teammates") == Some(&Value::Integer(20))));
+    assert_eq!(executed, 3);
+
+    // Correlated on a unique value: every row has its own question.
+    let (rows, executed) = runs(
+        &db,
+        "members.select { below: members.where { .score < members.score }.count() }",
+    );
+    let mut below: Vec<i64> = rows
+        .iter()
+        .map(|row| match row.get_field("below") {
+            Some(Value::Integer(count)) => *count,
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    below.sort();
+    assert_eq!(below, (0..60).collect::<Vec<i64>>());
+    assert_eq!(executed, 60);
+
+    // A query that reads a function's parameters is never shared.
+    db.define("fn rank(m: members) -> Integer { members.where { .score > m.score }.count() }");
+    let (rows, _) = runs(&db, "members.where { rank(*) < 3 }.sort { .score.desc }.select { id }");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].get_field("id"), Some(&text("m59")));
+
+    // Nothing is remembered from one statement to the next.
+    let (rows, _) = runs(&db, "teams.select { id, n: members.where { .team == teams.id }.count() }");
+    assert!(rows.iter().all(|row| row.get_field("n") == Some(&Value::Integer(20))));
+    db.rows(r#"members.insert { id: "extra", team: "t0", score: 1000 }"#);
+    let (rows, _) = runs(
+        &db,
+        r#"teams.where { .id == "t0" }.select { n: members.where { .team == teams.id }.count() }"#,
+    );
+    assert_eq!(rows[0].get_field("n"), Some(&Value::Integer(21)));
+    // A schema change between statements is seen too.
+    db.script("schema members { id: String, team: Ref(teams), score: Integer, note: String? }");
+    db.rows(r#"members.where { .id == "extra" }.update { note: "late" }"#);
+    assert_eq!(db.ids(r#"members.where { .note == "late" }"#), ["extra"]);
+}
+
+// ---------------------------------------------------------------------------
+// Found while building the storefront workload
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_path_in_a_chain_steps_every_row_through_it() {
+    let db = graph();
+    db.script(
+        r#"
+        carts.insert [
+          { id: "k1", state: "open", lines: [ { sku: "a", qty: 2 }, { sku: "b", qty: 1 } ] },
+          { id: "k2", state: "open", lines: [ { sku: "a", qty: 5 } ] },
+          { id: "k3", state: "done", lines: [ { sku: "c", qty: 9 } ] }
+        ]
+        "#,
+    );
+
+    // Embedded lists: every line of every matching cart.
+    assert_eq!(db.scalar(r#"carts.where { .state == "open" }.lines.sum(.qty)"#, "sum"), Value::Integer(8));
+    assert_eq!(db.scalar("carts.lines.count()", "count"), Value::Integer(4));
+    let rows = db.rows(
+        r#"carts.where { .state == "open" }.lines.group_by { .sku }.select { sku, units: sum(.qty) }.sort { .sku.asc }"#,
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get_field("units"), Some(&Value::Integer(7)));
+
+    // Relationships: the same step, through reverse references.
+    assert_eq!(db.scalar("orgs.teams.users.count()", "count"), Value::Integer(4));
+    assert_eq!(
+        db.scalar(r#"orgs.where { .id == "o1" }.teams.users.orders.sum(.amount)"#, "sum"),
+        Value::Float(475.0)
+    );
+    // And forward ones, where several rows may lead to the same target.
+    assert_eq!(
+        db.scalar(r#"orders.where { .status == "paid" }.user.select { id }.distinct().count()"#, "count"),
+        Value::Integer(2)
+    );
+
+    // Inside an expression, between two operations.
+    assert_eq!(
+        db.scalar(
+            r#"orgs.where { .id == "o1" }.select { n: .teams.where { .name == "Core" }.users.count() }"#,
+            "n"
+        ),
+        Value::Integer(2)
+    );
+    assert!(db.try_rows("orgs.teamz.count()").unwrap_err().contains("teamz"));
+}
+
+#[test]
+fn a_filter_on_id_finds_the_same_rows_as_any_other_filter() {
+    let db = graph();
+
+    assert_eq!(db.ids(r#"users.where { .id == "u2" }"#), ["u2"]);
+    assert_eq!(db.ids(r#"users.where { "u2" == .id }"#), ["u2"]);
+    assert_eq!(db.ids(r#"users.where { .id == "u2" && .name == "Bob" }"#), ["u2"]);
+    assert_eq!(db.ids(r#"users.where { .name == "Bob" && .id == "u2" }"#), ["u2"]);
+    // The rest of the condition still applies.
+    assert!(db.ids(r#"users.where { .id == "u2" && .name == "Ada" }"#).is_empty());
+    assert!(db.ids(r#"users.where { .id == "nobody" }"#).is_empty());
+    // A disjunction is not an identification.
+    let mut either = db.ids(r#"users.where { .id == "u2" || .name == "Ada" }"#);
+    either.sort();
+    assert_eq!(either, ["u1", "u2"]);
+    // Whole rows come back when nothing shapes them.
+    let row = &db.rows(r#"users.where { .id == "u1" }"#)[0];
+    assert_eq!(row.get_field("name"), Some(&text("Ada")));
+    assert!(row.get_field("profile").is_some());
+}
+
+#[test]
+fn reading_only_some_fields_never_changes_an_answer() {
+    let mut db = graph();
+    db.define("fn city_of(u: users) -> String { u.profile.city }");
+
+    // Each of these names fewer fields than it can observe some other way.
+    let row = &db.rows(r#"users.where { .name == "Ada" }.select { *, extra: 1 }"#)[0];
+    assert!(row.get_field("tags").is_some() && row.get_field("profile").is_some());
+    assert_eq!(
+        db.scalar(r#"users.where { .name == "Ada" }.select { c: city_of(*) }"#, "c"),
+        text("Lagos")
+    );
+    assert_eq!(
+        db.scalar(r#"users.where { .name == "Ada" }.select { n: orders.where { .user == users.id }.count() }"#, "n"),
+        Value::Integer(2)
+    );
+    let grouped = db.rows(
+        "users.group_by { .team.name }.select { name, first: sort { .id.asc }.first(), n: count() }.sort { .name.asc }",
+    );
+    let Some(Value::Object(first)) = grouped[0].get_field("first") else {
+        panic!("expected a whole row");
+    };
+    assert!(first.contains_key("tags") && first.contains_key("profile"));
+    assert_eq!(db.rows("users.distinct()").len(), 4);
+    assert_eq!(db.scalar("users.select { tags }.distinct().count()", "count"), Value::Integer(3));
+}
