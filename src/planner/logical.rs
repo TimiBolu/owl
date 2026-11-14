@@ -132,6 +132,14 @@ impl LogicalPlanner {
             Operation::Offset(offset) => Ok(PlanNode::new(PlanType::Offset)
                 .with_child(input)
                 .with_offset(*offset)),
+            // A count that is still an expression has not been bound to a
+            // value; such queries run on the general executor.
+            Operation::LimitExpr(_) | Operation::OffsetExpr(_) => Err(OQLError::generic(
+                "limit/offset with an unevaluated count cannot be planned",
+            )),
+            Operation::Distinct | Operation::Explain | Operation::AggregateExpr { .. } => Err(OQLError::generic(
+                "distinct and computed aggregates run on the general executor",
+            )),
             Operation::First => Ok(PlanNode::new(PlanType::Limit)
                 .with_child(input)
                 .with_limit(1)),

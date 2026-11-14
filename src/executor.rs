@@ -8,7 +8,6 @@ use crate::execution::{
     PhysicalOperatorCollect,
 };
 use crate::functions::FunctionRegistry;
-use crate::hot_path_optimizations::optimized_get_field;
 use crate::profile_call;
 // use crate::optimizer::QueryOptimizer; // TODO: Re-enable after optimizer module
 use crate::parser::{
@@ -193,6 +192,12 @@ impl<S: DocumentStore> QueryExecutor<S> {
         self.functions.register_user_function(func_def)
     }
 
+    /// Remove a user-defined function, for example when the transaction
+    /// that defined it is rolled back.
+    pub fn unregister_user_function(&mut self, name: &str) {
+        self.functions.unregister_user_function(name);
+    }
+
     /// Get access to the underlying store (for testing)
     pub fn store(&self) -> &Arc<S> {
         &self.store
@@ -256,6 +261,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
     pub fn execute_query(&self, query: &OQLQuery) -> OQLResult<Vec<Document>> {
         profile_call!("execute_query", {
             if let Some(plan) = self.try_plan_safe_read(query)? {
+                self.validate_declared_paths(query)?;
                 return self.execute_read_plan(&plan);
             }
 
@@ -336,6 +342,13 @@ impl<S: DocumentStore> QueryExecutor<S> {
     }
 
     fn execute_general_query(&self, query: &OQLQuery) -> OQLResult<Vec<Document>> {
+        if let Some((Operation::Explain, described)) = query.operations.split_last() {
+            return self.explain_query(&OQLQuery {
+                collection: query.collection.clone(),
+                operations: described.to_vec(),
+            });
+        }
+        self.validate_declared_paths(query)?;
         let mut documents = Vec::new();
         let mut is_insert_only = false;
 
@@ -379,6 +392,174 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
 
         Ok(documents)
+    }
+
+    /// `query.explain()`: one row saying how the query would run, without
+    /// running it.
+    fn explain_query(&self, query: &OQLQuery) -> OQLResult<Vec<Document>> {
+        self.validate_declared_paths(query)?;
+        let plan = self.try_plan_safe_read(query)?;
+        let mut fields = HashMap::new();
+        match &plan {
+            Some(plan) => {
+                fields.insert(
+                    "path".to_string(),
+                    Value::String("physical pipeline".to_string()),
+                );
+                fields.insert(
+                    "uses_index".to_string(),
+                    Value::Boolean(Self::contains_native_index_scan(&plan.root)),
+                );
+                fields.insert("plan".to_string(), Value::String(plan.root.explain()));
+            }
+            None => {
+                fields.insert(
+                    "path".to_string(),
+                    Value::String("general executor".to_string()),
+                );
+                fields.insert("uses_index".to_string(), Value::Boolean(false));
+                fields.insert(
+                    "plan".to_string(),
+                    Value::String(format!(
+                        "scan {} and apply {} operation(s) in order",
+                        query.collection,
+                        query.operations.len()
+                    )),
+                );
+            }
+        }
+        Ok(vec![Document::with_id(
+            "explain".to_string(),
+            "explain".to_string(),
+            fields,
+        )])
+    }
+
+    /// Reject a path whose first name the collection's schema does not
+    /// know. With a declared shape, `.nmae` cannot be a missing value; it is
+    /// a mistake, and reading it as null would hide that.
+    fn validate_declared_paths(&self, query: &OQLQuery) -> OQLResult<()> {
+        let Some(schema) = self.store.get_schema(&query.collection)? else {
+            return Ok(());
+        };
+        // Paths are checked up to the first operation that reshapes rows;
+        // after it, names refer to what that operation produced.
+        let mut checked = Vec::new();
+        let mut direct: Vec<String> = Vec::new();
+        for operation in &query.operations {
+            match operation {
+                Operation::Where(_) | Operation::Sort(_) => checked.push(operation),
+                // These carry their path directly rather than as an
+                // expression.
+                Operation::Sum(field)
+                | Operation::Avg(field)
+                | Operation::Min(field)
+                | Operation::Max(field) => {
+                    direct.extend(field.path.first().cloned());
+                    break;
+                }
+                Operation::GroupBy(block) => {
+                    direct.extend(block.fields.iter().filter_map(|field| field.path.first().cloned()));
+                    checked.push(operation);
+                    break;
+                }
+                Operation::Select(_) | Operation::AggregateExpr { .. } => {
+                    checked.push(operation);
+                    break;
+                }
+                Operation::Limit(_)
+                | Operation::Offset(_)
+                | Operation::LimitExpr(_)
+                | Operation::OffsetExpr(_)
+                | Operation::First
+                | Operation::Distinct => {}
+                _ => break,
+            }
+        }
+
+        // Paths inside a nested collection or query belong to its rows, so
+        // only a nested expression's source is in this scope.
+        fn first_names(node: &serde_json::Value, names: &mut Vec<String>) {
+            match node {
+                serde_json::Value::Object(fields) => {
+                    if let Some(path) = fields
+                        .get("FieldAccess")
+                        .and_then(|access| access.get("path"))
+                        .and_then(|path| path.as_array())
+                    {
+                        if let Some(first) = path.first().and_then(|name| name.as_str()) {
+                            names.push(first.to_string());
+                        }
+                    }
+                    for (key, value) in fields {
+                        match key.as_str() {
+                            "QueryExpression" => {}
+                            "CollectionExpression" => {
+                                if let Some(source) = value.get("source") {
+                                    first_names(source, names);
+                                }
+                            }
+                            _ => first_names(value, names),
+                        }
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    items.iter().for_each(|item| first_names(item, names))
+                }
+                _ => {}
+            }
+        }
+        let mut names = direct;
+        for operation in checked {
+            if let Ok(tree) = serde_json::to_value(operation) {
+                first_names(&tree, &mut names);
+            }
+        }
+
+        for name in names {
+            if name == "*"
+                || name.starts_with('_')
+                || schema.fields.contains_key(&name)
+                || DocumentSystemField::from_name(&name).is_some()
+            {
+                continue;
+            }
+            if matches!(
+                self.reverse_relationship(&schema.name, &name)?,
+                ReverseRelationship::Unknown
+            ) {
+                let closest = schema
+                    .fields
+                    .keys()
+                    .map(|field| (Self::edit_distance(field, &name), field))
+                    .filter(|(distance, _)| *distance <= 2)
+                    .min()
+                    .map(|(_, field)| format!(". Did you mean '{field}'?"))
+                    .unwrap_or_default();
+                return Err(OQLError::SchemaValidation {
+                    message: format!(
+                        "'{}' has no field or relationship '{}'{}",
+                        schema.name, name, closest
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn edit_distance(left: &str, right: &str) -> usize {
+        let right: Vec<char> = right.chars().collect();
+        let mut row: Vec<usize> = (0..=right.len()).collect();
+        for (i, a) in left.chars().enumerate() {
+            let mut previous = row[0];
+            row[0] = i + 1;
+            for (j, b) in right.iter().enumerate() {
+                let cost = previous + usize::from(a != *b);
+                previous = row[j + 1];
+                row[j + 1] = cost.min(row[j] + 1).min(previous + 1);
+            }
+        }
+        row[right.len()]
     }
 
     /// Explain the native indexed read plan selected for this query. `None`
@@ -561,7 +742,11 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 // limit/offset: `limit(5).where {..}` filters the first five
                 // rows, it does not return five matching rows.
                 Operation::Where(_) if bounded => return false,
-                Operation::Limit(_) | Operation::Offset(_) | Operation::First => bounded = true,
+                Operation::Limit(_)
+                | Operation::Offset(_)
+                | Operation::LimitExpr(_)
+                | Operation::OffsetExpr(_)
+                | Operation::First => bounded = true,
                 _ => {}
             }
             match operation {
@@ -600,9 +785,14 @@ impl<S: DocumentStore> QueryExecutor<S> {
     fn is_pipeline_safe_expression(expression: &Expression) -> bool {
         match expression {
             Expression::Literal(_) => true,
-            Expression::FieldAccess(FieldAccess { path }) => path.len() == 1,
+            Expression::FieldAccess(FieldAccess { path }) => path.len() == 1 && path[0] != "*",
             _ => false,
         }
+    }
+
+    /// The `*` entry of a `select` block.
+    fn is_all_fields(expression: &Expression) -> bool {
+        matches!(expression, Expression::FieldAccess(FieldAccess { path }) if path.len() == 1 && path[0] == "*")
     }
 
     fn is_pipeline_safe_condition(condition: &Condition) -> bool {
@@ -893,6 +1083,24 @@ impl<S: DocumentStore> QueryExecutor<S> {
             Operation::Sort(sort_block) => self.apply_sort_operation(documents, sort_block),
             Operation::Limit(limit_value) => self.apply_limit_operation(documents, *limit_value),
             Operation::Offset(offset) => Ok(documents.into_iter().skip(*offset as usize).collect()),
+            Operation::LimitExpr(count) => {
+                let count = self.evaluate_row_count("limit", count)?;
+                self.apply_limit_operation(documents, count)
+            }
+            Operation::Distinct => self.apply_distinct_operation(documents),
+            Operation::Explain => Err(OQLError::Generic {
+                message: "explain() describes a whole query, so it must be its last operation"
+                    .to_string(),
+            }),
+            Operation::AggregateExpr { function, input } => self.aggregate_result_row(
+                &documents,
+                function,
+                &AggregateInput::Expression(input.clone()),
+            ),
+            Operation::OffsetExpr(count) => {
+                let count = self.evaluate_row_count("offset", count)?;
+                Ok(documents.into_iter().skip(count as usize).collect())
+            }
             Operation::First => Ok(documents.into_iter().take(1).collect()),
             Operation::Exists => {
                 let exists = !documents.is_empty();
@@ -919,6 +1127,23 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     }),
                 })
             }
+        }
+    }
+
+    /// Evaluate the count of a `limit(expr)` or `offset(expr)`. The
+    /// expression has no current row; it is a constant, a parameter, or a
+    /// value computed from other collections.
+    fn evaluate_row_count(&self, operation: &str, count: &Expression) -> OQLResult<u64> {
+        let scope = Document::with_id(String::new(), String::new(), HashMap::new());
+        match self.evaluate_expression(&scope, count)? {
+            Value::Integer(count) if count >= 0 => Ok(count as u64),
+            other => Err(OQLError::TypeError {
+                expected: format!("a non-negative whole number for {operation}"),
+                actual: match other {
+                    Value::Integer(count) => count.to_string(),
+                    other => other.type_name().to_string(),
+                },
+            }),
         }
     }
 
@@ -1435,12 +1660,6 @@ impl<S: DocumentStore> QueryExecutor<S> {
         source: &Expression,
         operations: &[Operation],
     ) -> OQLResult<Value> {
-        let reverse_documents = match source {
-            Expression::FieldAccess(field) => {
-                self.resolve_reverse_collection_source(scope_document, &field.path)?
-            }
-            _ => None,
-        };
         let collection_scope = match source {
             Expression::FieldAccess(field) => field
                 .path
@@ -1450,46 +1669,57 @@ impl<S: DocumentStore> QueryExecutor<S> {
             Expression::Identifier(name) => name.clone(),
             _ => "$collection".to_string(),
         };
-        let (mut documents, source_was_object) = if let Some(documents) = reverse_documents {
-            (documents, false)
-        } else {
-            let source_value = self.evaluate_expression(scope_document, source)?;
-            let source_was_object = matches!(source_value, Value::Object(_));
-            let values = match source_value {
-                Value::List(values) => values,
-                Value::Object(object) => vec![Value::Object(object)],
-                Value::Null => Vec::new(),
-                scalar => vec![scalar],
-            };
-            let mut documents = Vec::with_capacity(values.len());
-            for (index, value) in values.into_iter().enumerate() {
-                let fields = match value {
-                    Value::Object(fields) => fields,
-                    scalar => HashMap::from([("value".to_string(), scalar)]),
-                };
-                documents.push(Document::with_id(
-                    index.to_string(),
-                    collection_scope.clone(),
-                    fields,
-                ));
+        let (documents, single) = match source {
+            // An operation written with no receiver, evaluated for a group
+            // row, applies to that group's rows.
+            Expression::Identifier(name) if name == crate::parser::CURRENT_ROWS => {
+                if scope_document.schema != "group" {
+                    return Err(OQLError::FunctionError {
+                        message: "an operation with nothing before it needs a collection to \
+                                  apply to; here it has only a single row. Write the collection \
+                                  it applies to, as in .items.where { .. }"
+                            .to_string(),
+                    });
+                }
+                (Self::group_rows(scope_document)?, false)
             }
-            (documents, source_was_object)
+            Expression::FieldAccess(field) if field.path != ["*"] => {
+                self.path_source_rows(scope_document, &field.path)?
+            }
+            _ => {
+                let value = self.evaluate_expression(scope_document, source)?;
+                let single = !matches!(value, Value::List(_));
+                let mut rows = Vec::new();
+                self.push_source_rows(value, &collection_scope, &mut rows)?;
+                (rows.into_iter().map(|row| row.document).collect(), single)
+            }
         };
+        self.run_collection_operations(documents, single, operations, scope_document, &collection_scope)
+    }
+
+    /// Apply operations to rows already in hand and shape the result as a
+    /// value: a scalar for an aggregate, one object for a single row, and a
+    /// list otherwise.
+    fn run_collection_operations(
+        &self,
+        mut documents: Vec<Document>,
+        mut single: bool,
+        operations: &[Operation],
+        scope_document: &Document,
+        collection_scope: &str,
+    ) -> OQLResult<Value> {
+        // `first()` narrows a collection to one row; whatever shapes that
+        // row afterwards still yields one value, not a list of one.
+        single |= operations
+            .iter()
+            .any(|operation| matches!(operation, Operation::First));
 
         for operation in operations {
             let materialized = self.materialize_operation_with_scope(operation, scope_document)?;
-            documents = self.apply_operation(documents, &materialized, &collection_scope)?;
+            documents = self.apply_operation(documents, &materialized, collection_scope)?;
         }
 
-        let aggregate_field = match operations.last() {
-            Some(Operation::Count) => Some("count"),
-            Some(Operation::Sum(_)) => Some("sum"),
-            Some(Operation::Avg(_)) => Some("avg"),
-            Some(Operation::Min(_)) => Some("min"),
-            Some(Operation::Max(_)) => Some("max"),
-            Some(Operation::Exists) => Some("exists"),
-            _ => None,
-        };
+        let aggregate_field = operations.last().and_then(Self::scalar_result_field);
         if let Some(field) = aggregate_field {
             return Ok(documents
                 .first()
@@ -1501,62 +1731,195 @@ impl<S: DocumentStore> QueryExecutor<S> {
         let mut rows = documents
             .into_iter()
             .map(|document| {
-                if document.fields.len() == 1 {
-                    if let Some(value) = document.fields.get("value") {
-                        return value.clone();
-                    }
+                match document.fields.get(SCALAR_ROW_FIELD) {
+                    Some(value) => value.clone(),
+                    None => Value::Object(document.fields),
                 }
-                Value::Object(document.fields)
             })
             .collect::<Vec<_>>();
-        if matches!(operations.last(), Some(Operation::First)) {
-            Ok(rows.into_iter().next().unwrap_or(Value::Null))
-        } else if source_was_object {
+        if single {
             Ok(rows.pop().unwrap_or(Value::Null))
         } else {
             Ok(Value::List(rows))
         }
     }
 
-    fn resolve_reverse_collection_source(
+    /// The field that holds the answer of an operation which reduces a
+    /// collection to one value.
+    fn scalar_result_field(operation: &Operation) -> Option<&str> {
+        match operation {
+            Operation::Count => Some("count"),
+            Operation::Sum(_) => Some("sum"),
+            Operation::Avg(_) => Some("avg"),
+            Operation::Min(_) => Some("min"),
+            Operation::Max(_) => Some("max"),
+            Operation::Exists => Some("exists"),
+            Operation::AggregateExpr { function, .. } => Some(function.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Expand one value into the rows it contributes to a collection.
+    ///
+    /// A reference contributes the document it points at, so the row keeps
+    /// its own schema and identity and can be traversed further. An object
+    /// contributes itself, a list contributes each element, a scalar
+    /// contributes a one-field row, and null contributes nothing.
+    fn push_source_rows(
+        &self,
+        value: Value,
+        scope: &str,
+        rows: &mut Vec<SourceRow>,
+    ) -> OQLResult<()> {
+        match value {
+            Value::Null => {}
+            Value::List(items) => {
+                for item in items {
+                    self.push_source_rows(item, scope, rows)?;
+                }
+            }
+            Value::Reference(reference) => {
+                if let Some(document) = self.resolve_objref_target(&reference)? {
+                    rows.push(SourceRow::stored(document));
+                }
+            }
+            Value::GlobalReference(reference) => {
+                if let Some(document) = self.store.navigate_global_reference(&reference)? {
+                    rows.push(SourceRow::stored(document));
+                }
+            }
+            Value::Object(fields) => rows.push(SourceRow::embedded(Document::with_id(
+                rows.len().to_string(),
+                scope.to_string(),
+                fields,
+            ))),
+            scalar => rows.push(SourceRow::embedded(Document::with_id(
+                rows.len().to_string(),
+                scope.to_string(),
+                HashMap::from([(SCALAR_ROW_FIELD.to_string(), scalar)]),
+            ))),
+        }
+        Ok(())
+    }
+
+    /// Resolve a path to the rows it denotes, starting from one row.
+    ///
+    /// Each step applies to every row reached so far and the results are
+    /// concatenated, so a step through a collection maps and flattens:
+    /// `.teams.users` on an organisation is every user of every team. A step
+    /// names a stored field when the row has one, and otherwise the reverse
+    /// relationship from the collection of that name. The second result is
+    /// true when the path can only ever denote a single row (it never passed
+    /// through a list or a reverse relationship).
+    fn path_source_rows(
         &self,
         scope_document: &Document,
         path: &[String],
-    ) -> OQLResult<Option<Vec<Document>>> {
-        let Some((reverse_name, forward_path)) = path.split_last() else {
-            return Ok(None);
-        };
-        let mut target = scope_document.clone();
-        for segment in forward_path {
-            let Some(value) = target.get_field(segment).cloned() else {
-                return Ok(Some(Vec::new()));
-            };
-            target = match value {
-                Value::Reference(reference) => {
-                    let Some(document) = self.resolve_objref_target(&reference)? else {
-                        return Ok(Some(Vec::new()));
-                    };
-                    document
+    ) -> OQLResult<(Vec<Document>, bool)> {
+        let mut rows = vec![SourceRow::stored(scope_document.clone())];
+        let mut single = true;
+        for segment in path {
+            let mut next = Vec::new();
+            for row in rows {
+                let stored_value = match DocumentSystemField::from_name(segment) {
+                    Some(system_field) if row.stored => Some(system_field.value(&row.document)),
+                    _ => row.document.get_field(segment).cloned(),
+                };
+                match stored_value {
+                    Some(value) => {
+                        single &= !matches!(value, Value::List(_));
+                        self.push_source_rows(value, segment, &mut next)?;
+                    }
+                    // An embedded value has no identity for anything to
+                    // refer to, so an absent field is simply absent.
+                    None if !row.stored => {}
+                    None => match self.reverse_relationship(&row.document.schema, segment)? {
+                        relationship @ (ReverseRelationship::Declared { .. }
+                        | ReverseRelationship::Unknowable) => {
+                            let (source, field) = match &relationship {
+                                ReverseRelationship::Declared { source, field } => {
+                                    (source.as_str(), field.as_deref())
+                                }
+                                _ => (segment.as_str(), None),
+                            };
+                            single = false;
+                            next.extend(
+                                self.store
+                                    .scan_referencing_documents(
+                                        &row.document.schema,
+                                        &row.document.id,
+                                        Some(source),
+                                        field,
+                                    )?
+                                    .into_iter()
+                                    .map(SourceRow::stored),
+                            );
+                        }
+                        // A declared field that this row does not carry.
+                        ReverseRelationship::AbsentField => {}
+                        ReverseRelationship::Unknown => {
+                            return Err(OQLError::SchemaValidation {
+                                message: format!(
+                                    "'{}' has no field '{}', and no collection named '{}' \
+                                     references it",
+                                    row.document.schema, segment, segment
+                                ),
+                            });
+                        }
+                    },
                 }
-                Value::GlobalReference(reference) => {
-                    let Some(document) = self.store.navigate_global_reference(&reference)? else {
-                        return Ok(Some(Vec::new()));
-                    };
-                    document
-                }
-                _ => return Ok(None),
-            };
+            }
+            rows = next;
         }
+        Ok((rows.into_iter().map(|row| row.document).collect(), single))
+    }
 
-        if target.get_field(reverse_name).is_some() {
-            return Ok(None);
+    /// Decide what an absent name on a stored row means.
+    fn reverse_relationship(&self, schema: &str, name: &str) -> OQLResult<ReverseRelationship> {
+        let Some(declared) = self.store.get_schema(schema)? else {
+            // Without a schema nothing says which fields exist, so the name
+            // may be an absent field or a relationship; reading it is
+            // graceful either way.
+            return Ok(ReverseRelationship::Unknowable);
+        };
+        if declared.fields.contains_key(name) {
+            return Ok(ReverseRelationship::AbsentField);
         }
-        Ok(Some(self.store.scan_referencing_documents(
-            &target.schema,
-            &target.id,
-            Some(reverse_name),
-            None,
-        )?))
+        fn references(field_type: &FieldType, target: &str) -> bool {
+            match field_type {
+                FieldType::Reference(reference) => reference.target_schema == target,
+                FieldType::Optional(inner) | FieldType::List(inner) => references(inner, target),
+                _ => false,
+            }
+        }
+        // A relationship named with `as` takes precedence over the name of
+        // a collection.
+        for source in self.store.list_schemas()? {
+            let Some(source_schema) = self.store.get_schema(&source)? else {
+                continue;
+            };
+            for (field, field_type) in &source_schema.fields {
+                if references(field_type, schema) && source_schema.reverse_name(field) == Some(name)
+                {
+                    return Ok(ReverseRelationship::Declared {
+                        source,
+                        field: Some(field.clone()),
+                    });
+                }
+            }
+        }
+        let refers = self
+            .store
+            .get_schema(name)?
+            .is_some_and(|source| source.fields.values().any(|field| references(field, schema)));
+        Ok(if refers {
+            ReverseRelationship::Declared {
+                source: name.to_string(),
+                field: None,
+            }
+        } else {
+            ReverseRelationship::Unknown
+        })
     }
 
     fn evaluate_query_expression(
@@ -1566,15 +1929,10 @@ impl<S: DocumentStore> QueryExecutor<S> {
     ) -> OQLResult<Value> {
         let materialized_query = self.materialize_query_with_scope(query, scope_document)?;
         let docs = self.execute_query(&materialized_query)?;
-        let aggregate_field = match materialized_query.operations.last() {
-            Some(Operation::Count) => Some("count"),
-            Some(Operation::Sum(_)) => Some("sum"),
-            Some(Operation::Avg(_)) => Some("avg"),
-            Some(Operation::Min(_)) => Some("min"),
-            Some(Operation::Max(_)) => Some("max"),
-            Some(Operation::Exists) => Some("exists"),
-            _ => None,
-        };
+        let aggregate_field = materialized_query
+            .operations
+            .last()
+            .and_then(Self::scalar_result_field);
         if let Some(field) = aggregate_field {
             let value = docs
                 .first()
@@ -1584,17 +1942,28 @@ impl<S: DocumentStore> QueryExecutor<S> {
             return Ok(value);
         }
 
-        let mut rows = Vec::with_capacity(docs.len());
-        for doc in docs {
-            let mut object_fields = std::collections::HashMap::new();
-            object_fields.insert("id".to_string(), Value::String(doc.id));
-            object_fields.insert("schema".to_string(), Value::String(doc.schema));
-            for (k, v) in doc.fields {
-                object_fields.insert(k, v);
-            }
-            rows.push(Value::Object(object_fields));
-        }
-        if matches!(materialized_query.operations.last(), Some(Operation::First)) {
+        // A row is its fields, exactly as when the same rows are reached
+        // through a path. Rows that were not shaped by a `select` also keep
+        // their identity, so `orders.first().id` works for generated ids.
+        let projected = materialized_query
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, Operation::Select(_) | Operation::GroupBy(_)));
+        let rows: Vec<Value> = docs
+            .into_iter()
+            .map(|doc| {
+                if projected {
+                    Value::Object(doc.fields)
+                } else {
+                    Self::row_as_value(&doc)
+                }
+            })
+            .collect();
+        if materialized_query
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, Operation::First))
+        {
             Ok(rows.into_iter().next().unwrap_or(Value::Null))
         } else {
             Ok(Value::List(rows))
@@ -1704,6 +2073,24 @@ impl<S: DocumentStore> QueryExecutor<S> {
             Operation::Having(block) => Operation::Having(crate::parser::HavingBlock {
                 condition: self
                     .materialize_condition_with_scope(&block.condition, scope_document)?,
+            }),
+            Operation::AggregateExpr { function, input } => Operation::AggregateExpr {
+                function: function.clone(),
+                input: self.materialize_expression_with_scope(input, scope_document)?,
+            },
+            Operation::GroupBy(block) => Operation::GroupBy(GroupByBlock {
+                fields: block.fields.clone(),
+                computed: block
+                    .computed
+                    .iter()
+                    .map(|key| {
+                        Ok(crate::parser::ComputedGroupKey {
+                            name: key.name.clone(),
+                            expression: self
+                                .materialize_expression_with_scope(&key.expression, scope_document)?,
+                        })
+                    })
+                    .collect::<OQLResult<Vec<_>>>()?,
             }),
             Operation::Nearest(block) => Operation::Nearest(crate::parser::NearestBlock {
                 field: block.field.clone(),
@@ -1907,24 +2294,16 @@ impl<S: DocumentStore> QueryExecutor<S> {
             )?
         };
 
+        // The enclosing row's value becomes a constant of the nested query.
+        // A reference is carried as the id of its target, which is what a
+        // reference compares equal to; an absent value is null, which
+        // matches nothing, so a nested query over it is simply empty.
         match value {
-            Value::String(s) => Ok(Expression::Literal(Literal::String(s))),
-            Value::Integer(i) => Ok(Expression::Literal(Literal::Integer(i))),
-            Value::Float(f) => Ok(Expression::Literal(Literal::Float(f))),
-            Value::Boolean(b) => Ok(Expression::Literal(Literal::Boolean(b))),
-            Value::DateTime(dt) => Ok(Expression::Literal(Literal::String(dt.to_rfc3339()))),
-            Value::Reference(r) => Ok(Expression::Literal(Literal::String(r.to_string_id()))),
-            Value::GlobalReference(r) => Ok(Expression::Literal(Literal::String(r.to_string_id()))),
-            Value::Null => Err(OQLError::FunctionError {
-                message: format!("Scope path {} resolved to Null", path.join(".")),
-            }),
-            other => Err(OQLError::FunctionError {
-                message: format!(
-                    "Scope path {} must resolve to scalar literal, got {}",
-                    path.join("."),
-                    other.type_name()
-                ),
-            }),
+            Value::DateTime(instant) => Ok(Expression::Literal(Literal::String(instant.to_rfc3339()))),
+            reference @ (Value::Reference(_) | Value::GlobalReference(_)) => {
+                Self::value_as_expression(self.reference_as_id(&reference)?)
+            }
+            other => Self::value_as_expression(other),
         }
     }
 
@@ -2049,6 +2428,16 @@ impl<S: DocumentStore> QueryExecutor<S> {
             (Value::String(a), Value::String(b)) if matches!(operator, BinaryOperator::Add) => {
                 Ok(Value::String(format!("{}{}", a, b)))
             }
+            // Lists concatenate, which is how an update appends:
+            // `tags: .tags + ["new"]`. An absent list is empty.
+            (Value::List(a), Value::List(b)) if matches!(operator, BinaryOperator::Add) => {
+                Ok(Value::List(a.iter().chain(b).cloned().collect()))
+            }
+            (Value::Null, Value::List(only)) | (Value::List(only), Value::Null)
+                if matches!(operator, BinaryOperator::Add) =>
+            {
+                Ok(Value::List(only.clone()))
+            }
             _ => Err(OQLError::FunctionError {
                 message: format!(
                     "Invalid binary operation: {:?} {:?} {:?}",
@@ -2061,27 +2450,41 @@ impl<S: DocumentStore> QueryExecutor<S> {
     /// Evaluate array access
     fn evaluate_array_access(&self, array_value: &Value, index_value: &Value) -> OQLResult<Value> {
         match (array_value, index_value) {
+            // A negative index counts from the end: `[-1]` is the last
+            // element. Anything out of range has no element.
             (Value::List(list), Value::Integer(index)) => {
-                let idx = *index as usize;
-                if idx < list.len() {
-                    Ok(list[idx].clone())
-                } else {
-                    Ok(Value::Null) // Return null for out-of-bounds access
-                }
+                Ok(Self::resolve_index(*index, list.len())
+                    .map(|position| list[position].clone())
+                    .unwrap_or(Value::Null))
             }
             (Value::String(s), Value::Integer(index)) => {
-                let idx = *index as usize;
                 let chars: Vec<char> = s.chars().collect();
-                if idx < chars.len() {
-                    Ok(Value::String(chars[idx].to_string()))
-                } else {
-                    Ok(Value::Null) // Return null for out-of-bounds access
-                }
+                Ok(Self::resolve_index(*index, chars.len())
+                    .map(|position| Value::String(chars[position].to_string()))
+                    .unwrap_or(Value::Null))
             }
+            // Indexing is a read, and reads are null-safe: an absent list
+            // or an absent index has no element.
+            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
             _ => Err(OQLError::FunctionError {
-                message: format!("Invalid array access: {:?}[{:?}]", array_value, index_value),
+                message: format!(
+                    "cannot index a {} with a {}",
+                    array_value.type_name(),
+                    index_value.type_name()
+                ),
             }),
         }
+    }
+
+    fn resolve_index(index: i64, length: usize) -> Option<usize> {
+        let position = if index < 0 {
+            index.checked_add(i64::try_from(length).ok()?)?
+        } else {
+            index
+        };
+        usize::try_from(position)
+            .ok()
+            .filter(|position| *position < length)
     }
 
     /// Get a field from a value (for chained access)
@@ -2160,8 +2563,11 @@ impl<S: DocumentStore> QueryExecutor<S> {
     ) -> OQLResult<Value> {
         profile_call!("get_field_value", {
             if field_access.path.is_empty() {
-                // Return null for empty path instead of error - graceful degradation
-                return Ok(Value::Null);
+                // The empty path is `.`: the current row or value itself.
+                return Ok(match document.fields.get(SCALAR_ROW_FIELD) {
+                    Some(value) => value.clone(),
+                    None => Self::row_as_value(document),
+                });
             }
 
             // Handle single-level field access directly with optimized lookup
@@ -2173,7 +2579,10 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     return Ok(system_field.value(document));
                 }
                 // Use optimized field access with caching.
-                return Ok(optimized_get_field(document, field_name).unwrap_or(Value::Null));
+                // Read the document itself. A cache keyed by document id
+                // and field name cannot tell two versions of a document,
+                // or two collections, apart.
+                return Ok(document.get_field(field_name).cloned().unwrap_or(Value::Null));
             }
 
             // Grouped rows flatten grouped key paths into underscore-separated fields
@@ -2181,7 +2590,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
             // those synthetic fields during the subsequent select phase.
             if document.schema == "group" {
                 let flattened_field_name = field_access.path.join("_");
-                if let Some(value) = optimized_get_field(document, &flattened_field_name) {
+                if let Some(value) = document.get_field(&flattened_field_name).cloned() {
                     return Ok(value);
                 }
             }
@@ -2473,7 +2882,47 @@ impl<S: DocumentStore> QueryExecutor<S> {
         operator: &ComparisonOperator,
         right: &Value,
     ) -> OQLResult<bool> {
+        // A reference is the document it points at, and a document is
+        // identified by its id, so `.user == "u1"` asks whether the
+        // reference targets that document.
+        if matches!(
+            (left, right),
+            (
+                Value::Reference(_) | Value::GlobalReference(_),
+                Value::String(_) | Value::List(_)
+            ) | (
+                Value::String(_),
+                Value::Reference(_) | Value::GlobalReference(_) | Value::List(_)
+            )
+        ) {
+            let left = self.reference_as_id(left)?;
+            let right = self.reference_as_id(right)?;
+            return Ok(crate::value_semantics::matches(&left, operator, &right));
+        }
         Ok(crate::value_semantics::matches(left, operator, right))
+    }
+
+    /// Replace a reference, or references inside a list, with the id of the
+    /// document referred to. A broken reference has no id.
+    fn reference_as_id(&self, value: &Value) -> OQLResult<Value> {
+        Ok(match value {
+            Value::Reference(reference) => self
+                .resolve_objref_target(reference)?
+                .map(|document| Value::String(document.id))
+                .unwrap_or(Value::Null),
+            Value::GlobalReference(reference) => self
+                .store
+                .navigate_global_reference(reference)?
+                .map(|document| Value::String(document.id))
+                .unwrap_or(Value::Null),
+            Value::List(items) => Value::List(
+                items
+                    .iter()
+                    .map(|item| self.reference_as_id(item))
+                    .collect::<OQLResult<_>>()?,
+            ),
+            other => other.clone(),
+        })
     }
 
     /// Check if two values are equal
@@ -2551,6 +3000,26 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 let mut projected_fields = HashMap::new();
 
                 for select_field in &select_block.fields {
+                    // `*` stands for every field of the row. Entries written
+                    // after it add to, or replace, what it brought in.
+                    if select_field.alias.is_none() && Self::is_all_fields(&select_field.expression)
+                    {
+                        projected_fields.extend(
+                            document
+                                .fields
+                                .iter()
+                                .map(|(name, value)| (name.clone(), value.clone())),
+                        );
+                        continue;
+                    }
+                    // `-name` leaves out a field that `*` brought in.
+                    if matches!(&select_field.expression, Expression::Identifier(marker) if marker == crate::parser::OMITTED_FIELD)
+                    {
+                        if let Some(name) = &select_field.alias {
+                            projected_fields.remove(name);
+                        }
+                        continue;
+                    }
                     let field_name = match &select_field.alias {
                         Some(alias) => alias.clone(),
                         None => {
@@ -2609,8 +3078,14 @@ impl<S: DocumentStore> QueryExecutor<S> {
             fields.insert(insert_field.name.clone(), value);
         }
 
+        if let Some(ref schema) = schema {
+            self.apply_defaults(schema, &mut fields)?;
+            self.coerce_shapes(schema, &mut fields)?;
+        }
+
         // Create new document
-        let document = Document::new(collection.to_string(), fields);
+        let document = Self::document_for_insert(collection, fields)?;
+        self.ensure_new_identity(&document, &mut HashSet::new())?;
 
         // Validate against schema if it exists
         if let Some(schema) = schema {
@@ -2625,6 +3100,366 @@ impl<S: DocumentStore> QueryExecutor<S> {
         Ok(vec![document])
     }
 
+    /// Declare a collection's schema, or change it.
+    ///
+    /// Redeclaring a schema is how it is altered. Changes that cannot
+    /// invalidate existing documents are applied: adding an optional field,
+    /// adding a field with a default (existing documents receive it), making
+    /// a field optional, widening `Integer` to `Float`, renaming with
+    /// `new: Type from old`, and dropping with `old: removed`. Any other
+    /// change is refused with the reason, and nothing is written.
+    pub fn define_schema(
+        &self,
+        definition: &crate::parser::SchemaDefinition,
+        schema: Schema,
+    ) -> OQLResult<()> {
+        let refuse = |reason: String| OQLError::SchemaValidation {
+            message: format!("cannot change schema '{}': {reason}", schema.name),
+        };
+        let existing = self.store.get_schema(&schema.name)?;
+        let mut rewritten = Vec::new();
+
+        if let Some(old) = existing.filter(|old| old != &schema) {
+            let rows = self.store.scan_documents(&schema.name)?;
+            let renames: HashMap<&str, &str> = definition
+                .fields
+                .iter()
+                .filter_map(|field| Some((field.renamed_from.as_deref()?, field.name.as_str())))
+                .collect();
+            let removed: HashSet<&str> = definition
+                .fields
+                .iter()
+                .filter(|field| field.removed)
+                .map(|field| field.name.as_str())
+                .collect();
+
+            for name in old.fields.keys() {
+                if schema.fields.contains_key(name)
+                    || renames.contains_key(name.as_str())
+                    || removed.contains(name.as_str())
+                {
+                    continue;
+                }
+                let holders = rows
+                    .iter()
+                    .filter(|row| row.fields.get(name).is_some_and(|value| !value.is_null()))
+                    .count();
+                if holders > 0 {
+                    return Err(refuse(format!(
+                        "field '{name}' is no longer declared but {holders} document(s) have a \
+                         value for it. Keep the field, rename it with 'new_name: Type from \
+                         {name}', or drop it with '{name}: removed'"
+                    )));
+                }
+            }
+            for (name, new_type) in &schema.fields {
+                let source = renames
+                    .iter()
+                    .find(|(_, renamed)| **renamed == name.as_str())
+                    .map(|(original, _)| *original);
+                let Some(old_type) = old.fields.get(source.unwrap_or(name.as_str())) else {
+                    let has_default = schema.constraints.iter().any(|constraint| {
+                        matches!(constraint, SchemaConstraint::Default { field, .. } if field == name)
+                    });
+                    if !new_type.is_optional() && !has_default && !rows.is_empty() {
+                        return Err(refuse(format!(
+                            "new field '{name}' is required, and existing documents have no \
+                             value for it. Give it a default ('{name}: Type = value') or make \
+                             it optional"
+                        )));
+                    }
+                    continue;
+                };
+                if !Self::type_change_is_safe(old_type, new_type) && !rows.is_empty() {
+                    return Err(refuse(format!(
+                        "field '{name}' cannot change from {} to {}",
+                        Self::describe_type(old_type),
+                        Self::describe_type(new_type)
+                    )));
+                }
+            }
+
+            for mut row in rows {
+                let before = row.fields.clone();
+                for (original, renamed) in &renames {
+                    if let Some(value) = row.fields.remove(*original) {
+                        row.fields.insert(renamed.to_string(), value);
+                    }
+                }
+                row.fields
+                    .retain(|name, _| schema.fields.contains_key(name));
+                self.apply_defaults(&schema, &mut row.fields)?;
+                for (name, field_type) in &schema.fields {
+                    if let Some(value) = row.fields.get(name).cloned() {
+                        let widened = match (value, Self::scalar_field_type(field_type)) {
+                            (Value::Integer(integer), FieldType::Float) => {
+                                Value::Float(integer as f64)
+                            }
+                            (value, _) => value,
+                        };
+                        row.fields.insert(name.clone(), widened);
+                    }
+                }
+                schema
+                    .validate_document(&row.fields)
+                    .map_err(|error| refuse(format!("document '{}' would not fit: {error}", row.id)))?;
+                self.check_expressions(&schema, &row)
+                    .map_err(|error| refuse(error.to_string()))?;
+                if row.fields != before {
+                    rewritten.push(row);
+                }
+            }
+        }
+
+        let (scalar_indexes, vector_indexes) =
+            crate::parser::schema_definition_indexes(definition, &schema)?;
+        self.store.put_schema(&schema)?;
+        if !rewritten.is_empty() {
+            self.store.put_documents(&rewritten)?;
+        }
+
+        // Indexes declared in the block are the collection's indexes. One
+        // that an earlier declaration created and this one omits is dropped.
+        let declared: HashSet<&str> = scalar_indexes
+            .iter()
+            .map(|index| index.name.as_str())
+            .collect();
+        for index in self.store.list_scalar_indexes(Some(&schema.name))? {
+            let ours = index.name.starts_with(&format!("{}_by_", schema.name))
+                || index.name.starts_with(&format!("{}_unique_", schema.name));
+            if ours && !declared.contains(index.name.as_str()) {
+                self.store.delete_scalar_index(&schema.name, &index.name)?;
+            }
+        }
+        for index in scalar_indexes {
+            self.store.upsert_scalar_index(index)?;
+        }
+        for index in vector_indexes {
+            self.store.upsert_vector_index(index)?;
+        }
+        Ok(())
+    }
+
+    /// Remove a collection: its documents, its indexes and its schema. A
+    /// collection that others still refer to is not dropped.
+    pub fn drop_collection(&self, name: &str) -> OQLResult<usize> {
+        for other in self.store.list_schemas()? {
+            if other == name {
+                continue;
+            }
+            let Some(schema) = self.store.get_schema(&other)? else {
+                continue;
+            };
+            if let Some((field, _)) = schema
+                .get_reference_fields()
+                .into_iter()
+                .find(|(_, reference)| reference.target_schema == name)
+            {
+                return Err(OQLError::SchemaValidation {
+                    message: format!(
+                        "cannot drop '{name}': '{other}.{field}' refers to it. Drop '{other}' \
+                         first, or remove that field"
+                    ),
+                });
+            }
+        }
+        let documents = self.store.scan_documents(name)?;
+        if documents.is_empty() && self.store.get_schema(name)?.is_none() {
+            return Err(OQLError::SchemaValidation {
+                message: format!("cannot drop '{name}': there is no such collection"),
+            });
+        }
+        for document in &documents {
+            self.store.delete_document(name, &document.id)?;
+        }
+        for index in self.store.list_scalar_indexes(Some(name))? {
+            self.store.delete_scalar_index(name, &index.name)?;
+        }
+        self.store.delete_schema(name)?;
+        Ok(documents.len())
+    }
+
+    fn scalar_field_type(field_type: &FieldType) -> &FieldType {
+        match field_type {
+            FieldType::Optional(inner) => Self::scalar_field_type(inner),
+            other => other,
+        }
+    }
+
+    /// Whether every value valid under `old` is valid, or can be made valid
+    /// without loss, under `new`.
+    fn type_change_is_safe(old: &FieldType, new: &FieldType) -> bool {
+        match (old, new) {
+            // Required may become optional, never the reverse.
+            (FieldType::Optional(old), FieldType::Optional(new)) => {
+                Self::type_change_is_safe(old, new)
+            }
+            (FieldType::Optional(_), _) => false,
+            (old, FieldType::Optional(new)) => Self::type_change_is_safe(old, new),
+            (FieldType::Integer, FieldType::Float) => true,
+            (FieldType::List(old), FieldType::List(new)) => Self::type_change_is_safe(old, new),
+            // Rules attached to a reference may change; its target may not.
+            (FieldType::Reference(old), FieldType::Reference(new)) => {
+                old.target_schema == new.target_schema
+            }
+            (old, new) => old == new,
+        }
+    }
+
+    fn describe_type(field_type: &FieldType) -> String {
+        match field_type {
+            FieldType::Optional(inner) => format!("Optional({})", Self::describe_type(inner)),
+            FieldType::List(inner) => format!("List({})", Self::describe_type(inner)),
+            FieldType::Reference(reference) => format!("Ref({})", reference.target_schema),
+            FieldType::Vector { dim } => format!("Vector({dim})"),
+            other => other.type_name().to_string(),
+        }
+    }
+
+    /// Evaluate a schema's `check(..)` declarations for one document.
+    fn check_expressions(&self, schema: &Schema, document: &Document) -> OQLResult<()> {
+        let checks = Schema::new_with_constraints(
+            schema.name.clone(),
+            HashMap::new(),
+            schema
+                .constraints
+                .iter()
+                .filter(|constraint| matches!(constraint, SchemaConstraint::CheckExpression { .. }))
+                .cloned()
+                .collect(),
+        );
+        self.validate_document_constraints(&checks, document, None)
+    }
+
+    /// Fill in declared defaults for fields an insert left out. A default
+    /// is an expression, evaluated against the fields written so far, so it
+    /// may be computed: `created: DateTime = now()`.
+    fn apply_defaults(&self, schema: &Schema, fields: &mut HashMap<String, Value>) -> OQLResult<()> {
+        for constraint in &schema.constraints {
+            let SchemaConstraint::Default { field, expression } = constraint else {
+                continue;
+            };
+            if fields.contains_key(field) {
+                continue;
+            }
+            let parsed = crate::parser::parse_stored_expression(expression).map_err(|error| {
+                OQLError::SchemaValidation {
+                    message: format!(
+                        "default of '{}.{field}' is not valid: {error}",
+                        schema.name
+                    ),
+                }
+            })?;
+            let scope = Document::with_id(String::new(), schema.name.clone(), fields.clone());
+            let mut value = self.evaluate_expression(&scope, &parsed)?;
+            if let Some(field_type) = schema.get_field_type(field) {
+                value = self.convert_to_schema_type(value, field_type, &schema.name)?;
+            }
+            fields.insert(field.clone(), value);
+        }
+        Ok(())
+    }
+
+    /// Bring the values inside declared embedded objects to their declared
+    /// types, exactly as top-level fields are: timestamp text becomes a
+    /// timestamp and an id becomes a reference.
+    fn coerce_shapes(&self, schema: &Schema, fields: &mut HashMap<String, Value>) -> OQLResult<()> {
+        for constraint in &schema.constraints {
+            let SchemaConstraint::Shape { path, .. } = constraint else {
+                continue;
+            };
+            if path.contains('.') {
+                continue;
+            }
+            if let Some(value) = fields.get_mut(path.trim_end_matches("[]")) {
+                self.coerce_shaped_value(schema, path, value)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn coerce_shaped_value(&self, schema: &Schema, path: &str, value: &mut Value) -> OQLResult<()> {
+        let Some(shape) = schema.shape(path) else {
+            return Ok(());
+        };
+        let objects: Vec<&mut HashMap<String, Value>> = match value {
+            Value::Object(object) => vec![object],
+            Value::List(items) => items
+                .iter_mut()
+                .filter_map(|item| match item {
+                    Value::Object(object) => Some(object),
+                    _ => None,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        let base = path.trim_end_matches("[]");
+        for object in objects {
+            for (name, field_type) in shape {
+                let Some(nested) = object.get_mut(name) else {
+                    continue;
+                };
+                *nested = self.convert_to_schema_type(nested.clone(), field_type, &schema.name)?;
+                self.coerce_shaped_value(schema, &format!("{base}.{name}"), nested)?;
+                self.coerce_shaped_value(schema, &format!("{base}.{name}[]"), nested)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Build the document for an insert.
+    ///
+    /// The `id` a user writes is the document's identity: it is the key the
+    /// collection stores the document under and the target that references
+    /// resolve to. A document inserted without an `id` is given one.
+    fn document_for_insert(
+        collection: &str,
+        fields: HashMap<String, Value>,
+    ) -> OQLResult<Document> {
+        let id = match fields.get("id") {
+            None | Some(Value::Null) => {
+                return Ok(Document::new(collection.to_string(), fields));
+            }
+            Some(Value::String(id)) if !id.is_empty() => id.clone(),
+            Some(Value::Integer(id)) => id.to_string(),
+            Some(other) => {
+                return Err(OQLError::SchemaValidation {
+                    message: format!(
+                        "'{collection}' id must be a non-empty String or an Integer, found {}",
+                        other.type_name()
+                    ),
+                });
+            }
+        };
+        Ok(Document::with_id(id, collection.to_string(), fields))
+    }
+
+    /// Reject an insert whose id is already taken, in the collection or
+    /// earlier in the same batch. Replacing a document is `upsert`'s job.
+    fn ensure_new_identity(
+        &self,
+        document: &Document,
+        batch_ids: &mut HashSet<String>,
+    ) -> OQLResult<()> {
+        if !document.fields.contains_key("id") {
+            return Ok(());
+        }
+        if !batch_ids.insert(document.id.clone())
+            || self
+                .store
+                .get_document(&document.schema, &document.id)?
+                .is_some()
+        {
+            return Err(OQLError::SchemaValidation {
+                message: format!(
+                    "a '{}' document with id '{}' already exists; use upsert to replace it",
+                    document.schema, document.id
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Apply INSERT MANY operation (batch insert)
     fn apply_insert_many_operation(
         &self,
@@ -2632,6 +3467,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
         insert_blocks: &[InsertBlock],
     ) -> OQLResult<Vec<Document>> {
         let mut documents = Vec::with_capacity(insert_blocks.len());
+        let mut batch_ids = HashSet::new();
 
         // Get schema once for all documents
         let schema = self.store.get_schema(collection).ok().flatten();
@@ -2656,8 +3492,14 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 fields.insert(insert_field.name.clone(), value);
             }
 
+            if let Some(ref schema) = schema {
+                self.apply_defaults(schema, &mut fields)?;
+                self.coerce_shapes(schema, &mut fields)?;
+            }
+
             // Create new document
-            let document = Document::new(collection.to_string(), fields);
+            let document = Self::document_for_insert(collection, fields)?;
+            self.ensure_new_identity(&document, &mut batch_ids)?;
 
             // Validate against schema if it exists
             if let Some(ref schema) = schema {
@@ -2730,6 +3572,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
             document.set_field(name, value);
         }
         if let Some(schema) = schema {
+            self.coerce_shapes(&schema, &mut document.fields)?;
             schema.validate_document(&document.fields)?;
             self.validate_document_constraints(&schema, &document, Some(&document.id))?;
         }
@@ -2785,23 +3628,14 @@ impl<S: DocumentStore> QueryExecutor<S> {
             (Value::String(ref_id), FieldType::Reference(ref_type)) => {
                 let target_schema = &ref_type.target_schema;
 
-                // Scan for the document with this id field value
-                let documents = self.store.scan_documents(target_schema)?;
-
-                // Find document where the "id" field matches
-                for doc in documents {
-                    if let Some(Value::String(doc_id)) = doc.fields.get("id") {
-                        if doc_id == &ref_id {
-                            // Found the document! Get its ObjRef
-                            if let Some(objref) =
-                                self.store.get_global_objref(target_schema, &doc.id)?
-                            {
-                                return Ok(Value::GlobalReference(objref));
-                            }
-                            if let Some(objref) = self.store.get_objref(target_schema, &doc.id)? {
-                                return Ok(Value::Reference(objref));
-                            }
-                        }
+                // A document is stored under its id, so the target is one
+                // lookup away.
+                if self.store.get_document(target_schema, &ref_id)?.is_some() {
+                    if let Some(objref) = self.store.get_global_objref(target_schema, &ref_id)? {
+                        return Ok(Value::GlobalReference(objref));
+                    }
+                    if let Some(objref) = self.store.get_objref(target_schema, &ref_id)? {
+                        return Ok(Value::Reference(objref));
                     }
                 }
 
@@ -2817,6 +3651,24 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     Ok(Value::Null)
                 }
             }
+            // A timestamp may be written as text: RFC 3339, or a bare date
+            // meaning midnight UTC.
+            (Value::String(text), FieldType::DateTime) => {
+                crate::value_semantics::parse_timestamp(&text)
+                    .map(Value::DateTime)
+                    .ok_or_else(|| OQLError::TypeError {
+                        expected:
+                            "a timestamp such as \"2026-01-05T10:00:00Z\" or \"2026-01-05\""
+                                .to_string(),
+                        actual: format!("\"{text}\""),
+                    })
+            }
+            (Value::List(items), FieldType::List(inner_type)) => Ok(Value::List(
+                items
+                    .into_iter()
+                    .map(|item| self.convert_to_schema_type(item, inner_type, _current_collection))
+                    .collect::<OQLResult<_>>()?,
+            )),
             // Handle optional types
             (v, FieldType::Optional(inner_type)) => {
                 if v.is_null() {
@@ -2866,6 +3718,17 @@ impl<S: DocumentStore> QueryExecutor<S> {
             let mut new_value = self.evaluate_expression(&document, &update_field.value)?;
             let path: Vec<&str> = update_field.name.split('.').collect();
             if path.len() == 1 {
+                if update_field.name == "id"
+                    && !self.values_equal(&new_value, &Value::String(document.id.clone()))
+                {
+                    return Err(OQLError::SchemaValidation {
+                        message: format!(
+                            "cannot change the id of '{}' document '{}': an id is a document's \
+                             identity",
+                            document.schema, document.id
+                        ),
+                    });
+                }
                 if let Some(ref schema) = schema {
                     if let Some(field_type) = schema.get_field_type(&update_field.name) {
                         new_value =
@@ -2890,6 +3753,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
 
         if let Some(schema) = schema {
+            self.coerce_shapes(&schema, &mut document.fields)?;
             schema.validate_document(&document.fields)?;
             self.validate_document_constraints(&schema, &document, Some(&document.id))?;
         }
@@ -2970,7 +3834,38 @@ impl<S: DocumentStore> QueryExecutor<S> {
 
         for constraint in &schema.constraints {
             match constraint {
+                SchemaConstraint::CheckExpression { expression } => {
+                    let condition = crate::parser::parse_check_condition(expression)
+                        .map_err(|error| OQLError::SchemaValidation {
+                            message: format!(
+                                "check({expression}) on '{}' is not valid: {error}",
+                                schema.name
+                            ),
+                        })?;
+                    if !self.evaluate_condition(document, &condition)? {
+                        return Err(OQLError::SchemaValidation {
+                            message: format!(
+                                "'{}' document '{}' fails check({expression})",
+                                schema.name, document.id
+                            ),
+                        });
+                    }
+                }
+                // Applied when a document is built, not checked afterwards.
+                SchemaConstraint::Default { .. }
+                | SchemaConstraint::Shape { .. }
+                | SchemaConstraint::ReverseName { .. } => {}
                 SchemaConstraint::Unique { fields, name } => {
+                    // A unique index over the same fields already enforces
+                    // this inside the storage engine, without a scan.
+                    if self
+                        .store
+                        .list_scalar_indexes(Some(&schema.name))?
+                        .iter()
+                        .any(|index| index.unique && &index.fields == fields)
+                    {
+                        continue;
+                    }
                     let docs = self.store.scan_documents(&schema.name)?;
                     for existing in docs {
                         if let Some(current_id) = current_document_id {
@@ -3169,18 +4064,106 @@ impl<S: DocumentStore> QueryExecutor<S> {
 
     /// Apply DELETE operation to documents
     fn apply_delete_operation(&self, documents: Vec<Document>) -> OQLResult<Vec<Document>> {
+        // Decide everything before changing anything: a `restrict` anywhere
+        // in the cascade must leave the database untouched.
+        let mut plan = DeletePlan::default();
+        for document in &documents {
+            self.plan_delete(document, &mut plan)?;
+        }
+
+        if !plan.nullified.is_empty() {
+            let survivors: Vec<Document> = plan
+                .nullified
+                .into_values()
+                .filter(|document| {
+                    !plan
+                        .deleted
+                        .contains(&(document.schema.clone(), document.id.clone()))
+                })
+                .collect();
+            self.store.put_documents(&survivors)?;
+        }
+        for document in &plan.cascaded {
+            self.store.delete_document(&document.schema, &document.id)?;
+        }
+
         let mut deleted_documents = Vec::new();
-
         for document in documents {
-            // Delete the document from storage
-            let was_deleted = self.store.delete_document(&document.schema, &document.id)?;
-
-            if was_deleted {
+            if self.store.delete_document(&document.schema, &document.id)? {
                 deleted_documents.push(document);
             }
         }
-
         Ok(deleted_documents)
+    }
+
+    /// Work out what deleting `document` entails for the documents that
+    /// refer to it, following each reference's `on delete` rule.
+    fn plan_delete(&self, document: &Document, plan: &mut DeletePlan) -> OQLResult<()> {
+        if !plan
+            .deleted
+            .insert((document.schema.clone(), document.id.clone()))
+        {
+            return Ok(());
+        }
+        for source in self.store.list_schemas()? {
+            let Some(source_schema) = self.store.get_schema(&source)? else {
+                continue;
+            };
+            for (field, reference) in source_schema.get_reference_fields() {
+                if reference.target_schema != document.schema {
+                    continue;
+                }
+                let referring = self.store.scan_referencing_documents(
+                    &document.schema,
+                    &document.id,
+                    Some(&source),
+                    Some(field),
+                )?;
+                for referrer in referring {
+                    let key = (referrer.schema.clone(), referrer.id.clone());
+                    if plan.deleted.contains(&key) {
+                        continue;
+                    }
+                    match reference.on_delete {
+                        crate::schema::CascadeBehavior::Restrict => {
+                            return Err(OQLError::ReferenceError {
+                                message: format!(
+                                    "cannot delete '{}' document '{}': '{}' document '{}' refers \
+                                     to it through '{}'. Delete or repoint that document first, \
+                                     or declare the reference 'on delete cascade' or \
+                                     'on delete nullify'",
+                                    document.schema, document.id, source, referrer.id, field
+                                ),
+                            });
+                        }
+                        crate::schema::CascadeBehavior::Cascade => {
+                            self.plan_delete(&referrer, plan)?;
+                            plan.cascaded.push(referrer);
+                        }
+                        crate::schema::CascadeBehavior::SetNull => {
+                            let entry = plan.nullified.entry(key).or_insert(referrer);
+                            let cleared = match entry.fields.get(field) {
+                                Some(Value::List(items)) => {
+                                    let mut kept = Vec::new();
+                                    for item in items {
+                                        if self.reference_as_id(item)?
+                                            != Value::String(document.id.clone())
+                                        {
+                                            kept.push(item.clone());
+                                        }
+                                    }
+                                    Value::List(kept)
+                                }
+                                _ => Value::Null,
+                            };
+                            entry.fields.insert(field.clone(), cleared);
+                        }
+                        crate::schema::CascadeBehavior::NoAction => {}
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Evaluate a function call expression
@@ -3191,8 +4174,8 @@ impl<S: DocumentStore> QueryExecutor<S> {
         args: &[Expression],
     ) -> OQLResult<Value> {
         if document.schema == "group" {
-            if let Some(field_path) = Self::aggregate_field_path(name, args)? {
-                return self.execute_group_aggregation(document, name, &field_path);
+            if let Some(input) = Self::aggregate_input(name, args)? {
+                return self.execute_group_aggregation(document, name, &input);
             }
         }
 
@@ -3211,6 +4194,12 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     });
                 };
                 let state = self.resolve_path_state(document, &path.path)?;
+                // `exists(.orders)` on a relationship asks whether there are
+                // any related rows, the same question as `.orders.exists()`.
+                if name == "exists" && matches!(state, PathState::Missing) {
+                    let (rows, _) = self.path_source_rows(document, &path.path)?;
+                    return Ok(Value::Boolean(!rows.is_empty()));
+                }
                 let result = match name {
                     "exists" => matches!(state, PathState::Present(_) | PathState::Null),
                     "is_null" => matches!(state, PathState::Null),
@@ -3248,41 +4237,48 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
     }
 
-    fn aggregate_field_path(name: &str, args: &[Expression]) -> OQLResult<Option<Vec<String>>> {
-        let is_aggregate = matches!(name, "count" | "sum" | "avg" | "min" | "max");
-        if !is_aggregate {
+    /// What an aggregate call such as `sum(.amount)` aggregates, or `None`
+    /// when `name` is not an aggregate.
+    fn aggregate_input(name: &str, args: &[Expression]) -> OQLResult<Option<AggregateInput>> {
+        if !matches!(name, "count" | "sum" | "avg" | "min" | "max") {
             return Ok(None);
         }
-        if name == "count" && args.is_empty() {
-            return Ok(Some(Vec::new()));
-        }
-        if args.len() != 1 {
-            return Err(OQLError::FunctionError {
-                message: format!(
-                    "{} expects {}",
-                    name,
-                    if name == "count" {
-                        "zero or one field argument"
-                    } else {
-                        "exactly one field argument"
-                    }
-                ),
-            });
-        }
-        match &args[0] {
-            Expression::FieldAccess(field) if field.path.len() == 1 && field.path[0] == "*" => {
+        match args {
+            [] if name == "count" => Ok(Some(AggregateInput::AllRows)),
+            [Expression::FieldAccess(field)] if field.path.len() == 1 && field.path[0] == "*" => {
                 if name == "count" {
-                    Ok(Some(Vec::new()))
+                    Ok(Some(AggregateInput::AllRows))
                 } else {
                     Err(OQLError::FunctionError {
                         message: format!("{} does not accept '*'", name),
                     })
                 }
             }
-            Expression::FieldAccess(field) => Ok(Some(field.path.clone())),
+            [Expression::FieldAccess(field)] => Ok(Some(AggregateInput::Path(field.path.clone()))),
+            // Any other expression is evaluated for each row and the
+            // results aggregated: `sum(.price * .qty)`.
+            [expression] => Ok(Some(AggregateInput::Expression(expression.clone()))),
             _ => Err(OQLError::FunctionError {
-                message: format!("{} expects a field path argument", name),
+                message: format!(
+                    "{} expects {}",
+                    name,
+                    if name == "count" {
+                        "zero or one argument"
+                    } else {
+                        "exactly one argument"
+                    }
+                ),
             }),
+        }
+    }
+
+    fn aggregate_input_value(&self, row: &Document, input: &AggregateInput) -> OQLResult<Value> {
+        match input {
+            AggregateInput::AllRows => Ok(Value::Null),
+            AggregateInput::Path(path) => {
+                self.get_field_value(row, &FieldAccess { path: path.clone() })
+            }
+            AggregateInput::Expression(expression) => self.evaluate_expression(row, expression),
         }
     }
 
@@ -3329,6 +4325,12 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 .iter()
                 .any(|field| Self::expression_contains_aggregate(&field.value)),
             Expression::ConditionExpr(condition) => Self::condition_contains_aggregate(condition),
+            // An operation with no receiver ranges over the select's input.
+            Expression::CollectionExpression { source, .. }
+                if matches!(source.as_ref(), Expression::Identifier(name) if name == crate::parser::CURRENT_ROWS) =>
+            {
+                true
+            }
             // Collection/query expressions have their own row scope. Their
             // terminal aggregates are correlated values, not aggregates over
             // the surrounding select input.
@@ -3360,12 +4362,24 @@ impl<S: DocumentStore> QueryExecutor<S> {
         expression: &Expression,
     ) -> OQLResult<Value> {
         if let Expression::FunctionCall { name, args } = expression {
-            if let Some(field_path) = Self::aggregate_field_path(name, args)? {
-                return self.execute_aggregation(documents, name, &field_path);
+            if let Some(input) = Self::aggregate_input(name, args)? {
+                return self.aggregate_rows(documents, name, &input);
             }
         }
 
         match expression {
+            Expression::CollectionExpression { source, operations }
+                if matches!(source.as_ref(), Expression::Identifier(name) if name == crate::parser::CURRENT_ROWS) =>
+            {
+                let scope = Document::with_id(String::new(), "$aggregate".to_string(), HashMap::new());
+                self.run_collection_operations(
+                    documents.to_vec(),
+                    false,
+                    operations,
+                    &scope,
+                    documents.first().map_or("$aggregate", |row| row.schema.as_str()),
+                )
+            }
             Expression::BinaryOp {
                 left,
                 operator,
@@ -3548,8 +4562,13 @@ impl<S: DocumentStore> QueryExecutor<S> {
         args: &[Expression],
     ) -> OQLResult<Value> {
         if args.is_empty() {
-            // count() or count(*) - count all documents
-            Ok(Value::Integer(1)) // For single document context, always 1
+            // Reaching here means `count()` was evaluated for one row with
+            // no collection to count: for example inside `where`.
+            Err(OQLError::FunctionError {
+                message: "count() has no collection to count here; use it in select or having, \
+                          or call it on a collection as in .orders.count()"
+                    .to_string(),
+            })
         } else if args.len() == 1 {
             // count(field) - count non-null values
             match &args[0] {
@@ -3659,19 +4678,33 @@ impl<S: DocumentStore> QueryExecutor<S> {
         function_name: &str,
         field_path: &[String],
     ) -> OQLResult<Value> {
+        let input = if field_path.is_empty() {
+            AggregateInput::AllRows
+        } else {
+            AggregateInput::Path(field_path.to_vec())
+        };
+        self.aggregate_rows(documents, function_name, &input)
+    }
+
+    /// The one implementation of every aggregate, shared by the terminal
+    /// form (`.sum(.x)`), the function form in a `select` or `having`, and
+    /// grouped queries.
+    fn aggregate_rows(
+        &self,
+        documents: &[Document],
+        function_name: &str,
+        input: &AggregateInput,
+    ) -> OQLResult<Value> {
         match function_name {
             "count" => {
-                if field_path.is_empty() {
+                if matches!(input, AggregateInput::AllRows) {
                     // count(*) - count all documents
                     Ok(Value::Integer(documents.len() as i64))
                 } else {
                     // count(field) - count non-null values
                     let mut count = 0i64;
                     for doc in documents {
-                        let field_access = FieldAccess {
-                            path: field_path.to_vec(),
-                        };
-                        let value = self.get_field_value(doc, &field_access)?;
+                        let value = self.aggregate_input_value(doc, input)?;
                         if !value.is_null() {
                             count += 1;
                         }
@@ -3686,10 +4719,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 let mut count = 0;
 
                 for doc in documents {
-                    let field_access = FieldAccess {
-                        path: field_path.to_vec(),
-                    };
-                    let value = self.get_field_value(doc, &field_access)?;
+                    let value = self.aggregate_input_value(doc, input)?;
 
                     match value {
                         Value::Integer(i) => {
@@ -3736,10 +4766,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 let mut count = 0;
 
                 for doc in documents {
-                    let field_access = FieldAccess {
-                        path: field_path.to_vec(),
-                    };
-                    let value = self.get_field_value(doc, &field_access)?;
+                    let value = self.aggregate_input_value(doc, input)?;
 
                     match value {
                         Value::Integer(i) => {
@@ -3770,10 +4797,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 let mut min_value: Option<Value> = None;
 
                 for doc in documents {
-                    let field_access = FieldAccess {
-                        path: field_path.to_vec(),
-                    };
-                    let value = self.get_field_value(doc, &field_access)?;
+                    let value = self.aggregate_input_value(doc, input)?;
 
                     if value.is_null() {
                         continue;
@@ -3797,10 +4821,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 let mut max_value: Option<Value> = None;
 
                 for doc in documents {
-                    let field_access = FieldAccess {
-                        path: field_path.to_vec(),
-                    };
-                    let value = self.get_field_value(doc, &field_access)?;
+                    let value = self.aggregate_input_value(doc, input)?;
 
                     if value.is_null() {
                         continue;
@@ -3845,21 +4866,17 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 let value = self.get_field_value(&document, field_access)?;
                 group_values.push(value);
             }
+            for key in &group_by_block.computed {
+                group_values.push(self.evaluate_expression(&document, &key.expression)?);
+            }
 
             // A typed composite encoding cannot collide when strings contain a
             // delimiter and keeps Integer(1) distinct from String("1").
             // Keys group by OQL equality, under which `1` and `1.0` are the
-            // same value, so whole floats are keyed as integers.
+            // same value.
             let canonical_key: Vec<Value> = group_values
                 .iter()
-                .map(|value| match value {
-                    Value::Float(float)
-                        if float.fract() == 0.0 && float.abs() < 9_007_199_254_740_992.0 =>
-                    {
-                        Value::Integer(*float as i64)
-                    }
-                    other => other.clone(),
-                })
+                .map(Self::canonical_key_value)
                 .collect();
             let group_key =
                 bincode::serialize(&canonical_key).map_err(|error| OQLError::Generic {
@@ -3893,6 +4910,14 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 if let Some(last) = field_access.path.last() {
                     fields.entry(last.clone()).or_insert(field_value);
                 }
+            }
+
+            for (offset, key) in group_by_block.computed.iter().enumerate() {
+                let value = group_values
+                    .get(group_by_block.fields.len() + offset)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                fields.insert(key.name.clone(), value);
             }
 
             // Add group count
@@ -3966,7 +4991,20 @@ impl<S: DocumentStore> QueryExecutor<S> {
         function: &str,
         field_access: &FieldAccess,
     ) -> OQLResult<Vec<Document>> {
-        let value = self.execute_aggregation(&documents, function, &field_access.path)?;
+        self.aggregate_result_row(
+            &documents,
+            function,
+            &AggregateInput::Path(field_access.path.clone()),
+        )
+    }
+
+    fn aggregate_result_row(
+        &self,
+        documents: &[Document],
+        function: &str,
+        input: &AggregateInput,
+    ) -> OQLResult<Vec<Document>> {
+        let value = self.aggregate_rows(documents, function, input)?;
         let mut fields = HashMap::new();
         fields.insert(function.to_string(), value);
         Ok(vec![Document::with_id(
@@ -3974,6 +5012,56 @@ impl<S: DocumentStore> QueryExecutor<S> {
             "aggregate".to_string(),
             fields,
         )])
+    }
+
+    /// `distinct()`: rows are the same when all their fields are equal.
+    /// The first of each set is kept, so the order of the input survives.
+    fn apply_distinct_operation(&self, documents: Vec<Document>) -> OQLResult<Vec<Document>> {
+        let mut seen = HashSet::new();
+        let mut distinct = Vec::new();
+        for document in documents {
+            let mut fields: Vec<(&String, Value)> = document
+                .fields
+                .iter()
+                .map(|(name, value)| (name, Self::canonical_key_value(value)))
+                .collect();
+            fields.sort_by(|left, right| left.0.cmp(right.0));
+            let key = bincode::serialize(&fields).map_err(|error| OQLError::Generic {
+                message: format!("Failed to compare rows for distinct: {error}"),
+            })?;
+            if seen.insert(key) {
+                distinct.push(document);
+            }
+        }
+        Ok(distinct)
+    }
+
+    /// A form of a value in which equal values are identical, for use as a
+    /// grouping or deduplication key. OQL equality treats `1` and `1.0` as
+    /// one value, so whole floats become integers; objects are ordered by
+    /// field name.
+    fn canonical_key_value(value: &Value) -> Value {
+        match value {
+            Value::Float(float)
+                if float.fract() == 0.0 && float.abs() < 9_007_199_254_740_992.0 =>
+            {
+                Value::Integer(*float as i64)
+            }
+            Value::List(items) => Value::List(items.iter().map(Self::canonical_key_value).collect()),
+            Value::Object(fields) => {
+                let mut entries: Vec<_> = fields.iter().collect();
+                entries.sort_by(|left, right| left.0.cmp(right.0));
+                Value::List(
+                    entries
+                        .into_iter()
+                        .flat_map(|(name, value)| {
+                            [Value::String(name.clone()), Self::canonical_key_value(value)]
+                        })
+                        .collect(),
+                )
+            }
+            other => other.clone(),
+        }
     }
 
     fn apply_sum_operation(
@@ -4009,24 +5097,27 @@ impl<S: DocumentStore> QueryExecutor<S> {
     }
 
     /// Execute aggregation over grouped documents
-    pub fn execute_group_aggregation(
+    fn execute_group_aggregation(
         &self,
         group_doc: &Document,
         function_name: &str,
-        field_path: &[String],
+        input: &AggregateInput,
     ) -> OQLResult<Value> {
-        let documents = match group_doc.get_field("_group_documents") {
+        let documents = Self::group_rows(group_doc)?;
+        self.aggregate_rows(&documents, function_name, input)
+    }
+
+    /// The source rows a group row stands for.
+    fn group_rows(group_doc: &Document) -> OQLResult<Vec<Document>> {
+        match group_doc.get_field("_group_documents") {
             Some(Value::List(documents)) => documents
                 .iter()
                 .map(Self::decode_group_source_document)
-                .collect::<OQLResult<Vec<_>>>()?,
-            _ => {
-                return Err(OQLError::Generic {
-                    message: "Group document missing source rows".to_string(),
-                })
-            }
-        };
-        self.execute_aggregation(&documents, function_name, field_path)
+                .collect(),
+            _ => Err(OQLError::Generic {
+                message: "Group document missing source rows".to_string(),
+            }),
+        }
     }
 
     fn encode_group_source_document(document: &Document) -> Value {
@@ -4253,6 +5344,74 @@ impl<S: DocumentStore> QueryExecutor<S> {
             Err(value.type_name().to_string())
         }
     }
+}
+
+/// The field that carries a scalar when a list of scalars is treated as a
+/// collection. It is not a legal field name, so it cannot collide with data.
+const SCALAR_ROW_FIELD: &str = "$value";
+
+/// Everything a delete will do, decided before any of it is done.
+#[derive(Default)]
+struct DeletePlan {
+    /// Documents being deleted, directly or by cascade.
+    deleted: HashSet<(String, String)>,
+    /// Documents deleted because something they refer to is being deleted.
+    cascaded: Vec<Document>,
+    /// Referring documents whose reference is cleared instead.
+    nullified: HashMap<(String, String), Document>,
+}
+
+/// What an aggregate function ranges over.
+#[derive(Debug, Clone)]
+enum AggregateInput {
+    /// `count()`: the rows themselves.
+    AllRows,
+    /// A stored path, `sum(.amount)`.
+    Path(Vec<String>),
+    /// A value computed per row, `sum(.price * .qty)`.
+    Expression(Expression),
+}
+
+/// One row of a collection being assembled from a path or a value.
+struct SourceRow {
+    document: Document,
+    /// True for a document held by a collection, which has a schema and an
+    /// identity that other documents can reference. False for an object or
+    /// scalar embedded in another document.
+    stored: bool,
+}
+
+impl SourceRow {
+    fn stored(document: Document) -> Self {
+        Self {
+            document,
+            stored: true,
+        }
+    }
+
+    fn embedded(document: Document) -> Self {
+        Self {
+            document,
+            stored: false,
+        }
+    }
+}
+
+/// What a name means on a stored row that has no field of that name.
+enum ReverseRelationship {
+    /// Documents of `source` refer to the row: through `field` when the
+    /// relationship was named with `as`, or through any field when it is
+    /// reached by the name of the referring collection.
+    Declared {
+        source: String,
+        field: Option<String>,
+    },
+    /// The row's schema declares the field; this row just has no value.
+    AbsentField,
+    /// The row's collection has no schema, so nothing can be ruled out.
+    Unknowable,
+    /// Neither a field nor a referencing collection: a mistake in the query.
+    Unknown,
 }
 
 /// Parameter bindings of the user function currently being evaluated.

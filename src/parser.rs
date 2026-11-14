@@ -29,6 +29,8 @@ pub enum Token {
     GroupBy,
     Having,
     Nearest,
+    Distinct,
+    Explain,
 
     // Function definition
     Fn,
@@ -102,12 +104,102 @@ pub enum Token {
     EOF,
 }
 
+/// The name the parser gives "the rows this expression is evaluated over"
+/// when an operation is written with no receiver. It is not a legal
+/// identifier, so it cannot collide with a binding or a field.
+pub const CURRENT_ROWS: &str = "$rows";
+
+/// The marker the parser gives a `select` entry written `-name`: the named
+/// field is left out of the result.
+pub const OMITTED_FIELD: &str = "$omit";
+
+impl Token {
+    /// The source word of a keyword token.
+    ///
+    /// Keywords are contextual: where the grammar expects a name (after a
+    /// `.`, before a `:`, as a projected field) a keyword is just a name, so
+    /// data may have fields called `count`, `first` or `limit`.
+    fn keyword_text(&self) -> Option<&'static str> {
+        Some(match self {
+            Token::Where => "where",
+            Token::Select => "select",
+            Token::Insert => "insert",
+            Token::Upsert => "upsert",
+            Token::Update => "update",
+            Token::Delete => "delete",
+            Token::Sort => "sort",
+            Token::Limit => "limit",
+            Token::Offset => "offset",
+            Token::First => "first",
+            Token::Exists => "exists",
+            Token::GroupBy => "group_by",
+            Token::Having => "having",
+            Token::Nearest => "nearest",
+            Token::Distinct => "distinct",
+            Token::Explain => "explain",
+            Token::Fn => "fn",
+            Token::Let => "let",
+            Token::On => "on",
+            Token::Count => "count",
+            Token::Sum => "sum",
+            Token::Avg => "avg",
+            Token::Min => "min",
+            Token::Max => "max",
+            Token::If => "if",
+            Token::Then => "then",
+            Token::Else => "else",
+            Token::Match => "match",
+            Token::Contains => "contains",
+            Token::StartsWith => "starts_with",
+            Token::EndsWith => "ends_with",
+            Token::In => "in",
+            _ => return None,
+        })
+    }
+
+    /// Whether this keyword names a collection operation (`.where { .. }`,
+    /// `.count()`), as opposed to an operator or a structural word.
+    fn is_operation_keyword(&self) -> bool {
+        matches!(
+            self,
+            Token::Where
+                | Token::Select
+                | Token::Insert
+                | Token::Upsert
+                | Token::Update
+                | Token::Delete
+                | Token::Sort
+                | Token::Limit
+                | Token::Offset
+                | Token::First
+                | Token::Exists
+                | Token::GroupBy
+                | Token::Having
+                | Token::Nearest
+                | Token::Distinct
+                | Token::Explain
+                | Token::Count
+                | Token::Sum
+                | Token::Avg
+                | Token::Min
+                | Token::Max
+        )
+    }
+}
+
 // Tokenizer implementation
 pub struct Tokenizer;
 
 impl Tokenizer {
     pub fn tokenize(input: &str) -> Result<Vec<Token>, TokenizeError> {
+        Self::tokenize_with_offsets(input).map(|(tokens, _)| tokens)
+    }
+
+    /// Tokenize, also returning the byte offset in `input` at which each
+    /// token starts, so an error can point at the user's own text.
+    pub fn tokenize_with_offsets(input: &str) -> Result<(Vec<Token>, Vec<usize>), TokenizeError> {
         let mut tokens = Vec::new();
+        let mut offsets = Vec::new();
         let mut remaining = input;
 
         while !remaining.is_empty() {
@@ -115,6 +207,7 @@ impl Tokenizer {
                 Ok((rest, token)) => {
                     if !matches!(token, Token::Whitespace | Token::Comment(_)) {
                         tokens.push(token);
+                        offsets.push(input.len() - remaining.len());
                     }
                     remaining = rest;
                 }
@@ -141,7 +234,8 @@ impl Tokenizer {
         }
 
         tokens.push(Token::EOF);
-        Ok(tokens)
+        offsets.push(input.len());
+        Ok((tokens, offsets))
     }
 
     fn next_token(input: &str) -> IResult<&str, Token> {
@@ -178,6 +272,7 @@ impl Tokenizer {
                 tag("group_by"),
                 tag("having"),
                 tag("nearest"),
+                tag("distinct"),
                 tag("where"),
                 tag("select"),
                 tag("insert"),
@@ -201,6 +296,7 @@ impl Tokenizer {
                 tag("not"),
             )),
             alt((
+                tag("explain"),
                 tag("fn"),
                 tag("let"),
                 tag("on"),
@@ -233,6 +329,8 @@ impl Tokenizer {
             "group_by" => Token::GroupBy,
             "having" => Token::Having,
             "nearest" => Token::Nearest,
+            "distinct" => Token::Distinct,
+            "explain" => Token::Explain,
             "where" => Token::Where,
             "select" => Token::Select,
             "insert" => Token::Insert,
@@ -411,25 +509,58 @@ impl Tokenizer {
 
     fn parse_field_access(input: &str) -> IResult<&str, Token> {
         let (input, _) = char('.')(input)?;
-
-        // Check if the next part is a keyword - if so, don't parse as field access
-        if let Ok((_, _keyword)) = Self::parse_keyword(input) {
-            // This is a dot followed by a keyword, not a field access
-            // Return the dot and let the keyword be parsed separately
-            return Err(nom::Err::Error(nom::error::Error::new(
-                input,
-                nom::error::ErrorKind::Alt,
-            )));
-        }
-
-        let (input, first_field) = Self::parse_identifier_name(input)?;
+        let (input, first_field) = Self::parse_path_segment(input)?;
         let (input, additional_fields) =
-            many0(preceded(char('.'), Self::parse_non_keyword_identifier_name))(input)?;
+            many0(preceded(char('.'), Self::parse_path_segment))(input)?;
 
         let mut path = vec![first_field];
         path.extend(additional_fields);
 
         Ok((input, Token::FieldAccess(path)))
+    }
+
+    /// One name in a dotted path. Any identifier is a valid field name,
+    /// including a keyword, unless the text is an operation being applied:
+    /// `.count` is the field `count`, while `.count()` counts.
+    fn parse_path_segment(input: &str) -> IResult<&str, String> {
+        if Self::is_operation_applied(input) {
+            return Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Tag,
+            )));
+        }
+        Self::parse_identifier_name(input)
+    }
+
+    /// True when `input` starts with an operation keyword followed by what
+    /// that operation takes: a block, an argument list, a list of documents
+    /// for `insert`, `on` for `upsert`, or a bare count for `limit`/`offset`.
+    fn is_operation_applied(input: &str) -> bool {
+        let Ok((rest, token)) = Self::parse_keyword(input) else {
+            return false;
+        };
+        if !token.is_operation_keyword() {
+            return false;
+        }
+        let rest = rest.trim_start();
+        match rest.chars().next() {
+            // `users.where { .. }.delete` with nothing after it is the
+            // long-standing bare form of `delete()`.
+            None => token == Token::Delete,
+            Some('{' | '(') => true,
+            Some('[') => token == Token::Insert,
+            Some(next) if next.is_ascii_digit() => matches!(token, Token::Limit | Token::Offset),
+            Some('o') => {
+                token == Token::Upsert
+                    && rest.strip_prefix("on").is_some_and(|after| {
+                        !after
+                            .chars()
+                            .next()
+                            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+                    })
+            }
+            _ => false,
+        }
     }
 
     fn parse_identifier(input: &str) -> IResult<&str, Token> {
@@ -442,16 +573,6 @@ impl Tokenizer {
             many0(alt((alphanumeric1, tag("_")))),
         ))(input)?;
         Ok((input, name.to_string()))
-    }
-
-    fn parse_non_keyword_identifier_name(input: &str) -> IResult<&str, String> {
-        if Self::parse_keyword(input).is_ok() {
-            return Err(nom::Err::Error(nom::error::Error::new(
-                input,
-                nom::error::ErrorKind::Tag,
-            )));
-        }
-        Self::parse_identifier_name(input)
     }
 
     fn parse_punctuation(input: &str) -> IResult<&str, Token> {
@@ -656,6 +777,21 @@ pub enum Operation {
     Sort(SortBlock),
     Limit(u64),
     Offset(u64),
+    /// `limit(expr)` whose count is not a literal, typically a `$parameter`.
+    /// It is folded into [`Operation::Limit`] as soon as the value is known.
+    LimitExpr(Expression),
+    /// `offset(expr)`; see [`Operation::LimitExpr`].
+    OffsetExpr(Expression),
+    /// `distinct()`: keep one row of each set of rows that are equal.
+    Distinct,
+    /// `explain()`: instead of running the query, report how it would run.
+    Explain,
+    /// `sum(expr)`, `avg(expr)`, `min(expr)` or `max(expr)` over a computed
+    /// value rather than a stored path, as in `.sum(.price * .qty)`.
+    AggregateExpr {
+        function: String,
+        input: Expression,
+    },
     First,
     Exists,
     Nearest(NearestBlock),
@@ -756,6 +892,17 @@ pub enum SortDirection {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GroupByBlock {
     pub fields: Vec<FieldAccess>,
+    /// Keys computed from an expression, such as
+    /// `month: format_date(.placed, "%Y-%m")`. Each has the name its value
+    /// takes in the group row.
+    #[serde(default)]
+    pub computed: Vec<ComputedGroupKey>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComputedGroupKey {
+    pub name: String,
+    pub expression: Expression,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -883,7 +1030,14 @@ pub struct Parser {
     tokens: Vec<Token>,
     position: usize,
     schema_registry: Option<crate::schema::SchemaRegistry>,
+    /// How many expressions and conditions are currently being parsed
+    /// inside one another.
+    depth: usize,
 }
+
+/// Nesting deeper than this is reported as an error. The parser is
+/// recursive, so unbounded nesting would exhaust the stack instead.
+const MAX_NESTING_DEPTH: usize = 64;
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
@@ -891,6 +1045,7 @@ impl Parser {
             tokens,
             position: 0,
             schema_registry: None,
+            depth: 0,
         }
     }
 
@@ -903,6 +1058,7 @@ impl Parser {
             tokens,
             position: 0,
             schema_registry: Some(schema_registry),
+            depth: 0,
         }
     }
 
@@ -1734,16 +1890,44 @@ impl Parser {
             None
         };
 
-        // Parse function body
+        // Parse function body: any number of local names, then the value.
         self.expect_token(Token::LeftBrace)?;
+        let mut locals: std::collections::HashMap<String, Expression> =
+            std::collections::HashMap::new();
+        while let (Some(Token::Identifier(local)), Some(Token::Assign)) =
+            (self.current_token(), self.peek_token())
+        {
+            let local = local.clone();
+            if parameters.iter().any(|parameter| parameter.name == local) {
+                return Err(ParseError::InvalidSyntax(format!(
+                    "local name '{local}' in function '{name}' would hide the parameter of \
+                     the same name"
+                )));
+            }
+            if locals.contains_key(&local) {
+                return Err(ParseError::InvalidSyntax(format!(
+                    "local name '{local}' is already defined in function '{name}'"
+                )));
+            }
+            self.advance();
+            self.advance();
+            // A local is a name for its expression, exactly as in a scoped
+            // query block: later lines may use the names before them.
+            let value = self.parse_expression()?;
+            let value = Self::substitute_scoped_locals_expression(&value, &locals);
+            locals.insert(local, value);
+        }
         let body = if return_type
             .as_ref()
             .map(|t| Self::is_boolean_type_name(t))
             .unwrap_or(false)
         {
-            Expression::ConditionExpr(Box::new(self.parse_condition()?))
+            Expression::ConditionExpr(Box::new(Self::substitute_scoped_locals_condition(
+                &self.parse_condition()?,
+                &locals,
+            )))
         } else {
-            self.parse_expression()?
+            Self::substitute_scoped_locals_expression(&self.parse_expression()?, &locals)
         };
         self.expect_token(Token::RightBrace)?;
 
@@ -1860,7 +2044,10 @@ impl Parser {
         let mut operations = Vec::new();
         let mut locals: std::collections::HashMap<String, Expression> =
             std::collections::HashMap::new();
-        let mut saw_select = false;
+        // The entry that produces the block's result: a `select`, or any
+        // terminal the chained form allows (`count()`, `first()`, an
+        // aggregate, `update { .. }`, `delete()`).
+        let mut result_entry: Option<&'static str> = None;
 
         while !matches!(self.current_token(), Some(Token::RightBrace)) {
             if matches!(self.current_token(), Some(Token::EOF) | None) {
@@ -1895,23 +2082,42 @@ impl Parser {
                 continue;
             }
 
-            if saw_select {
-                return Err(ParseError::InvalidSyntax(
-                    "select must be the final entry in a scoped query block".to_string(),
-                ));
+            if let Some(entry) = result_entry {
+                return Err(ParseError::InvalidSyntax(format!(
+                    "{entry} must be the final entry in a scoped query block"
+                )));
             }
 
             let operation = self.parse_operation()?;
             let operation = Self::substitute_scoped_locals_operation(&operation, &locals);
             self.validate_parsed_operation(&operation, &collection)?;
-            saw_select = matches!(operation, Operation::Select(_));
+            result_entry = match operation {
+                Operation::Select(_) => Some("select"),
+                Operation::Count => Some("count()"),
+                Operation::First => Some("first()"),
+                Operation::Exists => Some("exists()"),
+                Operation::Sum(_)
+                | Operation::Avg(_)
+                | Operation::Min(_)
+                | Operation::Max(_)
+                | Operation::AggregateExpr { .. }
+                | Operation::Explain => Some("an aggregate"),
+                Operation::Update(_) => Some("update"),
+                Operation::Delete => Some("delete()"),
+                Operation::Insert(_) | Operation::InsertMany(_) | Operation::Upsert(_) => {
+                    Some("an insert")
+                }
+                _ => None,
+            };
             operations.push(operation);
         }
 
         self.expect_token(Token::RightBrace)?;
-        if !saw_select {
+        if result_entry.is_none() {
             return Err(ParseError::InvalidSyntax(
-                "A scoped query block must end in exactly one select".to_string(),
+                "A scoped query block must end in a select or a terminal operation such as \
+                 count(), first() or update { .. }"
+                    .to_string(),
             ));
         }
         if !matches!(self.current_token(), Some(Token::EOF) | None) {
@@ -2012,6 +2218,44 @@ impl Parser {
             }),
             Operation::Having(block) => Operation::Having(HavingBlock {
                 condition: Self::substitute_scoped_locals_condition(&block.condition, locals),
+            }),
+            Operation::LimitExpr(count) => {
+                match fold_constant_integer(Self::substitute_scoped_locals_expression(
+                    count, locals,
+                )) {
+                    Expression::Literal(Literal::Integer(count)) if count >= 0 => {
+                        Operation::Limit(count as u64)
+                    }
+                    count => Operation::LimitExpr(count),
+                }
+            }
+            Operation::OffsetExpr(count) => {
+                match fold_constant_integer(Self::substitute_scoped_locals_expression(
+                    count, locals,
+                )) {
+                    Expression::Literal(Literal::Integer(count)) if count >= 0 => {
+                        Operation::Offset(count as u64)
+                    }
+                    count => Operation::OffsetExpr(count),
+                }
+            }
+            Operation::AggregateExpr { function, input } => Operation::AggregateExpr {
+                function: function.clone(),
+                input: Self::substitute_scoped_locals_expression(input, locals),
+            },
+            Operation::GroupBy(block) => Operation::GroupBy(GroupByBlock {
+                fields: block.fields.clone(),
+                computed: block
+                    .computed
+                    .iter()
+                    .map(|key| ComputedGroupKey {
+                        name: key.name.clone(),
+                        expression: Self::substitute_scoped_locals_expression(
+                            &key.expression,
+                            locals,
+                        ),
+                    })
+                    .collect(),
             }),
             Operation::Nearest(block) => Operation::Nearest(NearestBlock {
                 field: block.field.clone(),
@@ -2212,6 +2456,9 @@ impl Parser {
         &mut self,
         schema_name: &str,
     ) -> Result<Operation, ParseError> {
+        if let Some(operation) = self.parse_computed_operation()? {
+            return Ok(operation);
+        }
         match self.current_token() {
             Some(Token::Where) => {
                 self.advance();
@@ -2621,6 +2868,11 @@ impl Parser {
             Operation::Delete
             | Operation::Limit(_)
             | Operation::Offset(_)
+            | Operation::LimitExpr(_)
+            | Operation::OffsetExpr(_)
+            | Operation::Distinct
+            | Operation::AggregateExpr { .. }
+            | Operation::Explain
             | Operation::First
             | Operation::Exists
             | Operation::Count
@@ -2645,6 +2897,9 @@ impl Parser {
     }
 
     fn parse_operation(&mut self) -> Result<Operation, ParseError> {
+        if let Some(operation) = self.parse_computed_operation()? {
+            return Ok(operation);
+        }
         match self.current_token() {
             Some(Token::Where) => {
                 self.advance();
@@ -2735,12 +2990,17 @@ impl Parser {
             }
             Some(Token::Limit) => {
                 self.advance();
-                let limit_value = self.parse_limit_value()?;
-                Ok(Operation::Limit(limit_value))
+                Ok(match self.parse_row_count("limit")? {
+                    Expression::Literal(Literal::Integer(count)) => Operation::Limit(count as u64),
+                    count => Operation::LimitExpr(count),
+                })
             }
             Some(Token::Offset) => {
                 self.advance();
-                Ok(Operation::Offset(self.parse_limit_value()?))
+                Ok(match self.parse_row_count("offset")? {
+                    Expression::Literal(Literal::Integer(count)) => Operation::Offset(count as u64),
+                    count => Operation::OffsetExpr(count),
+                })
             }
             Some(Token::First) => {
                 self.advance();
@@ -2815,6 +3075,31 @@ impl Parser {
     }
 
     fn parse_select_field(&mut self) -> Result<SelectField, ParseError> {
+        // A keyword is a field name when it is used as one: as an alias
+        // (`min: ..`) or as a bare projected field (`count,`).
+        if matches!(
+            self.peek_token(),
+            Some(Token::Colon | Token::Comma | Token::RightBrace)
+        ) {
+            self.accept_keyword_as_name();
+        }
+        // `-name` drops a field that `*` brought in.
+        if matches!(self.current_token(), Some(Token::Minus)) {
+            let checkpoint = self.position;
+            self.advance();
+            self.accept_keyword_as_name();
+            if let (Some(Token::Identifier(name)), Some(Token::Comma | Token::RightBrace)) =
+                (self.current_token(), self.peek_token())
+            {
+                let name = name.clone();
+                self.advance();
+                return Ok(SelectField {
+                    alias: Some(name),
+                    expression: Expression::Identifier(OMITTED_FIELD.to_string()),
+                });
+            }
+            self.position = checkpoint;
+        }
         // Check if this is an aliased field (name: expression)
         if let Some(Token::Identifier(name)) = self.current_token() {
             let name = name.clone();
@@ -2893,6 +3178,7 @@ impl Parser {
 
     fn parse_upsert_block(&mut self) -> Result<UpsertBlock, ParseError> {
         self.expect_token(Token::On)?;
+        self.accept_keyword_as_name();
         let key = match self.current_token() {
             Some(Token::Identifier(name)) => {
                 let name = name.clone();
@@ -2925,6 +3211,7 @@ impl Parser {
     }
 
     fn parse_insert_field(&mut self) -> Result<InsertField, ParseError> {
+        self.accept_keyword_as_name();
         // Parse field name
         let name = match self.current_token() {
             Some(Token::Identifier(name)) => {
@@ -2979,6 +3266,7 @@ impl Parser {
     }
 
     fn parse_update_field(&mut self) -> Result<UpdateField, ParseError> {
+        self.accept_keyword_as_name();
         let first_name = match self.current_token() {
             Some(Token::Identifier(name)) => {
                 let field_name = name.clone();
@@ -3008,6 +3296,7 @@ impl Parser {
                 }
                 Some(Token::Dot) => {
                     self.advance();
+                    self.accept_keyword_as_name();
                     match self.current_token() {
                         Some(Token::Identifier(name)) => {
                             path.push(name.clone());
@@ -3075,27 +3364,70 @@ impl Parser {
         })
     }
 
+    /// `group_by { .status, .user.id, month: format_date(.placed, "%Y-%m") }`.
+    ///
+    /// A key is a path, or any expression given a name. A bare function
+    /// call is named after the function, so `group_by { year(.placed) }`
+    /// produces a `year` field.
     fn parse_group_by_block(&mut self) -> Result<GroupByBlock, ParseError> {
-        // Expect opening brace
         self.expect_token(Token::LeftBrace)?;
 
         let mut fields = Vec::new();
-
-        // Parse first field
-        let field = self.parse_field_access_expression()?;
-        fields.push(field);
-
-        // Parse additional fields separated by commas
-        while matches!(self.current_token(), Some(Token::Comma)) {
-            self.advance(); // consume comma
-            let field = self.parse_field_access_expression()?;
-            fields.push(field);
+        let mut computed = Vec::new();
+        loop {
+            if matches!(self.peek_token(), Some(Token::Colon)) {
+                self.accept_keyword_as_name();
+            }
+            let name = match (self.current_token(), self.peek_token()) {
+                (Some(Token::Identifier(name)), Some(Token::Colon)) => {
+                    let name = name.clone();
+                    self.advance();
+                    self.advance();
+                    Some(name)
+                }
+                _ => None,
+            };
+            match (name, self.parse_expression()?) {
+                (None, Expression::FieldAccess(field)) => fields.push(field),
+                (None, Expression::Identifier(field)) => {
+                    fields.push(FieldAccess { path: vec![field] })
+                }
+                (None, Expression::FunctionCall { name, args }) => {
+                    computed.push(ComputedGroupKey {
+                        name: name.clone(),
+                        expression: Expression::FunctionCall { name, args },
+                    })
+                }
+                (Some(name), expression) => computed.push(ComputedGroupKey { name, expression }),
+                (None, _) => {
+                    return Err(ParseError::InvalidSyntax(
+                        "a computed group_by key needs a name, as in `group_by { total: .a + .b }`"
+                            .to_string(),
+                    ))
+                }
+            }
+            if !matches!(self.current_token(), Some(Token::Comma)) {
+                break;
+            }
+            self.advance();
         }
 
-        // Expect closing brace
         self.expect_token(Token::RightBrace)?;
 
-        Ok(GroupByBlock { fields })
+        let mut names = std::collections::HashSet::new();
+        for name in fields
+            .iter()
+            .map(|field| field.path.join("_"))
+            .chain(computed.iter().map(|key| key.name.clone()))
+        {
+            if !names.insert(name.clone()) {
+                return Err(ParseError::InvalidSyntax(format!(
+                    "group_by has two keys named '{name}'"
+                )));
+            }
+        }
+
+        Ok(GroupByBlock { fields, computed })
     }
 
     fn parse_having_block(&mut self) -> Result<HavingBlock, ParseError> {
@@ -3357,57 +3689,43 @@ impl Parser {
         })
     }
 
-    fn parse_limit_value(&mut self) -> Result<u64, ParseError> {
-        // Handle function call syntax: limit(5)
-        if matches!(self.current_token(), Some(Token::LeftParen)) {
-            self.expect_token(Token::LeftParen)?;
-
-            let limit = match self.current_token() {
-                Some(Token::IntegerLiteral(value)) => {
-                    if *value < 0 {
-                        return Err(ParseError::InvalidSyntax(
-                            "LIMIT value must be non-negative".to_string(),
-                        ));
-                    }
-                    let limit = *value as u64;
-                    self.advance();
-                    limit
-                }
-                Some(token) => {
-                    return Err(ParseError::UnexpectedToken(format!(
-                        "Expected integer in LIMIT function, found {:?}",
-                        token
-                    )))
-                }
-                None => return Err(ParseError::UnexpectedEndOfInput),
-            };
-
+    /// The row count of `limit(..)` or `offset(..)`: any expression, most
+    /// often a literal or a `$parameter`. The bare form `limit 5` remains
+    /// for a literal count. A literal is checked here; anything else is
+    /// checked when its value is known.
+    fn parse_row_count(&mut self, operation: &str) -> Result<Expression, ParseError> {
+        let count = if matches!(self.current_token(), Some(Token::LeftParen)) {
+            self.advance();
+            let count = self.parse_expression()?;
             self.expect_token(Token::RightParen)?;
-            Ok(limit)
+            fold_constant_integer(count)
         } else {
-            // Handle legacy syntax: limit 5
-            match self.current_token() {
-                Some(Token::IntegerLiteral(value)) => {
-                    if *value < 0 {
-                        return Err(ParseError::InvalidSyntax(
-                            "LIMIT value must be non-negative".to_string(),
-                        ));
-                    }
-                    let limit = *value as u64;
-                    self.advance();
-                    Ok(limit)
-                }
-                Some(token) => Err(ParseError::UnexpectedToken(format!(
-                    "Expected integer for LIMIT, found {:?}",
-                    token
-                ))),
-                None => Err(ParseError::UnexpectedEndOfInput),
-            }
+            Expression::Literal(self.parse_literal()?)
+        };
+        match &count {
+            Expression::Literal(Literal::Integer(value)) if *value >= 0 => Ok(count),
+            Expression::Literal(_) => Err(ParseError::InvalidSyntax(format!(
+                "{operation} takes a non-negative whole number"
+            ))),
+            _ => Ok(count),
         }
     }
 
     fn parse_expression(&mut self) -> Result<Expression, ParseError> {
-        self.parse_logical_or_expression()
+        self.enter_nested()?;
+        let expression = self.parse_logical_or_expression();
+        self.depth -= 1;
+        expression
+    }
+
+    fn enter_nested(&mut self) -> Result<(), ParseError> {
+        if self.depth >= MAX_NESTING_DEPTH {
+            return Err(ParseError::InvalidSyntax(format!(
+                "the query is nested more than {MAX_NESTING_DEPTH} levels deep"
+            )));
+        }
+        self.depth += 1;
+        Ok(())
     }
 
     fn parse_logical_or_expression(&mut self) -> Result<Expression, ParseError> {
@@ -3660,13 +3978,19 @@ impl Parser {
                         }
                     } else {
                         // Multiple field access - chain them
+                        let mut path = path.clone();
+                        self.advance();
+                        let method = matches!(self.current_token(), Some(Token::LeftParen))
+                            .then(|| path.pop().unwrap_or_default());
                         for field_name in path {
                             expr = Expression::ChainedAccess {
                                 base: Box::new(expr),
-                                field: field_name.clone(),
+                                field: field_name,
                             };
                         }
-                        self.advance();
+                        if let Some(method) = method {
+                            expr = self.parse_method_arguments(method, expr)?;
+                        }
                     }
                 }
                 _ => break,
@@ -3677,28 +4001,7 @@ impl Parser {
     }
 
     fn is_operation_token(&self, token: Option<&Token>) -> bool {
-        matches!(
-            token,
-            Some(Token::Where)
-                | Some(Token::Select)
-                | Some(Token::Insert)
-                | Some(Token::Upsert)
-                | Some(Token::Update)
-                | Some(Token::Delete)
-                | Some(Token::Sort)
-                | Some(Token::Limit)
-                | Some(Token::Offset)
-                | Some(Token::First)
-                | Some(Token::Exists)
-                | Some(Token::Nearest)
-                | Some(Token::GroupBy)
-                | Some(Token::Having)
-                | Some(Token::Count)
-                | Some(Token::Sum)
-                | Some(Token::Avg)
-                | Some(Token::Min)
-                | Some(Token::Max)
-        )
+        token.is_some_and(Token::is_operation_keyword)
     }
 
     fn parse_if_then_else_expression(&mut self) -> Result<Expression, ParseError> {
@@ -3840,9 +4143,60 @@ impl Parser {
     fn parse_primary_expression(&mut self) -> Result<Expression, ParseError> {
         match self.current_token() {
             Some(Token::FieldAccess(path)) => {
-                let field_access = FieldAccess { path: path.clone() };
+                let mut path = path.clone();
                 self.advance();
-                Ok(Expression::FieldAccess(field_access))
+                // `.name.upper()` is `upper(.name)`: after a path, a name
+                // followed by `(` is a call on what precedes it.
+                if matches!(self.current_token(), Some(Token::LeftParen)) {
+                    let method = path.pop().unwrap_or_default();
+                    let receiver = Expression::FieldAccess(FieldAccess { path });
+                    return self.parse_method_arguments(method, receiver);
+                }
+                Ok(Expression::FieldAccess(FieldAccess { path }))
+            }
+            // A lone `.` is the current row or value itself, as in
+            // `.tags.where { . == "beta" }`.
+            Some(Token::Dot)
+                if !self
+                    .peek_token()
+                    .is_some_and(|next| next.is_operation_keyword()) =>
+            {
+                self.advance();
+                Ok(Expression::FieldAccess(FieldAccess { path: Vec::new() }))
+            }
+            // An operation with no receiver applies to the collection the
+            // expression is evaluated over: the rows of the group in a
+            // grouped select, or all rows in an aggregate select. So
+            // `big: where { .amount > 100 }.count()` counts within the group.
+            Some(
+                Token::Where
+                | Token::Sort
+                | Token::Limit
+                | Token::Offset
+                | Token::Select
+                | Token::First
+                | Token::Distinct
+                | Token::GroupBy,
+            ) if matches!(
+                self.peek_token(),
+                Some(Token::LeftBrace | Token::LeftParen)
+            ) =>
+            {
+                let operation = self.parse_operation()?;
+                Ok(Expression::CollectionExpression {
+                    source: Box::new(Expression::Identifier(CURRENT_ROWS.to_string())),
+                    operations: vec![operation],
+                })
+            }
+            // A keyword where a value is expected, not applied as a
+            // function, is a bare field name like any other.
+            Some(token)
+                if token.is_operation_keyword()
+                    && !matches!(self.peek_token(), Some(Token::LeftParen)) =>
+            {
+                let name = token.keyword_text().unwrap_or_default().to_string();
+                self.advance();
+                Ok(Expression::Identifier(name))
             }
             Some(Token::Identifier(name)) => {
                 let name = name.clone();
@@ -3932,6 +4286,69 @@ impl Parser {
         }
     }
 
+    /// Operations whose form is the same with or without schema validation:
+    /// `distinct()`, and an aggregate over a computed value.
+    fn parse_computed_operation(&mut self) -> Result<Option<Operation>, ParseError> {
+        if matches!(self.current_token(), Some(Token::Distinct)) {
+            self.advance();
+            self.expect_token(Token::LeftParen)?;
+            self.expect_token(Token::RightParen)?;
+            return Ok(Some(Operation::Distinct));
+        }
+        if matches!(self.current_token(), Some(Token::Explain)) {
+            self.advance();
+            self.expect_token(Token::LeftParen)?;
+            self.expect_token(Token::RightParen)?;
+            return Ok(Some(Operation::Explain));
+        }
+        let function = match self.current_token() {
+            Some(Token::Sum) => "sum",
+            Some(Token::Avg) => "avg",
+            Some(Token::Min) => "min",
+            Some(Token::Max) => "max",
+            _ => return Ok(None),
+        };
+        // A plain path keeps its dedicated operation, which the planner and
+        // schema validation understand.
+        let simple_path = matches!(
+            self.tokens.get(self.position + 2),
+            Some(Token::FieldAccess(_) | Token::Identifier(_))
+        ) && matches!(
+            self.tokens.get(self.position + 3),
+            Some(Token::RightParen)
+        );
+        if simple_path || !matches!(self.peek_token(), Some(Token::LeftParen)) {
+            return Ok(None);
+        }
+        self.advance();
+        self.expect_token(Token::LeftParen)?;
+        let input = self.parse_expression()?;
+        self.expect_token(Token::RightParen)?;
+        Ok(Some(Operation::AggregateExpr {
+            function: function.to_string(),
+            input,
+        }))
+    }
+
+    /// Parse `(args)` after a method name and build `method(receiver, args)`.
+    fn parse_method_arguments(
+        &mut self,
+        method: String,
+        receiver: Expression,
+    ) -> Result<Expression, ParseError> {
+        self.expect_token(Token::LeftParen)?;
+        let mut args = vec![receiver];
+        if !matches!(self.current_token(), Some(Token::RightParen)) {
+            args.push(self.parse_expression()?);
+            while matches!(self.current_token(), Some(Token::Comma)) {
+                self.advance();
+                args.push(self.parse_expression()?);
+            }
+        }
+        self.expect_token(Token::RightParen)?;
+        Ok(Expression::FunctionCall { name: method, args })
+    }
+
     fn parse_function_call(&mut self, name: String) -> Result<Expression, ParseError> {
         self.expect_token(Token::LeftParen)?;
 
@@ -3999,6 +4416,7 @@ impl Parser {
     }
 
     fn parse_object_field(&mut self) -> Result<ObjectField, ParseError> {
+        self.accept_keyword_as_name();
         // Parse field name
         let name = match self.current_token() {
             Some(Token::Identifier(name)) => {
@@ -4035,7 +4453,10 @@ impl Parser {
     }
 
     fn parse_condition(&mut self) -> Result<Condition, ParseError> {
-        self.parse_or_condition()
+        self.enter_nested()?;
+        let condition = self.parse_or_condition();
+        self.depth -= 1;
+        condition
     }
 
     fn parse_or_condition(&mut self) -> Result<Condition, ParseError> {
@@ -4191,6 +4612,18 @@ impl Parser {
         self.tokens.get(self.position)
     }
 
+    fn peek_token(&self) -> Option<&Token> {
+        self.tokens.get(self.position + 1)
+    }
+
+    /// At a position where the grammar expects a name, read a keyword as
+    /// that name. Does nothing for any other token.
+    fn accept_keyword_as_name(&mut self) {
+        if let Some(text) = self.current_token().and_then(Token::keyword_text) {
+            self.tokens[self.position] = Token::Identifier(text.to_string());
+        }
+    }
+
     fn advance(&mut self) {
         if self.position < self.tokens.len() {
             self.position += 1;
@@ -4209,6 +4642,35 @@ impl Parser {
             ))),
             None => Err(ParseError::UnexpectedEndOfInput),
         }
+    }
+}
+
+/// Reduce integer arithmetic over literals to one literal, so `limit(10 * 2)`
+/// is as plannable as `limit(20)`. Anything else is returned unchanged.
+fn fold_constant_integer(expression: Expression) -> Expression {
+    fn value(expression: &Expression) -> Option<i64> {
+        match expression {
+            Expression::Literal(Literal::Integer(value)) => Some(*value),
+            Expression::BinaryOp {
+                left,
+                operator,
+                right,
+            } => {
+                let (left, right) = (value(left)?, value(right)?);
+                match operator {
+                    BinaryOperator::Add => left.checked_add(right),
+                    BinaryOperator::Subtract => left.checked_sub(right),
+                    BinaryOperator::Multiply => left.checked_mul(right),
+                    BinaryOperator::Divide => left.checked_div(right),
+                    BinaryOperator::Modulo => left.checked_rem(right),
+                }
+            }
+            _ => None,
+        }
+    }
+    match value(&expression) {
+        Some(folded) => Expression::Literal(Literal::Integer(folded)),
+        None => expression,
     }
 }
 
@@ -4363,6 +4825,11 @@ fn operation_uses_legacy_outer(operation: &Operation) -> bool {
         Operation::Delete
         | Operation::Limit(_)
         | Operation::Offset(_)
+        | Operation::LimitExpr(_)
+        | Operation::OffsetExpr(_)
+        | Operation::Distinct
+        | Operation::AggregateExpr { .. }
+        | Operation::Explain
         | Operation::First
         | Operation::Exists
         | Operation::Count => false,
@@ -4386,11 +4853,113 @@ fn reject_legacy_outer(statement: &OQLStatement) -> Result<(), ParseError> {
 
 // Convenience function to parse OQL statements (queries or function definitions)
 pub fn parse_oql_statement(input: &str) -> Result<OQLStatement, Box<dyn std::error::Error>> {
-    let tokens = Tokenizer::tokenize(input)?;
+    let (tokens, offsets) = Tokenizer::tokenize_with_offsets(input)?;
     let mut parser = Parser::new(tokens);
-    let statement = parser.parse()?;
+    let statement = match parser.parse() {
+        Ok(statement) => statement,
+        Err(error) => return Err(describe_parse_error(input, &offsets, &parser, &error).into()),
+    };
     reject_legacy_outer(&statement)?;
     Ok(statement)
+}
+
+/// Turn a parse failure into a message about the user's text: what was
+/// expected, in the language's own symbols, and where, with the line shown.
+fn describe_parse_error(
+    input: &str,
+    offsets: &[usize],
+    parser: &Parser,
+    error: &ParseError,
+) -> String {
+    let offset = offsets
+        .get(parser.position)
+        .or(offsets.last())
+        .copied()
+        .unwrap_or(input.len())
+        .min(input.len());
+    let before = &input[..offset];
+    let line = before.matches('\n').count() + 1;
+    let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
+    let column = before[line_start..].chars().count() + 1;
+    let text = input[line_start..].lines().next().unwrap_or_default();
+    format!(
+        "{} at line {line}, column {column}:\n  {}\n  {}^",
+        readable_tokens(&error.to_string()),
+        text.trim_end(),
+        " ".repeat(column - 1)
+    )
+}
+
+/// Replace the parser's internal token names in a message with the text a
+/// user would have typed: `RightBrace` becomes `'}'`.
+fn readable_tokens(message: &str) -> String {
+    /// Rewrite every `open...close` span using `render` on what is inside.
+    fn rewrite(text: &str, open: &str, close: &str, render: impl Fn(&str) -> String) -> String {
+        let mut result = String::new();
+        let mut rest = text;
+        while let Some(start) = rest.find(open) {
+            let after = &rest[start + open.len()..];
+            let Some(end) = after.find(close) else {
+                break;
+            };
+            result.push_str(&rest[..start]);
+            result.push_str(&render(&after[..end]));
+            rest = &after[end + close.len()..];
+        }
+        result.push_str(rest);
+        result
+    }
+
+    let mut text = rewrite(message, "FieldAccess([", "])", |inner| {
+        format!(
+            "'.{}'",
+            inner
+                .split(", ")
+                .map(|segment| segment.trim_matches('"'))
+                .collect::<Vec<_>>()
+                .join(".")
+        )
+    });
+    text = rewrite(&text, "Identifier(\"", "\")", |inner| format!("'{inner}'"));
+    text = rewrite(&text, "StringLiteral(\"", "\")", |inner| format!("\"{inner}\""));
+    for literal in ["IntegerLiteral(", "FloatLiteral(", "BooleanLiteral("] {
+        text = rewrite(&text, literal, ")", |inner| inner.to_string());
+    }
+    text = rewrite(&text, "Comment(\"", "\")", |_| "a comment".to_string());
+    text = rewrite(&text, "Some(", ")", |inner| inner.to_string());
+    for (name, shown) in [
+        ("LeftBrace", "'{'"),
+        ("RightBrace", "'}'"),
+        ("LeftParen", "'('"),
+        ("RightParen", "')'"),
+        ("LeftBracket", "'['"),
+        ("RightBracket", "']'"),
+        ("GreaterEqual", "'>='"),
+        ("LessEqual", "'<='"),
+        ("NotEqual", "'!='"),
+        ("GreaterThan", "'>'"),
+        ("LessThan", "'<'"),
+        ("NullLiteral", "null"),
+        ("StartsWith", "'starts_with'"),
+        ("EndsWith", "'ends_with'"),
+        ("GroupBy", "'group_by'"),
+        ("Comma", "','"),
+        ("Colon", "':'"),
+        ("Arrow", "'->'"),
+        ("Assign", "'='"),
+        ("Equal", "'=='"),
+        ("Percent", "'%'"),
+        ("Slash", "'/'"),
+        ("Minus", "'-'"),
+        ("Plus", "'+'"),
+        ("Star", "'*'"),
+        ("Dot", "'.'"),
+        ("EOF", "the end of the query"),
+        ("None", "the end of the query"),
+    ] {
+        text = text.replace(name, shown);
+    }
+    text
 }
 
 // Parse OQL statement with schema registry for validation
@@ -4398,9 +4967,12 @@ pub fn parse_oql_statement_with_schema(
     input: &str,
     schema_registry: crate::schema::SchemaRegistry,
 ) -> Result<OQLStatement, Box<dyn std::error::Error>> {
-    let tokens = Tokenizer::tokenize(input)?;
+    let (tokens, offsets) = Tokenizer::tokenize_with_offsets(input)?;
     let mut parser = Parser::with_schema_registry(tokens, schema_registry);
-    let statement = parser.parse()?;
+    let statement = match parser.parse() {
+        Ok(statement) => statement,
+        Err(error) => return Err(describe_parse_error(input, &offsets, &parser, &error).into()),
+    };
     reject_legacy_outer(&statement)?;
     Ok(statement)
 }
@@ -5151,6 +5723,9 @@ pub enum OQLFileStatement {
     Query(OQLQuery),
     FunctionDef(FunctionDefinition),
     Transaction(Vec<OQLFileStatement>),
+    /// `drop collection_name`: remove a collection, its documents, indexes
+    /// and schema.
+    Drop(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5170,54 +5745,104 @@ pub struct ValueBinding {
 pub struct SchemaDefinition {
     pub name: String,
     pub fields: Vec<SchemaField>,
+    /// Facts about the collection as a whole: `unique(a, b)`, `check(..)`,
+    /// `index(..)`.
+    #[serde(default)]
+    pub declarations: Vec<SchemaDeclaration>,
 }
 
 /// Represents a field in a schema definition
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct SchemaField {
     pub name: String,
     pub field_type: String, // For now, store as string - can be parsed later
     pub optional: bool,
+    /// `email: String unique`
+    #[serde(default)]
+    pub unique: bool,
+    /// `plan: String = "free"`: OQL source of the default value.
+    #[serde(default)]
+    pub default: Option<String>,
+    /// `from: Ref(accounts) as outgoing`
+    #[serde(default)]
+    pub reverse_name: Option<String>,
+    /// `owner: Ref(users) on delete cascade`
+    #[serde(default)]
+    pub on_delete: Option<String>,
+    /// `full_name: String from name`: this field replaces `name`.
+    #[serde(default)]
+    pub renamed_from: Option<String>,
+    /// `legacy: removed`: the field is dropped from the collection.
+    #[serde(default)]
+    pub removed: bool,
+}
+
+/// A collection-level declaration inside a schema block.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum SchemaDeclaration {
+    /// `unique(tenant, email)`
+    Unique(Vec<String>),
+    /// `check(.age >= 0)`: OQL source of the condition.
+    Check(String),
+    /// `index(.status, .placed)`
+    Index(Vec<String>),
+    /// `index(.embedding, metric: "cosine")`
+    VectorIndex { field: String, metric: String },
 }
 
 /// Parse a complete OQL file containing multiple statements
 pub fn parse_oql_file(content: &str) -> Result<OQLFile, Box<dyn std::error::Error>> {
-    let statements = split_statements(content);
+    let statements = split_statements_with_lines(content);
     let mut parsed_statements = Vec::new();
+    let several = statements.len() > 1;
 
-    for statement in statements {
-        let trimmed = statement.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        if trimmed.starts_with("schema ") {
-            // Parse schema definition
-            let schema = parse_schema_definition(&statement)?;
-            parsed_statements.push(OQLFileStatement::Schema(schema));
-        } else if trimmed.starts_with("fn ") {
-            // Parse function definition
-            match parse_oql_statement(&statement)? {
-                OQLStatement::FunctionDef(func_def) => {
-                    parsed_statements.push(OQLFileStatement::FunctionDef(func_def));
-                }
-                _ => return Err("Expected function definition".into()),
+    for (line, statement) in statements {
+        match parse_file_statement(&statement) {
+            Ok(Some(parsed)) => parsed_statements.push(parsed),
+            Ok(None) => {}
+            // In a script, say which statement the problem is in. Positions
+            // inside the message count from that statement's first line.
+            Err(error) if several => {
+                return Err(
+                    format!("in the statement that starts on line {line}: {error}").into(),
+                )
             }
-        } else if is_transaction_statement_start(trimmed) {
-            let tx_statements = parse_transaction_statement(&statement)?;
-            parsed_statements.push(OQLFileStatement::Transaction(tx_statements));
-        } else if let Some(binding) = parse_binding_statement(&statement)? {
-            parsed_statements.push(binding);
-        } else {
-            // Parse as query
-            let query = parse_oql(&statement)?;
-            parsed_statements.push(OQLFileStatement::Query(query));
+            Err(error) => return Err(error),
         }
     }
 
     Ok(OQLFile {
         statements: parsed_statements,
     })
+}
+
+fn parse_file_statement(
+    statement: &str,
+) -> Result<Option<OQLFileStatement>, Box<dyn std::error::Error>> {
+    let trimmed = statement.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(if trimmed.starts_with("schema ") {
+        OQLFileStatement::Schema(parse_schema_definition(statement)?)
+    } else if let Some(name) = trimmed
+        .strip_prefix("drop ")
+        .map(str::trim)
+        .filter(|name| is_valid_identifier(name))
+    {
+        OQLFileStatement::Drop(name.to_string())
+    } else if trimmed.starts_with("fn ") {
+        match parse_oql_statement(statement)? {
+            OQLStatement::FunctionDef(func_def) => OQLFileStatement::FunctionDef(func_def),
+            _ => return Err("Expected function definition".into()),
+        }
+    } else if is_transaction_statement_start(trimmed) {
+        OQLFileStatement::Transaction(parse_transaction_statement(statement)?)
+    } else if let Some(binding) = parse_binding_statement(statement)? {
+        binding
+    } else {
+        OQLFileStatement::Query(parse_oql(statement)?)
+    }))
 }
 
 /// Split a script into statement source texts.
@@ -5228,7 +5853,17 @@ pub fn parse_oql_file(content: &str) -> Result<OQLFile, Box<dyn std::error::Erro
 /// unless the statement visibly continues: the line ends with an operator or
 /// separator (`total =`, `a +`), or the next line does not begin with a name
 /// (`.where { .. }`, `{`, `&& ..`).
+#[cfg(test)]
 fn split_statements(content: &str) -> Vec<String> {
+    split_statements_with_lines(content)
+        .into_iter()
+        .map(|(_, statement)| statement)
+        .collect()
+}
+
+/// [`split_statements`], with the line each statement starts on.
+fn split_statements_with_lines(content: &str) -> Vec<(usize, String)> {
+    let line_of = |offset: usize| content[..offset].matches('\n').count() + 1;
     let mut statements = Vec::new();
     let mut start: Option<usize> = None;
     let mut significant_end = 0usize;
@@ -5256,7 +5891,8 @@ fn split_statements(content: &str) -> Vec<String> {
             let continues = !(character.is_ascii_alphabetic() || character == '_')
                 || "=,+-*/%&|<>([{.:!".contains(last_significant);
             if !continues {
-                statements.push(content[start.unwrap()..significant_end].to_string());
+                let from = start.unwrap();
+                statements.push((line_of(from), content[from..significant_end].to_string()));
                 start = None;
             }
         }
@@ -5288,7 +5924,7 @@ fn split_statements(content: &str) -> Vec<String> {
         last_significant = character;
     }
     if let Some(start) = start {
-        statements.push(content[start..significant_end].to_string());
+        statements.push((line_of(start), content[start..significant_end].to_string()));
     }
     statements
 }
@@ -5673,6 +6309,20 @@ fn resolve_expression_bindings(
     bindings: &std::collections::HashMap<String, OQLQuery>,
 ) -> Result<Expression, String> {
     match expr {
+        // A binding is a name for its expression: using the name is the
+        // same as writing the bound query in its place. So a binding to an
+        // aggregate is a value, and a binding to a pipeline is a collection.
+        Expression::Identifier(name) if bindings.contains_key(name) => {
+            Ok(Expression::QueryExpression {
+                query: resolve_query_with_bindings(
+                    &OQLQuery {
+                        collection: name.clone(),
+                        operations: Vec::new(),
+                    },
+                    bindings,
+                )?,
+            })
+        }
         Expression::Identifier(_) | Expression::FieldAccess(_) | Expression::Literal(_) => {
             Ok(expr.clone())
         }
@@ -5784,6 +6434,60 @@ fn resolve_expression_bindings(
 }
 
 /// Parse a schema definition from OQL syntax
+/// Split `text` at the given separators, ignoring any that sit inside
+/// brackets or a string literal.
+fn split_top_level(text: &str, separators: &[char]) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+    let mut chars = text.chars();
+    while let Some(character) = chars.next() {
+        match character {
+            '"' => {
+                current.push(character);
+                while let Some(inner) = chars.next() {
+                    current.push(inner);
+                    match inner {
+                        '\\' => current.extend(chars.next()),
+                        '"' => break,
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            separator if depth == 0 && separators.contains(&separator) => {
+                parts.push(std::mem::take(&mut current));
+                continue;
+            }
+            _ => {}
+        }
+        current.push(character);
+    }
+    parts.push(current);
+    parts
+}
+
+/// The text between a leading `keyword(` and its closing `)`.
+fn declaration_arguments<'a>(entry: &'a str, keyword: &str) -> Option<&'a str> {
+    entry
+        .strip_prefix(keyword)
+        .map(str::trim_start)
+        .and_then(|rest| rest.strip_prefix('('))
+        .and_then(|rest| rest.trim_end().strip_suffix(')'))
+}
+
+/// A field name written as a path (`.email`) or bare (`email`).
+fn declared_field_name(text: &str) -> Result<String, String> {
+    let name = text.trim().trim_start_matches('.');
+    if name.split('.').all(is_valid_identifier) {
+        Ok(name.to_string())
+    } else {
+        Err(format!("'{}' is not a field name", text.trim()))
+    }
+}
+
 fn parse_schema_definition(
     statement: &str,
 ) -> Result<SchemaDefinition, Box<dyn std::error::Error>> {
@@ -5810,59 +6514,163 @@ fn parse_schema_definition(
         return Err(format!("'{}' is not a valid schema name", source[..header_end].trim()).into());
     }
 
-    // Fields are separated by commas or line breaks. Either may appear
-    // inside a parameterised type such as `List(Ref(teams))`, so only
-    // separators outside brackets count; that is what lets a schema be
-    // written on one line or many.
-    let mut declarations = Vec::new();
-    let mut current = String::new();
-    let mut depth = 0usize;
-    for character in source[header_end + 1..body_end].chars() {
-        match character {
-            '(' | '[' | '{' | '<' => depth += 1,
-            ')' | ']' | '}' | '>' => depth = depth.saturating_sub(1),
-            ',' | '\n' if depth == 0 => {
-                declarations.push(std::mem::take(&mut current));
-                continue;
-            }
-            _ => {}
-        }
-        current.push(character);
-    }
-    declarations.push(current);
-
+    // Entries are separated by commas or line breaks outside brackets, so a
+    // schema reads the same on one line or many.
     let mut fields = Vec::new();
-    for declaration in declarations {
-        let declaration = declaration.trim();
-        if declaration.is_empty() {
+    let mut declarations = Vec::new();
+    for entry in split_top_level(&source[header_end + 1..body_end], &[',', '\n']) {
+        let entry = entry.trim();
+        if entry.is_empty() {
             continue;
         }
-        let (name, declared_type) = declaration.split_once(':').ok_or_else(|| {
-            format!("schema '{schema_name}': expected 'name: Type', found '{declaration}'")
-        })?;
-        let name = name.trim().trim_matches('"');
-        let declared_type = declared_type.trim();
-        if name.is_empty() || declared_type.is_empty() {
-            return Err(
-                format!("schema '{schema_name}': incomplete field '{declaration}'").into(),
-            );
+        let fail = |problem: String| format!("schema '{schema_name}': {problem}");
+
+        // Facts about the collection as a whole.
+        if let Some(arguments) = declaration_arguments(entry, "unique") {
+            let names = split_top_level(arguments, &[','])
+                .iter()
+                .map(|name| declared_field_name(name))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(fail)?;
+            declarations.push(SchemaDeclaration::Unique(names));
+            continue;
         }
-        // A trailing `?` is shorthand for an optional field.
-        let (field_type, optional) = match declared_type.strip_suffix('?') {
-            Some(inner) => (inner.trim().to_string(), true),
-            None => (declared_type.to_string(), false),
-        };
-        fields.push(SchemaField {
-            name: name.to_string(),
-            field_type,
-            optional,
-        });
+        if let Some(condition) = declaration_arguments(entry, "check") {
+            parse_check_condition(condition).map_err(|error| fail(error.to_string()))?;
+            declarations.push(SchemaDeclaration::Check(condition.trim().to_string()));
+            continue;
+        }
+        if let Some(arguments) = declaration_arguments(entry, "index") {
+            let mut names = Vec::new();
+            let mut metric = None;
+            for argument in split_top_level(arguments, &[',']) {
+                match argument.split_once(':') {
+                    Some((option, value)) if option.trim() == "metric" => {
+                        metric = Some(value.trim().trim_matches('"').to_string());
+                    }
+                    Some((option, _)) => {
+                        return Err(fail(format!("unknown index option '{}'", option.trim())).into())
+                    }
+                    None => names.push(declared_field_name(&argument).map_err(fail)?),
+                }
+            }
+            declarations.push(match (metric, names.as_slice()) {
+                (Some(metric), [field]) => SchemaDeclaration::VectorIndex {
+                    field: field.clone(),
+                    metric,
+                },
+                (Some(_), _) => {
+                    return Err(fail("a vector index covers exactly one field".to_string()).into())
+                }
+                (None, []) => return Err(fail("index() needs a field".to_string()).into()),
+                (None, _) => SchemaDeclaration::Index(names),
+            });
+            continue;
+        }
+
+        let (name, declared) = entry
+            .split_once(':')
+            .ok_or_else(|| fail(format!("expected 'name: Type', found '{entry}'")))?;
+        let name = name.trim().trim_matches('"');
+        if name.is_empty() || declared.trim().is_empty() {
+            return Err(fail(format!("incomplete field '{entry}'")).into());
+        }
+        fields.push(parse_schema_field(name, declared).map_err(fail)?);
     }
 
     Ok(SchemaDefinition {
         name: schema_name.to_string(),
         fields,
+        declarations,
     })
+}
+
+/// Parse what follows `name:` in a schema block:
+/// `Type [as reverse] [on delete rule] [from old] [unique] [= default]`.
+fn parse_schema_field(name: &str, declared: &str) -> Result<SchemaField, String> {
+    let mut field = SchemaField {
+        name: name.to_string(),
+        ..SchemaField::default()
+    };
+    // The default is the rest of the entry, so it may contain anything.
+    let mut halves = split_top_level(declared, &['=']).into_iter();
+    let before_default = halves.next().unwrap_or_default();
+    let default: Vec<String> = halves.collect();
+    if !default.is_empty() {
+        let source = default.join("=").trim().to_string();
+        let tokens = Tokenizer::tokenize(&source).map_err(|error| error.to_string())?;
+        let mut parser = Parser::new(tokens);
+        parser
+            .parse_expression()
+            .map_err(|error| format!("default of '{name}': {error}"))?;
+        if !matches!(parser.current_token(), Some(Token::EOF) | None) {
+            return Err(format!("default of '{name}' has text after its value"));
+        }
+        field.default = Some(source);
+    }
+
+    let mut words = split_top_level(before_default.trim(), &[' ', '\t', '\n'])
+        .into_iter()
+        .filter(|word| !word.trim().is_empty());
+    let declared_type = words.next().ok_or_else(|| format!("field '{name}' has no type"))?;
+    if declared_type == "removed" {
+        field.removed = true;
+    }
+    // A trailing `?` is shorthand for an optional field.
+    match declared_type.strip_suffix('?') {
+        Some(inner) => {
+            field.field_type = inner.trim().to_string();
+            field.optional = true;
+        }
+        None => field.field_type = declared_type,
+    }
+    while let Some(word) = words.next() {
+        let mut argument = |what: &str| {
+            words
+                .next()
+                .filter(|value| is_valid_identifier(value))
+                .ok_or_else(|| format!("field '{name}': expected {what} after '{word}'"))
+        };
+        match word.as_str() {
+            "unique" => field.unique = true,
+            "as" => field.reverse_name = Some(argument("a name")?),
+            "from" => field.renamed_from = Some(argument("a field name")?),
+            "on" => {
+                if argument("'delete'")? != "delete" {
+                    return Err(format!("field '{name}': expected 'on delete <rule>'"));
+                }
+                let rule = argument("restrict, cascade or nullify")?;
+                if !matches!(rule.as_str(), "restrict" | "cascade" | "nullify") {
+                    return Err(format!(
+                        "field '{name}': '{rule}' is not a delete rule; use restrict, cascade or nullify"
+                    ));
+                }
+                field.on_delete = Some(rule);
+            }
+            other => {
+                return Err(format!("field '{name}': unexpected '{other}' after the type"));
+            }
+        }
+    }
+    Ok(field)
+}
+
+/// Parse the condition of a `check(..)` declaration.
+pub fn parse_check_condition(source: &str) -> Result<Condition, Box<dyn std::error::Error>> {
+    let tokens = Tokenizer::tokenize(source)?;
+    let mut parser = Parser::new(tokens);
+    let condition = parser.parse_condition()?;
+    if !matches!(parser.current_token(), Some(Token::EOF) | None) {
+        return Err("check() has text after its condition".into());
+    }
+    Ok(condition)
+}
+
+/// Parse the OQL source of a stored default value or check into an
+/// expression.
+pub fn parse_stored_expression(source: &str) -> Result<Expression, Box<dyn std::error::Error>> {
+    let tokens = Tokenizer::tokenize(source)?;
+    Ok(Parser::new(tokens).parse_expression()?)
 }
 
 /// Execute a parsed OQL file
@@ -5909,8 +6717,8 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
                 Ok(schema) => {
                     // Register in registry
                     registry.register(schema.clone()).ok();
-                    // Store in database
-                    if let Err(error) = script_executor.store().put_schema(&schema) {
+                    // Declare it, or apply the change to an existing one.
+                    if let Err(error) = script_executor.define_schema(schema_def, schema) {
                         schema_failures.insert(schema_def.name.clone(), error.to_string());
                     }
                 }
@@ -5922,7 +6730,15 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
     }
 
     // Third pass: Execute statements
+    let mut not_run = 0usize;
     for statement in &file.statements {
+        // A script is a sequence: once a statement has failed, the ones
+        // after it were written for a state that does not exist, so they
+        // are not run.
+        if !errors.is_empty() {
+            not_run += 1;
+            continue;
+        }
         match statement {
             OQLFileStatement::Schema(schema) => {
                 schema_count += 1;
@@ -5936,6 +6752,22 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
                 println!("📋 Schema definition: {}", schema.name);
                 success_count += 1;
                 results.push(StatementResult::Schema(schema.name.clone()));
+            }
+            OQLFileStatement::Drop(name) => {
+                query_count += 1;
+                match script_executor.drop_collection(name) {
+                    Ok(removed) => {
+                        println!("🗑️  Dropped {} ({} documents)", name, removed);
+                        success_count += 1;
+                        results.push(StatementResult::Query(removed));
+                    }
+                    Err(error) => {
+                        let message = format!("Drop failed: {}", error);
+                        println!("❌ {}", message);
+                        errors.push(message.clone());
+                        results.push(StatementResult::Error(message));
+                    }
+                }
             }
             OQLFileStatement::QueryBinding(binding) => {
                 binding_count += 1;
@@ -6035,8 +6867,12 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
             }
             OQLFileStatement::Transaction(tx_statements) => {
                 transaction_count += 1;
-                let snapshot = snapshot_store(script_executor.store().as_ref())?;
+                // The storage engine's own transaction makes the block
+                // atomic: its writes are published together or not at all.
+                // Only a store without that mechanism needs the fallback of
+                // copying the database so it can be put back.
                 let mut active_txn_id = None;
+                let mut snapshot = None;
                 if let Some(rust_store) = script_executor
                     .store()
                     .as_any()
@@ -6044,7 +6880,10 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
                 {
                     let tx_id = rust_store.begin_local_transaction()?;
                     active_txn_id = Some(tx_id);
+                } else {
+                    snapshot = Some(snapshot_store(script_executor.store().as_ref())?);
                 }
+                let mut tx_functions: Vec<String> = Vec::new();
                 let mut tx_errors = Vec::new();
                 let mut tx_results = Vec::new();
                 let mut tx_bindings = query_bindings.clone();
@@ -6063,6 +6902,7 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
                             match script_executor.register_user_function(func_def.clone()) {
                                 Ok(()) => {
                                     tx_success += 1;
+                                    tx_functions.push(func_def.name.clone());
                                     tx_results
                                         .push(StatementResult::Function(func_def.name.clone()));
                                 }
@@ -6132,19 +6972,32 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
                             tx_errors
                                 .push("Nested transaction blocks are not supported".to_string());
                         }
+                        OQLFileStatement::Drop(name) => {
+                            tx_errors.push(format!(
+                                "'drop {name}' cannot run inside a transaction block"
+                            ));
+                        }
                     }
                 }
 
+                // A commit that fails is a failed transaction like any
+                // other: nothing was published, and the block reports it.
                 if tx_errors.is_empty() {
-                    if let Some(tx_id) = active_txn_id {
+                    if let Some(tx_id) = active_txn_id.take() {
                         if let Some(rust_store) = script_executor
                             .store()
                             .as_any()
                             .downcast_ref::<crate::storage::RustStore>()
                         {
-                            rust_store.commit_local_transaction(tx_id)?;
+                            if let Err(error) = rust_store.commit_local_transaction(tx_id) {
+                                let _ = rust_store.rollback_local_transaction(tx_id);
+                                tx_errors.push(format!("Commit failed: {}", error));
+                            }
                         }
                     }
+                }
+
+                if tx_errors.is_empty() {
                     query_bindings = tx_bindings;
                     value_bindings = tx_value_bindings;
                     success_count += tx_success + 1;
@@ -6164,7 +7017,13 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
                             let _ = rust_store.rollback_local_transaction(tx_id);
                         }
                     }
-                    restore_store(script_executor.store().as_ref(), &snapshot)?;
+                    if let Some(snapshot) = &snapshot {
+                        restore_store(script_executor.store().as_ref(), snapshot)?;
+                    }
+                    // Definitions made inside the block go with it.
+                    for name in &tx_functions {
+                        script_executor.unregister_user_function(name);
+                    }
                     let tx_msg = format!(
                         "Transaction rolled back due to {} error(s)",
                         tx_errors.len()
@@ -6177,6 +7036,14 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
                 }
             }
         }
+    }
+
+    if not_run > 0 {
+        let message = format!(
+            "{not_run} later statement(s) were not run because an earlier statement failed"
+        );
+        println!("⏭️  {}", message);
+        errors.push(message);
     }
 
     println!(
@@ -6278,25 +7145,257 @@ pub fn schema_definition_to_schema(
     def: &SchemaDefinition,
     registry: &crate::schema::SchemaRegistry,
 ) -> crate::error::OQLResult<crate::schema::Schema> {
-    use crate::schema::FieldType;
+    use crate::schema::{CascadeBehavior, FieldType, SchemaConstraint};
     use std::collections::HashMap;
 
+    let invalid = |message: String| crate::error::OQLError::SchemaValidation { message };
     let mut fields = HashMap::new();
+    let mut constraints = Vec::new();
 
-    for field in &def.fields {
-        let field_type = parse_field_type(&field.field_type, registry)?;
+    for field in def.fields.iter().filter(|field| !field.removed) {
+        let mut shapes = Vec::new();
+        let mut field_type =
+            declared_field_type(&field.field_type, &field.name, registry, &mut shapes)?;
+        constraints.extend(
+            shapes
+                .into_iter()
+                .map(|(path, fields)| SchemaConstraint::Shape { path, fields }),
+        );
+
+        if let Some(rule) = &field.on_delete {
+            fn reference(field_type: &mut FieldType) -> Option<&mut crate::schema::ReferenceType> {
+                match field_type {
+                    FieldType::Reference(reference) => Some(reference),
+                    FieldType::Optional(inner) | FieldType::List(inner) => reference(inner),
+                    _ => None,
+                }
+            }
+            let reference = reference(&mut field_type).ok_or_else(|| {
+                invalid(format!(
+                    "'{}.{}': 'on delete' applies only to a reference",
+                    def.name, field.name
+                ))
+            })?;
+            reference.on_delete = match rule.as_str() {
+                "cascade" => CascadeBehavior::Cascade,
+                "nullify" => CascadeBehavior::SetNull,
+                _ => CascadeBehavior::Restrict,
+            };
+        }
+        if field.reverse_name.is_some() && field_type.referenced_schema().is_none() {
+            return Err(invalid(format!(
+                "'{}.{}': 'as' names the reverse of a reference",
+                def.name, field.name
+            )));
+        }
+        if field.on_delete.as_deref() == Some("nullify")
+            && !field.optional
+            && !matches!(field_type, FieldType::Optional(_) | FieldType::List(_))
+        {
+            return Err(invalid(format!(
+                "'{}.{}': 'on delete nullify' needs an optional reference",
+                def.name, field.name
+            )));
+        }
+
         let final_type = if field.optional {
             FieldType::Optional(Box::new(field_type))
         } else {
             field_type
         };
         fields.insert(field.name.clone(), final_type);
+
+        if field.unique {
+            constraints.push(SchemaConstraint::Unique {
+                fields: vec![field.name.clone()],
+                name: Some(format!("{}_{}_unique", def.name, field.name)),
+            });
+        }
+        if let Some(expression) = &field.default {
+            constraints.push(SchemaConstraint::Default {
+                field: field.name.clone(),
+                expression: expression.clone(),
+            });
+        }
+        if let Some(name) = &field.reverse_name {
+            constraints.push(SchemaConstraint::ReverseName {
+                field: field.name.clone(),
+                name: name.clone(),
+            });
+        }
     }
 
-    Ok(crate::schema::Schema::new(def.name.clone(), fields))
+    for declaration in &def.declarations {
+        let known = |name: &String| {
+            fields
+                .contains_key(name.split('.').next().unwrap_or(name))
+                .then_some(())
+                .ok_or_else(|| invalid(format!("'{}' has no field '{}'", def.name, name)))
+        };
+        match declaration {
+            SchemaDeclaration::Unique(names) => {
+                names.iter().try_for_each(known)?;
+                constraints.push(SchemaConstraint::Unique {
+                    fields: names.clone(),
+                    name: Some(format!("{}_{}_unique", def.name, names.join("_"))),
+                });
+            }
+            SchemaDeclaration::Check(expression) => {
+                constraints.push(SchemaConstraint::CheckExpression {
+                    expression: expression.clone(),
+                });
+            }
+            SchemaDeclaration::Index(names) => names.iter().try_for_each(known)?,
+            SchemaDeclaration::VectorIndex { field, .. } => known(field)?,
+        }
+    }
+
+    Ok(crate::schema::Schema::new_with_constraints(
+        def.name.clone(),
+        fields,
+        constraints,
+    ))
 }
 
-/// Parse a field type string into a FieldType enum
+/// The indexes a schema block declares, including the unique index behind
+/// each `unique` field or `unique(..)` declaration.
+pub fn schema_definition_indexes(
+    def: &SchemaDefinition,
+    schema: &crate::schema::Schema,
+) -> crate::error::OQLResult<(
+    Vec<crate::storage::ScalarIndexDefinition>,
+    Vec<crate::storage::VectorIndexDefinition>,
+)> {
+    use crate::storage::{
+        ScalarIndexDefinition, VectorIndexDefinition, VectorIndexState, VectorIndexType,
+        VectorMetricType,
+    };
+    let scalar = |fields: &[String], unique: bool| ScalarIndexDefinition {
+        name: format!(
+            "{}_{}{}",
+            def.name,
+            if unique { "unique_" } else { "by_" },
+            fields.join("_").replace('.', "_")
+        ),
+        schema: def.name.clone(),
+        fields: fields.to_vec(),
+        unique,
+    };
+    let mut scalars: Vec<ScalarIndexDefinition> = def
+        .fields
+        .iter()
+        .filter(|field| field.unique && !field.removed)
+        .map(|field| scalar(std::slice::from_ref(&field.name), true))
+        .collect();
+    let mut vectors = Vec::new();
+    for declaration in &def.declarations {
+        match declaration {
+            SchemaDeclaration::Unique(names) => scalars.push(scalar(names, true)),
+            SchemaDeclaration::Index(names) => scalars.push(scalar(names, false)),
+            SchemaDeclaration::Check(_) => {}
+            SchemaDeclaration::VectorIndex { field, metric } => {
+                let dimension = match schema.fields.get(field) {
+                    Some(crate::schema::FieldType::Vector { dim }) => *dim,
+                    _ => {
+                        return Err(crate::error::OQLError::SchemaValidation {
+                            message: format!(
+                                "'{}.{}' is not a Vector field, so it cannot have a vector index",
+                                def.name, field
+                            ),
+                        })
+                    }
+                };
+                vectors.push(VectorIndexDefinition {
+                    name: format!("{}_by_{}", def.name, field),
+                    schema: def.name.clone(),
+                    field: field.clone(),
+                    dimension,
+                    metric: match metric.to_ascii_lowercase().as_str() {
+                        "cosine" => VectorMetricType::Cosine,
+                        "l2" => VectorMetricType::L2,
+                        "dot" => VectorMetricType::Dot,
+                        other => {
+                            return Err(crate::error::OQLError::SchemaValidation {
+                                message: format!(
+                                    "'{other}' is not a vector metric; use cosine, l2 or dot"
+                                ),
+                            })
+                        }
+                    },
+                    index_type: VectorIndexType::Exact,
+                    quantization: None,
+                    state: VectorIndexState::Ready,
+                });
+            }
+        }
+    }
+    Ok((scalars, vectors))
+}
+
+/// Resolve a declared type, collecting the shape of every embedded object
+/// it describes. `address: { city: String }` is an `Object` field whose
+/// shape is recorded under the path `address`; a list of such objects is
+/// recorded under `items[]`.
+fn declared_field_type(
+    declared: &str,
+    path: &str,
+    registry: &crate::schema::SchemaRegistry,
+    shapes: &mut Vec<(String, Vec<(String, crate::schema::FieldType)>)>,
+) -> crate::error::OQLResult<crate::schema::FieldType> {
+    use crate::schema::FieldType;
+    let declared = declared.trim();
+    let wrapped = |prefix: &str| {
+        declared
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_suffix(')'))
+    };
+    if let Some(inner) = declared.strip_suffix('?') {
+        return Ok(FieldType::Optional(Box::new(declared_field_type(
+            inner, path, registry, shapes,
+        )?)));
+    }
+    if let Some(inner) = wrapped("Optional(") {
+        return Ok(FieldType::Optional(Box::new(declared_field_type(
+            inner, path, registry, shapes,
+        )?)));
+    }
+    if let Some(inner) = wrapped("List(").or_else(|| wrapped("Array(")) {
+        return Ok(FieldType::List(Box::new(declared_field_type(
+            inner,
+            &format!("{path}[]"),
+            registry,
+            shapes,
+        )?)));
+    }
+    let Some(body) = declared
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+    else {
+        return parse_field_type(declared, registry);
+    };
+
+    let base = path.trim_end_matches("[]");
+    let mut fields = Vec::new();
+    for entry in split_top_level(body, &[',', '\n']) {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let (name, nested) = entry.split_once(':').ok_or_else(|| {
+            crate::error::OQLError::SchemaValidation {
+                message: format!("in '{path}': expected 'name: Type', found '{entry}'"),
+            }
+        })?;
+        let name = name.trim();
+        fields.push((
+            name.to_string(),
+            declared_field_type(nested, &format!("{base}.{name}"), registry, shapes)?,
+        ));
+    }
+    shapes.push((path.to_string(), fields));
+    Ok(FieldType::Object)
+}
+
 fn parse_field_type(
     type_str: &str,
     registry: &crate::schema::SchemaRegistry,
@@ -6631,8 +7730,9 @@ transaction {
             fields: vec![SchemaField {
                 name: "geo".to_string(),
                 field_type: "GeoPoint".to_string(),
-                optional: false,
+                ..SchemaField::default()
             }],
+            declarations: Vec::new(),
         };
         let registry = crate::schema::SchemaRegistry::new();
         let res = schema_definition_to_schema(&def, &registry);

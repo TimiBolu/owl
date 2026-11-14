@@ -105,7 +105,7 @@ fn scoped_query_requires_one_final_select() {
     )
     .unwrap_err()
     .to_string();
-    assert!(missing.contains("must end in exactly one select"));
+    assert!(missing.contains("must end in a select or a terminal operation"));
 
     let not_final = parse_oql(
         r#"
