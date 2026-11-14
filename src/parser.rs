@@ -786,6 +786,10 @@ pub enum Operation {
     Distinct,
     /// `explain()`: instead of running the query, report how it would run.
     Explain,
+    /// A path step in a chain: `orders.where { .. }.items`. Every row is
+    /// replaced by the rows its path leads to, so the chain continues over
+    /// all of them together: every line item of every matching order.
+    Step(FieldAccess),
     /// `sum(expr)`, `avg(expr)`, `min(expr)` or `max(expr)` over a computed
     /// value rather than a stored path, as in `.sum(.price * .qty)`.
     AggregateExpr {
@@ -2017,11 +2021,21 @@ impl Parser {
         // Parse method chain (e.g., ".where { ... }.select { ... }")
         let mut operations = Vec::new();
 
-        while matches!(self.current_token(), Some(Token::Dot)) {
-            self.advance(); // consume dot
-
-            let operation = self.parse_operation_with_validation(&collection)?;
-            operations.push(operation);
+        loop {
+            match self.current_token() {
+                Some(Token::Dot) => {
+                    self.advance(); // consume dot
+                    let operation = self.parse_operation_with_validation(&collection)?;
+                    operations.push(operation);
+                }
+                // A path in the chain steps from each row to what the path
+                // leads to: `orders.items`, `teams.users.orders`.
+                Some(Token::FieldAccess(path)) => {
+                    operations.push(Operation::Step(FieldAccess { path: path.clone() }));
+                    self.advance();
+                }
+                _ => break,
+            }
         }
 
         // Expect EOF
@@ -2873,6 +2887,7 @@ impl Parser {
             | Operation::Distinct
             | Operation::AggregateExpr { .. }
             | Operation::Explain
+            | Operation::Step(_)
             | Operation::First
             | Operation::Exists
             | Operation::Count
@@ -3946,6 +3961,35 @@ impl Parser {
                         ));
                     }
                 }
+                // A path between two collection operations steps the whole
+                // collection through it: `.orders.where { .. }.items.sum(.qty)`.
+                Token::FieldAccess(path)
+                    if matches!(
+                        expr,
+                        Expression::QueryExpression { .. } | Expression::CollectionExpression { .. }
+                    ) && matches!(self.tokens.get(self.position + 1), Some(Token::Dot))
+                        && self
+                            .tokens
+                            .get(self.position + 2)
+                            .is_some_and(Token::is_operation_keyword) =>
+                {
+                    let step = Operation::Step(FieldAccess { path: path.clone() });
+                    self.advance();
+                    expr = match expr {
+                        Expression::QueryExpression { mut query } => {
+                            query.operations.push(step);
+                            Expression::QueryExpression { query }
+                        }
+                        Expression::CollectionExpression {
+                            source,
+                            mut operations,
+                        } => {
+                            operations.push(step);
+                            Expression::CollectionExpression { source, operations }
+                        }
+                        other => other,
+                    };
+                }
                 Token::FieldAccess(path) => {
                     // Handle field access tokens as chained access
                     // This happens when the tokenizer parsed .field as a FieldAccess token
@@ -4830,6 +4874,7 @@ fn operation_uses_legacy_outer(operation: &Operation) -> bool {
         | Operation::Distinct
         | Operation::AggregateExpr { .. }
         | Operation::Explain
+        | Operation::Step(_)
         | Operation::First
         | Operation::Exists
         | Operation::Count => false,

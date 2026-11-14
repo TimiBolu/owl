@@ -1,0 +1,6 @@
+// Customers ranked by lifetime paid spend
+customers.select {
+  id, name,
+  orders: .orders.count(),
+  spent: .orders.where { .status == "paid" }.sum(.total)
+}.sort { .spent.desc, .id.asc }.limit(20)

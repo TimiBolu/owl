@@ -99,6 +99,7 @@ impl QueryMetrics {
             crate::parser::Operation::Distinct => "select".to_string(),
             crate::parser::Operation::AggregateExpr { .. } => "aggregate".to_string(),
             crate::parser::Operation::Explain => "select".to_string(),
+            crate::parser::Operation::Step(_) => "select".to_string(),
             crate::parser::Operation::First => "select".to_string(),
             crate::parser::Operation::Exists => "aggregate".to_string(),
             crate::parser::Operation::Nearest(_) => "vector_search".to_string(),

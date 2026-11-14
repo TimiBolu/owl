@@ -1,0 +1,15 @@
+[package]
+name = "storefront"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+owl_db = { path = "../.." }
+# SQLite is the comparison baseline. It is compiled in, so the benchmark
+# does not depend on whatever version the machine happens to have.
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"
+tempfile = "3"

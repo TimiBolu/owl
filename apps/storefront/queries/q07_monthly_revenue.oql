@@ -1,0 +1,6 @@
+// Paid revenue by month
+orders
+  .where { .status == "paid" }
+  .group_by { month: format_date(.placed, "%Y-%m") }
+  .select { month, orders: count(), revenue: sum(.total) }
+  .sort { .month.asc }

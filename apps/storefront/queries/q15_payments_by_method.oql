@@ -1,0 +1,6 @@
+// Payments in one quarter, by method
+payments
+  .where { .paid_at >= "2026-01-01" && .paid_at < "2026-04-01" }
+  .group_by { .method }
+  .select { method, n: count(), amount: sum(.amount) }
+  .sort { .method.asc }

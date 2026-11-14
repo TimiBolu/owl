@@ -1,0 +1,6 @@
+// Paid revenue grouped through the customer reference
+orders
+  .where { .status == "paid" }
+  .group_by { .customer.country }
+  .select { country, orders: count(), revenue: sum(.total) }
+  .sort { .revenue.desc, .country.asc }

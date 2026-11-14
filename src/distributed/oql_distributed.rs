@@ -479,6 +479,7 @@ impl DistributedOQLEngine {
                 | Operation::Distinct
                 | Operation::AggregateExpr { .. }
                 | Operation::Explain
+                | Operation::Step(_)
                 | Operation::First
                 | Operation::Exists
                 | Operation::Nearest(_)
@@ -555,6 +556,7 @@ impl DistributedOQLEngine {
                 | Operation::Distinct
                 | Operation::AggregateExpr { .. }
                 | Operation::Explain
+                | Operation::Step(_)
                 | Operation::First
                 | Operation::Nearest(_) => selection_operations.push(operation.clone()),
                 Operation::Insert(_)

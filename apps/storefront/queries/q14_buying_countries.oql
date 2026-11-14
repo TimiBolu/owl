@@ -1,0 +1,6 @@
+// How many countries placed a paid order in one month
+orders
+  .where { .status == "paid" && .placed >= "2026-01-01" && .placed < "2026-02-01" }
+  .select { country: .customer.country }
+  .distinct()
+  .count()

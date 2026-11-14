@@ -1,0 +1,6 @@
+// The twenty most recent paid orders
+orders
+  .where { .status == "paid" }
+  .sort { .placed.desc, .id.asc }
+  .limit(20)
+  .select { id, placed, total }

@@ -1,0 +1,10 @@
+// Top-level categories with their children and product statistics
+categories.where { .parent == null }.sort { .id.asc }.select {
+  id, name,
+  products: .children.products.count(),
+  children: .children.sort { .id.asc }.select {
+    id,
+    products: .products.count(),
+    average_price: .products.avg(.price)
+  }
+}

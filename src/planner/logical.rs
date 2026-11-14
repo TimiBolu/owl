@@ -137,7 +137,10 @@ impl LogicalPlanner {
             Operation::LimitExpr(_) | Operation::OffsetExpr(_) => Err(OQLError::generic(
                 "limit/offset with an unevaluated count cannot be planned",
             )),
-            Operation::Distinct | Operation::Explain | Operation::AggregateExpr { .. } => Err(OQLError::generic(
+            Operation::Distinct
+            | Operation::Explain
+            | Operation::Step(_)
+            | Operation::AggregateExpr { .. } => Err(OQLError::generic(
                 "distinct and computed aggregates run on the general executor",
             )),
             Operation::First => Ok(PlanNode::new(PlanType::Limit)

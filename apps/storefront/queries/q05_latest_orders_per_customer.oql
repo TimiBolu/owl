@@ -1,0 +1,5 @@
+// Each gold customer with their three latest orders
+customers.where { .tier == "gold" }.sort { .id.asc }.limit(50).select {
+  id, name,
+  latest: .orders.sort { .placed.desc, .id.asc }.limit(3).select { id, placed, total }
+}

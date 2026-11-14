@@ -1,0 +1,70 @@
+// Storefront: a commerce data model that leans on what Owl is for.
+// References are declared once and navigated both ways, line items are a
+// typed list inside the order, and constraints and indexes live here.
+
+schema customers {
+  id: String,
+  name: String,
+  email: String unique,
+  tier: String,
+  country: String,
+  joined: DateTime,
+  address: { city: String, zip: String },
+  index(.country),
+  index(.tier)
+}
+
+schema categories {
+  id: String,
+  name: String,
+  parent: Optional(Ref(categories)) as children
+}
+
+schema products {
+  id: String,
+  name: String,
+  category: Ref(categories),
+  price: Float,
+  stock: Integer,
+  embedding: Vector(8),
+  check(.price >= 0 && .stock >= 0)
+}
+
+schema orders {
+  id: String,
+  customer: Ref(customers),
+  status: String,
+  placed: DateTime,
+  total: Float,
+  items: List({ product: Ref(products), qty: Integer, price: Float }),
+  index(.status, .placed),
+  index(.placed)
+}
+
+schema payments {
+  id: String,
+  order: Ref(orders) on delete cascade,
+  method: String,
+  amount: Float,
+  paid_at: DateTime,
+  index(.paid_at)
+}
+
+schema reviews {
+  id: String,
+  product: Ref(products),
+  customer: Ref(customers),
+  rating: Integer,
+  body: String,
+  written: DateTime,
+  check(.rating >= 1 && .rating <= 5)
+}
+
+schema tickets {
+  id: String,
+  customer: Ref(customers),
+  order: Optional(Ref(orders)),
+  status: String,
+  priority: Integer,
+  opened: DateTime
+}
