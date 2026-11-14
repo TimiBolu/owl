@@ -140,11 +140,12 @@ mod tests {
             users.select { broken: no_such_function(.age) }
         "#;
 
-        let error = runner.execute_content(script).unwrap_err().to_string();
-        assert!(error.contains("no_such_function"), "{error}");
-
         let report = runner.run_content(script).unwrap();
         assert_eq!(report.errors.len(), 1);
         assert_eq!(report.query_count, 2);
+
+        let failing = r#"users.select { broken: no_such_function(.age) }"#;
+        let error = runner.execute_content(failing).unwrap_err().to_string();
+        assert!(error.contains("no_such_function"), "{error}");
     }
 }

@@ -25,10 +25,20 @@ use crate::parser::ComparisonOperator;
 use chrono::{DateTime, Utc};
 use std::cmp::Ordering;
 
-fn parse_instant(text: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(text)
+/// Read a timestamp written as text: RFC 3339 (`2026-01-05T10:00:00Z`), or a
+/// calendar date (`2026-01-05`), which means midnight UTC on that day.
+pub fn parse_timestamp(text: &str) -> Option<DateTime<Utc>> {
+    if let Ok(instant) = DateTime::parse_from_rfc3339(text) {
+        return Some(instant.with_timezone(&Utc));
+    }
+    chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
         .ok()
-        .map(|instant| instant.with_timezone(&Utc))
+        .and_then(|date| date.and_hms_opt(0, 0, 0))
+        .map(|midnight| midnight.and_utc())
+}
+
+fn parse_instant(text: &str) -> Option<DateTime<Utc>> {
+    parse_timestamp(text)
 }
 
 /// Compare an integer with a float without rounding the integer first, so

@@ -1034,7 +1034,7 @@ if .amount >= 500 then "gold" else "standard"
 Method-style calls may exist when they improve readability without changing meaning.
 
 ```oql
-(.created_at).days_until(.now)
+.created_at.days_until(now())
 ```
 
 These should behave as syntax sugar for function calls, not as a separate method system.

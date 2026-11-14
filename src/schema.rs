@@ -62,7 +62,7 @@ impl Schema {
             }
         }
 
-        Ok(())
+        self.validate_shapes(fields)
     }
 
     /// Validate a single field value against its type
@@ -157,6 +157,102 @@ impl Schema {
         }
     }
 
+    /// The declared shape of the embedded object at `path`, if it has one.
+    pub fn shape(&self, path: &str) -> Option<&[(String, FieldType)]> {
+        self.constraints.iter().find_map(|constraint| match constraint {
+            SchemaConstraint::Shape {
+                path: declared,
+                fields,
+            } if declared == path => Some(fields.as_slice()),
+            _ => None,
+        })
+    }
+
+    /// The reverse-relationship name declared for a reference field.
+    pub fn reverse_name(&self, field: &str) -> Option<&str> {
+        self.constraints.iter().find_map(|constraint| match constraint {
+            SchemaConstraint::ReverseName {
+                field: declared,
+                name,
+            } if declared == field => Some(name.as_str()),
+            _ => None,
+        })
+    }
+
+    /// Check embedded objects against their declared shapes.
+    pub fn validate_shapes(&self, fields: &HashMap<String, Value>) -> OQLResult<()> {
+        for constraint in &self.constraints {
+            let SchemaConstraint::Shape { path, .. } = constraint else {
+                continue;
+            };
+            // Nested shapes are checked from their outermost ancestor.
+            if path.contains('.') || path.trim_end_matches("[]").contains("[]") {
+                continue;
+            }
+            let name = path.trim_end_matches("[]");
+            if let Some(value) = fields.get(name) {
+                self.validate_shaped_value(path, value)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_shaped_value(&self, path: &str, value: &Value) -> OQLResult<()> {
+        let Some(shape) = self.shape(path) else {
+            return Ok(());
+        };
+        match value {
+            Value::Null => Ok(()),
+            Value::List(items) if path.ends_with("[]") => items
+                .iter()
+                .try_for_each(|item| self.validate_shaped_object(path, shape, item)),
+            other => self.validate_shaped_object(path, shape, other),
+        }
+    }
+
+    fn validate_shaped_object(
+        &self,
+        path: &str,
+        shape: &[(String, FieldType)],
+        value: &Value,
+    ) -> OQLResult<()> {
+        let Value::Object(object) = value else {
+            if value.is_null() {
+                return Ok(());
+            }
+            return Err(OQLError::SchemaValidation {
+                message: format!("'{}' must be an object, found {}", path, value.type_name()),
+            });
+        };
+        let embedded = Schema::new(
+            path.to_string(),
+            shape.iter().cloned().collect::<HashMap<_, _>>(),
+        );
+        embedded
+            .validate_document(object)
+            .map_err(|error| OQLError::SchemaValidation {
+                message: format!("in '{}': {}", path, error),
+            })?;
+        for (name, field_type) in shape {
+            let Some(nested) = object.get(name) else {
+                continue;
+            };
+            let inner = match field_type {
+                FieldType::Optional(inner) => inner.as_ref(),
+                other => other,
+            };
+            let base = path.trim_end_matches("[]");
+            match inner {
+                FieldType::Object => self.validate_shaped_value(&format!("{base}.{name}"), nested)?,
+                FieldType::List(_) => {
+                    self.validate_shaped_value(&format!("{base}.{name}[]"), nested)?
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// Get field type by name
     pub fn get_field_type(&self, field_name: &str) -> Option<&FieldType> {
         self.fields.get(field_name)
@@ -219,6 +315,25 @@ pub enum SchemaConstraint {
         required: bool,
         name: Option<String>,
     },
+    // The declarations below were added after schemas were first persisted.
+    // They are appended, never reordered, so a schema written by an earlier
+    // build still decodes.
+    /// A condition every document must satisfy, kept as OQL source:
+    /// `check(.age >= 0 && .ends > .starts)`.
+    CheckExpression { expression: String },
+    /// The value a field takes when an insert omits it, kept as OQL source
+    /// so it may be computed: `created: DateTime = now()`.
+    Default { field: String, expression: String },
+    /// The declared shape of an embedded object. `path` names the field,
+    /// with `.` for nesting and a trailing `[]` when the shape describes
+    /// each element of a list: `address`, `address.geo`, `items[]`.
+    Shape {
+        path: String,
+        fields: Vec<(String, FieldType)>,
+    },
+    /// The name by which the target of the reference in `field` reaches the
+    /// documents that refer to it: `from: Ref(accounts) as outgoing`.
+    ReverseName { field: String, name: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

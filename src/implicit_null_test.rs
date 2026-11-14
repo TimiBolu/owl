@@ -204,13 +204,16 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_path_returns_null() {
+    fn test_empty_path_is_the_current_row() {
         let executor = create_test_executor();
         let doc = create_test_document_with_nested_fields();
 
+        // The empty path is `.`: the row itself, not an absent value.
         let field_access = FieldAccess { path: vec![] };
-        let result = executor.get_field_value(&doc, &field_access).unwrap();
-        assert_eq!(result, Value::Null);
+        let Value::Object(row) = executor.get_field_value(&doc, &field_access).unwrap() else {
+            panic!("the current row is an object");
+        };
+        assert_eq!(row.get("name"), doc.get_field("name"));
     }
 
     #[test]

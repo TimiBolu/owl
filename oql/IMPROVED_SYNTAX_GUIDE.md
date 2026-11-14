@@ -66,7 +66,7 @@ Method-style chaining on expressions is supported:
 
 ```oql
 companies.select {
-    days_in_assessment: (.timeline.assessment.entered_at || .created_at).days_until(.now)
+    days_in_assessment: (.timeline.assessment.entered_at || .created_at).days_until(now())
 }
 ```
 

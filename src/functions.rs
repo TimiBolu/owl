@@ -90,12 +90,23 @@ impl FunctionRegistry {
         Ok(())
     }
 
+    /// Remove a user-defined function. Built-in functions are unaffected.
+    pub fn unregister_user_function(&mut self, name: &str) {
+        self.user_functions.remove(name);
+    }
+
     /// Validate a function definition
     fn validate_function_definition(&self, func_def: &FunctionDefinition) -> OQLResult<()> {
-        // Check for duplicate function names
-        if self.has_function(&func_def.name) {
+        // Defining a function again replaces it: a script can be run twice,
+        // and a later definition can refine an earlier one. A built-in
+        // cannot be replaced, since that would silently change the meaning
+        // of every query that uses it.
+        if self.builtin_functions.contains_key(&func_def.name) {
             return Err(OQLError::Generic {
-                message: format!("Function '{}' already exists", func_def.name),
+                message: format!(
+                    "'{}' is a built-in function and cannot be redefined",
+                    func_def.name
+                ),
             });
         }
 
@@ -196,23 +207,27 @@ impl FunctionRegistry {
         self.register("days_ago", datetime_days_ago);
         self.register("hours_ago", datetime_hours_ago);
         self.register("minutes_ago", datetime_minutes_ago);
-        self.register("format_date", datetime_format);
+        self.register("format_date", text_or_datetime_format);
         self.register("parse_date", datetime_parse);
-        self.register("year", datetime_year);
-        self.register("month", datetime_month);
-        self.register("day", datetime_day);
-        self.register("hour", datetime_hour);
-        self.register("minute", datetime_minute);
-        self.register("second", datetime_second);
-        self.register("weekday", datetime_weekday);
-        self.register("add_days", datetime_add_days);
-        self.register("add_hours", datetime_add_hours);
-        self.register("diff_days", datetime_diff_days);
+        self.register("year", text_or_datetime_year);
+        self.register("month", text_or_datetime_month);
+        self.register("day", text_or_datetime_day);
+        self.register("hour", text_or_datetime_hour);
+        self.register("minute", text_or_datetime_minute);
+        self.register("second", text_or_datetime_second);
+        self.register("weekday", text_or_datetime_weekday);
+        self.register("add_days", text_or_datetime_add_days);
+        self.register("add_hours", text_or_datetime_add_hours);
+        self.register("diff_days", text_or_datetime_diff_days);
+        self.register("days_until", datetime_days_until);
+        self.register("days_since", datetime_days_since);
     }
 
     /// Register utility functions
     fn register_utility_functions(&mut self) {
         self.register("coalesce", utility_coalesce);
+        self.register("to_bool", utility_to_bool);
+        self.register("to_datetime", utility_to_datetime);
         self.register("if_null", utility_if_null);
         self.register("to_string", utility_to_string);
         self.register("to_int", utility_to_int);
@@ -292,7 +307,9 @@ fn string_length(args: &[Value]) -> OQLResult<Value> {
     }
 
     match &args[0] {
-        Value::String(s) => Ok(Value::Integer(s.len() as i64)),
+        // Length counts characters of text and elements of a list.
+        Value::String(s) => Ok(Value::Integer(s.chars().count() as i64)),
+        Value::List(items) => Ok(Value::Integer(items.len() as i64)),
         Value::Null => Ok(Value::Null),
         _ => Err(OQLError::TypeError {
             expected: "string".to_string(),
@@ -528,6 +545,15 @@ fn string_contains(args: &[Value]) -> OQLResult<Value> {
             message: "contains() expects exactly 2 arguments: contains(string, substring)"
                 .to_string(),
         });
+    }
+
+    // As a method, `.tags.contains("beta")` asks about a list's elements.
+    if let Value::List(_) = &args[0] {
+        return Ok(Value::Boolean(crate::value_semantics::matches(
+            &args[0],
+            &crate::parser::ComparisonOperator::Contains,
+            &args[1],
+        )));
     }
 
     let string = match &args[0] {
@@ -1212,6 +1238,42 @@ fn datetime_parse(args: &[Value]) -> OQLResult<Value> {
     }
 }
 
+/// Timestamps may arrive as text (RFC 3339 or a bare date), for example
+/// from a collection that stores them in a `String` field. Time functions
+/// read such text as the instant it denotes.
+fn timestamps_from_text(args: &[Value]) -> Vec<Value> {
+    args.iter()
+        .map(|arg| match arg {
+            Value::String(text) => crate::value_semantics::parse_timestamp(text)
+                .map(Value::DateTime)
+                .unwrap_or_else(|| arg.clone()),
+            other => other.clone(),
+        })
+        .collect()
+}
+
+macro_rules! accept_timestamp_text {
+    ($($wrapper:ident => $function:ident),* $(,)?) => {
+        $(fn $wrapper(args: &[Value]) -> OQLResult<Value> {
+            $function(&timestamps_from_text(args))
+        })*
+    };
+}
+
+accept_timestamp_text! {
+    text_or_datetime_format => datetime_format,
+    text_or_datetime_year => datetime_year,
+    text_or_datetime_month => datetime_month,
+    text_or_datetime_day => datetime_day,
+    text_or_datetime_hour => datetime_hour,
+    text_or_datetime_minute => datetime_minute,
+    text_or_datetime_second => datetime_second,
+    text_or_datetime_weekday => datetime_weekday,
+    text_or_datetime_add_days => datetime_add_days,
+    text_or_datetime_add_hours => datetime_add_hours,
+    text_or_datetime_diff_days => datetime_diff_days,
+}
+
 /// Extract year from date
 fn datetime_year(args: &[Value]) -> OQLResult<Value> {
     if args.len() != 1 {
@@ -1546,4 +1608,76 @@ fn utility_type_of(args: &[Value]) -> OQLResult<Value> {
     }
 
     Ok(Value::String(args[0].type_name().to_string()))
+}
+
+/// Convert a value to a boolean: `true`/`false` text, zero and non-zero
+/// numbers. Anything else has no boolean reading and yields null.
+fn utility_to_bool(args: &[Value]) -> OQLResult<Value> {
+    if args.len() != 1 {
+        return Err(OQLError::Generic {
+            message: "to_bool() expects exactly 1 argument".to_string(),
+        });
+    }
+    Ok(match &args[0] {
+        Value::Boolean(value) => Value::Boolean(*value),
+        Value::Integer(value) => Value::Boolean(*value != 0),
+        Value::Float(value) => Value::Boolean(*value != 0.0),
+        Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
+            "true" | "yes" | "1" => Value::Boolean(true),
+            "false" | "no" | "0" => Value::Boolean(false),
+            _ => Value::Null,
+        },
+        _ => Value::Null,
+    })
+}
+
+/// Convert timestamp text (RFC 3339 or a bare date) to a timestamp. Text
+/// that is not a timestamp yields null.
+fn utility_to_datetime(args: &[Value]) -> OQLResult<Value> {
+    if args.len() != 1 {
+        return Err(OQLError::Generic {
+            message: "to_datetime() expects exactly 1 argument".to_string(),
+        });
+    }
+    Ok(match &args[0] {
+        Value::DateTime(instant) => Value::DateTime(*instant),
+        Value::String(text) => crate::value_semantics::parse_timestamp(text)
+            .map(Value::DateTime)
+            .unwrap_or(Value::Null),
+        _ => Value::Null,
+    })
+}
+
+fn two_timestamps(name: &str, args: &[Value]) -> OQLResult<Option<(DateTime<Utc>, DateTime<Utc>)>> {
+    if args.len() != 2 {
+        return Err(OQLError::Generic {
+            message: format!("{name}() expects exactly 2 arguments: {name}(from, to)"),
+        });
+    }
+    match timestamps_from_text(args).as_slice() {
+        [Value::DateTime(from), Value::DateTime(to)] => Ok(Some((*from, *to))),
+        // An absent timestamp has no distance to anything.
+        [Value::Null, _] | [_, Value::Null] => Ok(None),
+        [first, second] => Err(OQLError::TypeError {
+            expected: "two timestamps".to_string(),
+            actual: format!("{} and {}", first.type_name(), second.type_name()),
+        }),
+        _ => unreachable!("argument count was checked"),
+    }
+}
+
+/// Whole days from the first timestamp until the second:
+/// `.created_at.days_until(now())`.
+fn datetime_days_until(args: &[Value]) -> OQLResult<Value> {
+    Ok(two_timestamps("days_until", args)?
+        .map(|(from, to)| Value::Integer((to - from).num_days()))
+        .unwrap_or(Value::Null))
+}
+
+/// Whole days since the second timestamp, as of the first:
+/// `now().days_since(.created_at)`.
+fn datetime_days_since(args: &[Value]) -> OQLResult<Value> {
+    Ok(two_timestamps("days_since", args)?
+        .map(|(as_of, earlier)| Value::Integer((as_of - earlier).num_days()))
+        .unwrap_or(Value::Null))
 }

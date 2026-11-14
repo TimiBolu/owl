@@ -67,6 +67,7 @@ fn run_script_with_output(
     for statement in file.statements {
         match statement {
             OQLFileStatement::Schema(_) => {}
+            OQLFileStatement::Drop(_) => {}
             OQLFileStatement::FunctionDef(func) => {
                 executor.register_user_function(func)?;
             }

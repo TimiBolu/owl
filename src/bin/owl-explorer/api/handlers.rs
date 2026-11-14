@@ -308,6 +308,24 @@ fn parse_constraint_defs(
 
 fn constraint_to_json(constraint: &SchemaConstraint) -> serde_json::Value {
     match constraint {
+        SchemaConstraint::CheckExpression { expression } => json!({
+            "kind": "check",
+            "expression": expression,
+        }),
+        SchemaConstraint::Default { field, expression } => json!({
+            "kind": "default",
+            "field": field,
+            "expression": expression,
+        }),
+        SchemaConstraint::Shape { path, .. } => json!({
+            "kind": "shape",
+            "field": path,
+        }),
+        SchemaConstraint::ReverseName { field, name } => json!({
+            "kind": "reverse_name",
+            "field": field,
+            "name": name,
+        }),
         SchemaConstraint::Unique { fields, name } => json!({
             "kind": "unique",
             "name": name,
@@ -420,6 +438,11 @@ fn validate_document_constraints_for_store(
 ) -> Result<(), String> {
     for constraint in &schema.constraints {
         match constraint {
+            // Enforced by the query executor on the OQL write path.
+            SchemaConstraint::CheckExpression { .. }
+            | SchemaConstraint::Default { .. }
+            | SchemaConstraint::Shape { .. }
+            | SchemaConstraint::ReverseName { .. } => {}
             SchemaConstraint::Unique { fields, name } => {
                 let docs = store
                     .scan_documents(&schema.name)
@@ -891,6 +914,15 @@ pub fn execute_query(db: &DatabaseEntry, query: &str) -> Result<serde_json::Valu
 
             for stmt in &file.statements {
                 match stmt {
+                    OQLFileStatement::Drop(name) => match script_executor.drop_collection(name) {
+                        Ok(removed) => {
+                            success_count += 1;
+                            summary.push(json!({"type": "drop", "value": name, "documents": removed}));
+                        }
+                        Err(error) => {
+                            summary.push(json!({"type": "error", "value": error.to_string()}));
+                        }
+                    },
                     OQLFileStatement::Schema(def) => {
                         schema_count += 1;
                         success_count += 1;
@@ -1105,6 +1137,11 @@ pub fn execute_query(db: &DatabaseEntry, query: &str) -> Result<serde_json::Valu
                                     tx_errors.push(
                                         "Nested transaction blocks are not supported".to_string(),
                                     );
+                                }
+                                OQLFileStatement::Drop(name) => {
+                                    tx_errors.push(format!(
+                                        "'drop {name}' cannot run inside a transaction block"
+                                    ));
                                 }
                             }
                         }
