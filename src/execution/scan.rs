@@ -223,6 +223,7 @@ impl FilterExec {
             Literal::Float(f) => Value::Float(*f),
             Literal::Boolean(b) => Value::Boolean(*b),
             Literal::Null => Value::Null,
+            Literal::Timestamp(instant) => Value::DateTime(*instant),
         }
     }
 

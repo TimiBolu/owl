@@ -1047,6 +1047,9 @@ impl IndexScanExec {
             crate::parser::Literal::Float(value) => crate::document::Value::Float(*value),
             crate::parser::Literal::Boolean(value) => crate::document::Value::Boolean(*value),
             crate::parser::Literal::Null => crate::document::Value::Null,
+            crate::parser::Literal::Timestamp(instant) => {
+                crate::document::Value::DateTime(*instant)
+            }
         }
     }
 
@@ -1057,6 +1060,9 @@ impl IndexScanExec {
             crate::parser::Literal::Boolean(b) => Some(u64::from(*b)),
             crate::parser::Literal::String(s) => Some(wyhash(s.as_bytes(), 0)),
             crate::parser::Literal::Null => None,
+            crate::parser::Literal::Timestamp(instant) => {
+                Some(instant.timestamp_micros() as u64)
+            }
         }
     }
 

@@ -481,6 +481,7 @@ impl LogicalPlanner {
             Literal::Float(_) => FieldType::Float,
             Literal::Boolean(_) => FieldType::Boolean,
             Literal::Null => FieldType::Optional(Box::new(FieldType::Object)),
+            Literal::Timestamp(_) => FieldType::DateTime,
         }
     }
 

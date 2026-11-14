@@ -687,6 +687,32 @@ pub trait DocumentStore: Send + Sync + 'static {
         Ok(documents)
     }
 
+    /// The reference by which stored documents point at this document, when
+    /// the store can say without reading it.
+    fn object_ref_of(
+        &self,
+        _schema: &str,
+        _id: &DocumentId,
+    ) -> OQLResult<Option<crate::document::ObjRef>> {
+        Ok(None)
+    }
+
+    /// The same rows as `scan_referencing_documents`, in the same order,
+    /// shared rather than copied when the store already holds them.
+    fn scan_referencing_documents_shared(
+        &self,
+        target_schema: &str,
+        target_id: &DocumentId,
+        source_schema: Option<&str>,
+        field_path: Option<&str>,
+    ) -> OQLResult<Vec<Arc<Document>>> {
+        Ok(self
+            .scan_referencing_documents(target_schema, target_id, source_schema, field_path)?
+            .into_iter()
+            .map(Arc::new)
+            .collect())
+    }
+
     fn upsert_vector_index(&self, _index: VectorIndexDefinition) -> OQLResult<()> {
         Err(OQLError::generic(
             "vector indexes are not supported by this store",
