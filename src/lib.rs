@@ -27,6 +27,7 @@ pub mod streaming;
 // pub mod transaction; // Deprecated RocksDB-era layer; pending Zig-native redesign.
 pub mod performance;
 pub mod type_syntax;
+pub mod value_semantics;
 
 // Task 13: Observability and monitoring
 pub mod logging;
@@ -68,7 +69,8 @@ pub use monitoring::{
     QueryStats as MonitoringQueryStats, SystemMetrics, TraceSpan,
 };
 pub use parser::{
-    execute_oql_file, parse_oql, parse_oql_file, parse_oql_statement,
+    bind_parameters, execute_oql_file, parse_oql, parse_oql_file, parse_oql_statement,
+    query_parameters,
     parse_oql_statement_with_schema, parse_oql_with_schema, resolve_query_with_bindings,
     resolve_query_with_value_bindings, resolve_value_with_bindings, ComparisonOperator, Condition,
     Expression, FieldAccess, Literal, OQLFile, OQLFileExecutionResult, OQLFileStatement, OQLQuery,
@@ -114,8 +116,8 @@ pub use streaming::{
 ///
 /// The macro returns the same result as [`parse_oql`]. Use the literal form
 /// for long queries and the token form for compact, fixed queries. Runtime
-/// values should still be bound through a query builder or safely constructed
-/// string rather than interpolated into macro tokens.
+/// values belong in `$name` parameters supplied through [`bind_parameters`],
+/// never interpolated into the query text.
 ///
 /// ```
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {

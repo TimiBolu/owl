@@ -118,11 +118,24 @@ impl Tokenizer {
                     }
                     remaining = rest;
                 }
-                Err(e) => {
+                Err(_) => {
+                    // Report where the input stopped making sense, in the
+                    // user's own text, rather than a parser-internal trace.
+                    let line = input[..input.len() - remaining.len()]
+                        .matches('\n')
+                        .count()
+                        + 1;
+                    if remaining.starts_with('"') {
+                        return Err(TokenizeError::ParseError(format!(
+                            "line {line}: string literal is unterminated or contains an \
+                             unknown escape (use \\\\ for a backslash and \\\" for a quote)"
+                        )));
+                    }
+                    let snippet: String = remaining.chars().take(24).collect();
                     return Err(TokenizeError::ParseError(format!(
-                        "Failed to parse token: {:?}",
-                        e
-                    )))
+                        "line {line}: unexpected input at `{}`",
+                        snippet.lines().next().unwrap_or_default()
+                    )));
                 }
             }
         }
@@ -140,6 +153,7 @@ impl Tokenizer {
             Self::parse_number,
             Self::parse_boolean,
             Self::parse_null,
+            Self::parse_parameter,
             Self::parse_field_access,
             Self::parse_keyword,
             Self::parse_identifier,
@@ -262,6 +276,7 @@ impl Tokenizer {
             map(tag("||"), |_| Token::Or),
             map(tag("=="), |_| Token::Equal),
             map(tag("!="), |_| Token::NotEqual),
+            map(tag("!"), |_| Token::Not),
             map(tag("<="), |_| Token::LessEqual),
             map(tag(">="), |_| Token::GreaterEqual),
             map(tag("="), |_| Token::Assign),
@@ -274,11 +289,57 @@ impl Tokenizer {
         ))(input)
     }
 
+    /// A double-quoted string. A backslash escapes the next character:
+    /// `\"` and `\\` stand for themselves, `\n`, `\r`, `\t` and `\0` are
+    /// the usual control characters, and `\u{1F989}` is a Unicode scalar.
+    /// Any other escape is an error rather than a silent guess.
     fn parse_string_literal(input: &str) -> IResult<&str, Token> {
-        let (input, _) = char('"')(input)?;
-        let (input, content) = take_while(|c| c != '"')(input)?;
-        let (input, _) = char('"')(input)?;
-        Ok((input, Token::StringLiteral(content.to_string())))
+        let (body, _) = char('"')(input)?;
+        let fail = |at: &'static str| {
+            let _ = at;
+            nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Escaped))
+        };
+        let mut content = String::new();
+        let mut chars = body.char_indices();
+        while let Some((offset, character)) = chars.next() {
+            match character {
+                '"' => {
+                    return Ok((&body[offset + 1..], Token::StringLiteral(content)));
+                }
+                '\\' => match chars.next().map(|(_, escaped)| escaped) {
+                    Some('"') => content.push('"'),
+                    Some('\\') => content.push('\\'),
+                    Some('/') => content.push('/'),
+                    Some('n') => content.push('\n'),
+                    Some('r') => content.push('\r'),
+                    Some('t') => content.push('\t'),
+                    Some('0') => content.push('\0'),
+                    Some('u') => {
+                        if chars.next().map(|(_, open)| open) != Some('{') {
+                            return Err(fail("unicode escape"));
+                        }
+                        let mut digits = String::new();
+                        loop {
+                            match chars.next().map(|(_, digit)| digit) {
+                                Some('}') => break,
+                                Some(digit) if digit.is_ascii_hexdigit() && digits.len() < 6 => {
+                                    digits.push(digit)
+                                }
+                                _ => return Err(fail("unicode escape")),
+                            }
+                        }
+                        let scalar = u32::from_str_radix(&digits, 16)
+                            .ok()
+                            .and_then(char::from_u32)
+                            .ok_or_else(|| fail("unicode escape"))?;
+                        content.push(scalar);
+                    }
+                    _ => return Err(fail("string escape")),
+                },
+                other => content.push(other),
+            }
+        }
+        Err(fail("unterminated string"))
     }
 
     fn parse_number(input: &str) -> IResult<&str, Token> {
@@ -305,10 +366,32 @@ impl Tokenizer {
     }
 
     fn parse_boolean(input: &str) -> IResult<&str, Token> {
-        alt((
+        let (rest, token) = alt((
             map(tag("true"), |_| Token::BooleanLiteral(true)),
             map(tag("false"), |_| Token::BooleanLiteral(false)),
-        ))(input)
+        ))(input)?;
+        // `true_count` and `falsey` are identifiers, not a literal followed
+        // by more text.
+        if rest
+            .chars()
+            .next()
+            .is_some_and(|next| next.is_ascii_alphanumeric() || next == '_')
+        {
+            return Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Tag,
+            )));
+        }
+        Ok((rest, token))
+    }
+
+    /// A query parameter such as `$from`. It is carried as a name whose
+    /// value the host supplies before execution (see [`bind_parameters`]),
+    /// so values never have to be spliced into query text.
+    fn parse_parameter(input: &str) -> IResult<&str, Token> {
+        let (rest, _) = char('$')(input)?;
+        let (rest, name) = Self::parse_identifier_name(rest)?;
+        Ok((rest, Token::Identifier(format!("${name}"))))
     }
 
     fn parse_null(input: &str) -> IResult<&str, Token> {
@@ -3357,8 +3440,41 @@ impl Parser {
             let expr = self.parse_logical_not_expression()?;
             Ok(Expression::LogicalNot(Box::new(expr)))
         } else {
-            self.parse_additive_expression()
+            self.parse_comparison_expression()
         }
+    }
+
+    fn comparison_operator(token: Option<&Token>) -> Option<ComparisonOperator> {
+        Some(match token? {
+            Token::Equal => ComparisonOperator::Equal,
+            Token::NotEqual => ComparisonOperator::NotEqual,
+            Token::LessThan => ComparisonOperator::LessThan,
+            Token::GreaterThan => ComparisonOperator::GreaterThan,
+            Token::LessEqual => ComparisonOperator::LessEqual,
+            Token::GreaterEqual => ComparisonOperator::GreaterEqual,
+            Token::Contains => ComparisonOperator::Contains,
+            Token::StartsWith => ComparisonOperator::StartsWith,
+            Token::EndsWith => ComparisonOperator::EndsWith,
+            Token::In => ComparisonOperator::In,
+            _ => return None,
+        })
+    }
+
+    /// A comparison is an ordinary boolean-valued expression, so it can be
+    /// projected (`select { adult: .age >= 18 }`), passed to a function, or
+    /// stored in a binding, not only used inside `where`.
+    fn parse_comparison_expression(&mut self) -> Result<Expression, ParseError> {
+        let left = self.parse_additive_expression()?;
+        let Some(operator) = Self::comparison_operator(self.current_token()) else {
+            return Ok(left);
+        };
+        self.advance();
+        let right = self.parse_additive_expression()?;
+        Ok(Expression::ConditionExpr(Box::new(Condition::Comparison {
+            left,
+            operator,
+            right,
+        })))
     }
 
     fn parse_additive_expression(&mut self) -> Result<Expression, ParseError> {
@@ -3410,6 +3526,27 @@ impl Parser {
         match self.current_token() {
             Some(Token::If) => self.parse_if_then_else_expression(),
             Some(Token::Match) => self.parse_match_expression(),
+            Some(Token::Minus) => {
+                // Unary minus binds tighter than any binary operator. A
+                // negated numeric literal is folded so `-5` is the literal
+                // negative five everywhere a literal is expected.
+                self.advance();
+                Ok(match self.parse_conditional_expression()? {
+                    Expression::Literal(Literal::Integer(value)) => {
+                        Expression::Literal(Literal::Integer(value.checked_neg().ok_or_else(
+                            || ParseError::InvalidSyntax("integer literal out of range".into()),
+                        )?))
+                    }
+                    Expression::Literal(Literal::Float(value)) => {
+                        Expression::Literal(Literal::Float(-value))
+                    }
+                    operand => Expression::BinaryOp {
+                        left: Box::new(Expression::Literal(Literal::Integer(0))),
+                        operator: BinaryOperator::Subtract,
+                        right: Box::new(operand),
+                    },
+                })
+            }
             _ => self.parse_postfix_expression(),
         }
     }
@@ -3936,122 +4073,87 @@ impl Parser {
     }
 
     fn parse_primary_condition(&mut self) -> Result<Condition, ParseError> {
-        // Handle parentheses
+        // A leading parenthesis may group a condition, `(.a == 1 || .b == 2)`,
+        // or an operand, `(.a + .b) > 5`. Read it as a condition first; if an
+        // operator follows the closing parenthesis it was an operand after
+        // all, so rewind and read it as one.
         if matches!(self.current_token(), Some(Token::LeftParen)) {
+            let checkpoint = self.position;
             self.advance(); // consume '('
-            let condition = self.parse_condition()?;
-            self.expect_token(Token::RightParen)?;
-            return Ok(condition);
+            let grouped = self
+                .parse_condition()
+                .and_then(|condition| self.expect_token(Token::RightParen).map(|_| condition));
+            let continues_as_operand = Self::comparison_operator(self.current_token()).is_some()
+                || matches!(
+                    self.current_token(),
+                    Some(
+                        Token::Plus
+                            | Token::Minus
+                            | Token::Star
+                            | Token::Slash
+                            | Token::Percent
+                            | Token::Dot
+                            | Token::FieldAccess(_)
+                            | Token::LeftBracket
+                    )
+                );
+            match grouped {
+                Ok(condition) if !continues_as_operand => return Ok(condition),
+                _ => self.position = checkpoint,
+            }
         }
 
         // Parse left side (simple expression without logical operators)
         let left = self.parse_simple_expression()?;
 
-        // Check if there's a comparison operator
-        match self.current_token() {
-            Some(Token::Equal) => {
+        match Self::comparison_operator(self.current_token()) {
+            Some(operator) => {
                 self.advance();
                 let right = self.parse_simple_expression()?;
                 Ok(Condition::Comparison {
                     left,
-                    operator: ComparisonOperator::Equal,
+                    operator,
                     right,
                 })
             }
-            Some(Token::NotEqual) => {
-                self.advance();
-                let right = self.parse_simple_expression()?;
-                Ok(Condition::Comparison {
-                    left,
-                    operator: ComparisonOperator::NotEqual,
-                    right,
-                })
-            }
-            Some(Token::LessThan) => {
-                self.advance();
-                let right = self.parse_simple_expression()?;
-                Ok(Condition::Comparison {
-                    left,
-                    operator: ComparisonOperator::LessThan,
-                    right,
-                })
-            }
-            Some(Token::GreaterThan) => {
-                self.advance();
-                let right = self.parse_simple_expression()?;
-                Ok(Condition::Comparison {
-                    left,
-                    operator: ComparisonOperator::GreaterThan,
-                    right,
-                })
-            }
-            Some(Token::LessEqual) => {
-                self.advance();
-                let right = self.parse_simple_expression()?;
-                Ok(Condition::Comparison {
-                    left,
-                    operator: ComparisonOperator::LessEqual,
-                    right,
-                })
-            }
-            Some(Token::GreaterEqual) => {
-                self.advance();
-                let right = self.parse_simple_expression()?;
-                Ok(Condition::Comparison {
-                    left,
-                    operator: ComparisonOperator::GreaterEqual,
-                    right,
-                })
-            }
-            Some(Token::Contains) => {
-                self.advance();
-                let right = self.parse_simple_expression()?;
-                Ok(Condition::Comparison {
-                    left,
-                    operator: ComparisonOperator::Contains,
-                    right,
-                })
-            }
-            Some(Token::StartsWith) => {
-                self.advance();
-                let right = self.parse_simple_expression()?;
-                Ok(Condition::Comparison {
-                    left,
-                    operator: ComparisonOperator::StartsWith,
-                    right,
-                })
-            }
-            Some(Token::EndsWith) => {
-                self.advance();
-                let right = self.parse_simple_expression()?;
-                Ok(Condition::Comparison {
-                    left,
-                    operator: ComparisonOperator::EndsWith,
-                    right,
-                })
-            }
-            Some(Token::In) => {
-                self.advance();
-                let right = self.parse_simple_expression()?;
-                Ok(Condition::Comparison {
-                    left,
-                    operator: ComparisonOperator::In,
-                    right,
-                })
-            }
-            _ => {
-                // No comparison operator found - treat the expression as a boolean condition
-                // This allows for conditions like "if .premium" or "if .active"
-                Ok(Condition::Comparison {
+            // No comparison operator: the expression itself is the condition,
+            // as in `where { .active }` or `where { is_open(*) }`.
+            None => Ok(match left {
+                Expression::ConditionExpr(condition) => *condition,
+                left => Condition::Comparison {
                     left,
                     operator: ComparisonOperator::Equal,
                     right: Expression::Literal(Literal::Boolean(true)),
-                })
-            }
+                },
+            }),
         }
     }
 
     fn parse_literal(&mut self) -> Result<Literal, ParseError> {
+        if matches!(self.current_token(), Some(Token::Minus)) {
+            let checkpoint = self.position;
+            self.advance();
+            return match self.current_token() {
+                Some(Token::IntegerLiteral(value)) => {
+                    let negated = value.checked_neg().ok_or_else(|| {
+                        ParseError::InvalidSyntax("integer literal out of range".into())
+                    })?;
+                    self.advance();
+                    Ok(Literal::Integer(negated))
+                }
+                Some(Token::FloatLiteral(value)) => {
+                    let negated = -*value;
+                    self.advance();
+                    Ok(Literal::Float(negated))
+                }
+                _ => {
+                    self.position = checkpoint;
+                    Err(ParseError::UnexpectedToken(
+                        "Expected a number after '-'".to_string(),
+                    ))
+                }
+            };
+        }
         match self.current_token() {
             Some(Token::StringLiteral(value)) => {
                 let literal = Literal::String(value.clone());
@@ -5080,8 +5182,7 @@ pub struct SchemaField {
 
 /// Parse a complete OQL file containing multiple statements
 pub fn parse_oql_file(content: &str) -> Result<OQLFile, Box<dyn std::error::Error>> {
-    let preprocessed_content = preprocess_method_chaining(content);
-    let statements = extract_statements(&preprocessed_content)?;
+    let statements = split_statements(content);
     let mut parsed_statements = Vec::new();
 
     for statement in statements {
@@ -5119,162 +5220,77 @@ pub fn parse_oql_file(content: &str) -> Result<OQLFile, Box<dyn std::error::Erro
     })
 }
 
-/// Preprocess content to handle method chaining
-fn preprocess_method_chaining(content: &str) -> String {
-    let mut result = String::new();
-    let lines: Vec<&str> = content.lines().collect();
-    let mut i = 0;
-
-    while i < lines.len() {
-        let line = lines[i];
-        let trimmed = line.trim();
-
-        // Skip empty lines and comments
-        if trimmed.is_empty() || trimmed.starts_with("//") {
-            result.push_str(line);
-            result.push('\n');
-            i += 1;
-            continue;
-        }
-
-        // Start building a statement
-        let mut statement_lines = vec![line];
-        i += 1;
-
-        // Look ahead for method chaining (lines starting with .)
-        while i < lines.len() {
-            let next_line = lines[i];
-            let next_trimmed = next_line.trim();
-
-            // Skip empty lines and comments in method chain
-            if next_trimmed.is_empty() || next_trimmed.starts_with("//") {
-                statement_lines.push(next_line);
-                i += 1;
-                continue;
-            }
-
-            // If next line starts with dot, it's method chaining
-            if next_trimmed.starts_with('.') {
-                statement_lines.push(next_line);
-                i += 1;
-            } else {
-                // Not method chaining, stop here
-                break;
-            }
-        }
-
-        // Join the statement lines and add to result
-        for (idx, stmt_line) in statement_lines.iter().enumerate() {
-            if idx > 0 {
-                result.push('\n');
-            }
-            result.push_str(stmt_line);
-        }
-        result.push('\n');
-    }
-
-    result
-}
-
-/// Extract individual statements from OQL file content (after preprocessing)
-fn extract_statements(content: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
-    // Statements are separated by blank lines, or by a new top-level statement start.
+/// Split a script into statement source texts.
+///
+/// The scan tracks strings, comments and bracket depth, so braces inside a
+/// string or comment, and blank lines inside a block, never affect where a
+/// statement ends. A statement ends at a line break outside all brackets,
+/// unless the statement visibly continues: the line ends with an operator or
+/// separator (`total =`, `a +`), or the next line does not begin with a name
+/// (`.where { .. }`, `{`, `&& ..`).
+fn split_statements(content: &str) -> Vec<String> {
     let mut statements = Vec::new();
-    let mut current_statement = String::new();
-    let mut brace_depth: i32 = 0;
+    let mut start: Option<usize> = None;
+    let mut significant_end = 0usize;
+    let mut last_significant = ' ';
+    let mut depth = 0usize;
+    let mut line_ended = false;
 
-    for line in content.lines() {
-        let trimmed = line.trim();
-
-        // If we hit an empty line and have a current statement, end it
-        if trimmed.is_empty() {
-            if !current_statement.trim().is_empty() {
-                statements.push(current_statement.trim().to_string());
-                current_statement.clear();
+    let mut chars = content.char_indices().peekable();
+    while let Some((index, character)) = chars.next() {
+        if character == '\n' {
+            line_ended = true;
+            continue;
+        }
+        if character.is_whitespace() {
+            continue;
+        }
+        if character == '/' && matches!(chars.peek(), Some((_, '/'))) {
+            while chars.peek().is_some_and(|(_, next)| *next != '\n') {
+                chars.next();
             }
             continue;
         }
 
-        // Skip standalone comments
-        if trimmed.starts_with("//") && current_statement.trim().is_empty() {
-            continue;
-        }
-
-        // If a new top-level statement starts while the current one is balanced,
-        // split even without requiring blank lines between statements.
-        if !current_statement.trim().is_empty()
-            && brace_depth == 0
-            && looks_like_statement_start(trimmed)
-        {
-            statements.push(current_statement.trim().to_string());
-            current_statement.clear();
-        }
-
-        // Add line to current statement
-        if !current_statement.is_empty() {
-            current_statement.push('\n');
-        }
-        current_statement.push_str(line);
-
-        for ch in line.chars() {
-            match ch {
-                '{' => brace_depth += 1,
-                '}' => brace_depth -= 1,
-                _ => {}
+        if line_ended && depth == 0 && start.is_some() {
+            let continues = !(character.is_ascii_alphabetic() || character == '_')
+                || "=,+-*/%&|<>([{.:!".contains(last_significant);
+            if !continues {
+                statements.push(content[start.unwrap()..significant_end].to_string());
+                start = None;
             }
         }
-    }
+        line_ended = false;
+        start.get_or_insert(index);
 
-    // Add any remaining statement
-    if !current_statement.trim().is_empty() {
-        statements.push(current_statement.trim().to_string());
+        let mut end = index + character.len_utf8();
+        match character {
+            '"' => {
+                // Consume the whole literal so its contents are opaque here.
+                while let Some((inner, next)) = chars.next() {
+                    end = inner + next.len_utf8();
+                    match next {
+                        '\\' => {
+                            if let Some((escaped, next)) = chars.next() {
+                                end = escaped + next.len_utf8();
+                            }
+                        }
+                        '"' => break,
+                        _ => {}
+                    }
+                }
+            }
+            '{' | '(' | '[' => depth += 1,
+            '}' | ')' | ']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        significant_end = end;
+        last_significant = character;
     }
-
-    Ok(statements)
-}
-
-fn looks_like_statement_start(trimmed: &str) -> bool {
-    if trimmed.starts_with("schema ")
-        || trimmed.starts_with("fn ")
-        || is_transaction_statement_start(trimmed)
-    {
-        return true;
+    if let Some(start) = start {
+        statements.push(content[start..significant_end].to_string());
     }
-    if looks_like_binding_start(trimmed) {
-        return true;
-    }
-
-    let token = trimmed.split_whitespace().next().unwrap_or(trimmed);
-    if is_valid_identifier(token.trim_end_matches('{').trim_end_matches(',')) {
-        return true;
-    }
-    let Some((collection, op)) = token.split_once('.') else {
-        return false;
-    };
-    if collection.is_empty()
-        || !collection
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-    {
-        return false;
-    }
-    matches!(
-        op,
-        "insert"
-            | "upsert"
-            | "where"
-            | "select"
-            | "update"
-            | "delete"
-            | "sort"
-            | "limit"
-            | "offset"
-            | "first"
-            | "exists"
-            | "group_by"
-            | "having"
-            | "nearest"
-    )
+    statements
 }
 
 fn is_transaction_statement_start(trimmed: &str) -> bool {
@@ -5305,14 +5321,6 @@ fn parse_transaction_statement(
     let inner = &trimmed[first_brace + 1..last_brace];
     let parsed = parse_oql_file(inner)?;
     Ok(parsed.statements)
-}
-
-fn looks_like_binding_start(trimmed: &str) -> bool {
-    let Some((lhs, _)) = trimmed.split_once('=') else {
-        return false;
-    };
-    let candidate = lhs.trim();
-    is_valid_identifier(candidate)
 }
 
 fn is_valid_identifier(name: &str) -> bool {
@@ -5441,6 +5449,106 @@ pub fn resolve_query_with_value_bindings(
             .map(|operation| Parser::substitute_scoped_locals_operation(operation, bindings))
             .collect(),
     }
+}
+
+/// The names of the query parameters (`$name`) a query still expects, without
+/// the `$`.
+pub fn query_parameters(query: &OQLQuery) -> std::collections::BTreeSet<String> {
+    // Parameters are carried as `Identifier("$name")` nodes. Walking the
+    // serialized tree finds them wherever the grammar can place an
+    // expression, without a second hand-maintained traversal of the AST.
+    fn collect(node: &serde_json::Value, found: &mut std::collections::BTreeSet<String>) {
+        match node {
+            serde_json::Value::Object(fields) => {
+                if let Some(serde_json::Value::String(name)) = fields.get("Identifier") {
+                    if let Some(parameter) = name.strip_prefix('$') {
+                        found.insert(parameter.to_string());
+                    }
+                }
+                fields.values().for_each(|value| collect(value, found));
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|item| collect(item, found)),
+            _ => {}
+        }
+    }
+
+    let mut found = std::collections::BTreeSet::new();
+    if let Ok(tree) = serde_json::to_value(query) {
+        collect(&tree, &mut found);
+    }
+    found
+}
+
+/// Supply values for a query's `$name` parameters.
+///
+/// This is how a host passes runtime values into a query: the query text is
+/// fixed, and values arrive as data, so they can never change the query's
+/// structure. Every parameter the query uses must be given a value; extra
+/// entries are ignored.
+///
+/// ```
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// use owl_db::{bind_parameters, parse_oql, Value};
+/// use std::collections::HashMap;
+///
+/// let query = parse_oql(r#"events.where { .level == $level && .attempts > $min }"#)?;
+/// let bound = bind_parameters(
+///     &query,
+///     &HashMap::from([
+///         ("level".to_string(), Value::String("error".into())),
+///         ("min".to_string(), Value::Integer(-1)),
+///     ]),
+/// )?;
+/// assert!(owl_db::query_parameters(&bound).is_empty());
+/// # Ok(())
+/// # }
+/// ```
+pub fn bind_parameters(
+    query: &OQLQuery,
+    parameters: &std::collections::HashMap<String, crate::document::Value>,
+) -> Result<OQLQuery, String> {
+    fn literal(value: &crate::document::Value) -> Result<Expression, String> {
+        use crate::document::Value;
+        Ok(match value {
+            Value::String(text) => Expression::Literal(Literal::String(text.clone())),
+            Value::Integer(integer) => Expression::Literal(Literal::Integer(*integer)),
+            Value::Float(float) => Expression::Literal(Literal::Float(*float)),
+            Value::Boolean(boolean) => Expression::Literal(Literal::Boolean(*boolean)),
+            Value::Null => Expression::Literal(Literal::Null),
+            // A timestamp travels as its RFC 3339 text, which compares with
+            // stored timestamps by instant.
+            Value::DateTime(instant) => Expression::Literal(Literal::String(instant.to_rfc3339())),
+            Value::List(items) => {
+                Expression::ArrayLiteral(items.iter().map(literal).collect::<Result<_, _>>()?)
+            }
+            Value::Object(fields) => Expression::ObjectLiteral(
+                fields
+                    .iter()
+                    .map(|(name, value)| {
+                        Ok(ObjectField {
+                            name: name.clone(),
+                            value: literal(value)?,
+                        })
+                    })
+                    .collect::<Result<_, String>>()?,
+            ),
+            Value::Reference(_) | Value::GlobalReference(_) => {
+                return Err("a reference cannot be passed as a query parameter".to_string())
+            }
+        })
+    }
+
+    let mut bindings = std::collections::HashMap::new();
+    for name in query_parameters(query) {
+        let value = parameters
+            .get(&name)
+            .ok_or_else(|| format!("query parameter ${name} has no value"))?;
+        bindings.insert(
+            format!("${name}"),
+            literal(value).map_err(|error| format!("query parameter ${name}: {error}"))?,
+        );
+    }
+    Ok(resolve_query_with_value_bindings(query, &bindings))
 }
 
 pub fn resolve_value_with_bindings(
@@ -5679,56 +5787,80 @@ fn resolve_expression_bindings(
 fn parse_schema_definition(
     statement: &str,
 ) -> Result<SchemaDefinition, Box<dyn std::error::Error>> {
-    let lines: Vec<&str> = statement.lines().collect();
-    if lines.is_empty() {
-        return Err("Empty schema definition".into());
-    }
+    // Comments carry no meaning; drop them before looking at structure.
+    let source: String = statement
+        .lines()
+        .map(|line| line.split("//").next().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n");
 
-    // Extract schema name from first line: "schema users {"
-    let first_line = lines[0].trim();
-    let parts: Vec<&str> = first_line.split_whitespace().collect();
-    if parts.len() < 2 || parts[0] != "schema" {
+    let header_end = source
+        .find('{')
+        .ok_or("schema declaration must have a '{ ... }' body")?;
+    let body_end = source
+        .rfind('}')
+        .filter(|end| *end > header_end)
+        .ok_or("schema declaration is missing its closing '}'")?;
+    let mut header = source[..header_end].split_whitespace();
+    if header.next() != Some("schema") {
         return Err("Invalid schema definition".into());
     }
+    let schema_name = header.next().ok_or("schema declaration has no name")?;
+    if !is_valid_identifier(schema_name) || header.next().is_some() {
+        return Err(format!("'{}' is not a valid schema name", source[..header_end].trim()).into());
+    }
 
-    let schema_name = parts[1].trim_end_matches('{').trim().to_string();
+    // Fields are separated by commas or line breaks. Either may appear
+    // inside a parameterised type such as `List(Ref(teams))`, so only
+    // separators outside brackets count; that is what lets a schema be
+    // written on one line or many.
+    let mut declarations = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+    for character in source[header_end + 1..body_end].chars() {
+        match character {
+            '(' | '[' | '{' | '<' => depth += 1,
+            ')' | ']' | '}' | '>' => depth = depth.saturating_sub(1),
+            ',' | '\n' if depth == 0 => {
+                declarations.push(std::mem::take(&mut current));
+                continue;
+            }
+            _ => {}
+        }
+        current.push(character);
+    }
+    declarations.push(current);
+
     let mut fields = Vec::new();
-
-    // Parse fields from remaining lines
-    for line in &lines[1..] {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed == "}" || trimmed.starts_with("//") {
+    for declaration in declarations {
+        let declaration = declaration.trim();
+        if declaration.is_empty() {
             continue;
         }
-
-        // Parse field definition: "name: String," or "email: String?,"
-        if let Some(colon_pos) = trimmed.find(':') {
-            let field_name = trimmed[..colon_pos].trim().to_string();
-            let field_type_part = trimmed[colon_pos + 1..].trim();
-
-            // Remove trailing comma
-            let field_type_clean = field_type_part.trim_end_matches(',').trim();
-
-            // Check if optional (ends with ?)
-            let (field_type, optional) = if field_type_clean.ends_with('?') {
-                (
-                    field_type_clean.trim_end_matches('?').trim().to_string(),
-                    true,
-                )
-            } else {
-                (field_type_clean.to_string(), false)
-            };
-
-            fields.push(SchemaField {
-                name: field_name,
-                field_type,
-                optional,
-            });
+        let (name, declared_type) = declaration.split_once(':').ok_or_else(|| {
+            format!("schema '{schema_name}': expected 'name: Type', found '{declaration}'")
+        })?;
+        let name = name.trim().trim_matches('"');
+        let declared_type = declared_type.trim();
+        if name.is_empty() || declared_type.is_empty() {
+            return Err(
+                format!("schema '{schema_name}': incomplete field '{declaration}'").into(),
+            );
         }
+        // A trailing `?` is shorthand for an optional field.
+        let (field_type, optional) = match declared_type.strip_suffix('?') {
+            Some(inner) => (inner.trim().to_string(), true),
+            None => (declared_type.to_string(), false),
+        };
+        fields.push(SchemaField {
+            name: name.to_string(),
+            field_type,
+            optional,
+        });
     }
 
     Ok(SchemaDefinition {
-        name: schema_name,
+        name: schema_name.to_string(),
         fields,
     })
 }
@@ -5755,6 +5887,8 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
 
     // Create a schema registry for type resolution
     let registry = crate::schema::SchemaRegistry::new();
+    let mut schema_failures: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
 
     // First pass: Register all schema names (for forward references)
     for statement in &file.statements {
@@ -5776,13 +5910,12 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
                     // Register in registry
                     registry.register(schema.clone()).ok();
                     // Store in database
-                    script_executor.store().put_schema(&schema).ok();
+                    if let Err(error) = script_executor.store().put_schema(&schema) {
+                        schema_failures.insert(schema_def.name.clone(), error.to_string());
+                    }
                 }
                 Err(e) => {
-                    eprintln!(
-                        "Warning: Failed to convert schema {}: {}",
-                        schema_def.name, e
-                    );
+                    schema_failures.insert(schema_def.name.clone(), e.to_string());
                 }
             }
         }
@@ -5793,6 +5926,13 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
         match statement {
             OQLFileStatement::Schema(schema) => {
                 schema_count += 1;
+                if let Some(reason) = schema_failures.get(&schema.name) {
+                    let message = format!("Schema '{}' was not defined: {}", schema.name, reason);
+                    println!("❌ {}", message);
+                    errors.push(message.clone());
+                    results.push(StatementResult::Error(message));
+                    continue;
+                }
                 println!("📋 Schema definition: {}", schema.name);
                 success_count += 1;
                 results.push(StatementResult::Schema(schema.name.clone()));
@@ -5808,6 +5948,10 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
                 binding_count += 1;
                 let value =
                     Parser::substitute_scoped_locals_expression(&binding.value, &value_bindings);
+                // A script value is also reachable as `$name`, so a query
+                // written with parameters runs unchanged inside a script
+                // that defines them.
+                value_bindings.insert(format!("${}", binding.name), value.clone());
                 value_bindings.insert(binding.name.clone(), value);
                 success_count += 1;
                 results.push(StatementResult::Binding(binding.name.clone()));
@@ -5939,6 +6083,7 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
                                 &binding.value,
                                 &tx_value_bindings,
                             );
+                            tx_value_bindings.insert(format!("${}", binding.name), value.clone());
                             tx_value_bindings.insert(binding.name.clone(), value);
                             tx_success += 1;
                             tx_results.push(StatementResult::Binding(binding.name.clone()));
@@ -6443,8 +6588,7 @@ transaction {
     #[test]
     fn test_debug_improved_syntax_statement_boundaries() {
         let content = include_str!("../oql/improved_syntax.oql");
-        let pre = preprocess_method_chaining(content);
-        let statements = extract_statements(&pre).expect("extract statements");
+        let statements = split_statements(content);
         for (idx, statement) in statements.iter().enumerate() {
             let trimmed = statement.trim();
             if trimmed.starts_with("schema ") {

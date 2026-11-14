@@ -192,6 +192,7 @@ pub fn execute_oql(store: std::sync::Arc<RustStore>, source: String) -> Result<V
             operation,
             Operation::Insert(_)
                 | Operation::InsertMany(_)
+                | Operation::Upsert(_)
                 | Operation::Update(_)
                 | Operation::Delete
                 | Operation::FunctionDef(_)

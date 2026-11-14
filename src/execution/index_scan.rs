@@ -90,34 +90,9 @@ impl IndexUnionExec {
                 .unwrap_or(crate::document::Value::Null)
         }
 
-        fn compare(
-            left: &crate::document::Value,
-            right: &crate::document::Value,
-        ) -> std::cmp::Ordering {
-            use crate::document::Value;
-            match (left, right) {
-                (Value::Integer(left), Value::Integer(right)) => left.cmp(right),
-                (Value::Float(left), Value::Float(right)) => {
-                    left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal)
-                }
-                (Value::Integer(left), Value::Float(right)) => (*left as f64)
-                    .partial_cmp(right)
-                    .unwrap_or(std::cmp::Ordering::Equal),
-                (Value::Float(left), Value::Integer(right)) => left
-                    .partial_cmp(&(*right as f64))
-                    .unwrap_or(std::cmp::Ordering::Equal),
-                (Value::String(left), Value::String(right)) => left.cmp(right),
-                (Value::DateTime(left), Value::DateTime(right)) => left.cmp(right),
-                (Value::Boolean(left), Value::Boolean(right)) => left.cmp(right),
-                (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
-                (Value::Null, _) => std::cmp::Ordering::Less,
-                (_, Value::Null) => std::cmp::Ordering::Greater,
-                _ => std::cmp::Ordering::Equal,
-            }
-        }
-
         for field in &self.order_fields {
-            let ordering = compare(&value(left, field), &value(right, field));
+            let ordering =
+                crate::value_semantics::sort_order(&value(left, field), &value(right, field));
             let ordering = match self.direction {
                 ScalarIndexDirection::Ascending => ordering,
                 ScalarIndexDirection::Descending => ordering.reverse(),

@@ -1,7 +1,7 @@
 // OQL File Runner - Execute OQL files using the database engine
 
 use crate::storage::{DocumentStore, RustStore};
-use crate::{execute_oql_file, parse_oql_file, QueryExecutor};
+use crate::{execute_oql_file, parse_oql_file, OQLFileExecutionResult, QueryExecutor};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -27,11 +27,33 @@ impl<S: DocumentStore> OQLRunner<S> {
         self.execute_content(&content)
     }
 
-    /// Execute OQL content from a string
+    /// Execute OQL content from a string.
+    ///
+    /// Succeeds only if every statement succeeded. A script in which any
+    /// statement failed returns an error naming each failure; use
+    /// [`Self::run_content`] to inspect per-statement results instead.
     pub fn execute_content(&self, content: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let report = self.run_content(content)?;
+        if report.errors.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "{} of the script's statements failed:\n  {}",
+            report.errors.len(),
+            report.errors.join("\n  ")
+        )
+        .into())
+    }
+
+    /// Execute OQL content and return the per-statement report, including
+    /// the errors of statements that failed. Only a script that cannot be
+    /// parsed, or a storage failure, is returned as `Err`.
+    pub fn run_content(
+        &self,
+        content: &str,
+    ) -> Result<OQLFileExecutionResult, Box<dyn std::error::Error>> {
         let oql_file = parse_oql_file(content)?;
-        let _result = execute_oql_file(&oql_file, &self.executor)?;
-        Ok(())
+        execute_oql_file(&oql_file, &self.executor)
     }
 
     /// Get access to the underlying executor (for testing)
@@ -40,7 +62,7 @@ impl<S: DocumentStore> OQLRunner<S> {
     }
 }
 
-/// Create a new OQL runner with default storage (Zig)
+/// Create a new OQL runner backed by the Rust storage engine at `db_path`
 pub fn create_oql_runner<P: AsRef<Path>>(
     db_path: P,
 ) -> Result<OQLRunner<RustStore>, Box<dyn std::error::Error>> {
@@ -107,5 +129,22 @@ mod tests {
         "#;
 
         runner.execute_content(oql_content).unwrap();
+    }
+
+    #[test]
+    fn a_failing_statement_fails_the_script() {
+        let temp_dir = TempDir::new().unwrap();
+        let runner = create_oql_runner(temp_dir.path().join("test_db")).unwrap();
+        let script = r#"
+            users.insert { id: "u1", age: 30 }
+            users.select { broken: no_such_function(.age) }
+        "#;
+
+        let error = runner.execute_content(script).unwrap_err().to_string();
+        assert!(error.contains("no_such_function"), "{error}");
+
+        let report = runner.run_content(script).unwrap();
+        assert_eq!(report.errors.len(), 1);
+        assert_eq!(report.query_count, 2);
     }
 }

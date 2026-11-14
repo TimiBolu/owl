@@ -7440,6 +7440,14 @@ fn typed_cell_equal(left: TypedCell<'_>, right: &Value) -> bool {
         (TypedCell::String(a), Value::String(b)) => a == b,
         (TypedCell::Integer(a), Value::Integer(b)) => a == *b,
         (TypedCell::Float(a), Value::Float(b)) => a == *b,
+        // Numeric equality crosses the integer/float boundary, matching
+        // `crate::value_semantics` and the ordered comparisons below.
+        (TypedCell::Integer(a), Value::Float(_)) => {
+            crate::value_semantics::equal(&Value::Integer(a), right)
+        }
+        (TypedCell::Float(a), Value::Integer(_)) => {
+            crate::value_semantics::equal(&Value::Float(a), right)
+        }
         (TypedCell::Boolean(a), Value::Boolean(b)) => a == *b,
         (TypedCell::DateTime(a), Value::DateTime(b)) => a == *b,
         (TypedCell::Reference(a), Value::Reference(b)) => a == *b,
@@ -7455,8 +7463,16 @@ fn typed_cell_less(left: TypedCell<'_>, right: &Value) -> bool {
         (TypedCell::Float(a), Value::Integer(b)) => a < (*b as f64),
         (TypedCell::String(a), Value::String(b)) => a < b.as_str(),
         (TypedCell::DateTime(a), Value::DateTime(b)) => a < *b,
-        (TypedCell::DateTime(a), Value::String(b)) => a.to_rfc3339() < *b,
-        (TypedCell::String(a), Value::DateTime(b)) => a < b.to_rfc3339().as_str(),
+        // Timestamps compare with timestamp strings by instant, never by
+        // text; see `crate::value_semantics`.
+        (TypedCell::DateTime(a), Value::String(_)) => {
+            crate::value_semantics::compare(&Value::DateTime(a), right)
+                == Some(std::cmp::Ordering::Less)
+        }
+        (TypedCell::String(a), Value::DateTime(_)) => {
+            crate::value_semantics::compare(&Value::String(a.to_string()), right)
+                == Some(std::cmp::Ordering::Less)
+        }
         (TypedCell::Boolean(a), Value::Boolean(b)) => !a && *b,
         _ => false,
     }
@@ -7470,8 +7486,14 @@ fn typed_value_less(left: &Value, right: TypedCell<'_>) -> bool {
         (Value::Float(a), TypedCell::Integer(b)) => *a < (b as f64),
         (Value::String(a), TypedCell::String(b)) => a.as_str() < b,
         (Value::DateTime(a), TypedCell::DateTime(b)) => *a < b,
-        (Value::DateTime(a), TypedCell::String(b)) => a.to_rfc3339().as_str() < b,
-        (Value::String(a), TypedCell::DateTime(b)) => *a < b.to_rfc3339(),
+        (Value::DateTime(_), TypedCell::String(b)) => {
+            crate::value_semantics::compare(left, &Value::String(b.to_string()))
+                == Some(std::cmp::Ordering::Less)
+        }
+        (Value::String(_), TypedCell::DateTime(b)) => {
+            crate::value_semantics::compare(left, &Value::DateTime(b))
+                == Some(std::cmp::Ordering::Less)
+        }
         (Value::Boolean(a), TypedCell::Boolean(b)) => !a && b,
         _ => false,
     }

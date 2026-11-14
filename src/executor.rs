@@ -14,13 +14,13 @@ use crate::profile_call;
 use crate::parser::{
     ComparisonOperator, Condition, Expression, FieldAccess, GroupByBlock, HavingBlock, InsertBlock,
     Literal, NearestBlock, OQLQuery, Operation, SelectBlock, SortBlock, UpdateBlock, UpsertBlock,
-    VectorMetric,
+    VectorMetric, WhereBlock,
 };
 use crate::planner::operators::{IndexAccessKind, PhysicalOperator};
 use crate::planner::{LogicalPlanner, PhysicalPlan, PhysicalPlanner};
 use crate::schema::DocumentSystemField;
 use crate::schema::SchemaRegistry;
-use crate::schema::{CheckOperator, Schema, SchemaConstraint};
+use crate::schema::{CheckOperator, FieldType, Schema, SchemaConstraint};
 use crate::simulation::Clock;
 use crate::storage::DocumentStore;
 use crate::storage::{VectorIndexState, VectorIndexType, VectorMetricType};
@@ -361,9 +361,21 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
 
         // Apply operations in sequence
+        let mut grouped = false;
         for operation in &query.operations {
+            // Grouping an empty collection yields no groups, so there is no
+            // group row to project or filter. Without this, an aggregate
+            // `select` would see no rows and summarise the whole (empty)
+            // collection into one phantom result.
+            if grouped
+                && documents.is_empty()
+                && matches!(operation, Operation::Select(_) | Operation::Having(_))
+            {
+                continue;
+            }
             let temp_docs = std::mem::take(&mut documents);
             documents = self.apply_operation(temp_docs, operation, &query.collection)?;
+            grouped |= matches!(operation, Operation::GroupBy(_));
         }
 
         Ok(documents)
@@ -438,6 +450,14 @@ impl<S: DocumentStore> QueryExecutor<S> {
         let Some(schema) = self.store.get_schema(&query.collection)? else {
             return Ok(None);
         };
+        // The general executor defines what a query means. Hand the planner
+        // only predicates whose literal already has the field's stored type,
+        // so index keys and storage-side comparisons cannot coerce
+        // differently; anything else stays on the general executor.
+        let Some(query) = Self::normalize_pipeline_literals(query, &schema) else {
+            return Ok(None);
+        };
+        let query = &query;
         let registry = SchemaRegistry::new();
         registry.register(schema)?;
         let logical = match LogicalPlanner::with_schema_registry(registry).plan(query) {
@@ -451,9 +471,99 @@ impl<S: DocumentStore> QueryExecutor<S> {
         Ok(Some(physical))
     }
 
+    /// Rewrite numeric literals to the compared field's declared type, or
+    /// return `None` when a predicate has no exact typed equivalent.
+    ///
+    /// `.price >= 10` on a `Float` field becomes `.price >= 10.0`, which is
+    /// the same predicate under [`crate::value_semantics`]. `.age == 2.5` on
+    /// an `Integer` field has no integer form, so the query is left to the
+    /// general executor instead of being approximated.
+    fn normalize_pipeline_literals(query: &OQLQuery, schema: &Schema) -> Option<OQLQuery> {
+        fn scalar_type(field_type: &FieldType) -> &FieldType {
+            match field_type {
+                FieldType::Optional(inner) => scalar_type(inner),
+                other => other,
+            }
+        }
+
+        fn normalize(condition: &Condition, schema: &Schema) -> Option<Condition> {
+            match condition {
+                Condition::Comparison {
+                    left: Expression::FieldAccess(FieldAccess { path }),
+                    operator,
+                    right: Expression::Literal(literal),
+                } if path.len() == 1 => {
+                    let literal = match (schema.fields.get(&path[0]).map(scalar_type), literal) {
+                        (Some(FieldType::Float), Literal::Integer(value)) => {
+                            let widened = *value as f64;
+                            // Beyond 2^53 the float cannot represent the
+                            // integer, so the predicate would change.
+                            if widened as i64 != *value {
+                                return None;
+                            }
+                            Literal::Float(widened)
+                        }
+                        (Some(FieldType::Integer), Literal::Float(value)) => {
+                            if value.fract() != 0.0
+                                || *value < -9_007_199_254_740_992.0
+                                || *value > 9_007_199_254_740_992.0
+                            {
+                                return None;
+                            }
+                            Literal::Integer(*value as i64)
+                        }
+                        // The pipeline has no timestamp literal; the general
+                        // executor compares timestamps with strings by
+                        // instant.
+                        (Some(FieldType::DateTime), Literal::String(_)) => return None,
+                        (_, literal) => literal.clone(),
+                    };
+                    Some(Condition::Comparison {
+                        left: Expression::FieldAccess(FieldAccess { path: path.clone() }),
+                        operator: operator.clone(),
+                        right: Expression::Literal(literal),
+                    })
+                }
+                Condition::And(left, right) => Some(Condition::And(
+                    Box::new(normalize(left, schema)?),
+                    Box::new(normalize(right, schema)?),
+                )),
+                Condition::Or(left, right) => Some(Condition::Or(
+                    Box::new(normalize(left, schema)?),
+                    Box::new(normalize(right, schema)?),
+                )),
+                _ => None,
+            }
+        }
+
+        let mut operations = Vec::with_capacity(query.operations.len());
+        for operation in &query.operations {
+            operations.push(match operation {
+                Operation::Where(block) => Operation::Where(WhereBlock {
+                    condition: normalize(&block.condition, schema)?,
+                }),
+                other => other.clone(),
+            });
+        }
+        Some(OQLQuery {
+            collection: query.collection.clone(),
+            operations,
+        })
+    }
+
     fn is_pipeline_safe_read(query: &OQLQuery) -> bool {
         let mut has_where = false;
+        let mut bounded = false;
         for operation in &query.operations {
+            match operation {
+                // The pipeline pushes filters down to the scan. That is only
+                // the same query while every filter precedes every
+                // limit/offset: `limit(5).where {..}` filters the first five
+                // rows, it does not return five matching rows.
+                Operation::Where(_) if bounded => return false,
+                Operation::Limit(_) | Operation::Offset(_) | Operation::First => bounded = true,
+                _ => {}
+            }
             match operation {
                 Operation::Where(block) => {
                     has_where = true;
@@ -1166,16 +1276,13 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 let right_value = self.evaluate_expression(document, right)?;
                 self.compare_values(&left_value, operator, &right_value)
             }
-            Condition::And(left, right) => {
-                let left_result = self.evaluate_condition(document, left)?;
-                let right_result = self.evaluate_condition(document, right)?;
-                Ok(left_result && right_result)
-            }
-            Condition::Or(left, right) => {
-                let left_result = self.evaluate_condition(document, left)?;
-                let right_result = self.evaluate_condition(document, right)?;
-                Ok(left_result || right_result)
-            }
+            // Both connectives short-circuit, so a guard such as
+            // `.kind == "a" && expensive_or_failing(.x)` never evaluates its
+            // right side for rows the left side already decided.
+            Condition::And(left, right) => Ok(self.evaluate_condition(document, left)?
+                && self.evaluate_condition(document, right)?),
+            Condition::Or(left, right) => Ok(self.evaluate_condition(document, left)?
+                || self.evaluate_condition(document, right)?),
             Condition::Not(inner) => {
                 let result = self.evaluate_condition(document, inner)?;
                 Ok(!result)
@@ -1190,12 +1297,30 @@ impl<S: DocumentStore> QueryExecutor<S> {
         expression: &Expression,
     ) -> OQLResult<Value> {
         match expression {
-            Expression::Identifier(name) => self.get_field_value(
-                document,
-                &FieldAccess {
-                    path: vec![name.clone()],
-                },
-            ),
+            Expression::Identifier(name) => {
+                // A bare name is a function parameter when one is in scope,
+                // then a query parameter, and otherwise a field of the
+                // current row.
+                if let Some(value) = CallFrame::value(name) {
+                    return Ok(value);
+                }
+                if let Some(row) = CallFrame::row(name) {
+                    return Ok(Self::row_as_value(&row));
+                }
+                if name.starts_with('$') {
+                    return Err(OQLError::Generic {
+                        message: format!(
+                            "query parameter {name} has no value; bind it before executing"
+                        ),
+                    });
+                }
+                self.get_field_value(
+                    document,
+                    &FieldAccess {
+                        path: vec![name.clone()],
+                    },
+                )
+            }
             Expression::FieldAccess(field_access) => self.get_field_value(document, field_access),
             Expression::Literal(literal) => Ok(self.literal_to_value(literal)),
             Expression::FunctionCall { name, args } => {
@@ -1230,15 +1355,14 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 }
             }
             Expression::LogicalOr(left, right) => {
+                // In a value position `a || b` yields the first operand that
+                // is present and truthy, so `.nickname || .name` is a
+                // fallback. With boolean operands this is ordinary OR.
                 let left_value = self.evaluate_expression(document, left)?;
-                let left_bool = self.value_to_bool(&left_value)?;
-
-                if left_bool {
-                    Ok(Value::Boolean(true))
+                if self.value_to_bool(&left_value)? {
+                    Ok(left_value)
                 } else {
-                    let right_value = self.evaluate_expression(document, right)?;
-                    let right_bool = self.value_to_bool(&right_value)?;
-                    Ok(Value::Boolean(right_bool))
+                    self.evaluate_expression(document, right)
                 }
             }
             Expression::LogicalNot(expr) => {
@@ -1261,6 +1385,11 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 self.evaluate_array_access(&array_value, &index_value)
             }
             Expression::ChainedAccess { base, field } => {
+                // `param.path` on a row parameter is ordinary path access on
+                // that row, with reference traversal and null-safety.
+                if let Some((row, path)) = Self::row_parameter_path(expression) {
+                    return self.get_field_value(&row, &FieldAccess { path });
+                }
                 let base_value = self.evaluate_expression(document, base)?;
                 self.get_field_from_value(&base_value, field)
             }
@@ -1799,6 +1928,35 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
     }
 
+    /// The value of a whole row, as seen when a row parameter is used
+    /// without a path.
+    fn row_as_value(row: &Document) -> Value {
+        let mut fields = row.fields.clone();
+        fields
+            .entry("id".to_string())
+            .or_insert_with(|| Value::String(row.id.clone()));
+        Value::Object(fields)
+    }
+
+    /// Recognise `param.a.b` where `param` is a row parameter of the
+    /// function being evaluated.
+    fn row_parameter_path(expression: &Expression) -> Option<(Document, Vec<String>)> {
+        let mut path = Vec::new();
+        let mut current = expression;
+        while let Expression::ChainedAccess { base, field } = current {
+            path.push(field.clone());
+            current = base;
+        }
+        let Expression::Identifier(name) = current else {
+            return None;
+        };
+        if path.is_empty() || !CallFrame::is_row(name) {
+            return None;
+        }
+        path.reverse();
+        CallFrame::row(name).map(|row| (row, path))
+    }
+
     /// Evaluate a binary operation
     fn evaluate_binary_operation(
         &self,
@@ -1809,29 +1967,34 @@ impl<S: DocumentStore> QueryExecutor<S> {
         use crate::parser::BinaryOperator;
 
         match (left, right) {
-            (Value::Integer(a), Value::Integer(b)) => match operator {
-                BinaryOperator::Add => Ok(Value::Integer(a + b)),
-                BinaryOperator::Subtract => Ok(Value::Integer(a - b)),
-                BinaryOperator::Multiply => Ok(Value::Integer(a * b)),
-                BinaryOperator::Divide => {
-                    if *b == 0 {
-                        Err(OQLError::FunctionError {
-                            message: "Division by zero".to_string(),
-                        })
-                    } else {
-                        Ok(Value::Integer(a / b))
+            (Value::Integer(a), Value::Integer(b)) => {
+                // Integer arithmetic is checked: a result outside the 64-bit
+                // range is an error, never a silently wrapped value.
+                let overflow = || OQLError::FunctionError {
+                    message: format!("Integer overflow evaluating {a} {operator:?} {b}"),
+                };
+                match operator {
+                    BinaryOperator::Add => a.checked_add(*b).map(Value::Integer).ok_or_else(overflow),
+                    BinaryOperator::Subtract => {
+                        a.checked_sub(*b).map(Value::Integer).ok_or_else(overflow)
+                    }
+                    BinaryOperator::Multiply => {
+                        a.checked_mul(*b).map(Value::Integer).ok_or_else(overflow)
+                    }
+                    BinaryOperator::Divide if *b == 0 => Err(OQLError::FunctionError {
+                        message: "Division by zero".to_string(),
+                    }),
+                    BinaryOperator::Divide => {
+                        a.checked_div(*b).map(Value::Integer).ok_or_else(overflow)
+                    }
+                    BinaryOperator::Modulo if *b == 0 => Err(OQLError::FunctionError {
+                        message: "Modulo by zero".to_string(),
+                    }),
+                    BinaryOperator::Modulo => {
+                        a.checked_rem(*b).map(Value::Integer).ok_or_else(overflow)
                     }
                 }
-                BinaryOperator::Modulo => {
-                    if *b == 0 {
-                        Err(OQLError::FunctionError {
-                            message: "Modulo by zero".to_string(),
-                        })
-                    } else {
-                        Ok(Value::Integer(a % b))
-                    }
-                }
-            },
+            }
             (Value::Float(a), Value::Float(b)) => match operator {
                 BinaryOperator::Add => Ok(Value::Float(a + b)),
                 BinaryOperator::Subtract => Ok(Value::Float(a - b)),
@@ -1981,10 +2144,10 @@ impl<S: DocumentStore> QueryExecutor<S> {
             Value::Float(f) => Ok(*f != 0.0),
             Value::String(s) => Ok(!s.is_empty()),
             Value::Null => Ok(false),
-            _ => Err(OQLError::TypeError {
-                expected: "boolean-convertible type".to_string(),
-                actual: value.type_name().to_string(),
-            }),
+            Value::List(items) => Ok(!items.is_empty()),
+            // Any other present value (object, timestamp, reference) is
+            // truthy, so truthiness is defined for every value.
+            _ => Ok(true),
         }
     }
 
@@ -2299,97 +2462,27 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
     }
 
-    /// Compare two values using the given operator
+    /// Compare two values using the given operator.
+    ///
+    /// Comparison semantics live in [`crate::value_semantics`] so that this
+    /// executor and the physical read pipeline cannot disagree. A comparison
+    /// never fails; an undecidable one does not match.
     fn compare_values(
         &self,
         left: &Value,
         operator: &ComparisonOperator,
         right: &Value,
     ) -> OQLResult<bool> {
-        match operator {
-            ComparisonOperator::Equal => Ok(self.values_equal(left, right)),
-            ComparisonOperator::NotEqual => Ok(!self.values_equal(left, right)),
-            ComparisonOperator::LessThan => {
-                self.compare_ordered_values(left, right, |ord| ord.is_lt())
-            }
-            ComparisonOperator::GreaterThan => {
-                self.compare_ordered_values(left, right, |ord| ord.is_gt())
-            }
-            ComparisonOperator::LessEqual => {
-                self.compare_ordered_values(left, right, |ord| ord.is_le())
-            }
-            ComparisonOperator::GreaterEqual => {
-                self.compare_ordered_values(left, right, |ord| ord.is_ge())
-            }
-            ComparisonOperator::Contains => self.string_contains(left, right),
-            ComparisonOperator::StartsWith => self.string_starts_with(left, right),
-            ComparisonOperator::EndsWith => self.string_ends_with(left, right),
-            ComparisonOperator::In => self.value_in_collection(left, right),
-        }
-    }
-
-    /// Check if left string contains right string
-    fn string_contains(&self, left: &Value, right: &Value) -> OQLResult<bool> {
-        match (left, right) {
-            (Value::String(left_str), Value::String(right_str)) => Ok(left_str.contains(right_str)),
-            _ => Ok(false), // Non-string values don't support contains
-        }
-    }
-
-    /// Check if left string starts with right string
-    fn string_starts_with(&self, left: &Value, right: &Value) -> OQLResult<bool> {
-        match (left, right) {
-            (Value::String(left_str), Value::String(right_str)) => {
-                Ok(left_str.starts_with(right_str))
-            }
-            _ => Ok(false), // Non-string values don't support starts_with
-        }
-    }
-
-    /// Check if left string ends with right string
-    fn string_ends_with(&self, left: &Value, right: &Value) -> OQLResult<bool> {
-        match (left, right) {
-            (Value::String(left_str), Value::String(right_str)) => {
-                Ok(left_str.ends_with(right_str))
-            }
-            _ => Ok(false), // Non-string values don't support ends_with
-        }
-    }
-
-    /// Check if left value is in right collection
-    fn value_in_collection(&self, left: &Value, right: &Value) -> OQLResult<bool> {
-        match right {
-            Value::List(items) => {
-                for item in items {
-                    if self.values_equal(left, item) {
-                        return Ok(true);
-                    }
-                }
-                Ok(false)
-            }
-            _ => Ok(false), // Right side must be a list for 'in' operator
-        }
+        Ok(crate::value_semantics::matches(left, operator, right))
     }
 
     /// Check if two values are equal
     fn values_equal(&self, left: &Value, right: &Value) -> bool {
-        match (left, right) {
-            (Value::String(a), Value::String(b)) => a == b,
-            (Value::Integer(a), Value::Integer(b)) => a == b,
-            (Value::Float(a), Value::Float(b)) => (a - b).abs() < f64::EPSILON,
-            (Value::Boolean(a), Value::Boolean(b)) => a == b,
-            (Value::DateTime(a), Value::DateTime(b)) => a == b,
-            (Value::Reference(a), Value::Reference(b)) => a == b,
-            (Value::GlobalReference(a), Value::GlobalReference(b)) => a == b,
-            (Value::Null, Value::Null) => true,
-            // Type coercion: Integer to Float
-            (Value::Integer(a), Value::Float(b)) => (*a as f64 - b).abs() < f64::EPSILON,
-            (Value::Float(a), Value::Integer(b)) => (a - *b as f64).abs() < f64::EPSILON,
-            _ => false,
-        }
+        crate::value_semantics::equal(left, right)
     }
 
-    /// Compare two values for ordering operations
+    /// Test the natural order of two values. Unordered pairs (a null, or
+    /// unrelated types) satisfy no ordering.
     fn compare_ordered_values<F>(
         &self,
         left: &Value,
@@ -2399,33 +2492,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
     where
         F: Fn(std::cmp::Ordering) -> bool,
     {
-        let ordering = match (left, right) {
-            (Value::String(a), Value::String(b)) => a.cmp(b),
-            (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
-            (Value::Float(a), Value::Float(b)) => {
-                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-            }
-            (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
-            (Value::DateTime(a), Value::DateTime(b)) => a.cmp(b),
-            // Type coercion: DateTime to String (treat as string comparison)
-            (Value::DateTime(a), Value::String(b)) => a.to_rfc3339().cmp(b),
-            (Value::String(a), Value::DateTime(b)) => a.cmp(&b.to_rfc3339()),
-            // Type coercion: Integer to Float
-            (Value::Integer(a), Value::Float(b)) => (*a as f64)
-                .partial_cmp(b)
-                .unwrap_or(std::cmp::Ordering::Equal),
-            (Value::Float(a), Value::Integer(b)) => a
-                .partial_cmp(&(*b as f64))
-                .unwrap_or(std::cmp::Ordering::Equal),
-            _ => {
-                return Err(OQLError::TypeError {
-                    expected: "comparable types".to_string(),
-                    actual: format!("{} and {}", left.type_name(), right.type_name()),
-                });
-            }
-        };
-
-        Ok(compare_fn(ordering))
+        Ok(crate::value_semantics::compare(left, right).is_some_and(compare_fn))
     }
 
     /// Apply SELECT projection to documents
@@ -3629,7 +3696,11 @@ impl<S: DocumentStore> QueryExecutor<S> {
                             if has_float {
                                 sum_float += i as f64;
                             } else {
-                                sum_int += i;
+                                sum_int = sum_int.checked_add(i).ok_or_else(|| {
+                                    OQLError::FunctionError {
+                                        message: "Integer overflow evaluating sum()".to_string(),
+                                    }
+                                })?;
                             }
                             count += 1;
                         }
@@ -3777,8 +3848,21 @@ impl<S: DocumentStore> QueryExecutor<S> {
 
             // A typed composite encoding cannot collide when strings contain a
             // delimiter and keeps Integer(1) distinct from String("1").
+            // Keys group by OQL equality, under which `1` and `1.0` are the
+            // same value, so whole floats are keyed as integers.
+            let canonical_key: Vec<Value> = group_values
+                .iter()
+                .map(|value| match value {
+                    Value::Float(float)
+                        if float.fract() == 0.0 && float.abs() < 9_007_199_254_740_992.0 =>
+                    {
+                        Value::Integer(*float as i64)
+                    }
+                    other => other.clone(),
+                })
+                .collect();
             let group_key =
-                bincode::serialize(&group_values).map_err(|error| OQLError::Generic {
+                bincode::serialize(&canonical_key).map_err(|error| OQLError::Generic {
                     message: format!("Failed to encode group key: {}", error),
                 })?;
             groups
@@ -3871,135 +3955,57 @@ impl<S: DocumentStore> QueryExecutor<S> {
         Ok(vec![result_doc])
     }
 
-    /// Apply SUM operation to documents
+    /// A terminal aggregate such as `orders.sum(.amount)`.
+    ///
+    /// It is the same computation as the aggregate function inside a
+    /// `select`, so both forms share [`Self::execute_aggregation`] and agree
+    /// on result types, null handling, and empty input.
+    fn apply_terminal_aggregate(
+        &self,
+        documents: Vec<Document>,
+        function: &str,
+        field_access: &FieldAccess,
+    ) -> OQLResult<Vec<Document>> {
+        let value = self.execute_aggregation(&documents, function, &field_access.path)?;
+        let mut fields = HashMap::new();
+        fields.insert(function.to_string(), value);
+        Ok(vec![Document::with_id(
+            format!("{function}_result"),
+            "aggregate".to_string(),
+            fields,
+        )])
+    }
+
     fn apply_sum_operation(
         &self,
         documents: Vec<Document>,
         field_access: &FieldAccess,
     ) -> OQLResult<Vec<Document>> {
-        let mut sum = 0.0;
-
-        for document in &documents {
-            if let Ok(value) = self.get_field_value(document, field_access) {
-                match value {
-                    Value::Integer(i) => sum += i as f64,
-                    Value::Float(f) => sum += f,
-                    _ => {} // Skip non-numeric values
-                }
-            }
-        }
-
-        let mut fields = HashMap::new();
-        fields.insert("sum".to_string(), Value::Float(sum));
-
-        let result_doc =
-            Document::with_id("sum_result".to_string(), "aggregate".to_string(), fields);
-
-        Ok(vec![result_doc])
+        self.apply_terminal_aggregate(documents, "sum", field_access)
     }
 
-    /// Apply AVG operation to documents
     fn apply_avg_operation(
         &self,
         documents: Vec<Document>,
         field_access: &FieldAccess,
     ) -> OQLResult<Vec<Document>> {
-        let mut sum = 0.0;
-        let mut count = 0;
-
-        for document in &documents {
-            if let Ok(value) = self.get_field_value(document, field_access) {
-                match value {
-                    Value::Integer(i) => {
-                        sum += i as f64;
-                        count += 1;
-                    }
-                    Value::Float(f) => {
-                        sum += f;
-                        count += 1;
-                    }
-                    _ => {} // Skip non-numeric values
-                }
-            }
-        }
-
-        let avg = if count > 0 { sum / count as f64 } else { 0.0 };
-
-        let mut fields = HashMap::new();
-        fields.insert("avg".to_string(), Value::Float(avg));
-
-        let result_doc =
-            Document::with_id("avg_result".to_string(), "aggregate".to_string(), fields);
-
-        Ok(vec![result_doc])
+        self.apply_terminal_aggregate(documents, "avg", field_access)
     }
 
-    /// Apply MIN operation to documents
     fn apply_min_operation(
         &self,
         documents: Vec<Document>,
         field_access: &FieldAccess,
     ) -> OQLResult<Vec<Document>> {
-        let mut min_value: Option<f64> = None;
-
-        for document in &documents {
-            if let Ok(value) = self.get_field_value(document, field_access) {
-                let numeric_value = match value {
-                    Value::Integer(i) => Some(i as f64),
-                    Value::Float(f) => Some(f),
-                    _ => None,
-                };
-
-                if let Some(val) = numeric_value {
-                    min_value = Some(min_value.map_or(val, |current| current.min(val)));
-                }
-            }
-        }
-
-        let mut fields = HashMap::new();
-        fields.insert(
-            "min".to_string(),
-            min_value.map(Value::Float).unwrap_or(Value::Null),
-        );
-
-        let result_doc =
-            Document::with_id("min_result".to_string(), "aggregate".to_string(), fields);
-
-        Ok(vec![result_doc])
+        self.apply_terminal_aggregate(documents, "min", field_access)
     }
 
-    /// Apply MAX operation to documents
     fn apply_max_operation(
         &self,
         documents: Vec<Document>,
         field_access: &FieldAccess,
     ) -> OQLResult<Vec<Document>> {
-        let mut max_value: Option<f64> = None;
-
-        for document in &documents {
-            if let Ok(value) = self.get_field_value(document, field_access) {
-                let numeric_value = match value {
-                    Value::Integer(i) => Some(i as f64),
-                    Value::Float(f) => Some(f),
-                    _ => None,
-                };
-
-                if let Some(val) = numeric_value {
-                    max_value = Some(max_value.map_or(val, |current| current.max(val)));
-                }
-            }
-        }
-
-        let mut fields = HashMap::new();
-        fields.insert(
-            "max".to_string(),
-            max_value.map(Value::Float).unwrap_or(Value::Null),
-        );
-
-        let result_doc =
-            Document::with_id("max_result".to_string(), "aggregate".to_string(), fields);
-
-        Ok(vec![result_doc])
+        self.apply_terminal_aggregate(documents, "max", field_access)
     }
 
     /// Execute aggregation over grouped documents
@@ -4151,256 +4157,180 @@ impl<S: DocumentStore> QueryExecutor<S> {
 
     /// Compare two values for sorting purposes
     fn compare_values_for_sort(&self, left: &Value, right: &Value) -> std::cmp::Ordering {
-        match (left, right) {
-            (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
-            (Value::Null, _) => std::cmp::Ordering::Less, // Null values sort first
-            (_, Value::Null) => std::cmp::Ordering::Greater,
-            (Value::String(a), Value::String(b)) => a.cmp(b),
-            (Value::Integer(a), Value::Integer(b)) => a.cmp(b),
-            (Value::Float(a), Value::Float(b)) => {
-                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
-            }
-            (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
-            (Value::DateTime(a), Value::DateTime(b)) => a.cmp(b),
-            // Type coercion: Integer to Float
-            (Value::Integer(a), Value::Float(b)) => (*a as f64)
-                .partial_cmp(b)
-                .unwrap_or(std::cmp::Ordering::Equal),
-            (Value::Float(a), Value::Integer(b)) => a
-                .partial_cmp(&(*b as f64))
-                .unwrap_or(std::cmp::Ordering::Equal),
-            // Different types: sort by type name for consistency
-            _ => left.type_name().cmp(right.type_name()),
-        }
+        crate::value_semantics::sort_order(left, right)
     }
 
-    /// Evaluate a user-defined function call
+    /// Evaluate a user-defined function call.
+    ///
+    /// Arguments are evaluated in the caller's scope, then bound to the
+    /// parameter names for the duration of the body. The body runs through
+    /// the ordinary evaluator, so parameters are visible everywhere an
+    /// expression can appear: nested calls, `if` conditions, match guards,
+    /// boolean bodies, and nested queries.
     fn evaluate_user_function(
         &self,
         document: &Document,
         user_func: &crate::functions::UserDefinedFunction,
         args: &[Expression],
     ) -> OQLResult<Value> {
-        // Validate argument count
-        if args.len() != user_func.parameter_types.len() {
+        let definition = &user_func.definition;
+        if args.len() != definition.parameters.len() {
             return Err(OQLError::Generic {
                 message: format!(
                     "Function '{}' expects {} arguments, got {}",
-                    user_func.definition.name,
-                    user_func.parameter_types.len(),
+                    definition.name,
+                    definition.parameters.len(),
                     args.len()
                 ),
             });
         }
 
-        // Evaluate arguments
-        let mut arg_values = Vec::new();
-        for (i, arg) in args.iter().enumerate() {
+        let mut frame = CallFrame::default();
+        for (parameter, arg) in definition.parameters.iter().zip(args) {
+            if let Some(row) = self.row_argument(document, arg) {
+                frame.rows.insert(parameter.name.clone(), row);
+                continue;
+            }
             let value = self.evaluate_expression(document, arg)?;
+            let value = Self::coerce_argument(value, &parameter.param_type).map_err(|actual| {
+                OQLError::TypeError {
+                    expected: format!(
+                        "{} for parameter '{}' of function '{}'",
+                        parameter.param_type, parameter.name, definition.name
+                    ),
+                    actual,
+                }
+            })?;
+            frame.values.insert(parameter.name.clone(), value);
+        }
 
-            // Type checking
-            let expected_type = &user_func.parameter_types[i];
-            if !self.is_value_compatible_with_type(&value, expected_type) {
-                return Err(OQLError::TypeError {
-                    expected: expected_type.to_string(),
-                    actual: value.type_name().to_string(),
+        let _guard = CallFrameGuard::enter(frame, &definition.name)?;
+        self.evaluate_expression(document, &definition.body)
+    }
+
+    /// A whole-row argument: `*` for the current row, or the name of a row
+    /// parameter being passed along to another function.
+    fn row_argument(&self, document: &Document, arg: &Expression) -> Option<Document> {
+        match arg {
+            Expression::FieldAccess(FieldAccess { path }) if path.len() == 1 && path[0] == "*" => {
+                Some(document.clone())
+            }
+            Expression::Identifier(name) => CallFrame::row(name),
+            _ => None,
+        }
+    }
+
+    /// Check an argument against its declared parameter type, widening an
+    /// integer passed for a `Float`. Returns the offending type name on
+    /// mismatch.
+    fn coerce_argument(value: Value, type_name: &str) -> Result<Value, String> {
+        let declared = type_name.to_ascii_lowercase();
+        let accepted = match (&value, declared.as_str()) {
+            (Value::Null, _) => true,
+            (Value::String(_), "string") => true,
+            (Value::Integer(_), "integer" | "int") => true,
+            (Value::Float(_), "float" | "double") => true,
+            (Value::Integer(integer), "float" | "double") => {
+                return Ok(Value::Float(*integer as f64));
+            }
+            (Value::Boolean(_), "boolean" | "bool") => true,
+            (Value::DateTime(_), "datetime" | "timestamp") => true,
+            // A timestamp parameter accepts the string form that schemas
+            // without a DateTime column store.
+            (Value::String(_), "datetime" | "timestamp") => true,
+            (
+                _,
+                "string" | "integer" | "int" | "float" | "double" | "boolean" | "bool"
+                | "datetime" | "timestamp",
+            ) => false,
+            // Any other declared type names a schema or structural type
+            // (`List`, `Object`, a collection). Those are not checked here.
+            _ => true,
+        };
+        if accepted {
+            Ok(value)
+        } else {
+            Err(value.type_name().to_string())
+        }
+    }
+}
+
+/// Parameter bindings of the user function currently being evaluated.
+#[derive(Default)]
+struct CallFrame {
+    /// Parameters bound to ordinary values.
+    values: HashMap<String, Value>,
+    /// Parameters bound to a whole row, so `p.team.name` keeps full path
+    /// semantics, including reference traversal.
+    rows: HashMap<String, Document>,
+}
+
+thread_local! {
+    /// One frame per active user-function call on this thread. Only the top
+    /// frame is visible, which gives each call its own lexical scope.
+    static CALL_FRAMES: std::cell::RefCell<Vec<CallFrame>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Calls nested deeper than this are reported as runaway recursion rather
+/// than overflowing the stack.
+const MAX_FUNCTION_CALL_DEPTH: usize = 48;
+
+impl CallFrame {
+    fn value(name: &str) -> Option<Value> {
+        CALL_FRAMES.with(|frames| {
+            frames
+                .borrow()
+                .last()
+                .and_then(|frame| frame.values.get(name).cloned())
+        })
+    }
+
+    fn row(name: &str) -> Option<Document> {
+        CALL_FRAMES.with(|frames| {
+            frames
+                .borrow()
+                .last()
+                .and_then(|frame| frame.rows.get(name).cloned())
+        })
+    }
+
+    fn is_row(name: &str) -> bool {
+        CALL_FRAMES.with(|frames| {
+            frames
+                .borrow()
+                .last()
+                .is_some_and(|frame| frame.rows.contains_key(name))
+        })
+    }
+}
+
+/// Pops the call frame when the function body finishes, including on error.
+struct CallFrameGuard;
+
+impl CallFrameGuard {
+    fn enter(frame: CallFrame, function: &str) -> OQLResult<Self> {
+        CALL_FRAMES.with(|frames| {
+            let mut frames = frames.borrow_mut();
+            if frames.len() >= MAX_FUNCTION_CALL_DEPTH {
+                return Err(OQLError::FunctionError {
+                    message: format!(
+                        "function '{function}' exceeded the maximum call depth of \
+                         {MAX_FUNCTION_CALL_DEPTH}; check for unbounded recursion"
+                    ),
                 });
             }
-
-            arg_values.push(value);
-        }
-
-        // Create a parameter binding context
-        let mut param_context = HashMap::new();
-        for (i, param) in user_func.definition.parameters.iter().enumerate() {
-            param_context.insert(param.name.clone(), arg_values[i].clone());
-        }
-
-        // Evaluate the function body with parameter bindings
-        self.evaluate_expression_with_context(document, &user_func.definition.body, &param_context)
-    }
-
-    /// Check if a value is compatible with a type
-    fn is_value_compatible_with_type(&self, value: &Value, type_name: &str) -> bool {
-        match (value, type_name) {
-            (Value::String(_), "String") => true,
-            (Value::Integer(_), "Integer") => true,
-            (Value::Float(_), "Float") => true,
-            (Value::Boolean(_), "Boolean") => true,
-            (Value::DateTime(_), "DateTime") => true,
-            (Value::Null, _) => true, // Null is compatible with any type
-            // Schema types would need more complex checking
-            _ => false,
-        }
-    }
-
-    /// Evaluate an expression with parameter context (for user-defined functions)
-    fn evaluate_expression_with_context(
-        &self,
-        document: &Document,
-        expr: &Expression,
-        context: &HashMap<String, Value>,
-    ) -> OQLResult<Value> {
-        match expr {
-            Expression::Literal(literal) => Ok(self.literal_to_value(literal)),
-            Expression::Identifier(name) => {
-                if let Some(value) = context.get(name) {
-                    Ok(value.clone())
-                } else {
-                    self.get_field_value(
-                        document,
-                        &FieldAccess {
-                            path: vec![name.clone()],
-                        },
-                    )
-                }
-            }
-            Expression::FieldAccess(field_access) => {
-                // Check if this is a parameter reference
-                if field_access.path.len() == 1 {
-                    let field_name = &field_access.path[0];
-                    if let Some(param_value) = context.get(field_name) {
-                        return Ok(param_value.clone());
-                    }
-                }
-
-                // Otherwise, evaluate as normal field access
-                self.get_field_value(document, field_access)
-            }
-            Expression::FunctionCall { name, args } => {
-                // Recursively evaluate function calls within user functions
-                self.evaluate_function_call(document, name, args)
-            }
-            Expression::IfThenElse {
-                condition,
-                then_expr,
-                else_expr,
-            } => {
-                let condition_result = self.evaluate_condition(document, condition)?;
-                if condition_result {
-                    self.evaluate_expression_with_context(document, then_expr, context)
-                } else {
-                    self.evaluate_expression_with_context(document, else_expr, context)
-                }
-            }
-            Expression::Match { expr, arms } => {
-                let expr_value = self.evaluate_expression_with_context(document, expr, context)?;
-                self.evaluate_match_expression_with_context(document, &expr_value, arms, context)
-            }
-            Expression::LogicalAnd(left, right) => {
-                let left_value = self.evaluate_expression_with_context(document, left, context)?;
-                let left_bool = self.value_to_bool(&left_value)?;
-
-                if !left_bool {
-                    Ok(Value::Boolean(false))
-                } else {
-                    let right_value =
-                        self.evaluate_expression_with_context(document, right, context)?;
-                    let right_bool = self.value_to_bool(&right_value)?;
-                    Ok(Value::Boolean(right_bool))
-                }
-            }
-            Expression::LogicalOr(left, right) => {
-                let left_value = self.evaluate_expression_with_context(document, left, context)?;
-                let left_bool = self.value_to_bool(&left_value)?;
-
-                if left_bool {
-                    Ok(Value::Boolean(true))
-                } else {
-                    let right_value =
-                        self.evaluate_expression_with_context(document, right, context)?;
-                    let right_bool = self.value_to_bool(&right_value)?;
-                    Ok(Value::Boolean(right_bool))
-                }
-            }
-            Expression::LogicalNot(expr) => {
-                let value = self.evaluate_expression_with_context(document, expr, context)?;
-                let bool_value = self.value_to_bool(&value)?;
-                Ok(Value::Boolean(!bool_value))
-            }
-            Expression::BinaryOp {
-                left,
-                operator,
-                right,
-            } => {
-                let left_value = self.evaluate_expression_with_context(document, left, context)?;
-                let right_value =
-                    self.evaluate_expression_with_context(document, right, context)?;
-                self.evaluate_binary_operation(&left_value, operator, &right_value)
-            }
-            Expression::ArrayAccess { array, index } => {
-                let array_value =
-                    self.evaluate_expression_with_context(document, array, context)?;
-                let index_value =
-                    self.evaluate_expression_with_context(document, index, context)?;
-                self.evaluate_array_access(&array_value, &index_value)
-            }
-            Expression::ChainedAccess { base, field } => {
-                let base_value = self.evaluate_expression_with_context(document, base, context)?;
-                self.get_field_from_value(&base_value, field)
-            }
-            Expression::Block(expressions) => {
-                // Evaluate all expressions in the block and return the last one
-                let mut last_value = Value::Null;
-                for expr in expressions {
-                    last_value = self.evaluate_expression_with_context(document, expr, context)?;
-                }
-                Ok(last_value)
-            }
-            Expression::ArrayLiteral(elements) => {
-                let mut values = Vec::new();
-                for element in elements {
-                    let value =
-                        self.evaluate_expression_with_context(document, element, context)?;
-                    values.push(value);
-                }
-                Ok(Value::List(values))
-            }
-            Expression::ObjectLiteral(fields) => {
-                let mut object_fields = std::collections::HashMap::new();
-                for field in fields {
-                    let value =
-                        self.evaluate_expression_with_context(document, &field.value, context)?;
-                    object_fields.insert(field.name.clone(), value);
-                }
-                Ok(Value::Object(object_fields))
-            }
-            Expression::ConditionExpr(condition) => Ok(Value::Boolean(
-                self.evaluate_condition(document, condition)?,
-            )),
-            Expression::QueryExpression { query } => {
-                self.evaluate_query_expression(document, query)
-            }
-            Expression::CollectionExpression { source, operations } => {
-                self.evaluate_collection_expression(document, source, operations)
-            }
-        }
-    }
-
-    /// Evaluate a match expression with parameter context
-    fn evaluate_match_expression_with_context(
-        &self,
-        document: &Document,
-        expr_value: &Value,
-        arms: &[crate::parser::MatchArm],
-        context: &HashMap<String, Value>,
-    ) -> OQLResult<Value> {
-        for arm in arms {
-            if self.pattern_matches(&arm.pattern, expr_value)? {
-                // Check guard condition if present
-                if let Some(guard) = &arm.guard {
-                    if !self.evaluate_condition(document, guard)? {
-                        continue;
-                    }
-                }
-
-                return self.evaluate_expression_with_context(document, &arm.body, context);
-            }
-        }
-
-        Err(OQLError::Generic {
-            message: "No matching pattern found in match expression".to_string(),
+            frames.push(frame);
+            Ok(Self)
         })
+    }
+}
+
+impl Drop for CallFrameGuard {
+    fn drop(&mut self) {
+        CALL_FRAMES.with(|frames| {
+            frames.borrow_mut().pop();
+        });
     }
 }
 

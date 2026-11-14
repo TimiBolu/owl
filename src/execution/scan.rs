@@ -290,41 +290,15 @@ impl FilterExec {
         }
     }
 
+    /// Comparison semantics are shared with the general executor through
+    /// [`crate::value_semantics`], so a filter means the same thing whether
+    /// the planner or the interpreter runs it.
     pub(crate) fn compare_values(
         left: &Value,
         operator: &ComparisonOperator,
         right: &Value,
     ) -> bool {
-        match operator {
-            ComparisonOperator::Equal => left == right,
-            ComparisonOperator::NotEqual => left != right,
-            ComparisonOperator::LessThan => Self::value_less_than(left, right),
-            ComparisonOperator::LessEqual => left == right || Self::value_less_than(left, right),
-            ComparisonOperator::GreaterThan => Self::value_less_than(right, left),
-            ComparisonOperator::GreaterEqual => left == right || Self::value_less_than(right, left),
-            ComparisonOperator::Contains
-            | ComparisonOperator::StartsWith
-            | ComparisonOperator::EndsWith
-            | ComparisonOperator::In => {
-                // String operations - simplified for now
-                false
-            }
-        }
-    }
-
-    fn value_less_than(left: &Value, right: &Value) -> bool {
-        match (left, right) {
-            (Value::Integer(a), Value::Integer(b)) => a < b,
-            (Value::Float(a), Value::Float(b)) => a < b,
-            (Value::Integer(a), Value::Float(b)) => (*a as f64) < *b,
-            (Value::Float(a), Value::Integer(b)) => *a < (*b as f64),
-            (Value::String(a), Value::String(b)) => a < b,
-            (Value::DateTime(a), Value::DateTime(b)) => a < b,
-            (Value::DateTime(a), Value::String(b)) => a.to_rfc3339() < *b,
-            (Value::String(a), Value::DateTime(b)) => *a < b.to_rfc3339(),
-            (Value::Boolean(a), Value::Boolean(b)) => !a && *b,
-            _ => false,
-        }
+        crate::value_semantics::matches(left, operator, right)
     }
 }
 
@@ -514,23 +488,7 @@ impl SortExec {
     }
 
     fn compare_values_static(a: &Value, b: &Value) -> Ordering {
-        match (a, b) {
-            (Value::Integer(x), Value::Integer(y)) => x.cmp(y),
-            (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
-            (Value::String(x), Value::String(y)) => x.cmp(y),
-            (Value::Boolean(x), Value::Boolean(y)) => x.cmp(y),
-            (Value::DateTime(x), Value::DateTime(y)) => x.cmp(y),
-            (Value::Integer(x), Value::Float(y)) => {
-                (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal)
-            }
-            (Value::Float(x), Value::Integer(y)) => {
-                x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal)
-            }
-            (Value::Null, Value::Null) => Ordering::Equal,
-            (Value::Null, _) => Ordering::Less,
-            (_, Value::Null) => Ordering::Greater,
-            _ => Ordering::Equal,
-        }
+        crate::value_semantics::sort_order(a, b)
     }
 }
 
