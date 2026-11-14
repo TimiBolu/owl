@@ -21,7 +21,7 @@ use crate::schema::DocumentSystemField;
 use crate::schema::SchemaRegistry;
 use crate::schema::{CheckOperator, FieldType, Schema, SchemaConstraint};
 use crate::simulation::Clock;
-use crate::storage::DocumentStore;
+use crate::storage::{DocumentStore, ProjectedValueRef, ScanPredicate};
 use crate::storage::{VectorIndexState, VectorIndexType, VectorMetricType};
 use crate::streaming::{
     PaginatedResult, QueryStream, StreamConfig, StreamCursor, StreamingExecutor,
@@ -261,6 +261,10 @@ impl<S: DocumentStore> QueryExecutor<S> {
     pub fn execute_query(&self, query: &OQLQuery) -> OQLResult<Vec<Document>> {
         let _statement = StatementGuard::enter();
         profile_call!("execute_query", {
+            if let Some(documents) = self.tie_broken_top_k(query)? {
+                self.validate_declared_paths(query)?;
+                return Ok(documents);
+            }
             if let Some(plan) = self.try_plan_safe_read(query)? {
                 self.validate_declared_paths(query)?;
                 return self.execute_read_plan(&plan);
@@ -352,8 +356,14 @@ impl<S: DocumentStore> QueryExecutor<S> {
             });
         }
         self.validate_declared_paths(query)?;
+        let reordered = Self::storage_filter_first(query);
+        let query = reordered.as_ref().unwrap_or(query);
+        if let Some(documents) = self.aggregate_from_columns(query)? {
+            return Ok(documents);
+        }
         let mut documents = Vec::new();
         let mut is_insert_only = false;
+        let mut filters_applied = 0;
 
         // Check if this is an INSERT-only operation
         if query.operations.len() == 1 {
@@ -370,6 +380,13 @@ impl<S: DocumentStore> QueryExecutor<S> {
             let scanned_docs =
                 if let Some(prefiltered) = self.prefilter_documents_for_query(query)? {
                     prefiltered
+                } else if let Some(rows) = self.rows_through_reference(query)? {
+                    // Only rows that can pass the filter; it still runs.
+                    rows
+                } else if let Some((rows, applied)) = self.pipeline_prefix(query)? {
+                    // Storage already applied the leading filters.
+                    filters_applied = applied;
+                    rows
                 } else if let Some(fields) = self.fields_read_by(query) {
                     // The query shapes its own output and names every field
                     // it reads, so the rest need not be decoded.
@@ -391,7 +408,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
 
         // Apply operations in sequence
         let mut grouped = false;
-        for operation in &query.operations {
+        for operation in &query.operations[filters_applied..] {
             // Grouping an empty collection yields no groups, so there is no
             // group row to project or filter. Without this, an aggregate
             // `select` would see no rows and summarise the whole (empty)
@@ -618,6 +635,823 @@ impl<S: DocumentStore> QueryExecutor<S> {
             }
         }
         row[right.len()]
+    }
+
+    /// Answer a filter-then-aggregate query straight from storage's column
+    /// batches, without building a row object for any input row.
+    ///
+    /// Covers the common reporting shapes: `count()`, an aggregate of one
+    /// field, an aggregate-only `select`, and `group_by` on plain fields
+    /// followed by a `select` of keys and aggregates. Anything else returns
+    /// `None` and takes the general path, which defines the semantics; this
+    /// path must produce exactly the same rows.
+    fn aggregate_from_columns(&self, query: &OQLQuery) -> OQLResult<Option<Vec<Document>>> {
+        let leading = query
+            .operations
+            .iter()
+            .take_while(|operation| {
+                matches!(operation, Operation::Where(block) if Self::is_pipeline_safe_condition(&block.condition))
+            })
+            .count();
+        let rest = &query.operations[leading..];
+        if !COLUMN_AGGREGATION.with(|enabled| enabled.get()) || self.store.has_pending_writes()? {
+            return Ok(None);
+        }
+        let Some(schema) = self.schema_of(&query.collection)? else {
+            return Ok(None);
+        };
+        let mut fields: Vec<String> = Vec::new();
+        let slot = |name: &str, fields: &mut Vec<String>| -> Option<usize> {
+            if !schema.fields.contains_key(name) || DocumentSystemField::from_name(name).is_some() {
+                return None;
+            }
+            Some(fields.iter().position(|known| known == name).unwrap_or_else(|| {
+                fields.push(name.to_string());
+                fields.len() - 1
+            }))
+        };
+        let simple_path = |expression: &Expression| match expression {
+            Expression::FieldAccess(FieldAccess { path }) if path.len() == 1 && path[0] != "*" => {
+                Some(path[0].clone())
+            }
+            _ => None,
+        };
+
+        enum Shape {
+            Terminal(&'static str),
+            Select,
+            Grouped,
+        }
+        let mut keys: Vec<(String, usize)> = Vec::new();
+        let mut outputs: Vec<(String, ColumnOutput)> = Vec::new();
+        let (shape, consumed) = match rest {
+            [Operation::Count, ..] => {
+                outputs.push(("count".into(), ColumnOutput::Aggregate(AggregateKind::Rows, 0)));
+                (Shape::Terminal("count"), 1)
+            }
+            [Operation::Sum(field) | Operation::Avg(field) | Operation::Min(field) | Operation::Max(field), ..]
+                if field.path.len() == 1 =>
+            {
+                let (name, kind) = match &rest[0] {
+                    Operation::Sum(_) => ("sum", AggregateKind::Sum),
+                    Operation::Avg(_) => ("avg", AggregateKind::Avg),
+                    Operation::Min(_) => ("min", AggregateKind::Min),
+                    _ => ("max", AggregateKind::Max),
+                };
+                let Some(index) = slot(&field.path[0], &mut fields) else {
+                    return Ok(None);
+                };
+                outputs.push((name.into(), ColumnOutput::Aggregate(kind, index)));
+                (Shape::Terminal(name), 1)
+            }
+            [Operation::GroupBy(group), Operation::Select(select), ..] if group.computed.is_empty() => {
+                for field in &group.fields {
+                    if field.path.len() != 1 {
+                        return Ok(None);
+                    }
+                    let Some(index) = slot(&field.path[0], &mut fields) else {
+                        return Ok(None);
+                    };
+                    keys.push((field.path[0].clone(), index));
+                }
+                for entry in &select.fields {
+                    let Some(output) = Self::column_output(entry, &keys, &mut |name| slot(name, &mut fields)) else {
+                        return Ok(None);
+                    };
+                    outputs.push(output);
+                }
+                (Shape::Grouped, 2)
+            }
+            [Operation::Select(select), ..] => {
+                for entry in &select.fields {
+                    match Self::column_output(entry, &[], &mut |name| slot(name, &mut fields)) {
+                        Some(output @ (_, ColumnOutput::Aggregate(..))) => outputs.push(output),
+                        _ => return Ok(None),
+                    }
+                }
+                (Shape::Select, 1)
+            }
+            _ => return Ok(None),
+        };
+        let _ = simple_path;
+
+        // The filters, with literals typed to their fields.
+        let Some(filtered) = Self::normalize_pipeline_literals(
+            &OQLQuery {
+                collection: query.collection.clone(),
+                operations: query.operations[..leading].to_vec(),
+            },
+            &schema,
+        ) else {
+            return Ok(None);
+        };
+        fn predicate(condition: &Condition) -> Option<ScanPredicate> {
+            Some(match condition {
+                Condition::Comparison {
+                    left: Expression::FieldAccess(FieldAccess { path }),
+                    operator,
+                    right: Expression::Literal(literal),
+                } if path.len() == 1 => ScanPredicate::Comparison {
+                    field: path[0].clone(),
+                    operator: operator.clone(),
+                    value: match literal {
+                        Literal::String(value) => Value::String(value.clone()),
+                        Literal::Integer(value) => Value::Integer(*value),
+                        Literal::Float(value) => Value::Float(*value),
+                        Literal::Boolean(value) => Value::Boolean(*value),
+                        Literal::Null => Value::Null,
+                        Literal::Timestamp(value) => Value::DateTime(*value),
+                    },
+                },
+                Condition::And(left, right) => {
+                    ScanPredicate::And(Box::new(predicate(left)?), Box::new(predicate(right)?))
+                }
+                Condition::Or(left, right) => {
+                    ScanPredicate::Or(Box::new(predicate(left)?), Box::new(predicate(right)?))
+                }
+                _ => return None,
+            })
+        }
+        let mut filters = Vec::new();
+        for operation in &filtered.operations {
+            let Operation::Where(block) = operation else {
+                return Ok(None);
+            };
+            // Every filtered field must be one storage can evaluate.
+            let Some(filter) = predicate(&block.condition) else {
+                return Ok(None);
+            };
+            filters.push(filter);
+        }
+        fn filter_fields<'a>(predicate: &'a ScanPredicate, names: &mut Vec<&'a str>) {
+            match predicate {
+                ScanPredicate::Comparison { field, .. } => names.push(field),
+                ScanPredicate::And(left, right) | ScanPredicate::Or(left, right) => {
+                    filter_fields(left, names);
+                    filter_fields(right, names);
+                }
+            }
+        }
+        let mut filtered_names = Vec::new();
+        filters
+            .iter()
+            .for_each(|filter| filter_fields(filter, &mut filtered_names));
+        if filtered_names.iter().any(|name| {
+            !schema.fields.contains_key(*name) || DocumentSystemField::from_name(name).is_some()
+        }) {
+            return Ok(None);
+        }
+        // Storage compares stored values with the literal as given, so the
+        // two must be of one plain type. A reference compared with an id, or
+        // anything compared with null, has meaning only the general path
+        // knows.
+        fn plainly_typed(predicate: &ScanPredicate, schema: &Schema) -> bool {
+            match predicate {
+                ScanPredicate::Comparison { field, value, .. } => {
+                    let mut declared = schema.fields.get(field);
+                    while let Some(FieldType::Optional(inner)) = declared {
+                        declared = Some(inner);
+                    }
+                    matches!(
+                        (declared, value),
+                        (Some(FieldType::String), Value::String(_))
+                            | (Some(FieldType::Integer), Value::Integer(_))
+                            | (Some(FieldType::Float), Value::Float(_))
+                            | (Some(FieldType::Boolean), Value::Boolean(_))
+                            | (Some(FieldType::DateTime), Value::DateTime(_))
+                    )
+                }
+                ScanPredicate::And(left, right) | ScanPredicate::Or(left, right) => {
+                    plainly_typed(left, schema) && plainly_typed(right, schema)
+                }
+            }
+        }
+        if !filters.iter().all(|filter| plainly_typed(filter, &schema)) {
+            return Ok(None);
+        }
+
+        let Some(batches) =
+            self.store
+                .scan_projected_batches(&query.collection, &filters, &fields, 4096)?
+        else {
+            return Ok(None);
+        };
+
+        // One state per group; ungrouped shapes have the single empty key.
+        let mut groups: Vec<ColumnGroup> = Vec::new();
+        let mut by_hash: HashMap<u64, Vec<usize>> = HashMap::new();
+        let new_group = |key: Vec<Value>, atoms: Vec<OwnedKeyAtom>| ColumnGroup {
+            key,
+            atoms,
+            rows: 0,
+            accumulators: outputs
+                .iter()
+                .map(|(_, output)| match output {
+                    ColumnOutput::Aggregate(kind, _) => Some(Accumulator::new(*kind)),
+                    ColumnOutput::Key(_) => None,
+                })
+                .collect(),
+        };
+        if keys.is_empty() {
+            groups.push(new_group(Vec::new(), Vec::new()));
+        }
+        let mut current: Vec<Option<ProjectedValueRef<'_>>> = vec![None; fields.len()];
+        let mut atoms: Vec<KeyAtom<'_>> = Vec::with_capacity(keys.len());
+        for batch in &batches {
+            for row in batch.rows() {
+                current.iter_mut().for_each(|value| *value = None);
+                for (name, value) in row.fields() {
+                    if let Some(index) = fields.iter().position(|field| field == name) {
+                        current[index] = Some(value);
+                    }
+                }
+                let group = if keys.is_empty() {
+                    0
+                } else {
+                    atoms.clear();
+                    for (_, index) in &keys {
+                        match KeyAtom::of(current[*index]) {
+                            Some(atom) => atoms.push(atom),
+                            // A list or object as a key: leave it to the
+                            // general path.
+                            None => return Ok(None),
+                        }
+                    }
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    std::hash::Hash::hash(&atoms, &mut hasher);
+                    let hash = std::hash::Hasher::finish(&hasher);
+                    let candidates = by_hash.entry(hash).or_default();
+                    match candidates
+                        .iter()
+                        .copied()
+                        .find(|index| groups[*index].matches(&atoms))
+                    {
+                        Some(index) => index,
+                        None => {
+                            let index = groups.len();
+                            let key = keys
+                                .iter()
+                                .map(|(_, slot)| {
+                                    current[*slot].map_or(Value::Null, ProjectedValueRef::to_owned)
+                                })
+                                .collect();
+                            groups.push(new_group(key, atoms.iter().map(KeyAtom::owned).collect()));
+                            candidates.push(index);
+                            index
+                        }
+                    }
+                };
+                let group = &mut groups[group];
+                group.rows += 1;
+                for ((_, output), accumulator) in outputs.iter().zip(&mut group.accumulators) {
+                    if let (ColumnOutput::Aggregate(kind, index), Some(accumulator)) =
+                        (output, accumulator)
+                    {
+                        match kind {
+                            AggregateKind::Rows => accumulator.count += 1,
+                            _ => accumulator.push(current[*index])?,
+                        }
+                    }
+                }
+            }
+        }
+
+        // Groups come out in the order the general path produces them.
+        let mut ordered: Vec<(Vec<u8>, ColumnGroup)> = groups
+            .into_iter()
+            .map(|group| {
+                let canonical: Vec<Value> =
+                    group.key.iter().map(Self::canonical_key_value).collect();
+                bincode::serialize(&canonical)
+                    .map(|encoded| (encoded, group))
+                    .map_err(|error| OQLError::Generic {
+                        message: format!("Failed to encode group key: {}", error),
+                    })
+            })
+            .collect::<OQLResult<_>>()?;
+        ordered.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut documents = Vec::with_capacity(ordered.len());
+        for (index, (_, group)) in ordered.into_iter().enumerate() {
+            let mut row = HashMap::with_capacity(outputs.len());
+            for ((name, output), accumulator) in outputs.iter().zip(group.accumulators) {
+                let value = match (output, accumulator) {
+                    (ColumnOutput::Key(position), _) => group.key[*position].clone(),
+                    (_, Some(accumulator)) => accumulator.finish(),
+                    (_, None) => Value::Null,
+                };
+                row.insert(name.clone(), value);
+            }
+            documents.push(match shape {
+                Shape::Terminal(function) => Document::with_id(
+                    format!("{function}_result"),
+                    "aggregate".to_string(),
+                    row,
+                ),
+                Shape::Select => Document::with_id(
+                    "aggregation_result".to_string(),
+                    "aggregation".to_string(),
+                    row,
+                ),
+                Shape::Grouped => Document::with_id(format!("group_{index}"), "group".to_string(), row),
+            });
+        }
+        for operation in &rest[consumed..] {
+            documents = self.apply_operation(documents, operation, &query.collection)?;
+        }
+        Ok(Some(documents))
+    }
+
+    /// Classify one `select` entry as a group key or a simple aggregate, with
+    /// the name it takes in the result.
+    fn column_output(
+        entry: &crate::parser::SelectField,
+        keys: &[(String, usize)],
+        slot: &mut dyn FnMut(&str) -> Option<usize>,
+    ) -> Option<(String, ColumnOutput)> {
+        match &entry.expression {
+            Expression::FieldAccess(FieldAccess { path }) if path.len() == 1 => {
+                let position = keys.iter().position(|(name, _)| name == &path[0])?;
+                Some((
+                    entry.alias.clone().unwrap_or_else(|| path[0].clone()),
+                    ColumnOutput::Key(position),
+                ))
+            }
+            Expression::FunctionCall { name, args } => {
+                let kind = match (name.as_str(), args.as_slice()) {
+                    ("count", []) => (AggregateKind::Rows, 0),
+                    ("count", [Expression::FieldAccess(FieldAccess { path })])
+                        if path.len() == 1 && path[0] == "*" =>
+                    {
+                        (AggregateKind::Rows, 0)
+                    }
+                    (function, [Expression::FieldAccess(FieldAccess { path })])
+                        if path.len() == 1 =>
+                    {
+                        let kind = match function {
+                            "count" => AggregateKind::NonNull,
+                            "sum" => AggregateKind::Sum,
+                            "avg" => AggregateKind::Avg,
+                            "min" => AggregateKind::Min,
+                            "max" => AggregateKind::Max,
+                            _ => return None,
+                        };
+                        (kind, slot(&path[0])?)
+                    }
+                    _ => return None,
+                };
+                Some((
+                    entry.alias.clone().unwrap_or_else(|| name.clone()),
+                    ColumnOutput::Aggregate(kind.0, kind.1),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// Source the rows of a query whose leading filter tests a field of a
+    /// referenced document, by starting from the documents that pass the
+    /// test and following the relationship back.
+    ///
+    /// `orders.where { .customer.country == "NG" }` reads the customers in
+    /// that country and then their orders, instead of every order. The rows
+    /// returned are a superset of the filter's answer, in the order a scan
+    /// yields them (by id), so the query then runs on them unchanged. `None`
+    /// when the shape does not apply or too many documents pass the test for
+    /// this to be cheaper than a scan.
+    fn rows_through_reference(&self, query: &OQLQuery) -> OQLResult<Option<Vec<Document>>> {
+        if query.operations.iter().any(|operation| {
+            matches!(
+                operation,
+                Operation::Insert(_)
+                    | Operation::InsertMany(_)
+                    | Operation::Upsert(_)
+                    | Operation::Update(_)
+                    | Operation::Delete
+                    | Operation::FunctionDef(_)
+                    | Operation::Explain
+            )
+        }) {
+            return Ok(None);
+        }
+        // Every conjunct of the leading filters must hold for a row to
+        // survive, so any one of them may choose where to start.
+        fn conjuncts<'a>(condition: &'a Condition, parts: &mut Vec<&'a Condition>) {
+            match condition {
+                Condition::And(left, right) => {
+                    conjuncts(left, parts);
+                    conjuncts(right, parts);
+                }
+                other => parts.push(other),
+            }
+        }
+        let mut parts = Vec::new();
+        for operation in &query.operations {
+            let Operation::Where(block) = operation else {
+                break;
+            };
+            conjuncts(&block.condition, &mut parts);
+        }
+        let Some(schema) = self.schema_of(&query.collection)? else {
+            return Ok(None);
+        };
+        let mut chosen = None;
+        for part in parts {
+            let Condition::Comparison {
+                left: Expression::FieldAccess(FieldAccess { path }),
+                operator: ComparisonOperator::Equal,
+                right: Expression::Literal(literal),
+            } = part
+            else {
+                continue;
+            };
+            if path.len() != 2 || matches!(literal, Literal::Null) {
+                continue;
+            }
+            let mut declared = schema.fields.get(&path[0]);
+            while let Some(FieldType::Optional(inner)) = declared {
+                declared = Some(inner);
+            }
+            let Some(FieldType::Reference(reference)) = declared else {
+                continue;
+            };
+            let Some(target) = self.schema_of(&reference.target_schema)? else {
+                continue;
+            };
+            let mut tested = target.fields.get(&path[1]);
+            while let Some(FieldType::Optional(inner)) = tested {
+                tested = Some(inner);
+            }
+            if matches!(
+                tested,
+                Some(
+                    FieldType::String
+                        | FieldType::Integer
+                        | FieldType::Float
+                        | FieldType::Boolean
+                        | FieldType::DateTime
+                )
+            ) && DocumentSystemField::from_name(&path[1]).is_none()
+            {
+                chosen = Some((path, part, reference.target_schema.clone()));
+                break;
+            }
+        }
+        let Some((path, test, target)) = chosen else {
+            return Ok(None);
+        };
+        if self.store.has_pending_writes()? {
+            return Ok(None);
+        }
+
+        // The documents that pass the test, asked as an ordinary query so the
+        // comparison means exactly what it means in the filter.
+        let Condition::Comparison { operator, right, .. } = test else {
+            return Ok(None);
+        };
+        let matching = self.execute_query(&OQLQuery {
+            collection: target.clone(),
+            operations: vec![
+                Operation::Where(crate::parser::WhereBlock {
+                    condition: Condition::Comparison {
+                        left: Expression::FieldAccess(FieldAccess {
+                            path: vec![path[1].clone()],
+                        }),
+                        operator: operator.clone(),
+                        right: right.clone(),
+                    },
+                }),
+                Operation::Select(SelectBlock {
+                    fields: vec![crate::parser::SelectField {
+                        alias: None,
+                        expression: Expression::FieldAccess(FieldAccess {
+                            path: vec!["id".to_string()],
+                        }),
+                    }],
+                }),
+            ],
+        })?;
+        // Following the relationship costs more per row than scanning, so it
+        // pays only when the test keeps a minority of the documents.
+        let total = self.execute_query(&OQLQuery {
+            collection: target.clone(),
+            operations: vec![Operation::Count],
+        })?;
+        let total = match total.first().and_then(|row| row.get_field("count")) {
+            Some(Value::Integer(count)) => *count as usize,
+            _ => return Ok(None),
+        };
+        if matching.len().saturating_mul(4) > total {
+            return Ok(None);
+        }
+
+        let fields = self.fields_read_by(query);
+        let mut related = Vec::new();
+        for document in &matching {
+            let Some(Value::String(id)) = document.get_field("id") else {
+                return Ok(None);
+            };
+            related.extend(self.store.scan_referencing_documents_shared(
+                &target,
+                &id.clone().into(),
+                Some(&query.collection),
+                Some(&path[0]),
+            )?);
+        }
+        // A scan yields rows by id, each once.
+        related.sort_by(|left, right| left.id.cmp(&right.id));
+        related.dedup_by(|left, right| left.id == right.id);
+        Ok(Some(
+            related
+                .iter()
+                .map(|document| match &fields {
+                    None => document.as_ref().clone(),
+                    Some(fields) => Document {
+                        fields: fields
+                            .iter()
+                            .filter_map(|name| {
+                                document
+                                    .fields
+                                    .get_key_value(name)
+                                    .map(|(name, value)| (name.clone(), value.clone()))
+                            })
+                            .collect(),
+                        ..Document::with_id(
+                            document.id.to_string(),
+                            document.schema.clone(),
+                            HashMap::new(),
+                        )
+                    },
+                })
+                .collect(),
+        ))
+    }
+
+    /// Split a leading filter so the part storage can evaluate comes first.
+    ///
+    /// `where { .customer.country == "NG" && .total > 900 }` becomes
+    /// `where { .total > 900 }.where { .customer.country == "NG" }`: the
+    /// same rows, but the reference is followed only for rows that passed
+    /// the cheap test. `None` when there is nothing to split.
+    fn storage_filter_first(query: &OQLQuery) -> Option<OQLQuery> {
+        let Some(Operation::Where(block)) = query.operations.first() else {
+            return None;
+        };
+        fn conjuncts<'a>(condition: &'a Condition, parts: &mut Vec<&'a Condition>) {
+            match condition {
+                Condition::And(left, right) => {
+                    conjuncts(left, parts);
+                    conjuncts(right, parts);
+                }
+                other => parts.push(other),
+            }
+        }
+        let mut parts = Vec::new();
+        conjuncts(&block.condition, &mut parts);
+        let (pushable, rest): (Vec<&Condition>, Vec<&Condition>) = parts
+            .into_iter()
+            .partition(|part| Self::is_pipeline_safe_condition(part));
+        if pushable.is_empty() || rest.is_empty() {
+            return None;
+        }
+        let join = |parts: Vec<&Condition>| {
+            parts
+                .into_iter()
+                .cloned()
+                .reduce(|left, right| Condition::And(Box::new(left), Box::new(right)))
+                .map(|condition| Operation::Where(crate::parser::WhereBlock { condition }))
+        };
+        let mut operations = Vec::with_capacity(query.operations.len() + 1);
+        operations.extend(join(pushable));
+        operations.extend(join(rest));
+        operations.extend(query.operations[1..].iter().cloned());
+        Some(OQLQuery {
+            collection: query.collection.clone(),
+            operations,
+        })
+    }
+
+    /// Fetch the root rows of a general query through the physical pipeline.
+    ///
+    /// The pipeline evaluates simple filters inside storage, picks an index
+    /// when one fits, and decodes only requested fields. A general query can
+    /// use all of that for its first step even though the rest of it (a
+    /// grouping, a nested projection) runs here. Returns the rows and how
+    /// many leading operations they already satisfy.
+    fn pipeline_prefix(&self, query: &OQLQuery) -> OQLResult<Option<(Vec<Document>, usize)>> {
+        let leading: Vec<Operation> = query
+            .operations
+            .iter()
+            .take_while(|operation| {
+                matches!(operation, Operation::Where(block) if Self::is_pipeline_safe_condition(&block.condition))
+            })
+            .cloned()
+            .collect();
+        // With no filter to push down, the direct projected scan is already
+        // the cheapest way to read the rows.
+        if leading.is_empty() {
+            return Ok(None);
+        }
+        let fields = self.fields_read_by(query);
+        if self.store.has_pending_writes()? {
+            return Ok(None);
+        }
+        let Some(schema) = self.schema_of(&query.collection)? else {
+            return Ok(None);
+        };
+
+        let applied = leading.len();
+        let mut operations = leading;
+        if let Some(fields) = fields {
+            // Names that are not stored fields (a relationship, a name from
+            // a nested scope) have nothing to decode.
+            let mut stored: Vec<String> = fields
+                .into_iter()
+                .filter(|name| schema.fields.contains_key(name))
+                .collect();
+            if stored.is_empty() {
+                stored.push("id".to_string());
+            }
+            stored.sort();
+            operations.push(Operation::Select(SelectBlock {
+                fields: stored
+                    .into_iter()
+                    .map(|name| crate::parser::SelectField {
+                        alias: None,
+                        expression: Expression::FieldAccess(FieldAccess { path: vec![name] }),
+                    })
+                    .collect(),
+            }));
+        }
+        let prefix = OQLQuery {
+            collection: query.collection.clone(),
+            operations,
+        };
+        // Every row that passes is fetched here; nothing bounds the read.
+        // The planner has no statistics, so judge selectivity by shape: a
+        // range usually narrows to a small part of the collection, while an
+        // equality alone (a status, a flag) often keeps most of it, and
+        // fetching most of a collection through an index is slower than
+        // scanning it.
+        fn has_range(condition: &Condition) -> bool {
+            match condition {
+                Condition::Comparison { operator, .. } => matches!(
+                    operator,
+                    ComparisonOperator::LessThan
+                        | ComparisonOperator::LessEqual
+                        | ComparisonOperator::GreaterThan
+                        | ComparisonOperator::GreaterEqual
+                ),
+                Condition::And(left, right) | Condition::Or(left, right) => {
+                    has_range(left) || has_range(right)
+                }
+                Condition::Not(inner) => has_range(inner),
+            }
+        }
+        let narrowing = prefix.operations.iter().any(|operation| {
+            matches!(operation, Operation::Where(block) if has_range(&block.condition))
+        });
+        let Some(plan) = self.plan_read_with(&prefix, &schema, narrowing)? else {
+            return Ok(None);
+        };
+        Ok(Some((self.execute_read_plan(&plan)?, applied)))
+    }
+
+    /// Plan a read made only of pipeline-safe operations.
+    fn plan_read(&self, query: &OQLQuery, schema: &Schema) -> OQLResult<Option<PhysicalPlan>> {
+        self.plan_read_with(query, schema, true)
+    }
+
+    fn plan_read_with(
+        &self,
+        query: &OQLQuery,
+        schema: &Schema,
+        offer_indexes: bool,
+    ) -> OQLResult<Option<PhysicalPlan>> {
+        let Some(query) = Self::normalize_pipeline_literals(query, schema) else {
+            return Ok(None);
+        };
+        let registry = SchemaRegistry::new();
+        registry.register(schema.clone())?;
+        let Ok(logical) = LogicalPlanner::with_schema_registry(registry).plan(&query) else {
+            return Ok(None);
+        };
+        let planner = if offer_indexes {
+            PhysicalPlanner::new().with_storage_catalog(self.store.as_ref())?
+        } else {
+            PhysicalPlanner::new().with_storage_scan_only(self.store.as_ref())
+        };
+        Ok(Some(planner.plan(&logical)?))
+    }
+
+    /// `sort { .a.desc, .b.asc }.limit(n)` when an index supplies `.a` in
+    /// order: take the first `n` rows in index order, then settle the rows
+    /// that tie on the last `.a` value by the remaining keys. This reads
+    /// about `n` rows instead of every row that passes the filter.
+    fn tie_broken_top_k(&self, query: &OQLQuery) -> OQLResult<Option<Vec<Document>>> {
+        let Some(sort_at) = query
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Sort(_)))
+        else {
+            return Ok(None);
+        };
+        let (Some(Operation::Sort(sort)), Some(Operation::Limit(limit))) = (
+            query.operations.get(sort_at),
+            query.operations.get(sort_at + 1),
+        ) else {
+            return Ok(None);
+        };
+        let filters = &query.operations[..sort_at];
+        if sort.fields.len() < 2
+            || query
+                .operations
+                .iter()
+                .any(|operation| matches!(operation, Operation::Explain))
+            || *limit == 0
+            || *limit > 10_000
+            || !filters.iter().all(|operation| {
+                matches!(operation, Operation::Where(block) if Self::is_pipeline_safe_condition(&block.condition))
+            })
+        {
+            return Ok(None);
+        }
+        let Expression::FieldAccess(leading_key) = &sort.fields[0].expression else {
+            return Ok(None);
+        };
+        if leading_key.path.len() != 1 || self.store.has_pending_writes()? {
+            return Ok(None);
+        }
+        let Some(schema) = self.schema_of(&query.collection)? else {
+            return Ok(None);
+        };
+
+        // Only worth doing when the index really supplies the order.
+        let mut first_rows = filters.to_vec();
+        first_rows.push(Operation::Sort(SortBlock {
+            fields: vec![sort.fields[0].clone()],
+        }));
+        first_rows.push(Operation::Limit(*limit));
+        let Some(plan) = self.plan_read(
+            &OQLQuery {
+                collection: query.collection.clone(),
+                operations: first_rows,
+            },
+            &schema,
+        )?
+        else {
+            return Ok(None);
+        };
+        let sorts_itself = plan
+            .root
+            .explain()
+            .lines()
+            .any(|line| line.trim_start().starts_with("Sort"));
+        if sorts_itself || !Self::contains_native_index_scan(&plan.root) {
+            return Ok(None);
+        }
+
+        let mut candidates = self.execute_read_plan(&plan)?;
+        if candidates.len() as u64 >= *limit {
+            let boundary = self.get_field_value(
+                candidates.last().expect("a full page has a last row"),
+                leading_key,
+            )?;
+            // Every row tied with the boundary competes for the last places.
+            let Ok(boundary_literal) = Self::value_as_expression(boundary.clone()) else {
+                return Ok(None);
+            };
+            if boundary.is_null() {
+                return Ok(None);
+            }
+            let mut tied = filters.to_vec();
+            tied.push(Operation::Where(WhereBlock {
+                condition: Condition::Comparison {
+                    left: Expression::FieldAccess(leading_key.clone()),
+                    operator: ComparisonOperator::Equal,
+                    right: boundary_literal,
+                },
+            }));
+            let tied = self.execute_query(&OQLQuery {
+                collection: query.collection.clone(),
+                operations: tied,
+            })?;
+            let mut settled = Vec::with_capacity(candidates.len() + tied.len());
+            for row in candidates {
+                if !self.values_equal(&self.get_field_value(&row, leading_key)?, &boundary) {
+                    settled.push(row);
+                }
+            }
+            settled.extend(tied);
+            candidates = settled;
+        }
+
+        let mut documents = self.apply_sort_operation(candidates, sort)?;
+        documents.truncate(*limit as usize);
+        for operation in &query.operations[sort_at + 2..] {
+            documents = self.apply_operation(documents, operation, &query.collection)?;
+        }
+        Ok(Some(documents))
     }
 
     /// The top-level fields of the root collection that `query` can read, or
@@ -881,10 +1715,11 @@ impl<S: DocumentStore> QueryExecutor<S> {
                             }
                             Literal::Integer(*value as i64)
                         }
-                        // The pipeline has no timestamp literal; the general
-                        // executor compares timestamps with strings by
-                        // instant.
-                        (Some(FieldType::DateTime), Literal::String(_)) => return None,
+                        // Timestamp text becomes the instant it denotes, so
+                        // an index on the field can serve the comparison.
+                        (Some(FieldType::DateTime), Literal::String(text)) => {
+                            Literal::Timestamp(crate::value_semantics::parse_timestamp(text)?)
+                        }
                         (_, literal) => literal.clone(),
                     };
                     Some(Condition::Comparison {
@@ -1894,6 +2729,11 @@ impl<S: DocumentStore> QueryExecutor<S> {
             Expression::Identifier(name) => name.clone(),
             _ => "$collection".to_string(),
         };
+        if let Expression::FieldAccess(field) = source {
+            if let Some(answer) = self.related_count(scope_document, &field.path, operations)? {
+                return Ok(answer);
+            }
+        }
         let (documents, single) = match source {
             // An operation written with no receiver, evaluated for a group
             // row, applies to that group's rows.
@@ -1909,7 +2749,12 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 (Self::group_rows(scope_document)?.as_ref().clone(), false)
             }
             Expression::FieldAccess(field) if field.path != ["*"] => {
-                self.path_source_rows(scope_document, &field.path)?
+                // What the operations read of the rows they are given.
+                let fields = self.fields_read_by(&OQLQuery {
+                    collection: collection_scope.clone(),
+                    operations: operations.to_vec(),
+                });
+                self.path_source_rows_reading(scope_document, &field.path, fields.as_deref())?
             }
             _ => {
                 let value = self.evaluate_expression(scope_document, source)?;
@@ -1920,6 +2765,186 @@ impl<S: DocumentStore> QueryExecutor<S> {
             }
         };
         self.run_collection_operations(documents, single, operations, scope_document, &collection_scope)
+    }
+
+    /// Answer `.relationship.where { .. }.count()` or `.exists()` for one
+    /// row from a tally made once for every row.
+    ///
+    /// Asked for a few rows, the relationship's index is the cheapest way to
+    /// answer. Asked for every row of a collection, it is far cheaper to
+    /// read the referring collection once and count per referenced
+    /// document, so after enough rows have asked the same question in one
+    /// statement the tally is built and the rest are answered from it.
+    /// `None` leaves the question to the general path, which defines the
+    /// answer.
+    fn related_count(
+        &self,
+        row: &Document,
+        path: &[String],
+        operations: &[Operation],
+    ) -> OQLResult<Option<Value>> {
+        /// Rows answered through the index before a tally is worth a scan.
+        const ROWS_BEFORE_TALLY: usize = 64;
+
+        let [name] = path else {
+            return Ok(None);
+        };
+        let Some((last, filters)) = operations.split_last() else {
+            return Ok(None);
+        };
+        if !matches!(last, Operation::Count | Operation::Exists)
+            || !filters.iter().all(|operation| {
+                matches!(operation, Operation::Where(block) if Self::is_pipeline_safe_condition(&block.condition))
+            })
+            || !StatementGuard::active()
+            || row.fields.contains_key(name)
+            || DocumentSystemField::from_name(name).is_some()
+        {
+            return Ok(None);
+        }
+        let key = format!(
+            "{}\u{0}{}\u{0}{}",
+            row.schema,
+            name,
+            serde_json::to_string(filters).unwrap_or_default()
+        );
+        let known = STATEMENT.with(|scope| {
+            let mut scope = scope.borrow_mut();
+            match scope.related_counts.entry(key.clone()).or_insert(RelatedCounts::Asked(0)) {
+                RelatedCounts::Asked(times) => {
+                    *times += 1;
+                    (*times > ROWS_BEFORE_TALLY).then_some(None)
+                }
+                RelatedCounts::Unavailable => None,
+                RelatedCounts::Ready(tally) => Some(Some(tally.clone())),
+            }
+        });
+        let tally = match known {
+            None => return Ok(None),
+            Some(Some(tally)) => tally,
+            Some(None) => {
+                let tally = self.tally_related(&row.schema, name, filters)?.map(Arc::new);
+                STATEMENT.with(|scope| {
+                    scope.borrow_mut().related_counts.insert(
+                        key,
+                        match &tally {
+                            Some(tally) => RelatedCounts::Ready(tally.clone()),
+                            None => RelatedCounts::Unavailable,
+                        },
+                    )
+                });
+                match tally {
+                    Some(tally) => tally,
+                    None => return Ok(None),
+                }
+            }
+        };
+        let Some(reference) = self.store.object_ref_of(&row.schema, &row.id)? else {
+            return Ok(None);
+        };
+        let count = tally.get(&reference).copied().unwrap_or(0);
+        Ok(Some(match last {
+            Operation::Exists => Value::Boolean(count > 0),
+            _ => Value::Integer(count),
+        }))
+    }
+
+    /// Count the documents that refer to each document of `target` through
+    /// the relationship `name` and pass `filters`, in one pass over the
+    /// referring collection. `None` when one pass cannot give the answer the
+    /// relationship's index gives.
+    fn tally_related(
+        &self,
+        target: &str,
+        name: &str,
+        filters: &[Operation],
+    ) -> OQLResult<Option<HashMap<ObjRef, i64>>> {
+        let ReverseRelationship::Declared { source, field } =
+            self.reverse_relationship(target, name)?
+        else {
+            return Ok(None);
+        };
+        let Some(schema) = self.schema_of(&source)? else {
+            return Ok(None);
+        };
+        // The relationship must run through exactly one plain reference
+        // field. Through a list, an embedded object, or several fields, a
+        // document can refer to its target in ways one column does not show.
+        fn mentions(field_type: &FieldType, target: &str) -> bool {
+            match field_type {
+                FieldType::Reference(reference) => reference.target_schema == target,
+                FieldType::Optional(inner) | FieldType::List(inner) => mentions(inner, target),
+                _ => false,
+            }
+        }
+        fn plain(field_type: &FieldType, target: &str) -> bool {
+            match field_type {
+                FieldType::Reference(reference) => reference.target_schema == target,
+                FieldType::Optional(inner) => plain(inner, target),
+                _ => false,
+            }
+        }
+        let embedded = schema.constraints.iter().any(|constraint| {
+            matches!(constraint, crate::schema::SchemaConstraint::Shape { fields, .. }
+                if fields.iter().any(|(_, field_type)| mentions(field_type, target)))
+        });
+        let referring: Vec<&String> = schema
+            .fields
+            .iter()
+            .filter(|(_, field_type)| mentions(field_type, target))
+            .map(|(field, _)| field)
+            .collect();
+        let through = match (&field, referring.as_slice()) {
+            (Some(field), _) if schema.fields.get(field).is_some_and(|declared| plain(declared, target)) => {
+                field.clone()
+            }
+            (None, [only]) if !embedded && plain(&schema.fields[*only], target) => (*only).clone(),
+            _ => return Ok(None),
+        };
+        let mut operations = filters.to_vec();
+        operations.push(Operation::GroupBy(crate::parser::GroupByBlock {
+            fields: vec![FieldAccess {
+                path: vec![through.clone()],
+            }],
+            computed: Vec::new(),
+        }));
+        operations.push(Operation::Select(SelectBlock {
+            fields: vec![
+                crate::parser::SelectField {
+                    alias: None,
+                    expression: Expression::FieldAccess(FieldAccess {
+                        path: vec![through.clone()],
+                    }),
+                },
+                crate::parser::SelectField {
+                    alias: Some("n".to_string()),
+                    expression: Expression::FunctionCall {
+                        name: "count".to_string(),
+                        args: Vec::new(),
+                    },
+                },
+            ],
+        }));
+        let Some(groups) = self.aggregate_from_columns(&OQLQuery {
+            collection: source,
+            operations,
+        })?
+        else {
+            return Ok(None);
+        };
+        let mut tally = HashMap::with_capacity(groups.len());
+        for group in groups {
+            match (group.fields.get(&through), group.fields.get("n")) {
+                (Some(Value::Reference(reference)), Some(Value::Integer(count))) => {
+                    tally.insert(*reference, *count);
+                }
+                (Some(Value::Null) | None, _) => {}
+                // A value that is not a reference is not something this
+                // tally understands.
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some(tally))
     }
 
     /// Apply operations to rows already in hand and shape the result as a
@@ -2041,9 +3066,23 @@ impl<S: DocumentStore> QueryExecutor<S> {
         scope_document: &Document,
         path: &[String],
     ) -> OQLResult<(Vec<Document>, bool)> {
+        self.path_source_rows_reading(scope_document, path, None)
+    }
+
+    /// `path_source_rows`, told which fields of the rows at the end of the
+    /// path will be read. Rows reached through a relationship in the last
+    /// step then carry only those fields, which spares copying the rest.
+    fn path_source_rows_reading(
+        &self,
+        scope_document: &Document,
+        path: &[String],
+        fields: Option<&[String]>,
+    ) -> OQLResult<(Vec<Document>, bool)> {
+        let last = path.len().saturating_sub(1);
         let mut rows = vec![SourceRow::stored(scope_document.clone())];
         let mut single = true;
-        for segment in path {
+        for (position, segment) in path.iter().enumerate() {
+            let wanted = fields.filter(|_| position == last);
             let mut next = Vec::new();
             for row in rows {
                 let stored_value = match DocumentSystemField::from_name(segment) {
@@ -2068,17 +3107,33 @@ impl<S: DocumentStore> QueryExecutor<S> {
                                 _ => (segment.as_str(), None),
                             };
                             single = false;
-                            next.extend(
-                                self.store
-                                    .scan_referencing_documents(
-                                        &row.document.schema,
-                                        &row.document.id,
-                                        Some(source),
-                                        field,
-                                    )?
-                                    .into_iter()
-                                    .map(SourceRow::stored),
-                            );
+                            let related = self.store.scan_referencing_documents_shared(
+                                &row.document.schema,
+                                &row.document.id,
+                                Some(source),
+                                field,
+                            )?;
+                            next.extend(related.iter().map(|document| {
+                                SourceRow::stored(match wanted {
+                                    None => document.as_ref().clone(),
+                                    Some(wanted) => Document {
+                                        fields: wanted
+                                            .iter()
+                                            .filter_map(|name| {
+                                                document
+                                                    .fields
+                                                    .get_key_value(name)
+                                                    .map(|(name, value)| (name.clone(), value.clone()))
+                                            })
+                                            .collect(),
+                                        ..Document::with_id(
+                                            document.id.to_string(),
+                                            document.schema.clone(),
+                                            HashMap::new(),
+                                        )
+                                    },
+                                })
+                            }));
                         }
                         // A declared field that this row does not carry.
                         ReverseRelationship::AbsentField => {}
@@ -2940,9 +3995,32 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
     }
 
+    /// The document a reference points at, fetched once per statement.
+    /// Many rows usually refer to few targets (orders to their customers),
+    /// so traversing `.customer.country` for every row need not decode the
+    /// same customer again each time.
+    fn referenced_document(&self, reference: &ObjRef) -> OQLResult<Option<Arc<Document>>> {
+        if !StatementGuard::active() {
+            return Ok(self.try_fast_navigation(reference)?.map(Arc::new));
+        }
+        if let Some(known) =
+            STATEMENT.with(|scope| scope.borrow().referenced.get(reference).cloned())
+        {
+            return Ok(known);
+        }
+        let document = self.try_fast_navigation(reference)?.map(Arc::new);
+        STATEMENT.with(|scope| {
+            scope
+                .borrow_mut()
+                .referenced
+                .insert(*reference, document.clone())
+        });
+        Ok(document)
+    }
+
     fn resolve_objref_target(&self, reference: &ObjRef) -> OQLResult<Option<Document>> {
-        if let Some(document) = self.try_fast_navigation(reference)? {
-            return Ok(Some(document));
+        if let Some(document) = self.referenced_document(reference)? {
+            return Ok(Some(document.as_ref().clone()));
         }
 
         let reference_id = reference.to_string_id();
@@ -3063,9 +4141,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
         objref: &ObjRef,
         remaining_path: &[String],
     ) -> OQLResult<Value> {
-        // Try O(1) pointer-based navigation first (if using Zig storage)
-        if let Some(referenced_doc) = self.try_fast_navigation(objref)? {
-            // Fast path: Direct pointer navigation succeeded
+        if let Some(referenced_doc) = self.referenced_document(objref)? {
             return self.resolve_nested_field_path(&referenced_doc, remaining_path);
         }
 
@@ -3146,6 +4222,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
             Literal::Float(f) => Value::Float(*f),
             Literal::Boolean(b) => Value::Boolean(*b),
             Literal::Null => Value::Null,
+            Literal::Timestamp(instant) => Value::DateTime(*instant),
         }
     }
 
@@ -4826,6 +5903,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 })
                 .collect::<OQLResult<Vec<_>>>()
                 .map(Expression::ObjectLiteral),
+            Value::DateTime(instant) => Ok(Expression::Literal(Literal::Timestamp(instant))),
             other => Err(OQLError::TypeError {
                 expected: "literal-compatible aggregate result".to_string(),
                 actual: other.type_name().to_string(),
@@ -5548,6 +6626,261 @@ thread_local! {
     static NESTED_QUERIES_RUN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
+thread_local! {
+    static COLUMN_AGGREGATION: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Turn the column-batch aggregation path on or off for this thread. It is
+/// an optimization only, so tests switch it off to get the reference answer.
+#[doc(hidden)]
+pub fn set_column_aggregation(enabled: bool) {
+    COLUMN_AGGREGATION.with(|flag| flag.set(enabled));
+}
+
+/// What one result field of a column-batch aggregation holds.
+enum ColumnOutput {
+    /// The group key at this position.
+    Key(usize),
+    /// An aggregate over the field in this slot.
+    Aggregate(AggregateKind, usize),
+}
+
+#[derive(Clone, Copy)]
+enum AggregateKind {
+    /// `count()`
+    Rows,
+    /// `count(.field)`
+    NonNull,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+/// The running state of one aggregate. Its results must equal what
+/// `aggregate_rows` computes for the same inputs.
+struct Accumulator {
+    kind: AggregateKind,
+    count: i64,
+    integer_sum: i64,
+    float_sum: f64,
+    has_float: bool,
+    extreme: Option<Value>,
+}
+
+impl Accumulator {
+    fn new(kind: AggregateKind) -> Self {
+        Self {
+            kind,
+            count: 0,
+            integer_sum: 0,
+            float_sum: 0.0,
+            has_float: false,
+            extreme: None,
+        }
+    }
+
+    fn push(&mut self, value: Option<ProjectedValueRef<'_>>) -> OQLResult<()> {
+        let value = match value {
+            None | Some(ProjectedValueRef::Null) | Some(ProjectedValueRef::Value(Value::Null)) => {
+                return Ok(())
+            }
+            Some(value) => value,
+        };
+        let number = match value {
+            ProjectedValueRef::Integer(integer) => Some(Ok(integer)),
+            ProjectedValueRef::Value(Value::Integer(integer)) => Some(Ok(*integer)),
+            ProjectedValueRef::Float(float) => Some(Err(float)),
+            ProjectedValueRef::Value(Value::Float(float)) => Some(Err(*float)),
+            _ => None,
+        };
+        match self.kind {
+            AggregateKind::Rows => self.count += 1,
+            AggregateKind::NonNull => self.count += 1,
+            AggregateKind::Sum => match number {
+                Some(Ok(integer)) => {
+                    if self.has_float {
+                        self.float_sum += integer as f64;
+                    } else {
+                        self.integer_sum =
+                            self.integer_sum.checked_add(integer).ok_or_else(|| {
+                                OQLError::FunctionError {
+                                    message: "Integer overflow evaluating sum()".to_string(),
+                                }
+                            })?;
+                    }
+                    self.count += 1;
+                }
+                Some(Err(float)) => {
+                    if self.has_float {
+                        self.float_sum += float;
+                    } else {
+                        self.float_sum = self.integer_sum as f64 + float;
+                        self.has_float = true;
+                    }
+                    self.count += 1;
+                }
+                None => return Err(Self::not_numeric(value)),
+            },
+            AggregateKind::Avg => match number {
+                Some(Ok(integer)) => {
+                    self.float_sum += integer as f64;
+                    self.count += 1;
+                }
+                Some(Err(float)) => {
+                    self.float_sum += float;
+                    self.count += 1;
+                }
+                None => return Err(Self::not_numeric(value)),
+            },
+            AggregateKind::Min | AggregateKind::Max => {
+                let wanted = if matches!(self.kind, AggregateKind::Min) {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                };
+                let candidate = value.to_owned();
+                match &self.extreme {
+                    None => self.extreme = Some(candidate),
+                    Some(current) => {
+                        if crate::value_semantics::compare(&candidate, current) == Some(wanted) {
+                            self.extreme = Some(candidate);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn not_numeric(value: ProjectedValueRef<'_>) -> OQLError {
+        OQLError::TypeError {
+            expected: "numeric type".to_string(),
+            actual: value.to_owned().type_name().to_string(),
+        }
+    }
+
+    fn finish(self) -> Value {
+        match self.kind {
+            AggregateKind::Rows | AggregateKind::NonNull => Value::Integer(self.count),
+            AggregateKind::Sum => {
+                if self.count == 0 {
+                    Value::Integer(0)
+                } else if self.has_float {
+                    Value::Float(self.float_sum)
+                } else {
+                    Value::Integer(self.integer_sum)
+                }
+            }
+            AggregateKind::Avg => {
+                if self.count == 0 {
+                    Value::Null
+                } else {
+                    Value::Float(self.float_sum / self.count as f64)
+                }
+            }
+            AggregateKind::Min | AggregateKind::Max => self.extreme.unwrap_or(Value::Null),
+        }
+    }
+}
+
+/// A group key component, borrowed from a column batch, in the form under
+/// which equal OQL values are identical: a whole float is an integer.
+#[derive(Hash, PartialEq)]
+enum KeyAtom<'a> {
+    Null,
+    Boolean(bool),
+    Integer(i64),
+    Float(u64),
+    Text(&'a str),
+    Instant(i64),
+    Reference(ObjRef),
+}
+
+#[derive(PartialEq)]
+enum OwnedKeyAtom {
+    Null,
+    Boolean(bool),
+    Integer(i64),
+    Float(u64),
+    Text(String),
+    Instant(i64),
+    Reference(ObjRef),
+}
+
+impl<'a> KeyAtom<'a> {
+    /// `None` for a value that is not a scalar.
+    fn of(value: Option<ProjectedValueRef<'a>>) -> Option<Self> {
+        let number = |float: f64| {
+            if float.fract() == 0.0 && float.abs() < 9_007_199_254_740_992.0 {
+                KeyAtom::Integer(float as i64)
+            } else {
+                KeyAtom::Float(float.to_bits())
+            }
+        };
+        Some(match value {
+            None | Some(ProjectedValueRef::Null) => KeyAtom::Null,
+            Some(ProjectedValueRef::Boolean(value)) => KeyAtom::Boolean(value),
+            Some(ProjectedValueRef::Integer(value)) => KeyAtom::Integer(value),
+            Some(ProjectedValueRef::Float(value)) => number(value),
+            Some(ProjectedValueRef::String(value)) => KeyAtom::Text(value),
+            Some(ProjectedValueRef::DateTime(value)) => KeyAtom::Instant(value.timestamp_micros()),
+            Some(ProjectedValueRef::Reference(value)) => KeyAtom::Reference(value),
+            Some(ProjectedValueRef::Value(value)) => match value {
+                Value::Null => KeyAtom::Null,
+                Value::Boolean(value) => KeyAtom::Boolean(*value),
+                Value::Integer(value) => KeyAtom::Integer(*value),
+                Value::Float(value) => number(*value),
+                Value::String(value) => KeyAtom::Text(value),
+                Value::DateTime(value) => KeyAtom::Instant(value.timestamp_micros()),
+                Value::Reference(value) => KeyAtom::Reference(*value),
+                _ => return None,
+            },
+        })
+    }
+
+    fn owned(&self) -> OwnedKeyAtom {
+        match self {
+            KeyAtom::Null => OwnedKeyAtom::Null,
+            KeyAtom::Boolean(value) => OwnedKeyAtom::Boolean(*value),
+            KeyAtom::Integer(value) => OwnedKeyAtom::Integer(*value),
+            KeyAtom::Float(value) => OwnedKeyAtom::Float(*value),
+            KeyAtom::Text(value) => OwnedKeyAtom::Text((*value).to_string()),
+            KeyAtom::Instant(value) => OwnedKeyAtom::Instant(*value),
+            KeyAtom::Reference(value) => OwnedKeyAtom::Reference(*value),
+        }
+    }
+
+    fn same(&self, owned: &OwnedKeyAtom) -> bool {
+        match (self, owned) {
+            (KeyAtom::Null, OwnedKeyAtom::Null) => true,
+            (KeyAtom::Boolean(a), OwnedKeyAtom::Boolean(b)) => a == b,
+            (KeyAtom::Integer(a), OwnedKeyAtom::Integer(b)) => a == b,
+            (KeyAtom::Float(a), OwnedKeyAtom::Float(b)) => a == b,
+            (KeyAtom::Text(a), OwnedKeyAtom::Text(b)) => *a == b.as_str(),
+            (KeyAtom::Instant(a), OwnedKeyAtom::Instant(b)) => a == b,
+            (KeyAtom::Reference(a), OwnedKeyAtom::Reference(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+/// One group of a column-batch aggregation.
+struct ColumnGroup {
+    /// The key as first seen, which is what the result reports.
+    key: Vec<Value>,
+    atoms: Vec<OwnedKeyAtom>,
+    rows: i64,
+    accumulators: Vec<Option<Accumulator>>,
+}
+
+impl ColumnGroup {
+    fn matches(&self, atoms: &[KeyAtom<'_>]) -> bool {
+        self.atoms.len() == atoms.len()
+            && atoms.iter().zip(&self.atoms).all(|(atom, owned)| atom.same(owned))
+    }
+}
+
 /// Work that can be shared by everything one statement evaluates.
 ///
 /// A statement reads a consistent picture of the database: its own writes
@@ -5583,7 +6916,21 @@ struct StatementScope {
     schema_names: Option<Arc<Vec<String>>>,
     /// The source rows of each group produced by `group_by`.
     group_rows: HashMap<String, Arc<Vec<Document>>>,
+    /// Documents reached through a reference.
+    referenced: HashMap<ObjRef, Option<Arc<Document>>>,
     reverse_relationships: HashMap<(String, String), ReverseRelationship>,
+    /// Per relationship and filter: how many referring documents each
+    /// document has.
+    related_counts: HashMap<String, RelatedCounts>,
+}
+
+/// The state of one relationship tally within a statement.
+enum RelatedCounts {
+    /// Rows that have asked so far, each answered through the index.
+    Asked(usize),
+    Ready(Arc<HashMap<ObjRef, i64>>),
+    /// One pass cannot answer this; keep using the index.
+    Unavailable,
 }
 
 thread_local! {

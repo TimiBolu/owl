@@ -72,6 +72,17 @@ impl PhysicalPlanner {
         Ok(self)
     }
 
+    /// Plan against storage without offering it any index: filters and
+    /// projection are still evaluated inside storage, but every row is
+    /// visited. For a filter that keeps most rows this beats fetching them
+    /// one by one through an index.
+    pub fn with_storage_scan_only(mut self, storage: &dyn DocumentStore) -> Self {
+        self.statistics
+            .get_or_insert_with(Statistics::new)
+            .supports_storage_owned_scan = storage.supports_storage_owned_scan();
+        self
+    }
+
     /// Convert a logical plan to a physical plan
     pub fn plan(&self, logical_plan: &LogicalPlan) -> OQLResult<PhysicalPlan> {
         let root = self.plan_node(&logical_plan.root)?;

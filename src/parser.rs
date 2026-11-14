@@ -1027,6 +1027,11 @@ pub enum Literal {
     Float(f64),
     Boolean(bool),
     Null,
+    /// An instant. There is no source syntax for this: timestamps are
+    /// written as text, and the engine produces this form once it knows a
+    /// value is compared with or stored in a `DateTime`, so that planning
+    /// and index keys work on the typed value.
+    Timestamp(chrono::DateTime<chrono::Utc>),
 }
 
 // Parser implementation for OQL method-chaining syntax
@@ -1223,6 +1228,7 @@ impl Parser {
                 // only used for projected null values; comparisons and writes
                 // handle null explicitly below.
                 Literal::Null => FieldType::Optional(Box::new(FieldType::Object)),
+                Literal::Timestamp(_) => FieldType::DateTime,
             }),
 
             Expression::FieldAccess(field_access) => {

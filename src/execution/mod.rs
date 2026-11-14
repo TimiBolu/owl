@@ -158,6 +158,7 @@ fn lower_scan_condition(
             Literal::Float(value) => Value::Float(*value),
             Literal::Boolean(value) => Value::Boolean(*value),
             Literal::Null => Value::Null,
+            Literal::Timestamp(instant) => Value::DateTime(*instant),
         }
     }
 

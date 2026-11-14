@@ -8857,6 +8857,77 @@ impl DocumentStore for RustStore {
         Ok(references)
     }
 
+    fn object_ref_of(&self, schema: &str, id: &DocumentId) -> OQLResult<Option<ObjRef>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+        lookup_object_ref(&state, schema, id)
+    }
+
+    fn scan_referencing_documents_shared(
+        &self,
+        target_schema: &str,
+        target_id: &DocumentId,
+        source_schema: Option<&str>,
+        field_path: Option<&str>,
+    ) -> OQLResult<Vec<Arc<Document>>> {
+        // Uncommitted writes are overlaid one document at a time by the
+        // general route.
+        if !self.pending_operations()?.is_empty() {
+            return Ok(self
+                .scan_referencing_documents(target_schema, target_id, source_schema, field_path)?
+                .into_iter()
+                .map(Arc::new)
+                .collect());
+        }
+        // One pass under one lock: the postings, each source's identity, and
+        // the document the store already holds for it.
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+        let Some(target) = lookup_object_ref(&state, target_schema, target_id)? else {
+            return Ok(Vec::new());
+        };
+        let prefix = target.packed().to_be_bytes().to_vec();
+        let end = target
+            .packed()
+            .checked_add(1)
+            .map(|next| Bound::Excluded(next.to_be_bytes().to_vec()))
+            .unwrap_or(Bound::Unbounded);
+        let (rows, _) = state
+            .reverse_reference_index
+            .range_entry_page(Bound::Included(prefix), end, None, None, false)
+            .map_err(|error| OQLError::storage_error(&error, None))?;
+        let mut seen = HashSet::new();
+        let mut documents = Vec::with_capacity(rows.len());
+        for (key, source) in rows {
+            if let Some(expected) = field_path {
+                if key.get(8..).unwrap_or_default() != expected.as_bytes() {
+                    continue;
+                }
+            }
+            let Some((schema, id)) = logical_object_identity(&state, source)? else {
+                continue;
+            };
+            if source_schema.is_some_and(|expected| expected != schema) {
+                continue;
+            }
+            // The current version of that document, as a lookup by id finds.
+            let Some(current) = lookup_object_ref(&state, &schema, &id)? else {
+                continue;
+            };
+            if !seen.insert(current) {
+                continue;
+            }
+            if let Some(document) = materialize_document(&mut state, current)? {
+                documents.push(document);
+            }
+        }
+        Ok(documents)
+    }
+
     fn navigate_reference(&self, object_ref: &ObjRef) -> OQLResult<Option<Document>> {
         if object_ref.is_null() {
             return Ok(None);

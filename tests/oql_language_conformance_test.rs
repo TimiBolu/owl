@@ -2654,3 +2654,599 @@ fn reading_only_some_fields_never_changes_an_answer() {
     assert_eq!(db.rows("users.distinct()").len(), 4);
     assert_eq!(db.scalar("users.select { tags }.distinct().count()", "count"), Value::Integer(3));
 }
+
+// ---------------------------------------------------------------------------
+// Faster paths must give the answers the plain ones give
+// ---------------------------------------------------------------------------
+
+/// A collection with an index whose order a sort can use, many ties on the
+/// indexed key, and a timestamp index.
+fn ledger() -> Db {
+    let db = Db::new();
+    db.script(
+        r#"
+        schema entries {
+          id: String,
+          kind: String,
+          day: Integer,
+          at: DateTime,
+          amount: Integer,
+          note: Optional(String),
+          index(.kind, .day),
+          index(.at)
+        }
+        "#,
+    );
+    let mut rows = String::from("entries.insert [\n");
+    for index in 0..120 {
+        // Only six distinct days, so every page boundary falls inside a tie.
+        rows.push_str(&format!(
+            "  {{ id: \"e{index:03}\", kind: \"{}\", day: {}, at: \"2026-01-{:02}T{:02}:00:00Z\", amount: {} }},\n",
+            if index % 4 == 0 { "debit" } else { "credit" },
+            index % 6,
+            1 + index % 28,
+            index % 24,
+            (index * 37) % 101
+        ));
+    }
+    rows.truncate(rows.len() - 2);
+    rows.push_str("\n]");
+    db.script(&rows);
+    db
+}
+
+#[test]
+fn a_tie_broken_top_k_matches_a_full_sort() {
+    let db = ledger();
+    // The same question asked so that no index order applies: sorting by a
+    // computed key forces every matching row to be sorted.
+    let reference = |filter: &str, limit: usize, descending: bool| {
+        let mut rows: Vec<(i64, String)> = db
+            .rows(&format!("entries.where {{ {filter} }}.select {{ id, day }}"))
+            .iter()
+            .map(|row| match (row.get_field("day"), row.get_field("id")) {
+                (Some(Value::Integer(day)), Some(Value::String(id))) => (*day, id.clone()),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            let by_day = if descending { b.0.cmp(&a.0) } else { a.0.cmp(&b.0) };
+            by_day.then(a.1.cmp(&b.1))
+        });
+        rows.into_iter().take(limit).map(|row| row.1).collect::<Vec<_>>()
+    };
+
+    for filter in [r#".kind == "credit""#, r#".kind == "debit""#, r#".kind == "credit" && .day >= 2"#] {
+        for limit in [1, 7, 20, 45, 500] {
+            for (direction, descending) in [("desc", true), ("asc", false)] {
+                let query = format!(
+                    "entries.where {{ {filter} }}.sort {{ .day.{direction}, .id.asc }}.limit({limit}).select {{ id }}"
+                );
+                assert_eq!(db.ids(&query), reference(filter, limit, descending), "{query}");
+            }
+        }
+    }
+    // Operations after the limit still apply, and explain still works.
+    assert_eq!(
+        db.ids(r#"entries.where { .kind == "debit" }.sort { .day.desc, .id.asc }.limit(10).offset(8).select { id }"#).len(),
+        2
+    );
+    assert_eq!(
+        db.rows(r#"entries.where { .kind == "debit" }.sort { .day.desc, .id.asc }.limit(10).select { id }.explain()"#).len(),
+        1
+    );
+}
+
+#[test]
+fn timestamp_filters_agree_whether_or_not_an_index_serves_them() {
+    let db = ledger();
+    let planned = db
+        .executor
+        .execute_query_with_plan(
+            &parse_oql(r#"entries.where { .at >= "2026-01-10" && .at < "2026-01-12" }.select { id }"#).unwrap(),
+        )
+        .unwrap();
+    assert!(planned.physical_plan.is_some(), "a timestamp range should be plannable");
+
+    for filter in [
+        r#".at >= "2026-01-10" && .at < "2026-01-12""#,
+        r#".at >= "2026-01-10T05:00:00Z" && .at <= "2026-01-10T07:00:00Z""#,
+        r#".at == "2026-01-03T02:00:00Z""#,
+        r#".at > "2026-01-27T12:00:00+01:00""#,
+        r#".at < "2026-01-01""#,
+        r#".kind == "debit" && .at >= "2026-01-15""#,
+    ] {
+        // Planned: a plain filtered read. General: the same filter, then an
+        // aggregate, which the pipeline does not run. Reference: a predicate
+        // the planner cannot push down at all.
+        let mut planned = db.ids(&format!("entries.where {{ {filter} }}.select {{ id }}"));
+        planned.sort();
+        let counted = db.scalar(&format!("entries.where {{ {filter} }}.count()"), "count");
+        let reference = db.scalar(
+            &format!("entries.where {{ ({filter}) && length(.id) == 4 }}.count()"),
+            "count",
+        );
+        assert_eq!(counted, Value::Integer(planned.len() as i64), "{filter}");
+        assert_eq!(counted, reference, "{filter}");
+    }
+    assert!(!db.ids(r#"entries.where { .at >= "2026-01-10" && .at < "2026-01-12" }"#).is_empty());
+    // Text that is not a timestamp matches nothing, on either path.
+    assert!(db.ids(r#"entries.where { .at >= "soon" }.select { id }"#).is_empty());
+    assert_eq!(db.scalar(r#"entries.where { .at >= "soon" }.count()"#, "count"), Value::Integer(0));
+}
+
+#[test]
+fn leading_filters_run_in_storage_without_changing_the_rest_of_the_query() {
+    let db = ledger();
+    // Each pair is the same question with and without a pushable leading
+    // filter shape.
+    for (pushed, plain) in [
+        (
+            r#"entries.where { .kind == "debit" && .day > 2 }.group_by { .day }.select { day, n: count(), total: sum(.amount) }.sort { .day.asc }"#,
+            r#"entries.where { .kind.lower() == "debit" && .day > 2 }.group_by { .day }.select { day, n: count(), total: sum(.amount) }.sort { .day.asc }"#,
+        ),
+        (
+            r#"entries.where { .day >= 4 }.where { .amount % 2 == 0 }.select { id, half: .amount / 2 }.sort { .id.asc }"#,
+            r#"entries.where { .day + 0 >= 4 }.where { .amount % 2 == 0 }.select { id, half: .amount / 2 }.sort { .id.asc }"#,
+        ),
+        (
+            r#"entries.where { .day < 2 }.select { id, note: .note || "none", size: length(.id) }.sort { .id.asc }"#,
+            r#"entries.where { .day * 1 < 2 }.select { id, note: .note || "none", size: length(.id) }.sort { .id.asc }"#,
+        ),
+        (
+            r#"entries.where { .amount >= 50 }.max(.amount)"#,
+            r#"entries.where { .amount + 0 >= 50 }.max(.amount)"#,
+        ),
+    ] {
+        let render = |query: &str| {
+            db.rows(query)
+                .iter()
+                .map(|row| {
+                    let mut fields: Vec<String> = row
+                        .fields
+                        .iter()
+                        .filter(|(name, _)| !name.starts_with('_'))
+                        .map(|(name, value)| format!("{name}={value:?}"))
+                        .collect();
+                    fields.sort();
+                    fields.join(",")
+                })
+                .collect::<Vec<_>>()
+        };
+        let pushed_rows = render(pushed);
+        assert!(!pushed_rows.is_empty(), "{pushed}");
+        assert_eq!(pushed_rows, render(plain), "{pushed}");
+    }
+    // Unshaped results still carry every field.
+    let row = &db.rows(r#"entries.where { .kind == "debit" && .day >= 4 }.sort { .id.asc }.first()"#)[0];
+    assert!(row.get_field("amount").is_some() && row.get_field("at").is_some());
+    // A write after a pushed filter sees and changes whole rows.
+    db.rows(r#"entries.where { .day >= 5 }.update { note: "late" }"#);
+    assert_eq!(db.scalar(r#"entries.where { .note == "late" }.count()"#, "count"), Value::Integer(20));
+    assert_eq!(db.scalar(r#"entries.where { .day >= 5 }.sum(.amount)"#, "sum"), db.scalar(r#"entries.where { .note == "late" }.sum(.amount)"#, "sum"));
+}
+
+#[test]
+fn aggregating_from_storage_columns_matches_aggregating_rows() {
+    let db = ledger();
+    // Rows the aggregates must treat with care: an absent optional field, a
+    // text field, and a collection with nothing in it.
+    db.script(
+        r#"
+        schema readings { id: String, site: String, level: Float, label: Optional(String) }
+        schema nothing { id: String, kind: String, amount: Integer }
+        readings.insert [
+          { id: "r1", site: "north", level: 2.0, label: "a" },
+          { id: "r2", site: "north", level: 2.5 },
+          { id: "r3", site: "south", level: 7.0, label: "b" },
+          { id: "r4", site: "south", level: 7.0 }
+        ]
+        "#,
+    );
+    let queries = [
+        "entries.count()",
+        "entries.where { kind == \"debit\" }.count()",
+        "entries.where { kind == \"debit\" && day >= 2 }.sum(.amount)",
+        "entries.where { at >= \"2026-01-10T00:00:00Z\" }.avg(.amount)",
+        "entries.min(.amount)",
+        "entries.max(.at)",
+        "entries.where { day > 99 }.sum(.amount)",
+        "entries.where { day > 99 }.avg(.amount)",
+        "entries.where { day > 99 }.count()",
+        "entries.select { n: count(), total: sum(.amount), low: min(.amount), high: max(.amount), mean: avg(.amount) }",
+        "entries.where { day > 99 }.select { n: count(), total: sum(.amount), mean: avg(.amount) }",
+        "entries.select { count(), sum(.amount) }",
+        "entries.group_by { .kind }.select { kind, n: count(), total: sum(.amount) }",
+        "entries.group_by { .kind, .day }.select { kind, day, n: count(), mean: avg(.amount), first: min(.at) }",
+        "entries.group_by { .day }.select { d: day, noted: count(.note), high: max(.amount) }",
+        "entries.where { kind == \"credit\" }.group_by { .day }.select { day, n: count() }.sort(.n desc, .day).limit(3)",
+        "entries.group_by { .kind }.select { kind, n: count() }.where { n > 40 }",
+        "entries.where { day > 99 }.group_by { .kind }.select { kind, n: count() }",
+        "entries.group_by { .at }.select { at, n: count() }",
+        "readings.group_by { .level }.select { level, n: count(), labelled: count(.label) }",
+        "readings.group_by { .label }.select { label, total: sum(.level) }",
+        "readings.group_by { .site }.select { site, low: min(.label), mean: avg(.level) }",
+        "readings.sum(.level)",
+        "readings.min(.label)",
+        "readings.select { labelled: count(.label), n: count() }",
+        "nothing.count()",
+        "nothing.sum(.amount)",
+        "nothing.max(.amount)",
+        "nothing.group_by { .kind }.select { kind, n: count() }",
+        "nothing.select { n: count(), total: sum(.amount) }",
+        // A sum over text is an error either way.
+        "readings.sum(.site)",
+        "readings.group_by { .site }.select { site, bad: avg(.label) }",
+    ];
+    let shape = |rows: Result<Vec<Document>, String>| {
+        rows.map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    let mut fields: Vec<(String, Value)> = row
+                        .fields
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone()))
+                        .collect();
+                    fields.sort_by(|left, right| left.0.cmp(&right.0));
+                    (row.id.to_string(), row.schema.clone(), fields)
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    for query in queries {
+        owl_db::executor::set_column_aggregation(false);
+        let reference = shape(db.try_rows(query));
+        owl_db::executor::set_column_aggregation(true);
+        let fast = shape(db.try_rows(query));
+        assert_eq!(fast, reference, "{query}");
+    }
+    // The comparison is only worth something if the answers are real.
+    assert_eq!(db.scalar("entries.count()", "count"), Value::Integer(120));
+    assert_eq!(
+        db.rows("entries.group_by { .kind }.select { kind, n: count() }").len(),
+        2
+    );
+}
+
+#[test]
+fn related_rows_are_the_same_however_few_fields_are_read() {
+    let db = graph();
+    let value = |query: &str| {
+        let mut rows: Vec<String> = db
+            .rows(query)
+            .iter()
+            // JSON objects print with sorted keys, so equal rows print alike.
+            .map(|row| serde_json::to_value(&row.fields).unwrap().to_string())
+            .collect();
+        rows.sort();
+        rows
+    };
+    // Each pair asks one question twice: once so that only named fields of
+    // the related rows are read, once so that whole rows are.
+    let pairs = [
+        (
+            "users.select { id, n: .orders.count() }",
+            "users.select { id, n: .orders.select { * }.count() }",
+        ),
+        (
+            "users.select { id, paid: .orders.where { .status == \"paid\" }.sum(.amount) }",
+            "users.select { id, paid: .orders.select { * }.where { .status == \"paid\" }.sum(.amount) }",
+        ),
+        (
+            "users.where { .orders.where { .status == \"paid\" }.exists() }.select { id }",
+            "users.where { .orders.select { * }.where { .status == \"paid\" }.exists() }.select { id }",
+        ),
+        (
+            "teams.select { id, spent: .users.orders.sum(.amount), names: .users.select { name } }",
+            "teams.select { id, spent: .users.orders.select { * }.sum(.amount), names: .users.select { name } }",
+        ),
+        // The related row's own references and relationships still resolve.
+        (
+            "teams.select { id, cities: .users.select { c: .profile.city, t: .team.name, n: .orders.count() } }",
+            "teams.select { id, cities: .users.select { c: .profile.city, t: .team.name, n: .orders.select { * }.count() } }",
+        ),
+    ];
+    for (trimmed, whole) in pairs {
+        assert_eq!(value(trimmed), value(whole), "{trimmed}");
+    }
+    assert_eq!(
+        value("users.where { .id == \"u1\" }.select { n: .orders.count(), paid: .orders.where { .status == \"paid\" }.sum(.amount) }"),
+        value("users.where { .id == \"u1\" }.select { n: 2, paid: 120.0 }")
+    );
+    // Unshaped related rows are whole rows.
+    let rows = db.rows("users.where { .id == \"u3\" }.select { o: .orders.first() }");
+    let Some(Value::Object(order)) = rows[0].get_field("o") else {
+        panic!("{rows:?}");
+    };
+    assert_eq!(order.get("status"), Some(&text("paid")));
+    assert_eq!(order.get("amount"), Some(&Value::Float(300.0)));
+}
+
+#[test]
+fn a_filter_means_the_same_whichever_part_storage_evaluates() {
+    let db = graph();
+    let ids = |query: &str| {
+        let mut ids = db.ids(query);
+        ids.sort();
+        ids
+    };
+    // A reference test and a plain test, in either order, with the plain
+    // part on its own as the reference answer filtered by hand.
+    assert_eq!(
+        ids(r#"orders.where { .user.team.name == "Core" && .amount > 100 }"#),
+        ["r1", "r3"]
+    );
+    assert_eq!(
+        ids(r#"orders.where { .amount > 100 && .user.team.name == "Core" }"#),
+        ["r1", "r3"]
+    );
+    assert_eq!(
+        ids(r#"orders.where { .status == "paid" && .user.name == "Ada" && .amount >= 120 }"#),
+        ["r1"]
+    );
+    assert_eq!(
+        ids(r#"orders.where { (.user.name == "Ada" || .amount > 200) && .status == "paid" }"#),
+        ["r1", "r3"]
+    );
+    assert_eq!(
+        ids(r#"orders.where { .user.name == "Nobody" && .status == "paid" }"#),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        db.scalar(
+            r#"orders.where { .status == "paid" && .user.team.name == "Core" }.sum(.amount)"#,
+            "sum"
+        ),
+        Value::Float(420.0)
+    );
+}
+
+#[test]
+fn a_filter_through_a_reference_gives_the_rows_a_scan_gives_in_the_same_order() {
+    let db = Db::new();
+    db.script(
+        r#"
+        schema owners { id: String, kind: String, rank: Integer }
+        schema things {
+          id: String,
+          owner: Ref(owners),
+          backup: Optional(Ref(owners)),
+          size: Integer,
+          note: String
+        }
+        "#,
+    );
+    let mut owners = String::from("owners.insert [\n");
+    for index in 0..40 {
+        owners.push_str(&format!(
+            "  {{ id: \"w{index:02}\", kind: \"{}\", rank: {} }},\n",
+            match index % 8 {
+                0 => "rare",
+                1..=2 => "some",
+                _ => "common",
+            },
+            index % 5
+        ));
+    }
+    owners.truncate(owners.len() - 2);
+    owners.push_str("\n]");
+    db.script(&owners);
+    // Inserted out of id order, so insertion order and id order differ.
+    let mut things = String::from("things.insert [\n");
+    for step in 0..200 {
+        let index = (step * 73) % 200;
+        let backup = if index % 3 == 0 {
+            format!(", backup: \"w{:02}\"", (index * 11) % 40)
+        } else {
+            String::new()
+        };
+        things.push_str(&format!(
+            "  {{ id: \"t{index:03}\", owner: \"w{:02}\", size: {}, note: \"n{}\"{backup} }},\n",
+            (index * 7) % 40,
+            index % 17,
+            index % 4
+        ));
+    }
+    things.truncate(things.len() - 2);
+    things.push_str("\n]");
+    db.script(&things);
+
+    // `in` with one value asks the same question in a form that is always
+    // answered by scanning.
+    let agree = |through: &str, scanned: &str| {
+        let rows = |query: &str| {
+            db.rows(query)
+                .iter()
+                .map(|row| serde_json::to_value(&row.fields).unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+        let left = rows(through);
+        assert_eq!(left, rows(scanned), "{through}");
+        left.len()
+    };
+    let cases = [
+        // Few owners pass, then many, then none.
+        (r#".owner.kind == "rare""#, r#".owner.kind in ["rare"]"#),
+        (r#".owner.kind == "common""#, r#".owner.kind in ["common"]"#),
+        (r#".owner.kind == "absent""#, r#".owner.kind in ["absent"]"#),
+        (r#".owner.rank == 3"#, r#".owner.rank in [3]"#),
+        (r#".backup.kind == "rare""#, r#".backup.kind in ["rare"]"#),
+        (
+            r#".owner.kind == "rare" && .size > 5"#,
+            r#".owner.kind in ["rare"] && .size > 5"#,
+        ),
+        (
+            r#".size > 5 && .note == "n1" && .owner.kind == "rare""#,
+            r#".size > 5 && .note == "n1" && .owner.kind in ["rare"]"#,
+        ),
+        (
+            r#".owner.kind == "rare" && .backup.kind == "some""#,
+            r#".owner.kind in ["rare"] && .backup.kind in ["some"]"#,
+        ),
+    ];
+    let tails = [
+        "",
+        ".select { id, size }",
+        ".limit(7)",
+        ".offset(3).limit(4).select { id, k: .owner.kind }",
+        ".sort { .size.desc }.limit(9).select { id, size }",
+        ".count()",
+        ".sum(.size)",
+        ".group_by { .note }.select { note, n: count() }",
+        ".first()",
+    ];
+    let mut some_rows = 0;
+    for (through, scanned) in cases {
+        for tail in tails {
+            some_rows += agree(
+                &format!("things.where {{ {through} }}{tail}"),
+                &format!("things.where {{ {scanned} }}{tail}"),
+            );
+        }
+    }
+    assert!(some_rows > 100, "the cases should return rows: {some_rows}");
+    assert_eq!(
+        db.ids(r#"things.where { .owner.kind == "rare" }.limit(3)"#),
+        ["t000", "t008", "t016"]
+    );
+
+    // Still true after rows move between owners, gain and lose references,
+    // and disappear.
+    db.script(
+        r#"
+        things.where { .id == "t000" }.update { owner: "w03" }
+        things.where { .id == "t001" }.update { owner: "w00" }
+        things.where { .id == "t003" }.update { backup: "w08" }
+        things.where { .id == "t040" }.delete
+        owners.where { .id == "w16" }.update { kind: "common" }
+        "#,
+    );
+    for (through, scanned) in cases {
+        agree(
+            &format!("things.where {{ {through} }}.select {{ id, size }}"),
+            &format!("things.where {{ {scanned} }}.select {{ id, size }}"),
+        );
+    }
+    assert_eq!(
+        db.ids(r#"things.where { .owner.kind == "rare" }.limit(3)"#),
+        ["t001", "t016", "t024"]
+    );
+}
+
+#[test]
+fn counting_related_rows_for_every_row_matches_counting_them_one_row_at_a_time() {
+    let db = Db::new();
+    db.script(
+        r#"
+        schema people { id: String, name: String }
+        schema tasks {
+          id: String,
+          owner: Ref(people) as owned,
+          reviewer: Optional(Ref(people)) as reviewing,
+          state: String,
+          effort: Integer
+        }
+        schema notes { id: String, author: Optional(Ref(people)), kind: String }
+        schema badges { id: String, holders: List(Ref(people)) }
+        "#,
+    );
+    let mut people = String::from("people.insert [\n");
+    for index in 0..150 {
+        people.push_str(&format!("  {{ id: \"p{index:03}\", name: \"P{index}\" }},\n"));
+    }
+    people.truncate(people.len() - 2);
+    people.push_str("\n]");
+    db.script(&people);
+    let mut tasks = String::from("tasks.insert [\n");
+    for index in 0..500 {
+        let reviewer = if index % 4 == 0 {
+            format!(", reviewer: \"p{:03}\"", (index * 13) % 150)
+        } else {
+            String::new()
+        };
+        tasks.push_str(&format!(
+            "  {{ id: \"k{index:03}\", owner: \"p{:03}\", state: \"{}\", effort: {}{reviewer} }},\n",
+            // Some people own nothing.
+            (index * 7) % 120,
+            ["open", "done", "done", "blocked"][index % 4],
+            index % 9
+        ));
+    }
+    tasks.truncate(tasks.len() - 2);
+    tasks.push_str("\n]");
+    db.script(&tasks);
+    let mut notes = String::from("notes.insert [\n");
+    for index in 0..300 {
+        let author = if index % 5 == 0 {
+            String::new()
+        } else {
+            format!(", author: \"p{:03}\"", (index * 11) % 150)
+        };
+        notes.push_str(&format!(
+            "  {{ id: \"n{index:03}\", kind: \"{}\"{author} }},\n",
+            ["memo", "todo"][index % 2]
+        ));
+    }
+    notes.truncate(notes.len() - 2);
+    notes.push_str("\n]");
+    db.script(&notes);
+    db.script(
+        r#"badges.insert [ { id: "b1", holders: ["p000", "p001", "p001"] }, { id: "b2", holders: ["p001"] } ]"#,
+    );
+
+    let queries = [
+        "people.select { id, n: .owned.count() }",
+        "people.select { id, n: .owned.where { .state == \"done\" }.count(), any: .owned.where { .state == \"blocked\" && .effort > 3 }.exists() }",
+        "people.select { id, r: .reviewing.count(), has: .reviewing.exists() }",
+        "people.select { id, n: .notes.count(), todo: .notes.where { .kind == \"todo\" }.exists() }",
+        "people.where { .owned.where { .state == \"open\" }.exists() && !.notes.exists() }.select { id }",
+        "people.where { .owned.count() > 4 }.count()",
+        "people.sort { .id.desc }.select { id, n: .owned.where { .effort >= 8 }.count() }.where { n > 0 }",
+        // Through a list of references, where one column cannot answer.
+        "people.select { id, b: .badges.count() }",
+        // Mixed with forms that need the rows themselves.
+        "people.select { id, n: .owned.count(), most: .owned.max(.effort), first: .owned.sort { .id.asc }.first().id }",
+    ];
+    let check = || {
+        for query in queries {
+            let rows = |fast: bool| {
+                owl_db::executor::set_column_aggregation(fast);
+                let rows: Vec<String> = db
+                    .rows(query)
+                    .iter()
+                    .map(|row| serde_json::to_value(&row.fields).unwrap().to_string())
+                    .collect();
+                owl_db::executor::set_column_aggregation(true);
+                rows
+            };
+            let reference = rows(false);
+            assert!(reference.len() > 0 || query.contains("count() > 4"), "{query}");
+            assert_eq!(rows(true), reference, "{query}");
+        }
+    };
+    check();
+    assert_eq!(
+        db.scalar("people.where { .id == \"p007\" }.select { n: .owned.count() }", "n"),
+        Value::Integer(5)
+    );
+    assert_eq!(
+        db.scalar("people.where { !.owned.exists() }.count()", "count"),
+        Value::Integer(30)
+    );
+
+    // Still true after rows change hands, lose references and disappear.
+    db.script(
+        r#"
+        tasks.where { .id == "k000" }.update { owner: "p149" }
+        tasks.where { .id == "k004" }.update { reviewer: "p149" }
+        tasks.where { .state == "blocked" && .effort > 6 }.delete
+        notes.where { .kind == "todo" && .id < "n050" }.delete
+        tasks.where { .id == "k001" }.update { state: "blocked", effort: 5 }
+        "#,
+    );
+    check();
+    assert_eq!(
+        db.scalar("people.where { !.owned.exists() }.count()", "count"),
+        Value::Integer(29)
+    );
+}
