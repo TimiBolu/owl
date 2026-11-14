@@ -320,8 +320,11 @@ fn string_substring(args: &[Value]) -> OQLResult<Value> {
         }
     };
 
+    // Positions count characters, not bytes, and are clamped to the string:
+    // a start before the beginning is the beginning, and a length that runs
+    // past the end (or is negative) takes what is there.
     let start = match &args[1] {
-        Value::Integer(i) => *i as usize,
+        Value::Integer(i) => usize::try_from(*i).unwrap_or(0),
         _ => {
             return Err(OQLError::TypeError {
                 expected: "integer".to_string(),
@@ -330,26 +333,18 @@ fn string_substring(args: &[Value]) -> OQLResult<Value> {
         }
     };
 
-    if start >= string.len() {
-        return Ok(Value::String(String::new()));
-    }
-
-    let result = if args.len() == 3 {
-        let length = match &args[2] {
-            Value::Integer(i) => *i as usize,
-            _ => {
-                return Err(OQLError::TypeError {
-                    expected: "integer".to_string(),
-                    actual: args[2].type_name().to_string(),
-                })
-            }
-        };
-
-        let end = std::cmp::min(start + length, string.len());
-        string[start..end].to_string()
-    } else {
-        string[start..].to_string()
+    let length = match args.get(2) {
+        None => usize::MAX,
+        Some(Value::Integer(i)) => usize::try_from(*i).unwrap_or(0),
+        Some(other) => {
+            return Err(OQLError::TypeError {
+                expected: "integer".to_string(),
+                actual: other.type_name().to_string(),
+            })
+        }
     };
+
+    let result: String = string.chars().skip(start).take(length).collect();
 
     Ok(Value::String(result))
 }
@@ -559,6 +554,22 @@ fn string_contains(args: &[Value]) -> OQLResult<Value> {
     Ok(Value::Boolean(string.contains(substring)))
 }
 
+/// Longest string a padding function will produce. A query must not be able
+/// to request an arbitrarily large allocation with one integer.
+const MAX_PADDED_LENGTH: usize = 1 << 20;
+
+fn padded_length(requested: i64) -> OQLResult<usize> {
+    let length = usize::try_from(requested).unwrap_or(0);
+    if length > MAX_PADDED_LENGTH {
+        return Err(OQLError::FunctionError {
+            message: format!(
+                "padding to {requested} characters exceeds the limit of {MAX_PADDED_LENGTH}"
+            ),
+        });
+    }
+    Ok(length)
+}
+
 /// Pad string on the left
 fn string_pad_left(args: &[Value]) -> OQLResult<Value> {
     if args.len() < 2 || args.len() > 3 {
@@ -579,7 +590,7 @@ fn string_pad_left(args: &[Value]) -> OQLResult<Value> {
     };
 
     let length = match &args[1] {
-        Value::Integer(i) => *i as usize,
+        Value::Integer(i) => padded_length(*i)?,
         _ => {
             return Err(OQLError::TypeError {
                 expected: "integer".to_string(),
@@ -602,10 +613,11 @@ fn string_pad_left(args: &[Value]) -> OQLResult<Value> {
         ' '
     };
 
-    if string.len() >= length {
+    let current = string.chars().count();
+    if current >= length {
         Ok(Value::String(string.clone()))
     } else {
-        let padding = pad_char.to_string().repeat(length - string.len());
+        let padding = pad_char.to_string().repeat(length - current);
         Ok(Value::String(format!("{}{}", padding, string)))
     }
 }
@@ -630,7 +642,7 @@ fn string_pad_right(args: &[Value]) -> OQLResult<Value> {
     };
 
     let length = match &args[1] {
-        Value::Integer(i) => *i as usize,
+        Value::Integer(i) => padded_length(*i)?,
         _ => {
             return Err(OQLError::TypeError {
                 expected: "integer".to_string(),
@@ -653,10 +665,11 @@ fn string_pad_right(args: &[Value]) -> OQLResult<Value> {
         ' '
     };
 
-    if string.len() >= length {
+    let current = string.chars().count();
+    if current >= length {
         Ok(Value::String(string.clone()))
     } else {
-        let padding = pad_char.to_string().repeat(length - string.len());
+        let padding = pad_char.to_string().repeat(length - current);
         Ok(Value::String(format!("{}{}", string, padding)))
     }
 }

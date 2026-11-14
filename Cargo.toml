@@ -110,6 +110,10 @@ path = "tests/oql_examples_parse_test.rs"
 name = "oql_dual_representation_test"
 path = "tests/oql_dual_representation_test.rs"
 
+[[test]]
+name = "oql_language_conformance_test"
+path = "tests/oql_language_conformance_test.rs"
+
 [[bench]]
 name = "index_scan_bench"
 path = "benches/index_scan_bench.rs"

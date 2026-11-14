@@ -96,6 +96,25 @@ User-defined functions, correlated subqueries via collection-name scope anchors,
 match expressions, conditional expressions, and vector `nearest` search are all
 part of the current language surface.
 
+Runtime values enter a query through `$name` parameters, never by building
+query text:
+
+```rust
+use owl_db::{bind_parameters, parse_oql, Value};
+use std::collections::HashMap;
+
+let query = parse_oql(r#"events.where { .level == $level && .attempts > $min }"#)?;
+let query = bind_parameters(&query, &HashMap::from([
+    ("level".to_string(), Value::String("error".into())),
+    ("min".to_string(), Value::Integer(3)),
+]))?;
+```
+
+A query means the same thing however the engine runs it. Comparison, null
+and ordering rules are defined once (`src/value_semantics.rs`) and shared by
+the general executor and the physical read pipeline;
+`tests/oql_language_conformance_test.rs` checks that both agree.
+
 ### Using OQL from Rust
 
 ```rust
@@ -203,9 +222,11 @@ Owl requires only a Rust toolchain.
 ```bash
 cargo check --all-targets
 cargo test --lib storage_engine
+cargo test --test oql_language_conformance_test --test oql_dual_representation_test
 ```
 
-The focused storage invariant tests are the release gate. The wider historical
+The focused storage invariant tests and the OQL conformance suites are the
+release gate. The wider historical
 test suite contains known failures in experimental features (distributed,
 simulation, columnar) that are outside the trusted single-node path.
 

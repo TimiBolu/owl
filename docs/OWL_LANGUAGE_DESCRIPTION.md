@@ -112,6 +112,12 @@ activeUsers.select { id, name }
 
 A script is evaluated top to bottom.
 
+Layout is free. A statement ends at a line break outside all brackets, unless
+it visibly continues: the line ends with an operator or `=`, or the next line
+begins with something other than a name (most often `.where`, `.select`, and
+so on). Blank lines and comments may appear anywhere, including inside a
+block, and braces inside strings or comments have no effect.
+
 Later statements may refer to earlier declarations.
 
 ## Names and Scope
@@ -166,6 +172,21 @@ Scalar values include:
 - `Float`
 - `String`
 - `DateTime`
+
+Literal forms:
+
+```oql
+42        -7        3.14      -0.5
+true      false     null
+"plain"   "a \"quoted\" word"   "line one\nline two"
+```
+
+A leading `-` makes a negative number wherever a value may appear, and negates
+any other expression (`-.balance`).
+
+Inside a string, a backslash escapes the next character: `\"`, `\\`, `\n`,
+`\r`, `\t`, `\0`, and `\u{1F989}` for a Unicode scalar. An unknown escape is
+an error, not a guess.
 
 ### Objects
 
@@ -530,12 +551,46 @@ collection.
 .deleted_at == null
 ```
 
+A comparison never fails; a predicate that cannot be decided for a row simply
+does not match it. The rules are the same everywhere a comparison appears and
+for every way the engine may execute the query:
+
+- Integers and floats compare by numeric value: `10 == 10.0`.
+- `null == null` is true, and `x != null` is true for any present `x`. Every
+  ordered comparison (`<`, `<=`, `>`, `>=`) with `null` on either side is
+  false, so `.age > 25` needs no `.age != null` guard.
+- A `DateTime` compares with a string holding an RFC 3339 timestamp by
+  instant, not by text.
+- Values of otherwise different types are unequal and unordered.
+
+A comparison is an ordinary boolean expression. It can be projected or passed
+to a function, not only used in `where`:
+
+```oql
+people.select { id, adult: .age >= 18 }
+```
+
+Parentheses group either a condition or an operand:
+
+```oql
+(.status == "paid" || .status == "open") && .amount > 100
+(.width + .height) > 5
+```
+
 ### Boolean logic
 
 ```oql
 .status == "paid" && .amount > 100
 .country == "NG" || .country == "GH"
 !(.active == true)
+```
+
+`&&` and `||` evaluate left to right and stop as soon as the result is known.
+In a value position, `a || b` yields the first operand that is present and
+truthy, which makes it a fallback:
+
+```oql
+users.select { id, shown: .nickname || .name }
 ```
 
 ### Membership
@@ -921,9 +976,46 @@ most application-level work.
 Explicit transaction control may still exist operationally, but the block form should be
 considered the primary language form.
 
+## Query Parameters
+
+A query may refer to values supplied by its caller with `$name`:
+
+```oql
+events
+  .where { .level == $level && .occurred_at >= $from }
+  .limit(100)
+```
+
+The query text is fixed and the values arrive separately as data, so a value
+can never alter the structure of the query. A host binds every parameter
+before execution (`bind_parameters` in the Rust API); executing a query with an
+unbound parameter is an error. Inside a script, a value binding satisfies the
+parameter of the same name:
+
+```oql
+from = "2026-01-01T00:00:00Z"
+events.where { .occurred_at >= $from }
+```
+
 ## Functions, Conditionals, And Expressions
 
 Owl expressions should remain small and readable.
+
+A function's parameters are names in scope throughout its body, including in
+nested calls, conditions, and nested queries. A parameter typed with a schema
+name receives a whole row: pass the current row with `*`, and read it with
+ordinary paths, which traverse references as they do anywhere else.
+
+```oql
+fn is_core_staff(m: members, tag: String) -> Bool {
+  m.status == "active" && m.tags contains tag && m.team.name == "Core"
+}
+
+members.where { is_core_staff(*, "staff") }
+```
+
+Integer arithmetic is checked: a result outside the 64-bit range is an error,
+never a wrapped value.
 
 ### Function call
 
