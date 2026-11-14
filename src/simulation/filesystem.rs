@@ -620,7 +620,17 @@ impl FileSystem for RealFileSystem {
 
 #[cfg(unix)]
 fn sync_parent_directory(path: &Path) -> io::Result<()> {
-    File::open(path.parent().unwrap_or_else(|| Path::new(".")))?.sync_all()
+    File::open(parent_directory(path))?.sync_all()
+}
+
+/// Directory containing `path`. A bare relative name such as `db.owl` has the
+/// empty path as its parent, which cannot be opened; it lives in the current
+/// directory.
+fn parent_directory(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
 }
 
 #[cfg(not(unix))]
@@ -714,6 +724,18 @@ impl FileHandle for RealFileHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bare_relative_path_syncs_the_current_directory() {
+        assert_eq!(parent_directory(Path::new("db.owl")), Path::new("."));
+        assert_eq!(parent_directory(Path::new("./db.owl")), Path::new("."));
+        assert_eq!(parent_directory(Path::new("data/db.owl")), Path::new("data"));
+        assert_eq!(parent_directory(Path::new("/db.owl")), Path::new("/"));
+        // The root has no parent at all; syncing "." is harmless there.
+        assert_eq!(parent_directory(Path::new("/")), Path::new("."));
+        #[cfg(unix)]
+        sync_parent_directory(Path::new("bare-name-that-need-not-exist.owl")).unwrap();
+    }
 
     #[test]
     fn test_simulated_filesystem_basic() {

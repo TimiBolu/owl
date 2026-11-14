@@ -40,9 +40,118 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 const WAL_MAGIC: [u8; 4] = *b"OWLW";
-const WAL_VERSION: u16 = 2;
+/// Current WAL frame format. The 24-byte header is:
+///
+/// ```text
+/// 0..4   magic "OWLW"
+/// 4..6   format version
+/// 6..8   CRC-16 over header bytes 0..6 and 8..20 (version 3 and later)
+/// 8..16  commit LSN
+/// 16..20 payload length
+/// 20..24 CRC-32 over header bytes 0..20 followed by the payload
+/// ```
+///
+/// The header check authenticates the length before it is trusted, so a
+/// damaged length in a complete frame is reported as corruption instead of
+/// being mistaken for a torn tail.
+const WAL_VERSION: u16 = 3;
+/// Version 2 frames checksum the payload only and leave bytes 6..8 zero. They
+/// remain readable so existing databases open; new frames are never written in
+/// this format.
+const WAL_LEGACY_VERSION: u16 = 2;
 const WAL_HEADER_LEN: usize = 24;
 const MAX_WAL_FRAME: usize = 64 * 1024 * 1024;
+
+/// CRC-16/CCITT-FALSE. Small enough to fit the two reserved header bytes
+/// while still detecting every single-bit and every burst error up to 16 bits
+/// in the 18 authenticated header bytes.
+fn wal_header_check(header: &[u8; WAL_HEADER_LEN]) -> u16 {
+    let mut crc = 0xffffu16;
+    for byte in header[0..6].iter().chain(&header[8..20]) {
+        crc ^= u16::from(*byte) << 8;
+        for _ in 0..8 {
+            crc = if crc & 0x8000 != 0 {
+                (crc << 1) ^ 0x1021
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
+}
+
+fn encode_wal_header(lsn: u64, payload: &[u8]) -> [u8; WAL_HEADER_LEN] {
+    let mut header = [0u8; WAL_HEADER_LEN];
+    header[0..4].copy_from_slice(&WAL_MAGIC);
+    header[4..6].copy_from_slice(&WAL_VERSION.to_le_bytes());
+    header[8..16].copy_from_slice(&lsn.to_le_bytes());
+    header[16..20].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+    let check = wal_header_check(&header);
+    header[6..8].copy_from_slice(&check.to_le_bytes());
+    let mut hasher = Hasher::new();
+    hasher.update(&header[0..20]);
+    hasher.update(payload);
+    header[20..24].copy_from_slice(&hasher.finalize().to_le_bytes());
+    header
+}
+
+/// Read the next WAL frame, returning its header LSN and authenticated
+/// payload. `None` means the file ends inside a frame (or exactly between
+/// frames): the only state an interrupted append can leave behind. Any defect
+/// in a frame whose bytes are all present is an error.
+fn read_wal_frame(
+    file: &mut dyn FileHandle,
+    path: &Path,
+) -> OQLResult<Option<(u64, Vec<u8>)>> {
+    let mut header = [0u8; WAL_HEADER_LEN];
+    let header_len =
+        read_up_to(file, &mut header).map_err(|e| storage_io("read WAL header", path, e))?;
+    if header_len < WAL_HEADER_LEN {
+        return Ok(None);
+    }
+    if header[0..4] != WAL_MAGIC {
+        return Err(OQLError::storage_error("invalid WAL frame magic", None));
+    }
+    let version = u16::from_le_bytes([header[4], header[5]]);
+    if version != WAL_VERSION && version != WAL_LEGACY_VERSION {
+        return Err(OQLError::storage_error(
+            "unsupported WAL format version",
+            None,
+        ));
+    }
+    if version == WAL_VERSION
+        && u16::from_le_bytes([header[6], header[7]]) != wal_header_check(&header)
+    {
+        return Err(OQLError::storage_error(
+            "WAL frame header checksum mismatch",
+            None,
+        ));
+    }
+    let header_lsn = u64::from_le_bytes(header[8..16].try_into().unwrap());
+    let payload_len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+    let expected_checksum = u32::from_le_bytes(header[20..24].try_into().unwrap());
+    if payload_len > MAX_WAL_FRAME {
+        return Err(OQLError::storage_error(
+            "WAL frame is unreasonably large",
+            None,
+        ));
+    }
+    let mut payload = vec![0u8; payload_len];
+    if read_up_to(file, &mut payload).map_err(|e| storage_io("read WAL payload", path, e))?
+        < payload_len
+    {
+        return Ok(None);
+    }
+    let mut hasher = Hasher::new();
+    if version == WAL_VERSION {
+        hasher.update(&header[0..20]);
+    }
+    hasher.update(&payload);
+    if hasher.finalize() != expected_checksum {
+        return Err(OQLError::storage_error("WAL frame checksum mismatch", None));
+    }
+    Ok(Some((header_lsn, payload)))
+}
 const DEFAULT_AUTO_CHECKPOINT_WAL_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_AUTO_CHECKPOINT_COMMITS: u64 = 10_000;
 const MIN_DELTA_COMPACTION_BYTES: u64 = 64 * 1024;
@@ -386,6 +495,9 @@ struct PendingCheckpoint {
 
 struct PublishedCheckpoint {
     info: CheckpointInfo,
+    /// Slot of the base segment file, which is independent of the manifest
+    /// slot reported in `info`.
+    segment_slot: u8,
     typed_locator: TypedLocatorLeaf,
     typed_segments: Vec<TypedSegmentFileDescriptor>,
 }
@@ -2089,27 +2201,42 @@ impl StoreCore {
                 .load(Ordering::Acquire)
                 .checked_add(1)
                 .ok_or_else(|| OQLError::storage_error("checkpoint sequence exhausted", None))?;
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
-            let checkpoint_lsn = state.committed_lsn;
-            let commits_at_snapshot = self.commits_since_checkpoint.load(Ordering::Acquire);
-            state.object_records.take_delta(
-                self.record_delta_base_lsn.load(Ordering::Acquire),
-                checkpoint_lsn,
-            );
-            take_index_delta(
-                &mut state,
-                self.record_delta_base_lsn.load(Ordering::Acquire),
-                checkpoint_lsn,
-            )?;
-            state
-                .reverse_reference_index
-                .take_delta()
-                .map_err(|error| OQLError::storage_error(&error, None))?;
-            drop(state);
+            // Rotate before draining the dirty sets: a rotation that fails
+            // cleanly must leave them intact, or a later incremental
+            // checkpoint would omit those records. The commit lock freezes
+            // the committed LSN across both steps.
             self.rotate_wal_locked()?;
+            let drained = (|| {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+                let checkpoint_lsn = state.committed_lsn;
+                let commits_at_snapshot = self.commits_since_checkpoint.load(Ordering::Acquire);
+                state.object_records.take_delta(
+                    self.record_delta_base_lsn.load(Ordering::Acquire),
+                    checkpoint_lsn,
+                );
+                take_index_delta(
+                    &mut state,
+                    self.record_delta_base_lsn.load(Ordering::Acquire),
+                    checkpoint_lsn,
+                )?;
+                state
+                    .reverse_reference_index
+                    .take_delta()
+                    .map_err(|error| OQLError::storage_error(&error, None))?;
+                Ok::<_, OQLError>((checkpoint_lsn, commits_at_snapshot))
+            })();
+            let (checkpoint_lsn, commits_at_snapshot) = match drained {
+                Ok(drained) => drained,
+                Err(error) => {
+                    // Same hazard as a failed reconstruction below: the sealed
+                    // WAL is unpublished and no pending snapshot covers it.
+                    self.poisoned.store(true, Ordering::Release);
+                    return Err(error);
+                }
+            };
             (sequence, checkpoint_lsn, commits_at_snapshot)
         };
 
@@ -2286,7 +2413,7 @@ impl StoreCore {
                 let install_started = Instant::now();
                 self.install_live_typed_checkpoint(
                     checkpoint.checkpoint_lsn,
-                    checkpoint.slot,
+                    published.segment_slot,
                     published.typed_locator,
                     published.typed_segments,
                 )?;
@@ -2317,14 +2444,14 @@ impl StoreCore {
     fn install_live_typed_checkpoint(
         &self,
         checkpoint_lsn: u64,
-        slot: u8,
+        segment_slot: u8,
         typed_locator: TypedLocatorLeaf,
         descriptors: Vec<TypedSegmentFileDescriptor>,
     ) -> OQLResult<()> {
         let open_started = Instant::now();
         let segment_path = self
             .segment_paths
-            .get(slot as usize)
+            .get(segment_slot as usize)
             .ok_or_else(|| OQLError::storage_error("checkpoint slot is invalid", None))?;
         let typed_segments = open_typed_segment_handles(
             self.filesystem.as_ref(),
@@ -2494,6 +2621,25 @@ impl StoreCore {
         &self,
         base: Manifest,
     ) -> OQLResult<PendingIncrementalCheckpoint> {
+        let rotated = AtomicBool::new(false);
+        let prepared = self.prepare_incremental_checkpoint_inner(base, &rotated);
+        if prepared.is_err() && rotated.load(Ordering::Acquire) {
+            // The sealed WAL now holds acknowledged commits that no manifest
+            // publishes, and the dirty record/index sets describing them may
+            // already be drained. Nothing in memory can retry this snapshot,
+            // and the next rotation would reclaim the sealed WAL as if it had
+            // been published. Both WAL generations remain recoverable, so stop
+            // writing and let reopen consolidate them.
+            self.poisoned.store(true, Ordering::Release);
+        }
+        prepared
+    }
+
+    fn prepare_incremental_checkpoint_inner(
+        &self,
+        base: Manifest,
+        rotated: &AtomicBool,
+    ) -> OQLResult<PendingIncrementalCheckpoint> {
         let (
             sequence,
             checkpoint_lsn,
@@ -2511,6 +2657,12 @@ impl StoreCore {
                 .load(Ordering::Acquire)
                 .checked_add(1)
                 .ok_or_else(|| OQLError::storage_error("checkpoint sequence exhausted", None))?;
+            // Rotate before draining the dirty sets. The commit lock freezes
+            // the committed LSN across both steps, and a rotation that fails
+            // cleanly then leaves the dirty tracking intact for a later
+            // attempt.
+            self.rotate_wal_locked()?;
+            rotated.store(true, Ordering::Release);
             let mut state = self
                 .state
                 .lock()
@@ -2527,7 +2679,6 @@ impl StoreCore {
                 .take_delta(delta_base_lsn, checkpoint_lsn);
             let index_delta = take_index_delta(&mut state, delta_base_lsn, checkpoint_lsn)?;
             drop(state);
-            self.rotate_wal_locked()?;
             (
                 sequence,
                 checkpoint_lsn,
@@ -2683,9 +2834,20 @@ impl StoreCore {
         let sequence = image.sequence;
         let checkpoint_lsn = image.checkpoint_lsn;
         let slot = (sequence & 1) as usize;
+        // Manifest slots alternate with the sequence, but the base segment
+        // must not: an incremental checkpoint publishes a new manifest that
+        // keeps referencing the previous base, so after one incremental the
+        // sequence parity points back at the live base. Writing the segment
+        // truncates its file, so always target the slot the durable manifest
+        // does not reference. A crash mid-write then leaves the published
+        // checkpoint untouched.
+        let segment_slot = match latest_manifest(self.filesystem.as_ref(), &self.manifest_paths)? {
+            Some(published) => 1 - published.segment_slot as usize,
+            None => slot,
+        };
         let segment = write_segment_file(
             self.filesystem.as_ref(),
-            &self.segment_paths[slot],
+            &self.segment_paths[segment_slot],
             image,
             self.max_size_bytes,
         )?;
@@ -2718,7 +2880,7 @@ impl StoreCore {
             segment_checksum: segment.checksum,
             live_objects: live_objects as u64,
             slot: slot as u8,
-            segment_slot: slot as u8,
+            segment_slot: segment_slot as u8,
             delta_len: 0,
             delta_checksum: 0,
             has_record_root: true,
@@ -2741,6 +2903,7 @@ impl StoreCore {
                 segment_bytes: segment.len,
                 slot: slot as u8,
             },
+            segment_slot: segment_slot as u8,
             typed_locator: segment.typed_locator,
             typed_segments: segment.typed_segments,
         })
@@ -3727,15 +3890,7 @@ impl RustStore {
             ));
         }
 
-        let mut hasher = Hasher::new();
-        hasher.update(payload);
-        let checksum = hasher.finalize();
-        let mut header = [0u8; WAL_HEADER_LEN];
-        header[0..4].copy_from_slice(&WAL_MAGIC);
-        header[4..6].copy_from_slice(&WAL_VERSION.to_le_bytes());
-        header[8..16].copy_from_slice(&lsn.to_le_bytes());
-        header[16..20].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-        header[20..24].copy_from_slice(&checksum.to_le_bytes());
+        let header = encode_wal_header(lsn, payload);
 
         let mut wal = self
             .wal
@@ -4098,42 +4253,10 @@ impl RustStore {
         let mut valid_len = 0u64;
         let mut previous_wal_lsn = None;
         loop {
-            let mut header = [0u8; WAL_HEADER_LEN];
-            let header_len = read_up_to(file.as_mut(), &mut header)
-                .map_err(|e| storage_io("read WAL header", path, e))?;
-            if header_len == 0 || header_len < WAL_HEADER_LEN {
+            let Some((header_lsn, payload)) = read_wal_frame(file.as_mut(), path)? else {
                 break;
-            }
-            if header[0..4] != WAL_MAGIC {
-                return Err(OQLError::storage_error("invalid WAL frame magic", None));
-            }
-            let version = u16::from_le_bytes([header[4], header[5]]);
-            if version != WAL_VERSION {
-                return Err(OQLError::storage_error(
-                    "unsupported WAL format version",
-                    None,
-                ));
-            }
-            let header_lsn = u64::from_le_bytes(header[8..16].try_into().unwrap());
-            let payload_len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
-            let expected_checksum = u32::from_le_bytes(header[20..24].try_into().unwrap());
-            if payload_len > MAX_WAL_FRAME {
-                return Err(OQLError::storage_error(
-                    "WAL frame is unreasonably large",
-                    None,
-                ));
-            }
-            let mut payload = vec![0u8; payload_len];
-            if read_up_to(file.as_mut(), &mut payload)
-                .map_err(|e| storage_io("read WAL payload", path, e))?
-                < payload_len
-            {
-                break;
-            }
-            let actual_checksum = crc32fast::hash(&payload);
-            if actual_checksum != expected_checksum {
-                return Err(OQLError::storage_error("WAL frame checksum mismatch", None));
-            }
+            };
+            let payload_len = payload.len();
             let batch: WalBatch = bincode::deserialize(&payload).map_err(|e| {
                 OQLError::serialization_error(&format!("cannot decode WAL batch: {e}"), None)
             })?;
@@ -4433,37 +4556,10 @@ fn replay_wal_for_compaction(
     let mut valid_len = 0u64;
     let mut previous_wal_lsn = None;
     loop {
-        let mut header = [0u8; WAL_HEADER_LEN];
-        let header_len = read_up_to(file.as_mut(), &mut header)
-            .map_err(|error| storage_io("read WAL header for compaction", path, error))?;
-        if header_len == 0 || header_len < WAL_HEADER_LEN {
+        let Some((header_lsn, payload)) = read_wal_frame(file.as_mut(), path)? else {
             break;
-        }
-        if header[0..4] != WAL_MAGIC || u16::from_le_bytes([header[4], header[5]]) != WAL_VERSION {
-            return Err(OQLError::storage_error(
-                "invalid WAL frame during compaction",
-                None,
-            ));
-        }
-        let header_lsn = u64::from_le_bytes(header[8..16].try_into().unwrap());
-        let payload_len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
-        let expected_checksum = u32::from_le_bytes(header[20..24].try_into().unwrap());
-        if payload_len > MAX_WAL_FRAME {
-            return Err(OQLError::storage_error(
-                "WAL frame is unreasonably large",
-                None,
-            ));
-        }
-        let mut payload = vec![0u8; payload_len];
-        if read_up_to(file.as_mut(), &mut payload)
-            .map_err(|error| storage_io("read WAL payload for compaction", path, error))?
-            < payload_len
-        {
-            break;
-        }
-        if crc32fast::hash(&payload) != expected_checksum {
-            return Err(OQLError::storage_error("WAL frame checksum mismatch", None));
-        }
+        };
+        let payload_len = payload.len();
         let batch: WalBatch = bincode::deserialize(&payload).map_err(|error| {
             OQLError::serialization_error(
                 &format!("cannot decode WAL batch for compaction: {error}"),
@@ -9475,6 +9571,8 @@ mod tests {
     struct CheckpointFailingFileSystem {
         inner: SimulatedFileSystem,
         fail_checkpoints: AtomicBool,
+        fail_manifests: AtomicBool,
+        fail_sealed_wal_reads: AtomicBool,
         block_checkpoints: AtomicBool,
         checkpoint_entered: (Mutex<bool>, std::sync::Condvar),
         checkpoint_release: (Mutex<bool>, std::sync::Condvar),
@@ -9485,6 +9583,8 @@ mod tests {
             Self {
                 inner: SimulatedFileSystem::new(seed),
                 fail_checkpoints: AtomicBool::new(false),
+                fail_manifests: AtomicBool::new(false),
+                fail_sealed_wal_reads: AtomicBool::new(false),
                 block_checkpoints: AtomicBool::new(false),
                 checkpoint_entered: (Mutex::new(false), std::sync::Condvar::new()),
                 checkpoint_release: (Mutex::new(false), std::sync::Condvar::new()),
@@ -9493,6 +9593,19 @@ mod tests {
 
         fn set_checkpoint_failure(&self, fail: bool) {
             self.fail_checkpoints.store(fail, Ordering::Release);
+        }
+
+        /// Fail manifest publication only, so a base segment is fully written
+        /// but never becomes authoritative: the state a crash between the two
+        /// steps leaves behind.
+        fn set_manifest_failure(&self, fail: bool) {
+            self.fail_manifests.store(fail, Ordering::Release);
+        }
+
+        /// Fail reads of the sealed WAL, which interrupts an incremental
+        /// checkpoint after rotation and before anything is published.
+        fn set_sealed_wal_read_failure(&self, fail: bool) {
+            self.fail_sealed_wal_reads.store(fail, Ordering::Release);
         }
 
         fn block_checkpoints(&self) {
@@ -9548,11 +9661,27 @@ mod tests {
                     "injected checkpoint failure",
                 ));
             }
+            if path.to_string_lossy().contains(".manifest.")
+                && self.fail_manifests.load(Ordering::Acquire)
+            {
+                return Err(std::io::Error::new(
+                    ErrorKind::Other,
+                    "injected manifest failure",
+                ));
+            }
             self.inner.create(path)
         }
 
         fn open(&self, path: &Path) -> std::io::Result<Box<dyn FileHandle>> {
             self.block_checkpoint_io_if_requested(path);
+            if path.to_string_lossy().ends_with(".wal.sealed")
+                && self.fail_sealed_wal_reads.load(Ordering::Acquire)
+            {
+                return Err(std::io::Error::new(
+                    ErrorKind::Other,
+                    "injected sealed WAL read failure",
+                ));
+            }
             self.inner.open(path)
         }
 
@@ -11088,8 +11217,195 @@ mod tests {
         .unwrap();
         assert_eq!(upgraded.sequence, compacted.sequence);
         assert_eq!(upgraded.delta_len, 0);
-        assert_eq!(upgraded.segment_slot, upgraded.slot);
+        // Sequence 3 lands in manifest slot 1, but the base it replaces also
+        // lives in segment slot 1 (published by sequence 1 and still
+        // referenced by the incremental sequence 2). The new base must go to
+        // the other segment file.
+        assert_eq!(upgraded.slot, 1);
+        assert_eq!(upgraded.segment_slot, 0);
         assert!(upgraded.has_index_root);
+    }
+
+    #[test]
+    fn interrupted_compaction_never_overwrites_the_published_base_segment() {
+        let fs = Arc::new(CheckpointFailingFileSystem::new(61));
+        let path = Path::new("base-overwrite.owl");
+        let base_segment = Path::new("base-overwrite.owl.segment.1");
+        {
+            let store = RustStore::new_with_fs(path, 1024 * 1024, fs.clone()).unwrap();
+            store.put_document(&document("base")).unwrap();
+            // Sequence 1: full checkpoint, base in segment slot 1.
+            assert_eq!(store.checkpoint().unwrap().sequence, 1);
+            store.put_document(&document("delta")).unwrap();
+            // Sequence 2: incremental, manifest slot 0 still references the
+            // base in segment slot 1.
+            assert_eq!(store.checkpoint().unwrap().sequence, 2);
+            let published = Manifest::decode(&read_file(
+                fs.as_ref(),
+                Path::new("base-overwrite.owl.manifest.0"),
+            ))
+            .unwrap();
+            assert_eq!(published.segment_slot, 1);
+            let base_bytes = read_file(fs.as_ref(), base_segment);
+
+            store.put_document(&document("tail")).unwrap();
+            // Sequence 3 writes its whole segment, then "crashes" before the
+            // manifest that would publish it.
+            fs.set_manifest_failure(true);
+            store
+                .compact()
+                .expect_err("manifest publication was injected to fail");
+            fs.set_manifest_failure(false);
+
+            assert_eq!(
+                read_file(fs.as_ref(), base_segment),
+                base_bytes,
+                "an unpublished compaction rewrote the authoritative base segment"
+            );
+        }
+
+        let reopened = RustStore::new_with_fs(path, 1024 * 1024, fs).unwrap();
+        assert_eq!(reopened.committed_lsn(), 3);
+        assert_eq!(reopened.scan_documents("events").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn failed_incremental_checkpoint_does_not_lose_the_sealed_wal() {
+        let fs = Arc::new(CheckpointFailingFileSystem::new(62));
+        let path = Path::new("sealed-wal-retained.owl");
+        {
+            let store = RustStore::new_with_fs(path, 1024 * 1024, fs.clone()).unwrap();
+            store.put_document(&document("base")).unwrap();
+            store.checkpoint().unwrap();
+            store.put_document(&document("delta")).unwrap();
+
+            // The incremental checkpoint rotates the WAL, then fails before
+            // it can build or publish anything from the sealed generation.
+            fs.set_sealed_wal_read_failure(true);
+            store
+                .checkpoint()
+                .expect_err("sealed WAL read was injected to fail");
+            fs.set_sealed_wal_read_failure(false);
+            assert!(fs.exists(Path::new("sealed-wal-retained.owl.wal.sealed")));
+
+            // The store must refuse further work rather than rotate again:
+            // another rotation would reclaim the sealed WAL holding "delta".
+            assert!(store.put_document(&document("after")).is_err());
+            assert!(store.checkpoint().is_err());
+            assert!(fs.exists(Path::new("sealed-wal-retained.owl.wal.sealed")));
+        }
+
+        let reopened = RustStore::new_with_fs(path, 1024 * 1024, fs).unwrap();
+        assert_eq!(reopened.committed_lsn(), 2);
+        assert!(reopened
+            .get_document("events", &"delta".to_string())
+            .unwrap()
+            .is_some());
+        assert_eq!(reopened.scan_documents("events").unwrap().len(), 2);
+    }
+
+    fn overwrite_at(fs: &SimulatedFileSystem, path: &Path, offset: u64, bytes: &[u8]) {
+        let mut file = fs
+            .open_with_options(
+                path,
+                &FileOptions {
+                    read: true,
+                    write: true,
+                    create: false,
+                    truncate: false,
+                    append: false,
+                },
+            )
+            .unwrap();
+        file.seek(SeekFrom::Start(offset)).unwrap();
+        write_all(file.as_mut(), bytes).unwrap();
+        file.sync().unwrap();
+    }
+
+    #[test]
+    fn damaged_frame_length_is_corruption_not_a_torn_tail() {
+        let fs = Arc::new(SimulatedFileSystem::new(63));
+        let path = Path::new("header-length.owl");
+        {
+            let store = RustStore::new_with_fs(path, 1024 * 1024, fs.clone()).unwrap();
+            store.put_document(&document("a")).unwrap();
+            store.put_document(&document("b")).unwrap();
+        }
+        let wal_len = fs.file_size(path).unwrap();
+        let wal = read_file(fs.as_ref(), path);
+        // Enlarge the first frame's length so its payload appears to run past
+        // the end of the file, exactly like an interrupted append would.
+        let mut length = u32::from_le_bytes(wal[16..20].try_into().unwrap());
+        length |= 1 << 20;
+        overwrite_at(fs.as_ref(), path, 16, &length.to_le_bytes());
+
+        let error = RustStore::new_with_fs(path, 1024 * 1024, fs.clone())
+            .err()
+            .expect("a damaged length in a complete frame must fail open");
+        assert!(error.to_string().contains("header checksum"));
+        // Both committed frames are still on disk for repair.
+        assert_eq!(fs.file_size(path).unwrap(), wal_len);
+    }
+
+    #[test]
+    fn damaged_frame_lsn_is_detected_by_the_header_check() {
+        let fs = Arc::new(SimulatedFileSystem::new(64));
+        let path = Path::new("header-lsn.owl");
+        {
+            let store = RustStore::new_with_fs(path, 1024 * 1024, fs.clone()).unwrap();
+            store.put_document(&document("a")).unwrap();
+        }
+        let wal = read_file(fs.as_ref(), path);
+        overwrite_at(fs.as_ref(), path, 8, &[wal[8] ^ 0x04]);
+        let error = RustStore::new_with_fs(path, 1024 * 1024, fs)
+            .err()
+            .expect("a damaged header LSN must fail open");
+        assert!(error.to_string().contains("header checksum"));
+    }
+
+    #[test]
+    fn legacy_payload_only_checksum_frames_still_recover() {
+        let fs = Arc::new(SimulatedFileSystem::new(65));
+        let path = Path::new("legacy-frames.owl");
+        {
+            let store = RustStore::new_with_fs(path, 1024 * 1024, fs.clone()).unwrap();
+            store.put_document(&document("a")).unwrap();
+            store.put_document(&document("b")).unwrap();
+        }
+        // Rewrite every frame header in the version 2 layout: reserved bytes
+        // zero and a CRC-32 over the payload alone.
+        let wal = read_file(fs.as_ref(), path);
+        let mut offset = 0usize;
+        let mut frames = 0;
+        while offset < wal.len() {
+            let payload_len =
+                u32::from_le_bytes(wal[offset + 16..offset + 20].try_into().unwrap()) as usize;
+            let payload = &wal[offset + WAL_HEADER_LEN..offset + WAL_HEADER_LEN + payload_len];
+            overwrite_at(
+                fs.as_ref(),
+                path,
+                offset as u64 + 4,
+                &[WAL_LEGACY_VERSION.to_le_bytes(), [0, 0]].concat(),
+            );
+            overwrite_at(
+                fs.as_ref(),
+                path,
+                offset as u64 + 20,
+                &crc32fast::hash(payload).to_le_bytes(),
+            );
+            offset += WAL_HEADER_LEN + payload_len;
+            frames += 1;
+        }
+        assert_eq!(frames, 2);
+
+        let reopened = RustStore::new_with_fs(path, 1024 * 1024, fs.clone()).unwrap();
+        assert_eq!(reopened.committed_lsn(), 2);
+        assert_eq!(reopened.scan_documents("events").unwrap().len(), 2);
+        // New commits append current-format frames after the legacy ones.
+        reopened.put_document(&document("c")).unwrap();
+        drop(reopened);
+        let again = RustStore::new_with_fs(path, 1024 * 1024, fs).unwrap();
+        assert_eq!(again.scan_documents("events").unwrap().len(), 3);
     }
 
     #[test]
