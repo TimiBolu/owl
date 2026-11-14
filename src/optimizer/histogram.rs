@@ -198,7 +198,29 @@ pub fn estimate_range_selectivity(
         return 0.0;
     }
 
-    let mut matching_count = 0u64;
+    // A numeric bucket the range only partly covers counts in proportion to
+    // the part covered, assuming its values are spread evenly.
+    fn number(value: &Value) -> Option<f64> {
+        match value {
+            Value::Integer(value) => Some(*value as f64),
+            Value::Float(value) => Some(*value),
+            _ => None,
+        }
+    }
+    let covered = |bucket: &HistogramBucket| -> f64 {
+        let (Some(low), Some(high)) = (number(&bucket.lower_bound), number(&bucket.upper_bound))
+        else {
+            return 1.0;
+        };
+        if high <= low {
+            return 1.0;
+        }
+        let from = lower.and_then(number).map_or(low, |bound| bound.max(low));
+        let to = upper.and_then(number).map_or(high, |bound| bound.min(high));
+        ((to - from) / (high - low)).clamp(0.0, 1.0)
+    };
+
+    let mut matching_count = 0.0f64;
 
     for bucket in &histogram.buckets {
         let bucket_matches = match (lower, upper) {
@@ -219,11 +241,11 @@ pub fn estimate_range_selectivity(
         };
 
         if bucket_matches {
-            matching_count += bucket.count;
+            matching_count += bucket.count as f64 * covered(bucket);
         }
     }
 
-    matching_count as f64 / total_count as f64
+    matching_count / total_count as f64
 }
 
 #[cfg(test)]

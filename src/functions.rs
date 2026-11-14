@@ -177,6 +177,7 @@ impl FunctionRegistry {
         self.register("starts_with", string_starts_with);
         self.register("ends_with", string_ends_with);
         self.register("contains", string_contains);
+        self.register("matches", text_matches);
         self.register("pad_left", string_pad_left);
         self.register("pad_right", string_pad_right);
     }
@@ -536,6 +537,107 @@ fn string_ends_with(args: &[Value]) -> OQLResult<Value> {
     };
 
     Ok(Value::Boolean(string.ends_with(suffix)))
+}
+
+thread_local! {
+    /// Patterns already compiled on this thread. A query tests one pattern
+    /// against every row, and a server sees the same few patterns again and
+    /// again, so compiling is paid once.
+    static PATTERNS: std::cell::RefCell<std::collections::HashMap<String, regex::Regex>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The compiled form of `pattern`, from this thread's cache.
+pub(crate) fn compiled_pattern(pattern: &str) -> OQLResult<regex::Regex> {
+    /// More distinct patterns than this and the cache starts over.
+    const MOST_PATTERNS: usize = 256;
+
+    if let Some(known) = PATTERNS.with(|patterns| patterns.borrow().get(pattern).cloned()) {
+        return Ok(known);
+    }
+    let compiled = regex::Regex::new(pattern).map_err(|error| OQLError::FunctionError {
+        message: format!("matches(): \"{pattern}\" is not a valid pattern: {error}"),
+    })?;
+    PATTERNS.with(|patterns| {
+        let mut patterns = patterns.borrow_mut();
+        if patterns.len() >= MOST_PATTERNS {
+            patterns.clear();
+        }
+        patterns.insert(pattern.to_string(), compiled.clone());
+    });
+    Ok(compiled)
+}
+
+/// The text every match of `pattern` must start with, when there is one.
+///
+/// `^ab-[0-9]+` can only match text that starts with `ab-`, so a field
+/// tested against it need only be read from `"ab-"` up to the next prefix,
+/// which an index on the field does without touching the rest. `None` for
+/// a pattern that can match elsewhere than the start, that ignores case,
+/// or whose matches share no opening text.
+pub(crate) fn required_prefix(pattern: &str) -> Option<String> {
+    use regex_syntax::hir::literal::{ExtractKind, Extractor};
+    use regex_syntax::hir::Look;
+
+    let hir = regex_syntax::parse(pattern).ok()?;
+    // Every match has to begin at the very start of the text.
+    if !hir.properties().look_set_prefix().contains(Look::Start) {
+        return None;
+    }
+    let mut extractor = Extractor::new();
+    extractor.kind(ExtractKind::Prefix);
+    let prefixes = extractor.extract(&hir);
+    let shared = prefixes.longest_common_prefix()?;
+    // Cut back to whole characters: the shared bytes may end inside one.
+    let mut end = shared.len();
+    while end > 0 && std::str::from_utf8(&shared[..end]).is_err() {
+        end -= 1;
+    }
+    let prefix = std::str::from_utf8(&shared[..end]).ok()?;
+    (!prefix.is_empty()).then(|| prefix.to_string())
+}
+
+/// The least text greater than everything that starts with `prefix`, or
+/// `None` when nothing is.
+pub(crate) fn after_prefix(prefix: &str) -> Option<String> {
+    let mut characters: Vec<char> = prefix.chars().collect();
+    while let Some(last) = characters.pop() {
+        // The next character, stepping over the gap where no characters are.
+        let next = match last as u32 {
+            0xD7FF => Some('\u{E000}'),
+            code => char::from_u32(code + 1),
+        };
+        if let Some(next) = next {
+            characters.push(next);
+            return Some(characters.into_iter().collect());
+        }
+    }
+    None
+}
+
+/// `matches(text, pattern)`: whether the regular expression `pattern` is
+/// found anywhere in `text`. Anchor it with `^` and `$` to match the whole
+/// text, and start it with `(?i)` to ignore case. Matching takes time in
+/// proportion to the text, whatever the pattern: there are no
+/// back-references or look-around to make it otherwise. Text that is null
+/// or not text matches nothing.
+fn text_matches(args: &[Value]) -> OQLResult<Value> {
+    let [text, pattern] = args else {
+        return Err(OQLError::FunctionError {
+            message: "matches() expects exactly 2 arguments: matches(text, pattern)".to_string(),
+        });
+    };
+    let Value::String(pattern) = pattern else {
+        return Err(OQLError::TypeError {
+            expected: "a pattern written as text".to_string(),
+            actual: pattern.type_name().to_string(),
+        });
+    };
+    let compiled = compiled_pattern(pattern)?;
+    Ok(Value::Boolean(match text {
+        Value::String(text) => compiled.is_match(text),
+        _ => false,
+    }))
 }
 
 /// Check if string contains substring

@@ -2908,6 +2908,663 @@ fn aggregating_from_storage_columns_matches_aggregating_rows() {
     );
 }
 
+/// The ledger, with shops that belong to regions and sales that belong to
+/// shops: enough to reach a value one and two references away.
+fn shop_ledger() -> Db {
+    let db = ledger();
+    db.script(
+        r#"
+        schema regions { id: String, name: String, zone: String }
+        schema shops { id: String, region: Ref(regions), tier: String, opened: DateTime, tags: List(String) }
+        schema sales {
+          id: String,
+          shop: Ref(shops),
+          backup: Optional(Ref(shops)),
+          qty: Integer,
+          price: Float,
+          state: String,
+          at: DateTime,
+          memo: Optional(String)
+        }
+        schema nothing { id: String, kind: String, amount: Integer }
+        regions.insert [
+          { id: "g1", name: "North", zone: "a" },
+          { id: "g2", name: "South", zone: "a" },
+          { id: "g3", name: "East", zone: "b" }
+        ]
+        shops.insert [
+          { id: "s1", region: "g1", tier: "gold", opened: "2025-03-01T00:00:00Z", tags: ["x"] },
+          { id: "s2", region: "g1", tier: "plain", opened: "2025-07-01T00:00:00Z", tags: [] },
+          { id: "s3", region: "g2", tier: "gold", opened: "2026-01-01T00:00:00Z", tags: ["x", "y"] },
+          { id: "s4", region: "g3", tier: "plain", opened: "2026-02-01T00:00:00Z", tags: [] }
+        ]
+        "#,
+    );
+    let mut rows = String::from("sales.insert [\n");
+    for index in 0..90 {
+        rows.push_str(&format!(
+            "  {{ id: \"v{index:03}\", shop: \"s{}\", {}qty: {}, price: {}.5, state: \"{}\", at: \"2026-{:02}-{:02}T08:00:00Z\"{} }},\n",
+            1 + index % 4,
+            if index % 5 == 0 { format!("backup: \"s{}\", ", 1 + (index / 5) % 4) } else { String::new() },
+            1 + index % 7,
+            (index * 13) % 40,
+            ["paid", "open", "void"][index % 3],
+            1 + index % 6,
+            1 + index % 27,
+            if index % 4 == 1 { ", memo: \"m\"" } else { "" },
+        ));
+    }
+    rows.truncate(rows.len() - 2);
+    rows.push_str("\n]");
+    db.script(&rows);
+
+    db
+}
+
+#[test]
+fn folding_with_the_evaluator_matches_aggregating_rows() {
+    let db = shop_ledger();
+    let queries = [
+        // A computed key.
+        "sales.group_by { month: format_date(.at, \"%Y-%m\") }.select { month, n: count(), units: sum(.qty) }",
+        "sales.where { state == \"paid\" }.group_by { month: format_date(.at, \"%Y-%m\") }.select { month, n: count(), revenue: sum(.qty * .price) }.sort { .month.asc }",
+        "sales.group_by { big: .qty > 3, .state }.select { big, state, n: count() }",
+        // A key through a reference, one and two steps away.
+        "sales.group_by { .shop.tier }.select { tier, n: count(), mean: avg(.price) }",
+        "sales.where { state == \"paid\" }.group_by { .shop.region.name }.select { name, n: count(), units: sum(.qty) }",
+        "sales.group_by { .shop.id }.select { shop_id, n: count() }",
+        "sales.group_by { .shop.region.zone, .state }.select { shop_region_zone, state, n: count() }",
+        // A reference that is sometimes absent.
+        "sales.group_by { .backup.tier }.select { tier, n: count() }",
+        "sales.group_by { .backup }.select { backup, n: count() }",
+        // Aggregates of expressions and of paths.
+        "sales.select { revenue: sum(.qty * .price), dearest: max(.qty * .price), n: count() }",
+        "sales.group_by { .state }.select { state, revenue: sum(.qty * .price), oldest: min(.shop.opened) }",
+        "sales.where { state == \"paid\" }.sum(.qty * .price)",
+        "sales.avg(.qty + 1)",
+        "sales.select { noted: count(.memo), shops: count(.shop.tier) }",
+        // An aggregate over part of a group.
+        "sales.group_by { .state }.select { state, n: count(), big: where { .qty > 4 }.count(), big_units: where { .qty > 4 }.sum(.qty) }",
+        "sales.select { n: count(), paid: where { .state == \"paid\" }.count(), dear: where { .price > 20 }.max(.price) }",
+        "sales.group_by { .shop.tier }.select { tier, noted: where { .memo == \"m\" }.count(), early: where { .at < \"2026-03-01\" }.count() }",
+        // Filters storage cannot evaluate.
+        "sales.where { .shop.tier == \"gold\" }.count()",
+        "sales.where { .shop.region.zone == \"a\" && qty > 2 }.group_by { .state }.select { state, n: count() }",
+        "sales.where { qty * 2 > 9 }.sum(.qty)",
+        "sales.where { memo == null }.count()",
+        "sales.where { backup == null && state == \"open\" }.group_by { .shop.tier }.select { tier, n: count() }",
+        "sales.where { backup != null }.select { n: count(), units: sum(.qty) }",
+        "sales.where { state == \"paid\" || .shop.tier == \"gold\" }.count()",
+        "sales.where { !(qty > 3) }.where { state == \"void\" }.avg(.price)",
+        "sales.where { shop == \"s2\" }.count()",
+        "sales.where { id > \"v040\" }.count()",
+        "sales.where { .qty > sales.avg(.qty) }.count()",
+        "sales.where { .shop.tier > 3 }.count()",
+        // A filter on groups.
+        "sales.group_by { .shop.id }.having { count() >= 23 }.select { shop_id, n: count(), mean: avg(.price) }",
+        "sales.group_by { .state }.having { sum(.qty) > 100 && count() > 1 }.select { state, units: sum(.qty) }",
+        "sales.group_by { .state }.having { !(.state == \"void\") || count() < 0 }.select { state, n: count() }",
+        "sales.group_by { .state }.having { count() > 1000 }.select { state, n: count() }",
+        "sales.group_by { .state }.having { where { .qty > 4 }.count() > 12 }.select { state, n: count() }",
+        // What follows the fold still runs.
+        "sales.group_by { .shop.region.name }.select { name, units: sum(.qty) }.sort { .units.desc, .name.asc }.limit(2)",
+        "sales.group_by { .state }.select { state, n: count() }.where { n > 29 }.count()",
+        // Nothing to fold.
+        "sales.where { .shop.tier == \"none\" }.count()",
+        "sales.where { .shop.tier == \"none\" }.sum(.qty * .price)",
+        "sales.where { .shop.tier == \"none\" }.avg(.qty * .price)",
+        "sales.where { .shop.tier == \"none\" }.group_by { .state }.select { state, n: count() }",
+        "sales.where { .shop.tier == \"none\" }.select { n: count(), top: max(.qty * .price) }",
+        "nothing.group_by { size: .amount * 2 }.select { size, n: count() }",
+        "nothing.group_by { .kind }.having { count() > 0 }.select { kind, n: count() }",
+        "nothing.select { total: sum(.amount * 2) }",
+        "shops.group_by { .tier }.select { tier, sold: sum(.sales.count()) }",
+        "shops.select { n: count(), busiest: max(.sales.count()) }",
+        "shops.where { .sales.where { state == \"paid\" }.count() > 7 }.count()",
+        "entries.group_by { week: .day / 2 }.select { week, n: count(), total: sum(.amount) }",
+        "entries.where { kind == \"debit\" }.group_by { .day }.select { day, late: where { .at >= \"2026-01-15\" }.count() }",
+    ];
+    // Shapes the fold declines, which must still answer, and the same
+    // written with a bare field name inside a nested filter.
+    let declined = [
+        "sales.group_by { .state }.select { state, share: sum(.qty) / count() }",
+        "sales.group_by { .shop.tags }.select { tags, n: count() }",
+        "sales.group_by { .state }.select { state, group_count }",
+        "sales.group_by { .state }.select { state, big: where { qty > 4 }.count() }",
+        "sales.group_by { .state }.having { state == \"void\" }.select { state, n: count() }",
+    ];
+    // Errors are errors either way.
+    let failing = [
+        "sales.sum(.state + 1)",
+        "sales.group_by { .state }.select { state, bad: sum(.shop.tier) }",
+        "sales.where { .shop.tier == \"gold\" }.sum(.state)",
+    ];
+    let shape = |rows: Result<Vec<Document>, String>| {
+        rows.map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    let mut fields: Vec<(String, Value)> = row
+                        .fields
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone()))
+                        .collect();
+                    fields.sort_by(|left, right| left.0.cmp(&right.0));
+                    (row.id.to_string(), row.schema.clone(), fields)
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    let compare = |query: &str| {
+        owl_db::executor::set_column_aggregation(false);
+        let reference = shape(db.try_rows(query));
+        owl_db::executor::set_column_aggregation(true);
+        let before = owl_db::executor::column_folds_run();
+        let fast = shape(db.try_rows(query));
+        let folded = owl_db::executor::column_folds_run() > before;
+        assert_eq!(fast, reference, "{query}");
+        (reference, folded)
+    };
+    let mut answered = 0;
+    for query in queries {
+        let (reference, folded) = compare(query);
+        // The comparison is only worth something if the fold is what
+        // answered.
+        assert!(folded, "not folded: {query}");
+        let rows = reference.unwrap_or_else(|error| panic!("{error}\n{query}"));
+        answered += usize::from(!rows.is_empty());
+    }
+    for query in declined {
+        let (reference, folded) = compare(query);
+        assert!(!folded, "folded: {query}");
+        assert!(reference.is_ok_and(|rows| !rows.is_empty()), "{query}");
+    }
+    for query in failing {
+        let (reference, _) = compare(query);
+        assert!(reference.is_err(), "{query}");
+    }
+    // Compaction moves the rows out of memory into column segments, which
+    // the fold then reads without a stored document to hand the evaluator.
+    db.executor.store().compact().unwrap();
+    for query in queries {
+        let (reference, folded) = compare(query);
+        assert!(folded, "not folded after compaction: {query}");
+        assert!(reference.is_ok(), "{query}");
+    }
+    for query in declined.into_iter().chain(failing) {
+        let _ = compare(query);
+    }
+    // And only if the answers are real.
+    assert!(answered >= 40, "only {answered} queries returned rows");
+    assert_eq!(
+        db.scalar("sales.where { .shop.tier == \"gold\" }.count()", "count"),
+        Value::Integer(45)
+    );
+    assert_eq!(
+        db.rows("sales.group_by { .shop.region.name }.select { name, n: count() }").len(),
+        3
+    );
+}
+
+#[test]
+fn shaping_rows_as_they_are_read_matches_shaping_built_rows() {
+    let db = shop_ledger();
+    let queries = [
+        "sales.where { .state == \"paid\" }.select { id, qty, total: .qty * .price }",
+        "sales.where { .state == \"paid\" && .qty > 3 }.select { id, tier: .shop.tier, value: .qty * .price }",
+        "sales.where { .shop.region.zone == \"a\" }.select { id, region: .shop.region.name }.sort { .id.desc }.limit(7)",
+        "sales.where { .memo == null }.select { id, memo, at }.count()",
+        "sales.where { .qty > 5 }.select { shop, state }.distinct().count()",
+        "sales.where { .backup != null }.select { id, backup: .backup.tier, sold: .shop.sales.count() }",
+        "sales.select { id, month: format_date(.at, \"%m\") }.where { .month == \"03\" }",
+        "sales.where { .qty > 2 }.where { .price < 20 }.select { id, cheap: .price < 5, memo }",
+        "sales.where { .state == \"void\" }.select { id, qty, tier: .shop.tier }.sort { .qty.desc, .id.asc }.offset(3).limit(5)",
+        "sales.select { shop_id: .shop.id, created_at, version }.limit(4)",
+        "shops.where { .tier == \"gold\" }.select { id, tags, sold: .sales.sum(.qty), busy: .sales.where { .qty > 4 }.exists() }",
+        "sales.where { .qty > 100 }.select { id, day: format_date(.at, \"%d\") }",
+        "sales.where { .shop.tier == \"gold\" }.select { id, label: if .qty > 3 then \"big\" else \"small\" }",
+    ];
+    // Shapes answered another way: plain fields behind a plain filter go
+    // to the physical pipeline, and every field, an index that narrows the
+    // read, or a filter after a limit stay on the general path.
+    let declined = [
+        "sales.where { .state == \"paid\" }.select { id, qty, price }",
+        "sales.where { .qty > 5 }.select { *, big: true }",
+        "entries.where { .kind == \"debit\" && .day >= 4 }.select { id, amount: .amount * 2 }",
+        "sales.limit(10).where { .qty > 3 }.select { id }",
+    ];
+    let failing = ["sales.where { .qty > 3 }.select { id, bad: .state + 1 }"];
+    let shape = |rows: Result<Vec<Document>, String>| {
+        rows.map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    (
+                        row.id.to_string(),
+                        row.schema.clone(),
+                        serde_json::to_value(&row.fields).unwrap().to_string(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    let compare = |query: &str| {
+        owl_db::executor::set_column_aggregation(false);
+        let reference = shape(db.try_rows(query));
+        owl_db::executor::set_column_aggregation(true);
+        let before = owl_db::executor::column_folds_run();
+        let fast = shape(db.try_rows(query));
+        let streamed = owl_db::executor::column_folds_run() > before;
+        assert_eq!(fast, reference, "{query}");
+        (reference, streamed)
+    };
+    let check = |compacted: bool| {
+        let mut answered = 0;
+        for query in queries {
+            let (reference, streamed) = compare(query);
+            assert!(streamed, "not streamed (compacted: {compacted}): {query}");
+            let rows = reference.unwrap_or_else(|error| panic!("{error}\n{query}"));
+            answered += usize::from(!rows.is_empty());
+        }
+        assert_eq!(answered, queries.len() - 1);
+        for query in declined {
+            let (reference, _) = compare(query);
+            assert!(reference.is_ok_and(|rows| !rows.is_empty()), "{query}");
+        }
+        for query in failing {
+            let (reference, _) = compare(query);
+            assert!(reference.is_err(), "{query}");
+        }
+    };
+    check(false);
+    assert_eq!(
+        db.rows("sales.where { .shop.tier == \"gold\" }.select { id }").len(),
+        45
+    );
+    // The same from column segments, with no stored document in memory.
+    db.executor.store().compact().unwrap();
+    check(true);
+}
+
+#[test]
+fn inserting_values_is_inserting_text_without_the_parse() {
+    let schema = r#"
+        schema owners { id: String, name: String, email: String unique }
+        schema things {
+          id: String,
+          owner: Ref(owners),
+          helper: Optional(Ref(owners)),
+          made: DateTime,
+          weight: Float,
+          grade: Integer = 3,
+          tags: List(String),
+          box: { wide: Integer, deep: Integer },
+          note: Optional(String),
+          check(.weight >= 0)
+        }
+        owners.insert [ { id: "w1", name: "Ada", email: "a@x" }, { id: "w2", name: "Bo", email: "b@x" } ]
+    "#;
+    let written = Db::new();
+    let given = Db::new();
+    written.script(schema);
+    given.script(schema);
+
+    let text = |value: &str| Value::String(value.to_string());
+    let row = |fields: Vec<(&str, Value)>| -> HashMap<String, Value> {
+        fields
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value))
+            .collect()
+    };
+    let shape = |wide: i64, deep: i64| {
+        Value::Object(row(vec![("wide", Value::Integer(wide)), ("deep", Value::Integer(deep))]))
+    };
+    written.script(
+        r#"things.insert [
+          { id: "t1", owner: "w1", made: "2026-02-03T04:05:06Z", weight: 1.5, tags: ["a", "b"], box: { wide: 1, deep: 2 } },
+          { id: "t2", owner: "w2", helper: "w1", made: "2026-02-04", weight: 2.5, grade: 9, tags: [], box: { wide: 3, deep: 4 }, note: "n" }
+        ]"#,
+    );
+    let inserted = given
+        .executor
+        .insert_documents(
+            "things",
+            vec![
+                row(vec![
+                    ("id", text("t1")),
+                    ("owner", text("w1")),
+                    ("made", text("2026-02-03T04:05:06Z")),
+                    ("weight", Value::Float(1.5)),
+                    ("tags", Value::List(vec![text("a"), text("b")])),
+                    ("box", shape(1, 2)),
+                ]),
+                row(vec![
+                    ("id", text("t2")),
+                    ("owner", text("w2")),
+                    ("helper", text("w1")),
+                    ("made", text("2026-02-04")),
+                    ("weight", Value::Float(2.5)),
+                    ("grade", Value::Integer(9)),
+                    ("tags", Value::List(Vec::new())),
+                    ("box", shape(3, 4)),
+                    ("note", text("n")),
+                ]),
+            ],
+        )
+        .unwrap();
+    assert_eq!(inserted.len(), 2);
+
+    // Every field, typed and defaulted alike, and references that lead to
+    // the same documents.
+    let look = "things.sort { .id.asc }.select { id, owner: .owner.name, helper: .helper.name, made, weight, grade, tags, box, note, wide: .box.wide }";
+    let seen = |db: &Db| -> Vec<String> {
+        db.rows(look)
+            .iter()
+            .map(|row| serde_json::to_value(&row.fields).unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(seen(&given), seen(&written));
+    assert_eq!(seen(&given).len(), 2);
+    assert_eq!(
+        given.scalar("things.where { .id == \"t1\" }.select { grade }", "grade"),
+        Value::Integer(3)
+    );
+    assert_eq!(
+        // Owner of one thing and helper on the other.
+        given.scalar("owners.where { .id == \"w1\" }.select { n: .things.count() }", "n"),
+        Value::Integer(2)
+    );
+
+    // What the language refuses, this refuses, in the same words, and a
+    // refused batch leaves nothing behind.
+    let good = |id: &str| {
+        row(vec![
+            ("id", text(id)),
+            ("owner", text("w1")),
+            ("made", text("2026-03-01")),
+            ("weight", Value::Float(1.0)),
+            ("tags", Value::List(Vec::new())),
+            ("box", shape(1, 1)),
+        ])
+    };
+    let with = |id: &str, name: &str, value: Value| {
+        let mut fields = good(id);
+        fields.insert(name.to_string(), value);
+        fields
+    };
+    let cases: Vec<(&str, HashMap<String, Value>)> = vec![
+        (r#"{ id: "t1", owner: "w1", made: "2026-03-01", weight: 1.0, tags: [], box: { wide: 1, deep: 1 } }"#, good("t1")),
+        (r#"{ id: "t8", owner: "nobody", made: "2026-03-01", weight: 1.0, tags: [], box: { wide: 1, deep: 1 } }"#, with("t8", "owner", text("nobody"))),
+        (r#"{ id: "t8", owner: "w1", made: "soon", weight: 1.0, tags: [], box: { wide: 1, deep: 1 } }"#, with("t8", "made", text("soon"))),
+        (r#"{ id: "t8", owner: "w1", made: "2026-03-01", weight: -1.0, tags: [], box: { wide: 1, deep: 1 } }"#, with("t8", "weight", Value::Float(-1.0))),
+        (r#"{ id: "t8", owner: "w1", made: "2026-03-01", weight: 1.0, tags: [], box: { wide: "x", deep: 1 } }"#, with("t8", "box", Value::Object(row(vec![("wide", text("x")), ("deep", Value::Integer(1))])))),
+        (r#"{ id: "t8", owner: "w1", made: "2026-03-01", weight: 1.0, tags: [], box: { wide: 1, deep: 1 }, grade: "high" }"#, with("t8", "grade", text("high"))),
+        (r#"{ id: "t8", owner: "w1", made: "2026-03-01", weight: "heavy", tags: [], box: { wide: 1, deep: 1 } }"#, with("t8", "weight", text("heavy"))),
+    ];
+    for (literal, fields) in cases {
+        let by_text = written
+            .try_rows(&format!(
+                "things.insert [ {{ id: \"t7\", owner: \"w1\", made: \"2026-03-01\", weight: 1.0, tags: [], box: {{ wide: 1, deep: 1 }} }}, {literal} ]"
+            ))
+            .map(|rows| rows.len());
+        let by_value = given
+            .executor
+            .insert_documents("things", vec![good("t7"), fields])
+            .map(|rows| rows.len())
+            .map_err(|error| error.to_string());
+        assert!(by_text.is_err(), "{literal}");
+        assert_eq!(by_value, by_text, "{literal}");
+        assert_eq!(given.scalar("things.count()", "count"), Value::Integer(2), "{literal}");
+    }
+
+    // A whole number given for a Float is the float it denotes, written
+    // either way, on insert and on update.
+    written.script(
+        r#"things.insert [ { id: "t5", owner: "w1", made: "2026-03-01", weight: 2, tags: [], box: { wide: 1, deep: 1 } } ]"#,
+    );
+    given
+        .executor
+        .insert_documents("things", vec![with("t5", "weight", Value::Integer(2))])
+        .unwrap();
+    for db in [&written, &given] {
+        assert_eq!(
+            db.scalar(r#"things.where { .id == "t5" }.select { weight }"#, "weight"),
+            Value::Float(2.0)
+        );
+        db.rows(r#"things.where { .id == "t5" }.update { weight: 3 }"#);
+        assert_eq!(
+            db.scalar(r#"things.where { .id == "t5" }.select { weight }"#, "weight"),
+            Value::Float(3.0)
+        );
+        db.rows(r#"things.where { .id == "t5" }.delete"#);
+    }
+
+    // A unique field, repeated within the batch and against what is stored.
+    let owner = |id: &str, email: &str| row(vec![("id", text(id)), ("name", text("N")), ("email", text(email))]);
+    for (batch, literal) in [
+        (vec![owner("w3", "c@x"), owner("w4", "c@x")], r#"{ id: "w3", name: "N", email: "c@x" }, { id: "w4", name: "N", email: "c@x" }"#),
+        (vec![owner("w3", "c@x"), owner("w4", "a@x")], r#"{ id: "w3", name: "N", email: "c@x" }, { id: "w4", name: "N", email: "a@x" }"#),
+    ] {
+        let by_text = written
+            .try_rows(&format!("owners.insert [ {literal} ]"))
+            .map(|rows| rows.len());
+        let by_value = given
+            .executor
+            .insert_documents("owners", batch)
+            .map(|rows| rows.len())
+            .map_err(|error| error.to_string());
+        assert!(by_text.is_err(), "{literal}");
+        assert_eq!(by_value, by_text, "{literal}");
+        assert_eq!(given.scalar("owners.count()", "count"), Value::Integer(2), "{literal}");
+    }
+    // And one that is fine goes in.
+    given
+        .executor
+        .insert_documents("owners", vec![owner("w3", "c@x"), owner("w4", "d@x")])
+        .unwrap();
+    assert_eq!(given.scalar("owners.count()", "count"), Value::Integer(4));
+}
+
+fn directory() -> Db {
+    let db = Db::new();
+    db.script(
+        r#"
+        schema people {
+          id: String,
+          name: String,
+          email: Optional(String),
+          code: String,
+          age: Integer,
+          index(.code),
+          index(.name)
+        }
+        people.insert [
+          { id: "p1", name: "Ada Lovelace", email: "ada@math.org", code: "ab-100", age: 36 },
+          { id: "p2", name: "alan turing", email: "alan@bletchley.uk", code: "ab-205", age: 41 },
+          { id: "p3", name: "Grace Hopper", code: "ac-001", age: 85 },
+          { id: "p4", name: "Édith Piaf", email: "edith@chanson.fr", code: "b.9", age: 47 },
+          { id: "p5", name: "Bo", email: "BO@EXAMPLE.COM", code: "ab", age: 19 },
+          { id: "p6", name: "a+b", email: "plus@example.com", code: "ab-1", age: 5 }
+        ]
+        "#,
+    );
+    db
+}
+
+#[test]
+fn a_pattern_matches_text() {
+    let db = directory();
+    let ids = |filter: &str| db.ids(&format!("people.where {{ {filter} }}.sort {{ .id.asc }}.select {{ id }}"));
+
+    // Found anywhere unless anchored.
+    assert_eq!(ids(r#"matches(.name, "a")"#), ["p1", "p2", "p3", "p4", "p6"]);
+    assert_eq!(ids(r#"matches(.name, "^a")"#), ["p2", "p6"]);
+    assert_eq!(ids(r#"matches(.name, "r$")"#), ["p3"]);
+    assert_eq!(ids(r#"matches(.name, "^Bo$")"#), ["p5"]);
+    // Classes, repetition, alternation, and case on request.
+    assert_eq!(ids(r#"matches(.code, "^ab-[0-9]{3}$")"#), ["p1", "p2"]);
+    assert_eq!(ids(r#"matches(.name, "Lovelace|Hopper")"#), ["p1", "p3"]);
+    assert_eq!(ids(r#"matches(.name, "(?i)^a")"#), ["p1", "p2", "p6"]);
+    assert_eq!(ids(r#"matches(.email, "(?i)@example\\.com$")"#), ["p5", "p6"]);
+    // A character that means something in a pattern is literal when escaped.
+    assert_eq!(ids(r#"matches(.name, "a\\+b")"#), ["p6"]);
+    assert_eq!(ids(r#"matches(.code, "^b\\.9")"#), ["p4"]);
+    // Text is matched by character, not byte.
+    assert_eq!(ids(r#"matches(.name, "^.dith")"#), ["p4"]);
+    // An absent value matches nothing, and neither does a number.
+    assert_eq!(ids(r#"matches(.email, "")"#), ["p1", "p2", "p4", "p5", "p6"]);
+    assert_eq!(ids(r#"!matches(.email, "")"#), ["p3"]);
+    assert_eq!(ids(r#"matches(.age, "3")"#), [] as [&str; 0]);
+    // With other conditions, and as a value.
+    assert_eq!(ids(r#"matches(.code, "^ab") && .age > 30"#), ["p1", "p2"]);
+    assert_eq!(ids(r#"matches(.code, "^ac") || .age < 10"#), ["p3", "p6"]);
+    assert_eq!(
+        db.rows(r#"people.where { .id == "p1" }.select { id, uk: matches(.email, "\\.uk$"), org: matches(.email, "\\.org$") }"#)[0]
+            .get_field("org"),
+        Some(&Value::Boolean(true))
+    );
+    assert_eq!(
+        db.scalar(r#"people.select { n: where { matches(.code, "^ab") }.count() }"#, "n"),
+        Value::Integer(4)
+    );
+    assert_eq!(
+        db.scalar(r#"people.where { matches(.name, "^[A-Z]") }.count()"#, "count"),
+        Value::Integer(3)
+    );
+
+    // A pattern that is not one is an error that says so, not an empty answer.
+    let error = db.try_rows(r#"people.where { matches(.name, "(unclosed") }"#).unwrap_err();
+    assert!(error.contains("not a valid pattern"), "{error}");
+    assert!(db.try_rows(r#"people.where { matches(.name) }"#).is_err());
+    assert!(db.try_rows(r#"people.where { matches(.name, 3) }"#).is_err());
+}
+
+#[test]
+fn an_anchored_pattern_reads_only_the_rows_that_could_match() {
+    let db = directory();
+    // `^ab-` can only match codes from "ab-" up to, not including, "ab.".
+    // With an index on the field that range is all that is read.
+    let anchored = [
+        (r#"matches(.code, "^ab-")"#, vec!["p1", "p2", "p6"]),
+        (r#"matches(.code, "^ab-1")"#, vec!["p1", "p6"]),
+        (r#"matches(.code, "^ab")"#, vec!["p1", "p2", "p5", "p6"]),
+        (r#"matches(.code, "^ab-[0-9]+$")"#, vec!["p1", "p2", "p6"]),
+        (r#"matches(.code, "^b\\.9$")"#, vec!["p4"]),
+        (r#"matches(.code, "^zz")"#, vec![]),
+        (r#"matches(.name, "^Ada L") && .age > 30"#, vec!["p1"]),
+    ];
+    for (filter, expected) in anchored {
+        let query = format!("people.where {{ {filter} }}.sort {{ .id.asc }}.select {{ id, name }}");
+        assert_eq!(db.ids(&query), expected, "{filter}");
+        let plan = db.rows(&format!("{query}.explain()"));
+        assert_eq!(
+            plan[0].get_field("uses_index"),
+            Some(&Value::Boolean(true)),
+            "{filter}: {:?}",
+            plan[0].fields
+        );
+    }
+    // Patterns that give no fixed start are answered all the same, by
+    // testing every row.
+    let unanchored = [
+        (r#"matches(.code, "ab-")"#, vec!["p1", "p2", "p6"]),
+        (r#"matches(.code, "(?i)^AB-")"#, vec!["p1", "p2", "p6"]),
+        (r#"matches(.code, "^(ab|ac)-")"#, vec!["p1", "p2", "p3", "p6"]),
+        (r#"matches(.code, "^a?b")"#, vec!["p1", "p2", "p4", "p5", "p6"]),
+        (r#"matches(.code, "^ab*-")"#, vec!["p1", "p2", "p6"]),
+        (r#"matches(.code, "^")"#, vec!["p1", "p2", "p3", "p4", "p5", "p6"]),
+    ];
+    for (filter, expected) in unanchored {
+        let query = format!("people.where {{ {filter} }}.sort {{ .id.asc }}.select {{ id }}");
+        assert_eq!(db.ids(&query), expected, "{filter}");
+    }
+}
+
+#[test]
+fn a_range_of_text_is_the_same_rows_with_or_without_an_index() {
+    let db = Db::new();
+    db.script(
+        r#"
+        schema words { id: String, indexed: String, plain: String, n: Integer, index(.indexed) }
+        "#,
+    );
+    // Words chosen to sit either side of every boundary a byte comparison
+    // has: a prefix of another word, case, an accent, an empty word.
+    let words = [
+        "", "A", "Z", "a", "ab", "ab-", "ab-1", "ab.", "abc", "ac", "b", "z", "zz", "é", "éa", "~",
+        "ab-9", "ab-10", "aB", "AB",
+    ];
+    let mut rows = String::from("words.insert [\n");
+    for (index, word) in words.iter().enumerate() {
+        rows.push_str(&format!(
+            "  {{ id: \"w{index:02}\", indexed: \"{word}\", plain: \"{word}\", n: {index} }},\n"
+        ));
+    }
+    rows.truncate(rows.len() - 2);
+    rows.push_str("\n]");
+    db.script(&rows);
+
+    let bounds = ["", "a", "ab", "ab-", "ab.", "b", "é", "zz", "~", "A"];
+    for low in bounds {
+        for (low_op, high_op) in [(">=", "<"), (">", "<=")] {
+            for high in bounds {
+                let expected: Vec<String> = words
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, word)| {
+                        let above = if low_op == ">=" { **word >= low } else { **word > low };
+                        let below = if high_op == "<" { **word < high } else { **word <= high };
+                        above && below
+                    })
+                    .map(|(index, _)| format!("w{index:02}"))
+                    .collect();
+                for field in ["indexed", "plain"] {
+                    let query = format!(
+                        "words.where {{ .{field} {low_op} \"{low}\" && .{field} {high_op} \"{high}\" }}.sort {{ .id.asc }}.select {{ id }}"
+                    );
+                    assert_eq!(db.ids(&query), expected, "{query}");
+                    // And when something the pipeline cannot do follows.
+                    let general = format!(
+                        "words.where {{ .{field} {low_op} \"{low}\" && .{field} {high_op} \"{high}\" && .n * 1 >= 0 }}.sort {{ .id.asc }}.select {{ id }}"
+                    );
+                    assert_eq!(db.ids(&general), expected, "{general}");
+                }
+            }
+        }
+    }
+    let plan = db.rows(r#"words.where { .indexed >= "ab" && .indexed < "ac" }.select { id }.explain()"#);
+    assert_eq!(plan[0].get_field("uses_index"), Some(&Value::Boolean(true)), "{:?}", plan[0].fields);
+}
+
+#[test]
+fn sorting_whole_rows_keeps_every_field() {
+    let db = graph();
+    let fields = |query: &str| -> Vec<Vec<String>> {
+        db.rows(query)
+            .iter()
+            .map(|row| {
+                let mut names: Vec<String> = row.fields.keys().cloned().collect();
+                names.sort();
+                names
+            })
+            .collect()
+    };
+    let whole = vec!["amount".to_string(), "id".to_string(), "status".to_string(), "user".to_string()];
+    for query in [
+        "orders.sort { .id.asc }",
+        "orders.where { .amount >= 10 }.sort { .id.asc }",
+        "orders.where { .amount >= 10.0 }.sort { .id.desc }",
+        "orders.where { .amount >= 10 }.sort { .amount.desc }",
+        "orders.where { .amount >= 10 }.sort { .id.asc }.limit(2)",
+        "orders.where { .status == \"paid\" }.sort { .id.asc }",
+        "orders.where { .amount >= 10 }",
+    ] {
+        let got = fields(query);
+        assert!(!got.is_empty(), "{query}");
+        for row in got {
+            assert_eq!(row, whole, "{query}");
+        }
+    }
+}
+
 #[test]
 fn related_rows_are_the_same_however_few_fields_are_read() {
     let db = graph();
@@ -3206,6 +3863,12 @@ fn counting_related_rows_for_every_row_matches_counting_them_one_row_at_a_time()
         "people.select { id, b: .badges.count() }",
         // Mixed with forms that need the rows themselves.
         "people.select { id, n: .owned.count(), most: .owned.max(.effort), first: .owned.sort { .id.asc }.first().id }",
+        // An aggregate of the related rows rather than a count of them.
+        "people.select { id, effort: .owned.sum(.effort), mean: .owned.avg(.effort), low: .owned.min(.effort), high: .owned.max(.effort) }",
+        "people.select { id, done: .owned.where { .state == \"done\" }.sum(.effort), last: .owned.max(.id), state: .owned.min(.state) }",
+        "people.select { id, reviewed: .reviewing.avg(.effort), blocked: .reviewing.where { .state == \"blocked\" }.max(.effort) }",
+        "people.where { .owned.sum(.effort) > 20 }.sort { .id.asc }.select { id }",
+        "people.select { id, b: .badges.max(.id), n: .notes.min(.kind) }",
     ];
     let check = || {
         for query in queries {

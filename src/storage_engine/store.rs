@@ -29,7 +29,7 @@ use crc32fast::Hasher;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::io::{ErrorKind, SeekFrom};
 use std::ops::{Bound, Deref};
 use std::path::{Path, PathBuf};
@@ -472,6 +472,153 @@ struct State {
     scalar_index_deletes: BTreeSet<(String, String)>,
     vector_indexes: HashMap<String, Vec<VectorIndexDefinition>>,
     reverse_reference_index: Arc<BTreeIndex>,
+    /// What open transactions need in order to tell, at commit, whether
+    /// someone else changed a document they wrote.
+    conflicts: ConflictLog,
+}
+
+/// The documents one committed batch wrote.
+#[derive(Debug, Default)]
+struct WrittenKeys {
+    /// A change to a schema or an index, which bears on every document.
+    everything: bool,
+    documents: HashSet<(String, DocumentId)>,
+}
+
+impl WrittenKeys {
+    fn of(operations: &[WriteOperation]) -> Self {
+        let mut keys = Self::default();
+        for operation in operations {
+            match operation {
+                WriteOperation::PutDocument(document) => {
+                    keys.documents
+                        .insert((document.schema.clone(), document.id.clone()));
+                }
+                WriteOperation::DeleteDocument { schema, id } => {
+                    keys.documents.insert((schema.clone(), id.clone()));
+                }
+                _ => keys.everything = true,
+            }
+        }
+        keys
+    }
+
+    /// The first thing both batches wrote, described for an error message.
+    fn overlap(&self, other: &Self) -> Option<String> {
+        if self.everything || other.everything {
+            return Some("a schema or an index".to_string());
+        }
+        let (small, large) = if self.documents.len() <= other.documents.len() {
+            (&self.documents, &other.documents)
+        } else {
+            (&other.documents, &self.documents)
+        };
+        small
+            .iter()
+            .find(|key| large.contains(*key))
+            .map(|(schema, id)| format!("'{schema}' document '{id}'"))
+    }
+}
+
+/// Commits that an open transaction may conflict with.
+///
+/// A transaction conflicts when a batch committed after it began wrote a
+/// document it also writes. Batches are remembered only while a transaction
+/// that began before them is still open, so with no transaction open this
+/// holds nothing.
+#[derive(Debug, Default)]
+struct ConflictLog {
+    /// Open transactions and the commit each one began after.
+    open: BTreeMap<u64, u64>,
+    /// Committed batches newer than the oldest open transaction.
+    recent: VecDeque<(u64, WrittenKeys)>,
+    /// Batches at or below this commit were forgotten to bound memory, so
+    /// a transaction that began before it cannot be checked and is refused.
+    forgotten_through: u64,
+}
+
+impl ConflictLog {
+    /// Batches remembered for the sake of one long-open transaction.
+    const MOST_BATCHES: usize = 65_536;
+
+    fn refuse(reason: String) -> OQLError {
+        OQLError::TransactionConflict { message: reason }
+    }
+
+    /// Whether transaction `id` may commit `written`.
+    fn check(&self, id: u64, written: &WrittenKeys) -> OQLResult<()> {
+        let began_after = *self.open.get(&id).ok_or_else(|| OQLError::TransactionError {
+            message: format!("transaction {id} is not open"),
+        })?;
+        if began_after < self.forgotten_through {
+            return Err(Self::refuse(
+                "the transaction was open for too long to be checked against later commits"
+                    .to_string(),
+            ));
+        }
+        for (lsn, batch) in self.recent.iter().rev() {
+            if *lsn <= began_after {
+                break;
+            }
+            if let Some(what) = batch.overlap(written) {
+                return Err(Self::refuse(format!(
+                    "{what} was changed by another commit after this transaction began"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Note a committed batch for the transactions still open.
+    fn committed(&mut self, lsn: u64, written: WrittenKeys) {
+        if !self.open.is_empty() {
+            self.recent.push_back((lsn, written));
+            if self.recent.len() > Self::MOST_BATCHES {
+                if let Some((forgotten, _)) = self.recent.pop_front() {
+                    self.forgotten_through = forgotten;
+                }
+            }
+        }
+        self.forget_unneeded();
+    }
+
+    fn close(&mut self, id: u64) {
+        self.open.remove(&id);
+        self.forget_unneeded();
+    }
+
+    fn forget_unneeded(&mut self) {
+        match self.open.values().min().copied() {
+            None => self.recent.clear(),
+            Some(oldest) => {
+                while self.recent.front().is_some_and(|(lsn, _)| *lsn <= oldest) {
+                    self.recent.pop_front();
+                }
+            }
+        }
+    }
+}
+
+thread_local! {
+    /// The transaction this thread's reads and writes belong to, with the
+    /// store it belongs to.
+    static BOUND_TRANSACTION: std::cell::Cell<Option<(usize, u64)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Binds a transaction to the current thread until dropped. See
+/// [`RustStore::bind_transaction`].
+#[must_use = "the transaction is bound only while this guard lives"]
+pub struct TransactionBinding {
+    previous: Option<(usize, u64)>,
+    /// A binding belongs to the thread that made it.
+    _thread: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for TransactionBinding {
+    fn drop(&mut self) {
+        BOUND_TRANSACTION.with(|bound| bound.set(self.previous));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -481,9 +628,10 @@ struct TypedIdFence {
     segment_index: usize,
 }
 
-#[derive(Debug)]
+/// The writes of a transaction that has not committed. Only the
+/// transaction itself reads them.
+#[derive(Debug, Default)]
 struct PendingTransaction {
-    id: u64,
     operations: Vec<WriteOperation>,
 }
 
@@ -1536,7 +1684,7 @@ pub struct StoreCore {
     checkpoint_lock: Mutex<()>,
     pending_checkpoint: Mutex<Option<PendingCheckpoint>>,
     pending_incremental_checkpoint: Mutex<Option<PendingIncrementalCheckpoint>>,
-    active_transaction: Mutex<Option<PendingTransaction>>,
+    transactions: Mutex<HashMap<u64, PendingTransaction>>,
     next_transaction_id: AtomicU64,
     checkpoint_sequence: AtomicU64,
     record_delta_base_lsn: AtomicU64,
@@ -1664,14 +1812,40 @@ impl RustStore {
         })
     }
 
+    /// The identity under which this store's transactions are bound to a
+    /// thread.
+    fn binding_key(&self) -> usize {
+        Arc::as_ptr(&self.core) as usize
+    }
+
+    /// The transaction the current thread is working in, if any.
+    fn current_transaction(&self) -> Option<u64> {
+        let key = self.binding_key();
+        BOUND_TRANSACTION
+            .with(std::cell::Cell::get)
+            .filter(|(store, _)| *store == key)
+            .map(|(_, id)| id)
+    }
+
+    fn not_open(id: u64) -> OQLError {
+        OQLError::TransactionError {
+            message: format!("transaction {id} is not open"),
+        }
+    }
+
+    /// What the current thread's transaction has written and not committed.
+    /// Outside a transaction there is nothing: other transactions' writes
+    /// are theirs alone.
     fn pending_operations(&self) -> OQLResult<Vec<WriteOperation>> {
-        Ok(self
-            .active_transaction
+        let Some(id) = self.current_transaction() else {
+            return Ok(Vec::new());
+        };
+        self.transactions
             .lock()
             .map_err(|_| OQLError::generic("transaction lock poisoned"))?
-            .as_ref()
+            .get(&id)
             .map(|transaction| transaction.operations.clone())
-            .unwrap_or_default())
+            .ok_or_else(|| Self::not_open(id))
     }
 
     pub fn new<P: AsRef<Path>>(path: P, max_size_bytes: usize) -> OQLResult<Self> {
@@ -1803,7 +1977,7 @@ impl RustStore {
             checkpoint_lock: Mutex::new(()),
             pending_checkpoint: Mutex::new(None),
             pending_incremental_checkpoint: Mutex::new(None),
-            active_transaction: Mutex::new(None),
+            transactions: Mutex::new(HashMap::new()),
             next_transaction_id: AtomicU64::new(1),
             checkpoint_sequence: AtomicU64::new(checkpoint_sequence),
             record_delta_base_lsn: AtomicU64::new(record_delta_base_lsn),
@@ -1946,6 +2120,18 @@ impl RustStore {
     }
 
     pub fn write_batch(&self, operations: Vec<WriteOperation>) -> OQLResult<u64> {
+        self.write_batch_for(operations, None)
+    }
+
+    /// Commit a batch, on behalf of a transaction when one is given. A
+    /// transaction's batch is first checked against what was committed
+    /// since the transaction began, under the same locks that make the
+    /// commit, so nothing can slip in between the check and the write.
+    fn write_batch_for(
+        &self,
+        operations: Vec<WriteOperation>,
+        transaction: Option<u64>,
+    ) -> OQLResult<u64> {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(OQLError::storage_error(
                 "storage writer is poisoned after a failed WAL append; reopen to recover",
@@ -1963,6 +2149,10 @@ impl RustStore {
             .state
             .lock()
             .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+        let written = WrittenKeys::of(&operations);
+        if let Some(id) = transaction {
+            state.conflicts.check(id, &written)?;
+        }
         let lsn = state.committed_lsn.checked_add(1).ok_or_else(|| {
             OQLError::storage_error("commit sequence number space exhausted", None)
         })?;
@@ -1981,6 +2171,10 @@ impl RustStore {
         self.append_frame(lsn, &payload)?;
         Self::apply_batch(&mut state, batch)
             .expect("a validated durable batch must remain applicable");
+        if let Some(id) = transaction {
+            state.conflicts.open.remove(&id);
+        }
+        state.conflicts.committed(lsn, written);
         drop(state);
         drop(_commit);
 
@@ -3632,53 +3826,153 @@ fn run_scheduled_maintenance(core: &StoreCore) {
 }
 
 impl RustStore {
-    pub fn begin_local_transaction(&self) -> OQLResult<u64> {
+    /// Open a transaction and return its id.
+    ///
+    /// The transaction's writes are held apart until it commits: only
+    /// statements run while it is bound to their thread see them (see
+    /// [`Self::bind_transaction`]). Its reads see what is committed at the
+    /// time of each read, plus its own writes. At commit it is refused if a
+    /// document it wrote was changed by another commit after it began, so
+    /// work computed from a value someone else has since replaced is never
+    /// applied. It is not checked for documents it only read.
+    pub fn begin_transaction(&self) -> OQLResult<u64> {
         let id = self.next_transaction_id.fetch_add(1, Ordering::Relaxed);
-        let mut active = self
-            .active_transaction
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+            let began_after = state.committed_lsn;
+            state.conflicts.open.insert(id, began_after);
+        }
+        self.transactions
             .lock()
-            .map_err(|_| OQLError::generic("transaction lock poisoned"))?;
-        if active.is_some() {
+            .map_err(|_| OQLError::generic("transaction lock poisoned"))?
+            .insert(id, PendingTransaction::default());
+        Ok(id)
+    }
+
+    /// Make the current thread work in transaction `id` until the returned
+    /// guard is dropped: its writes join the transaction and its reads see
+    /// them. A server binds a transaction for the length of each statement
+    /// a client sends in it.
+    pub fn bind_transaction(&self, id: u64) -> OQLResult<TransactionBinding> {
+        if !self
+            .transactions
+            .lock()
+            .map_err(|_| OQLError::generic("transaction lock poisoned"))?
+            .contains_key(&id)
+        {
+            return Err(Self::not_open(id));
+        }
+        let previous = BOUND_TRANSACTION.with(|bound| bound.replace(Some((self.binding_key(), id))));
+        Ok(TransactionBinding {
+            previous,
+            _thread: std::marker::PhantomData,
+        })
+    }
+
+    /// Commit a transaction: all of its writes, durably, or none of them.
+    /// Whatever the outcome, the transaction is over. A refusal for which
+    /// [`OQLError::is_transaction_conflict`] holds means another commit got
+    /// there first; run the transaction again.
+    pub fn commit_transaction(&self, id: u64) -> OQLResult<()> {
+        let transaction = self.take_transaction(id)?;
+        if transaction.operations.is_empty() {
+            return self.close_transaction(id);
+        }
+        let outcome = self.write_batch_for(transaction.operations, Some(id));
+        // A successful commit closed it; a refused one still has to be.
+        self.close_transaction(id)?;
+        outcome.map(|_| ())
+    }
+
+    /// Run `work` as one transaction on the current thread and commit it.
+    ///
+    /// Everything `work` writes through this store commits together or not
+    /// at all. When the commit is refused because another commit got there
+    /// first, `work` is run again from the start, up to `attempts` times in
+    /// all, so it must compute what it writes from what it reads each time.
+    /// An error from `work` rolls the transaction back and is returned.
+    pub fn in_transaction<T>(
+        &self,
+        attempts: usize,
+        mut work: impl FnMut() -> OQLResult<T>,
+    ) -> OQLResult<T> {
+        let mut attempt = 1;
+        loop {
+            let id = self.begin_transaction()?;
+            let outcome = {
+                let _bound = self.bind_transaction(id)?;
+                work()
+            };
+            let value = match outcome {
+                Ok(value) => value,
+                Err(error) => {
+                    self.rollback_transaction(id)?;
+                    return Err(error);
+                }
+            };
+            match self.commit_transaction(id) {
+                Ok(()) => return Ok(value),
+                Err(error) if error.is_transaction_conflict() && attempt < attempts => {
+                    attempt += 1;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Abandon a transaction and everything it wrote.
+    pub fn rollback_transaction(&self, id: u64) -> OQLResult<()> {
+        self.take_transaction(id)?;
+        self.close_transaction(id)
+    }
+
+    fn take_transaction(&self, id: u64) -> OQLResult<PendingTransaction> {
+        let transaction = self
+            .transactions
+            .lock()
+            .map_err(|_| OQLError::generic("transaction lock poisoned"))?
+            .remove(&id)
+            .ok_or_else(|| Self::not_open(id))?;
+        // A thread still bound to it by `begin_local_transaction` is freed.
+        let key = self.binding_key();
+        BOUND_TRANSACTION.with(|bound| {
+            if bound.get() == Some((key, id)) {
+                bound.set(None);
+            }
+        });
+        Ok(transaction)
+    }
+
+    fn close_transaction(&self, id: u64) -> OQLResult<()> {
+        self.state
+            .lock()
+            .map_err(|_| OQLError::generic("storage state lock poisoned"))?
+            .conflicts
+            .close(id);
+        Ok(())
+    }
+
+    /// Open a transaction and bind it to the current thread until it is
+    /// committed or rolled back: the form a script's `transaction { .. }`
+    /// block uses, where one thread runs every statement.
+    pub fn begin_local_transaction(&self) -> OQLResult<u64> {
+        if self.current_transaction().is_some() {
             return Err(OQLError::generic("a local transaction is already active"));
         }
-        *active = Some(PendingTransaction {
-            id,
-            operations: Vec::new(),
-        });
+        let id = self.begin_transaction()?;
+        BOUND_TRANSACTION.with(|bound| bound.set(Some((self.binding_key(), id))));
         Ok(id)
     }
 
     pub fn commit_local_transaction(&self, id: u64) -> OQLResult<()> {
-        let operations = {
-            let mut active = self
-                .active_transaction
-                .lock()
-                .map_err(|_| OQLError::generic("transaction lock poisoned"))?;
-            let transaction = active
-                .take()
-                .ok_or_else(|| OQLError::generic("no local transaction is active"))?;
-            if transaction.id != id {
-                *active = Some(transaction);
-                return Err(OQLError::generic("local transaction id does not match"));
-            }
-            transaction.operations
-        };
-        self.write_batch(operations).map(|_| ())
+        self.commit_transaction(id)
     }
 
     pub fn rollback_local_transaction(&self, id: u64) -> OQLResult<()> {
-        let mut active = self
-            .active_transaction
-            .lock()
-            .map_err(|_| OQLError::generic("transaction lock poisoned"))?;
-        match active.as_ref() {
-            Some(transaction) if transaction.id == id => {
-                *active = None;
-                Ok(())
-            }
-            Some(_) => Err(OQLError::generic("local transaction id does not match")),
-            None => Err(OQLError::generic("no local transaction is active")),
-        }
+        self.rollback_transaction(id)
     }
 
     pub fn resolve_index_id_for_payload_id(
@@ -3708,16 +4002,19 @@ impl RustStore {
         if operations.is_empty() {
             return Ok(());
         }
-        let mut active = self
-            .active_transaction
+        // Inside a transaction a write waits for the commit; outside one it
+        // is its own commit.
+        let Some(id) = self.current_transaction() else {
+            return self.write_batch(operations).map(|_| ());
+        };
+        self.transactions
             .lock()
-            .map_err(|_| OQLError::generic("transaction lock poisoned"))?;
-        if let Some(transaction) = active.as_mut() {
-            transaction.operations.extend(operations);
-            return Ok(());
-        }
-        drop(active);
-        self.write_batch(operations).map(|_| ())
+            .map_err(|_| OQLError::generic("transaction lock poisoned"))?
+            .get_mut(&id)
+            .ok_or_else(|| Self::not_open(id))?
+            .operations
+            .extend(operations);
+        Ok(())
     }
 
     fn plan_mutations(state: &State, operations: Vec<WriteOperation>) -> OQLResult<Vec<Mutation>> {
@@ -5793,6 +6090,9 @@ fn logical_collection_identities(
     Ok(identities)
 }
 
+/// The live rows of a collection in id order, which is the order a scan
+/// yields them. Rows held in memory are already kept in that order, so only
+/// a collection with rows in typed segments needs the ids to merge by.
 fn logical_collection_object_refs(state: &State, schema: &str) -> OQLResult<Vec<ObjRef>> {
     if !state.typed_id_fences.contains_key(schema) {
         return Ok(state
@@ -6431,6 +6731,46 @@ fn validate_unique_candidate(
     candidate: &Document,
 ) -> OQLResult<()> {
     let candidate_key = document_index_key(candidate, index)?;
+    let duplicate = || {
+        OQLError::storage_error(
+            &format!(
+                "unique scalar index '{}' would contain a duplicate key",
+                index.name
+            ),
+            None,
+        )
+    };
+    // The index already knows which stored documents hold this key. Only
+    // an index this same batch creates, which has no entries yet, leaves
+    // every document to be read.
+    let indexed = state
+        .scalar_index_data
+        .get(&(index.schema.clone(), index.name.clone()));
+    if let Some(data) = indexed {
+        for object_ref in data
+            .search_key(&candidate_key)
+            .map_err(|error| OQLError::storage_error(&error, None))?
+        {
+            // A document this batch rewrites or deletes is judged below by
+            // what the batch makes of it.
+            if object_ref != candidate_ref && !planned.contains_key(&object_ref) {
+                return Err(duplicate());
+            }
+        }
+        for (object_ref, document) in planned {
+            if *object_ref == candidate_ref {
+                continue;
+            }
+            if let Some(document) = document {
+                if document.schema == index.schema
+                    && document_index_key(document, index)? == candidate_key
+                {
+                    return Err(duplicate());
+                }
+            }
+        }
+        return Ok(());
+    }
     for (object_ref, stored) in logical_documents(state)? {
         if object_ref == candidate_ref {
             continue;
@@ -8017,11 +8357,14 @@ impl DocumentStore for RustStore {
     }
 
     fn has_pending_writes(&self) -> OQLResult<bool> {
+        let Some(id) = self.current_transaction() else {
+            return Ok(false);
+        };
         Ok(self
-            .active_transaction
+            .transactions
             .lock()
             .map_err(|_| OQLError::generic("transaction lock poisoned"))?
-            .as_ref()
+            .get(&id)
             .is_some_and(|transaction| !transaction.operations.is_empty()))
     }
 
@@ -8091,9 +8434,9 @@ impl DocumentStore for RustStore {
                     .state
                     .lock()
                     .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
-                logical_collection_identities(&state, schema)?
+                logical_collection_object_refs(&state, schema)?
                     .into_iter()
-                    .map(|(_, object_ref)| {
+                    .map(|object_ref| {
                         logical_document(&state, object_ref).and_then(|document| {
                             document
                                 .map(|document| document.as_ref().clone())
@@ -8181,9 +8524,9 @@ impl DocumentStore for RustStore {
                     .state
                     .lock()
                     .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
-                logical_collection_identities(&state, schema)?
+                logical_collection_object_refs(&state, schema)?
                     .into_iter()
-                    .map(|(_, object_ref)| {
+                    .map(|object_ref| {
                         logical_document(&state, object_ref).and_then(|document| {
                             document
                                 .map(|document| project(&document, fields))
@@ -8262,10 +8605,7 @@ impl DocumentStore for RustStore {
                 .state
                 .lock()
                 .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
-            let object_refs = logical_collection_identities(&state, schema)?
-                .into_iter()
-                .map(|(_, object_ref)| object_ref)
-                .collect::<Vec<_>>();
+            let object_refs = logical_collection_object_refs(&state, schema)?;
             let decoded_rows_resident =
                 object_refs
                     .iter()
@@ -8572,14 +8912,14 @@ impl DocumentStore for RustStore {
         {
             return Ok(Some(batches));
         }
-        let identities = logical_collection_identities(&state, schema)?;
+        let object_refs = logical_collection_object_refs(&state, schema)?;
         let mut batches = Vec::new();
         let mut batch = ProjectedRowBatch::shared_with_capacity(
             schema.to_string(),
             fields,
-            batch_rows.min(identities.len()),
+            batch_rows.min(object_refs.len()),
         );
-        for (_, object_ref) in identities {
+        for object_ref in object_refs {
             let Some(document) = logical_document(&state, object_ref)? else {
                 continue;
             };
@@ -8857,6 +9197,49 @@ impl DocumentStore for RustStore {
         Ok(references)
     }
 
+    fn run_atomically(&self, work: &mut dyn FnMut() -> OQLResult<()>) -> OQLResult<()> {
+        // Inside a transaction the statement is part of it, and it is the
+        // transaction that commits or is refused.
+        if self.current_transaction().is_some() {
+            return work();
+        }
+        // Someone always wins a conflict, so losing this many times in a
+        // row means the document is being written without pause.
+        self.in_transaction(1_024, work)
+    }
+
+    fn document_exists(&self, schema: &str, id: &DocumentId) -> OQLResult<bool> {
+        let mut exists = {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+            lookup_object_ref(&state, schema, id)?.is_some()
+        };
+        let active = self
+            .transactions
+            .lock()
+            .map_err(|_| OQLError::generic("transaction lock poisoned"))?;
+        let own = self.current_transaction().and_then(|id| active.get(&id));
+        for operation in own.iter().flat_map(|transaction| &transaction.operations) {
+            match operation {
+                WriteOperation::PutDocument(pending)
+                    if pending.schema == schema && pending.id == *id =>
+                {
+                    exists = true;
+                }
+                WriteOperation::DeleteDocument {
+                    schema: pending_schema,
+                    id: pending_id,
+                } if pending_schema == schema && pending_id == id => {
+                    exists = false;
+                }
+                _ => {}
+            }
+        }
+        Ok(exists)
+    }
+
     fn object_ref_of(&self, schema: &str, id: &DocumentId) -> OQLResult<Option<ObjRef>> {
         let state = self
             .state
@@ -8940,6 +9323,17 @@ impl DocumentStore for RustStore {
             materialize_document(&mut state, *object_ref)?
                 .map(|document| document.as_ref().clone()),
         )
+    }
+
+    fn navigate_reference_shared(&self, object_ref: &ObjRef) -> OQLResult<Option<Arc<Document>>> {
+        if object_ref.is_null() {
+            return Ok(None);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+        materialize_document(&mut state, *object_ref)
     }
 
     fn navigate_references(&self, object_refs: &[ObjRef]) -> OQLResult<Vec<Option<Document>>> {

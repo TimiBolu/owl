@@ -60,9 +60,11 @@ pub struct SimulatedClock {
 impl SimulatedClock {
     /// Create a new simulated clock starting at a deterministic time
     pub fn new(seed: u64) -> Self {
-        // Create a deterministic start time based on seed
-        // We use a fixed reference point and add the seed as offset
-        let reference_instant = Instant::now();
+        // A start time that depends only on the seed. An `Instant` cannot
+        // be built from a number, so every simulated clock in the process
+        // counts from one shared reference point.
+        static REFERENCE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+        let reference_instant = *REFERENCE.get_or_init(Instant::now);
         let start_time = reference_instant + Duration::from_nanos(seed);
 
         Self {
@@ -267,21 +269,34 @@ mod tests {
     fn test_real_clock_performance() {
         let clock = RealClock::new();
 
-        // Measure overhead of clock.now() vs Instant::now()
-        let start = Instant::now();
-        for _ in 0..1000 {
+        // Measure overhead of clock.now() vs Instant::now(). One timing of
+        // a thousand calls says more about what else the machine was doing
+        // than about the clock, so compare the best of several.
+        let best = |call: &dyn Fn()| {
+            (0..25)
+                .map(|_| {
+                    let start = Instant::now();
+                    for _ in 0..1000 {
+                        call();
+                    }
+                    start.elapsed()
+                })
+                .min()
+                .expect("at least one timing")
+        };
+        let clock_duration = best(&|| {
             let _ = clock.now();
-        }
-        let clock_duration = start.elapsed();
-
-        let start = Instant::now();
-        for _ in 0..1000 {
+        });
+        let direct_duration = best(&|| {
             let _ = Instant::now();
-        }
-        let direct_duration = start.elapsed();
+        });
 
-        // Should have minimal overhead (within 50% is acceptable)
-        assert!(clock_duration.as_nanos() < direct_duration.as_nanos() * 3 / 2);
+        // Should have minimal overhead: within twice the direct call, with
+        // a floor for timers too coarse to tell them apart.
+        assert!(
+            clock_duration.as_nanos() <= direct_duration.as_nanos() * 2 + 20_000,
+            "{clock_duration:?} against {direct_duration:?}"
+        );
     }
 
     #[test]

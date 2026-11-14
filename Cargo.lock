@@ -951,6 +951,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 
 [[package]]
+name = "owl-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "http-body-util",
+ "owl_db",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tower",
+]
+
+[[package]]
 name = "owl_db"
 version = "0.1.0"
 dependencies = [
@@ -969,6 +985,8 @@ dependencies = [
  "proptest",
  "rand 0.8.5",
  "rayon",
+ "regex",
+ "regex-syntax",
  "serde",
  "serde_json",
  "tempfile",

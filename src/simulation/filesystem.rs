@@ -22,6 +22,12 @@ pub trait FileSystem: Send + Sync {
     /// Remove a file
     fn remove(&self, path: &Path) -> io::Result<()>;
 
+    /// Make sure a directory and its parents exist. A file system with no
+    /// directories of its own, such as the simulated one, has nothing to do.
+    fn create_dir_all(&self, _path: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
     /// Atomically move a file within the same filesystem.
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
 
@@ -546,6 +552,10 @@ impl Default for RealFileSystem {
 }
 
 impl FileSystem for RealFileSystem {
+    fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+        std::fs::create_dir_all(path)
+    }
+
     fn create(&self, path: &Path) -> io::Result<Box<dyn FileHandle>> {
         let file = File::create(path)?;
         sync_parent_directory(path)?;
@@ -787,25 +797,26 @@ mod tests {
         let mut file = fs.create(path).unwrap();
         file.write(b"Unsynced data").unwrap();
 
-        // Crash the system
+        // Crash the system. Nothing answers until it has recovered.
         fs.crash();
+        assert!(!fs.exists(path));
+        fs.recover();
 
-        // Data should be lost
+        // The file was never synced, so the crash took it.
         assert!(!fs.exists(path));
 
-        // Recover and try again with sync
-        fs.recover();
+        // Try again with sync
         let mut file = fs.create(path).unwrap();
         file.write(b"Synced data").unwrap();
         file.sync().unwrap();
 
         // Crash again
         fs.crash();
+        fs.recover();
 
         // Synced data should survive
         assert!(fs.exists(path));
 
-        fs.recover();
         let mut file = fs.open(path).unwrap();
         let mut buf = vec![0u8; 11];
         file.read(&mut buf).unwrap();

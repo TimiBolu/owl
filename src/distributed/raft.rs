@@ -944,6 +944,11 @@ mod tests {
         let clock = Arc::new(SimulatedClock::new(42));
         let network = Arc::new(SimulatedNetwork::new(42));
         let config = RaftConfig::default();
+        // The network delivers only between nodes it knows.
+        network.add_node(id);
+        for peer in &peers {
+            network.add_node(*peer);
+        }
 
         RaftNode::new(id, peers, clock, network, config)
     }

@@ -97,6 +97,12 @@ pub enum OQLError {
     #[error("Transaction error: {message}")]
     TransactionError { message: String },
 
+    /// A transaction could not commit because a document it wrote was
+    /// changed by someone else after it began. Nothing was applied; run the
+    /// transaction again from the start.
+    #[error("Transaction conflict: {message}")]
+    TransactionConflict { message: String },
+
     #[error("Concurrency error: {message}")]
     ConcurrencyError { message: String },
 
@@ -233,6 +239,12 @@ pub enum OQLError {
 }
 
 impl OQLError {
+    /// Whether this is a refused commit that will succeed if the whole
+    /// transaction is run again.
+    pub fn is_transaction_conflict(&self) -> bool {
+        matches!(self, OQLError::TransactionConflict { .. })
+    }
+
     /// Get a user-friendly error message with context
     pub fn user_message(&self) -> String {
         let base_message = match self {
@@ -250,6 +262,9 @@ impl OQLError {
             OQLError::ParseError { message } => format!("Parse error: {}", message),
             OQLError::FunctionError { message } => format!("Function error: {}", message),
             OQLError::TransactionError { message } => format!("Transaction error: {}", message),
+            OQLError::TransactionConflict { message } => {
+                format!("Transaction conflict: {}", message)
+            }
             OQLError::ConcurrencyError { message } => format!("Concurrency error: {}", message),
             OQLError::QueryExecution { message } => format!("Query execution error: {}", message),
             OQLError::Io(e) => format!("IO error: {}", e),
@@ -356,6 +371,7 @@ impl OQLError {
             OQLError::ParseError { .. } => ErrorSeverity::Error,
             OQLError::FunctionError { .. } => ErrorSeverity::Error,
             OQLError::TransactionError { .. } => ErrorSeverity::Error,
+            OQLError::TransactionConflict { .. } => ErrorSeverity::Error,
             OQLError::ConcurrencyError { .. } => ErrorSeverity::Warning,
             OQLError::QueryExecution { .. } => ErrorSeverity::Error,
             OQLError::Io(_) => ErrorSeverity::Error,
@@ -396,6 +412,7 @@ impl OQLError {
             OQLError::ParseError { .. } => None,
             OQLError::FunctionError { .. } => None,
             OQLError::TransactionError { .. } => None,
+            OQLError::TransactionConflict { .. } => None,
             OQLError::ConcurrencyError { .. } => None,
             OQLError::QueryExecution { .. } => None,
             OQLError::Io(_) => None,
@@ -436,6 +453,7 @@ impl OQLError {
             OQLError::ParseError { .. } => None,
             OQLError::FunctionError { .. } => None,
             OQLError::TransactionError { .. } => None,
+            OQLError::TransactionConflict { .. } => None,
             OQLError::ConcurrencyError { .. } => None,
             OQLError::QueryExecution { .. } => None,
             OQLError::Io(_) => None,
@@ -502,6 +520,9 @@ impl Clone for OQLError {
                 message: message.clone(),
             },
             OQLError::TransactionError { message } => OQLError::TransactionError {
+                message: message.clone(),
+            },
+            OQLError::TransactionConflict { message } => OQLError::TransactionConflict {
                 message: message.clone(),
             },
             OQLError::ConcurrencyError { message } => OQLError::ConcurrencyError {

@@ -182,12 +182,25 @@ impl ParallelAggregateExec {
         for doc in documents {
             partial.count += 1;
 
-            for spec in aggregates {
+            for (position, spec) in aggregates.iter().enumerate() {
                 if let Some(field_access) = &spec.field {
                     let field_key = field_access.path.join(".");
                     if let Some(value) = doc.fields.get(&field_access.path[0]) {
                         match spec.function {
                             AggregateFunction::Sum | AggregateFunction::Avg => {
+                                // `sum(.x)` and `avg(.x)` read one running
+                                // total, so a document adds to it once
+                                // however many of them ask.
+                                let already_added = aggregates[..position].iter().any(|earlier| {
+                                    matches!(
+                                        earlier.function,
+                                        AggregateFunction::Sum | AggregateFunction::Avg
+                                    ) && earlier.field.as_ref().map(|field| &field.path)
+                                        == Some(&field_access.path)
+                                });
+                                if already_added {
+                                    continue;
+                                }
                                 if let Ok(num) = Self::value_to_number(value) {
                                     *partial.sums.entry(field_key.clone()).or_insert(0.0) += num;
                                 }

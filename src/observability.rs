@@ -240,10 +240,12 @@ pub fn init_tracing(service_name: &str) -> OQLResult<()> {
     // Set up tracing subscriber with JSON formatting
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    tracing_subscriber::registry()
+    // A process has one global subscriber. Asking again, as a second
+    // component or a second test does, keeps the one already installed.
+    let _ = tracing_subscriber::registry()
         .with(env_filter)
         .with(tracing_subscriber::fmt::layer().json())
-        .init();
+        .try_init();
 
     info!(service = service_name, "Tracing initialized");
 

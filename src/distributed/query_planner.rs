@@ -830,6 +830,10 @@ mod tests {
     #[test]
     fn test_simple_query_planning() {
         let shard_manager = Arc::new(ShardManager::new());
+        // A cluster with nothing in it has nothing to scan, which costs
+        // nothing; give the plan a shard to read.
+        shard_manager.add_node("node1", "localhost:8080").unwrap();
+        shard_manager.create_shard("node1").unwrap();
         let planner = DistributedQueryPlanner::new(shard_manager);
 
         let oql = "User.select { id, name }";

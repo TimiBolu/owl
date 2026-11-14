@@ -659,11 +659,16 @@ impl CheckpointManager {
             .ok_or_else(|| OQLError::generic("Invalid checkpoint directory path"))?
             .to_string();
 
-        // Create checkpoint directory if it doesn't exist
-        if !filesystem.exists(checkpoint_dir.as_ref()) {
-            // Note: FileSystem trait doesn't have create_dir, so we assume it exists
-            // In a real implementation, we'd extend the trait or handle this differently
-        }
+        // Checkpoint files are created inside this directory, so it has
+        // to exist first.
+        filesystem
+            .create_dir_all(checkpoint_dir.as_ref())
+            .map_err(|error| {
+                OQLError::storage_error(
+                    &format!("Failed to create checkpoint directory: {}", error),
+                    None,
+                )
+            })?;
 
         Ok(Self {
             shard_id,
@@ -1043,7 +1048,10 @@ mod tests {
         let checkpoint = checkpoint_mgr.create_checkpoint(shard_lsns).unwrap();
 
         assert_eq!(checkpoint.checkpoint_id, 1);
-        assert_eq!(checkpoint.lsn, 3); // WAL entry for checkpoint itself
+        // The checkpoint covers what was written before it. Its own marker
+        // is the next entry, which truncation must keep.
+        assert_eq!(checkpoint.lsn, 2);
+        assert_eq!(wal.current_lsn(), 3);
         assert!(checkpoint.verify());
 
         // Verify it's the latest checkpoint

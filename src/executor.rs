@@ -21,7 +21,7 @@ use crate::schema::DocumentSystemField;
 use crate::schema::SchemaRegistry;
 use crate::schema::{CheckOperator, FieldType, Schema, SchemaConstraint};
 use crate::simulation::Clock;
-use crate::storage::{DocumentStore, ProjectedValueRef, ScanPredicate};
+use crate::storage::{DocumentStore, ProjectedRowRef, ProjectedValueRef, ScanPredicate};
 use crate::storage::{VectorIndexState, VectorIndexType, VectorMetricType};
 use crate::streaming::{
     PaginatedResult, QueryStream, StreamConfig, StreamCursor, StreamingExecutor,
@@ -259,6 +259,47 @@ impl<S: DocumentStore> QueryExecutor<S> {
 
     /// Execute an OQL query and return matching documents
     pub fn execute_query(&self, query: &OQLQuery) -> OQLResult<Vec<Document>> {
+        self.atomically(query, || self.execute_statement(query))
+    }
+
+    /// Run a statement so that, if it writes, it is one indivisible step.
+    ///
+    /// A statement that writes reads first: the rows to update, the id that
+    /// must be free, the value to add one to. Run on its own it takes
+    /// effect only if nobody else changed what it wrote in the meantime,
+    /// and is otherwise run again, so `update { stock: .stock - 1 }` from
+    /// two callers takes two off and `where { .version == 3 }.update { .. }`
+    /// is a compare-and-set. Inside a transaction, or inside another
+    /// statement, it is part of that instead.
+    fn atomically<T>(
+        &self,
+        query: &OQLQuery,
+        mut statement: impl FnMut() -> OQLResult<T>,
+    ) -> OQLResult<T> {
+        let writes = query.operations.iter().any(|operation| {
+            matches!(
+                operation,
+                Operation::Insert(_)
+                    | Operation::InsertMany(_)
+                    | Operation::Upsert(_)
+                    | Operation::Update(_)
+                    | Operation::Delete
+            )
+        });
+        if !writes || StatementGuard::active() {
+            return statement();
+        }
+        let mut outcome = None;
+        self.store.run_atomically(&mut || {
+            outcome = Some(statement()?);
+            Ok(())
+        })?;
+        outcome.ok_or_else(|| OQLError::Generic {
+            message: "the statement did not run".to_string(),
+        })
+    }
+
+    fn execute_statement(&self, query: &OQLQuery) -> OQLResult<Vec<Document>> {
         let _statement = StatementGuard::enter();
         profile_call!("execute_query", {
             if let Some(documents) = self.tie_broken_top_k(query)? {
@@ -280,6 +321,10 @@ impl<S: DocumentStore> QueryExecutor<S> {
     /// consumers. Queries outside the safe physical-read subset remain fully
     /// supported by wrapping their established document output in chunks.
     pub fn execute_query_batches(&self, query: &OQLQuery) -> OQLResult<BatchQueryExecution> {
+        self.atomically(query, || self.execute_statement_batches(query))
+    }
+
+    fn execute_statement_batches(&self, query: &OQLQuery) -> OQLResult<BatchQueryExecution> {
         let _statement = StatementGuard::enter();
         let planning_started = Instant::now();
         let plan = self.try_plan_safe_read(query)?;
@@ -314,6 +359,10 @@ impl<S: DocumentStore> QueryExecutor<S> {
     /// Planning and execution share one plan, so observability does not cause
     /// a second planner pass or risk describing a different execution.
     pub fn execute_query_with_plan(&self, query: &OQLQuery) -> OQLResult<QueryExecution> {
+        self.atomically(query, || self.execute_statement_with_plan(query))
+    }
+
+    fn execute_statement_with_plan(&self, query: &OQLQuery) -> OQLResult<QueryExecution> {
         let _statement = StatementGuard::enter();
         profile_call!("execute_query_with_plan", {
             let planning_started = Instant::now();
@@ -356,9 +405,11 @@ impl<S: DocumentStore> QueryExecutor<S> {
             });
         }
         self.validate_declared_paths(query)?;
+        let ranged = self.pattern_ranges(query)?;
+        let query = ranged.as_ref().unwrap_or(query);
         let reordered = Self::storage_filter_first(query);
         let query = reordered.as_ref().unwrap_or(query);
-        if let Some(documents) = self.aggregate_from_columns(query)? {
+        if let Some(documents) = self.aggregate_from_columns(query, false)? {
             return Ok(documents);
         }
         let mut documents = Vec::new();
@@ -383,10 +434,23 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 } else if let Some(rows) = self.rows_through_reference(query)? {
                     // Only rows that can pass the filter; it still runs.
                     rows
-                } else if let Some((rows, applied)) = self.pipeline_prefix(query)? {
+                } else if let Some(documents) = self.aggregate_from_columns(query, true)? {
+                    // Nothing narrows the read, so every row is visited
+                    // once and none is kept.
+                    return Ok(documents);
+                } else if let Some((plan, applied)) = self.pipeline_prefix(query)? {
+                    // An index that narrows the read beats visiting every
+                    // row; without one, shaping rows as they are read does.
+                    if !Self::contains_native_index_scan(&plan.root) {
+                        if let Some(documents) = self.select_from_columns(query)? {
+                            return Ok(documents);
+                        }
+                    }
                     // Storage already applied the leading filters.
                     filters_applied = applied;
-                    rows
+                    self.execute_read_plan(&plan)?
+                } else if let Some(documents) = self.select_from_columns(query)? {
+                    return Ok(documents);
                 } else if let Some(fields) = self.fields_read_by(query) {
                     // The query shapes its own output and names every field
                     // it reads, so the rest need not be decoded.
@@ -488,14 +552,35 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     "path".to_string(),
                     Value::String("general executor".to_string()),
                 );
-                fields.insert("uses_index".to_string(), Value::Boolean(false));
+                // The general executor still reads its rows through an
+                // index when its leading filters allow one.
+                let ranged = self.pattern_ranges(query)?;
+                let sourced = ranged.as_ref().unwrap_or(query);
+                let reordered = Self::storage_filter_first(sourced);
+                let sourced = reordered.as_ref().unwrap_or(sourced);
+                let index_plan = self
+                    .pipeline_prefix(sourced)?
+                    .filter(|(plan, _)| Self::contains_native_index_scan(&plan.root));
+                fields.insert(
+                    "uses_index".to_string(),
+                    Value::Boolean(index_plan.is_some()),
+                );
                 fields.insert(
                     "plan".to_string(),
-                    Value::String(format!(
-                        "scan {} and apply {} operation(s) in order",
-                        query.collection,
-                        query.operations.len()
-                    )),
+                    Value::String(match index_plan {
+                        Some((plan, applied)) => format!(
+                            "read {} through an index for its first {} filter(s), then apply the \
+                             remaining operations in order\n{}",
+                            query.collection,
+                            applied,
+                            plan.root.explain()
+                        ),
+                        None => format!(
+                            "scan {} and apply {} operation(s) in order",
+                            query.collection,
+                            query.operations.len()
+                        ),
+                    }),
                 );
             }
         }
@@ -637,60 +722,68 @@ impl<S: DocumentStore> QueryExecutor<S> {
         row[right.len()]
     }
 
-    /// Answer a filter-then-aggregate query straight from storage's column
-    /// batches, without building a row object for any input row.
+    /// Answer a filter-then-aggregate query by folding storage's column
+    /// batches, without building a row object for each input row.
     ///
-    /// Covers the common reporting shapes: `count()`, an aggregate of one
-    /// field, an aggregate-only `select`, and `group_by` on plain fields
-    /// followed by a `select` of keys and aggregates. Anything else returns
-    /// `None` and takes the general path, which defines the semantics; this
-    /// path must produce exactly the same rows.
-    fn aggregate_from_columns(&self, query: &OQLQuery) -> OQLResult<Option<Vec<Document>>> {
+    /// Covers `count()`, a terminal aggregate, an aggregate-only `select`,
+    /// and `group_by` followed by an optional `having` and a `select` of
+    /// keys and aggregates. Filters storage can evaluate are pushed into the
+    /// scan. Everything else (any other filter, a computed or referenced
+    /// group key, an aggregate of an expression, an aggregate over a
+    /// filtered group) is evaluated by the general evaluator against one
+    /// reused row, and only when `with_row_evaluation` allows it: the caller
+    /// first tries the ways of reading fewer rows.
+    ///
+    /// Anything else returns `None` and takes the general path, which
+    /// defines the semantics; this path must produce exactly the same rows.
+    fn aggregate_from_columns(
+        &self,
+        query: &OQLQuery,
+        with_row_evaluation: bool,
+    ) -> OQLResult<Option<Vec<Document>>> {
+        if !COLUMN_AGGREGATION.with(|enabled| enabled.get()) {
+            return Ok(None);
+        }
         let leading = query
             .operations
             .iter()
-            .take_while(|operation| {
-                matches!(operation, Operation::Where(block) if Self::is_pipeline_safe_condition(&block.condition))
-            })
+            .take_while(|operation| matches!(operation, Operation::Where(_)))
             .count();
         let rest = &query.operations[leading..];
-        if !COLUMN_AGGREGATION.with(|enabled| enabled.get()) || self.store.has_pending_writes()? {
+        if !matches!(
+            rest,
+            [Operation::Count
+                | Operation::Sum(_)
+                | Operation::Avg(_)
+                | Operation::Min(_)
+                | Operation::Max(_)
+                | Operation::AggregateExpr { .. }
+                | Operation::Select(_), ..]
+                | [Operation::GroupBy(_), Operation::Select(_) | Operation::Having(_), ..]
+        ) {
             return Ok(None);
         }
         let Some(schema) = self.schema_of(&query.collection)? else {
             return Ok(None);
         };
-        let mut fields: Vec<String> = Vec::new();
-        let slot = |name: &str, fields: &mut Vec<String>| -> Option<usize> {
-            if !schema.fields.contains_key(name) || DocumentSystemField::from_name(name).is_some() {
-                return None;
-            }
-            Some(fields.iter().position(|known| known == name).unwrap_or_else(|| {
-                fields.push(name.to_string());
-                fields.len() - 1
-            }))
-        };
-        let simple_path = |expression: &Expression| match expression {
-            Expression::FieldAccess(FieldAccess { path }) if path.len() == 1 && path[0] != "*" => {
-                Some(path[0].clone())
-            }
-            _ => None,
-        };
 
         enum Shape {
-            Terminal(&'static str),
+            Terminal(String),
             Select,
             Grouped,
         }
-        let mut keys: Vec<(String, usize)> = Vec::new();
-        let mut outputs: Vec<(String, ColumnOutput)> = Vec::new();
+        let mut plan = FoldPlan::default();
         let (shape, consumed) = match rest {
             [Operation::Count, ..] => {
-                outputs.push(("count".into(), ColumnOutput::Aggregate(AggregateKind::Rows, 0)));
-                (Shape::Terminal("count"), 1)
+                plan.aggregates.push(FoldAggregate {
+                    kind: AggregateKind::Rows,
+                    input: RowInput::Rows,
+                    filters: Vec::new(),
+                });
+                plan.outputs.push(("count".into(), FoldOutput::Aggregate(0)));
+                (Shape::Terminal("count".into()), 1)
             }
-            [Operation::Sum(field) | Operation::Avg(field) | Operation::Min(field) | Operation::Max(field), ..]
-                if field.path.len() == 1 =>
+            [Operation::Sum(field) | Operation::Avg(field) | Operation::Min(field) | Operation::Max(field), ..] =>
             {
                 let (name, kind) = match &rest[0] {
                     Operation::Sum(_) => ("sum", AggregateKind::Sum),
@@ -698,53 +791,337 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     Operation::Min(_) => ("min", AggregateKind::Min),
                     _ => ("max", AggregateKind::Max),
                 };
-                let Some(index) = slot(&field.path[0], &mut fields) else {
+                let Some(input) = plan.input(&schema, &field.path) else {
                     return Ok(None);
                 };
-                outputs.push((name.into(), ColumnOutput::Aggregate(kind, index)));
-                (Shape::Terminal(name), 1)
+                plan.aggregates.push(FoldAggregate {
+                    kind,
+                    input,
+                    filters: Vec::new(),
+                });
+                plan.outputs.push((name.into(), FoldOutput::Aggregate(0)));
+                (Shape::Terminal(name.into()), 1)
             }
-            [Operation::GroupBy(group), Operation::Select(select), ..] if group.computed.is_empty() => {
+            [Operation::AggregateExpr { function, input }, ..] => {
+                let Some(kind) = AggregateKind::named(function, false) else {
+                    return Ok(None);
+                };
+                if Self::expression_contains_aggregate(input) {
+                    return Ok(None);
+                }
+                plan.aggregates.push(FoldAggregate {
+                    kind,
+                    input: RowInput::Expression(input.clone()),
+                    filters: Vec::new(),
+                });
+                plan.outputs.push((function.clone(), FoldOutput::Aggregate(0)));
+                (Shape::Terminal(function.clone()), 1)
+            }
+            [Operation::GroupBy(group), after @ ..] => {
+                // The names a group row answers to, as `group_by` assigns
+                // them: later assignments of a name win, except that a
+                // path's last segment never displaces an earlier name.
                 for field in &group.fields {
-                    if field.path.len() != 1 {
+                    let Some(input) = plan.input(&schema, &field.path) else {
+                        return Ok(None);
+                    };
+                    let position = plan.keys.len();
+                    plan.keys.push(input);
+                    plan.name_key(field.path.join("_"), position, true);
+                    if let Some(last) = field.path.last() {
+                        plan.name_key(last.clone(), position, false);
+                    }
+                }
+                for key in &group.computed {
+                    if Self::expression_contains_aggregate(&key.expression) {
                         return Ok(None);
                     }
-                    let Some(index) = slot(&field.path[0], &mut fields) else {
-                        return Ok(None);
-                    };
-                    keys.push((field.path[0].clone(), index));
+                    let position = plan.keys.len();
+                    plan.keys.push(RowInput::Expression(key.expression.clone()));
+                    plan.name_key(key.name.clone(), position, true);
                 }
+                plan.key_names.retain(|(name, _)| {
+                    !matches!(name.as_str(), "group_count" | "_group_schema" | "_group_rows")
+                        && DocumentSystemField::from_name(name).is_none()
+                });
+                let (select, consumed) = match after {
+                    [Operation::Select(select), ..] => (select, 2),
+                    [Operation::Having(having), Operation::Select(select), ..] => {
+                        let Some(condition) =
+                            self.fold_condition(&mut plan, &schema, &having.condition)
+                        else {
+                            return Ok(None);
+                        };
+                        plan.having = Some(condition);
+                        (select, 3)
+                    }
+                    _ => return Ok(None),
+                };
                 for entry in &select.fields {
-                    let Some(output) = Self::column_output(entry, &keys, &mut |name| slot(name, &mut fields)) else {
+                    let Some(output) = Self::fold_output(&mut plan, &schema, entry, true) else {
                         return Ok(None);
                     };
-                    outputs.push(output);
+                    plan.outputs.push(output);
                 }
-                (Shape::Grouped, 2)
+                (Shape::Grouped, consumed)
             }
             [Operation::Select(select), ..] => {
                 for entry in &select.fields {
-                    match Self::column_output(entry, &[], &mut |name| slot(name, &mut fields)) {
-                        Some(output @ (_, ColumnOutput::Aggregate(..))) => outputs.push(output),
-                        _ => return Ok(None),
-                    }
+                    let Some(output) = Self::fold_output(&mut plan, &schema, entry, false) else {
+                        return Ok(None);
+                    };
+                    plan.outputs.push(output);
                 }
                 (Shape::Select, 1)
             }
             _ => return Ok(None),
         };
-        let _ = simple_path;
 
-        // The filters, with literals typed to their fields.
-        let Some(filtered) = Self::normalize_pipeline_literals(
-            &OQLQuery {
-                collection: query.collection.clone(),
-                operations: query.operations[..leading].to_vec(),
-            },
-            &schema,
-        ) else {
+        let (filters, residual) =
+            Self::split_storage_filters(&query.collection, &schema, &query.operations[..leading]);
+        plan.residual = residual;
+
+        let needs_row = plan.needs_row();
+        if needs_row {
+            if !with_row_evaluation {
+                return Ok(None);
+            }
+            // The row the evaluator sees carries every field the query
+            // reads, exactly as a projected scan would give it.
+            let Some(read) = self.fields_read_by(query) else {
+                return Ok(None);
+            };
+            for name in read {
+                plan.slot(&schema, &name);
+            }
+        }
+        if self.store.has_pending_writes()? {
+            return Ok(None);
+        }
+        let Some(batches) =
+            self.store
+                .scan_projected_batches(&query.collection, &filters, &plan.fields, 4096)?
+        else {
             return Ok(None);
         };
+
+        // One state per group; ungrouped shapes have the single empty key.
+        let mut groups: Vec<ColumnGroup> = Vec::new();
+        let mut by_hash: HashMap<u64, Vec<usize>> = HashMap::new();
+        let new_group = |key: Vec<Value>, atoms: Vec<OwnedKeyAtom>| ColumnGroup {
+            key,
+            atoms,
+            accumulators: plan
+                .aggregates
+                .iter()
+                .map(|aggregate| Accumulator::new(aggregate.kind))
+                .collect(),
+        };
+        if plan.keys.is_empty() {
+            groups.push(new_group(Vec::new(), Vec::new()));
+        }
+        let mut current: Vec<Option<ProjectedValueRef<'_>>> = vec![None; plan.fields.len()];
+        let mut scratch =
+            Document::with_id(String::new(), query.collection.clone(), HashMap::new());
+        let mut key_values: Vec<Held> = Vec::with_capacity(plan.keys.len());
+        let mut memos: Vec<HashMap<ObjRef, usize>> = vec![HashMap::new(); plan.memos];
+        let mut remembered: Vec<Value> = Vec::new();
+        for batch in &batches {
+            'rows: for row in batch.rows() {
+                current.iter_mut().for_each(|value| *value = None);
+                for (name, value) in row.fields() {
+                    if let Some(index) = plan.fields.iter().position(|field| field == name) {
+                        current[index] = Some(value);
+                    }
+                }
+                // The row the evaluator reads: the stored document when it
+                // is in memory, which holds at least the fields read, and
+                // otherwise one filled from the columns.
+                let document: &Document = match row.document() {
+                    Some(document) => document,
+                    None => {
+                        if needs_row {
+                            Self::fill_scratch_row(&mut scratch, &row, &plan.fields, &current);
+                        }
+                        &scratch
+                    }
+                };
+                for condition in &plan.residual {
+                    if !self.evaluate_condition(document, condition)? {
+                        continue 'rows;
+                    }
+                }
+                key_values.clear();
+                for key in &plan.keys {
+                    key_values.push(match key {
+                        RowInput::Rows | RowInput::Slot(_) => Held::Owned(Value::Null),
+                        evaluated => {
+                            self.fold_input(evaluated, document, &current, &mut memos, &mut remembered)?
+                        }
+                    });
+                }
+                let group = if plan.keys.is_empty() {
+                    0
+                } else {
+                    let atom = |position: usize| match (&plan.keys[position], &key_values[position]) {
+                        (RowInput::Slot(slot), _) => KeyAtom::of(current[*slot]),
+                        (_, Held::Owned(value)) => KeyAtom::of(Some(ProjectedValueRef::Value(value))),
+                        (_, Held::Remembered(index)) => {
+                            KeyAtom::of(Some(ProjectedValueRef::Value(&remembered[*index])))
+                        }
+                    };
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    for position in 0..plan.keys.len() {
+                        match atom(position) {
+                            Some(atom) => std::hash::Hash::hash(&atom, &mut hasher),
+                            // A list or object as a key: leave it to the
+                            // general path.
+                            None => return Ok(None),
+                        }
+                    }
+                    let hash = std::hash::Hasher::finish(&hasher);
+                    let candidates = by_hash.entry(hash).or_default();
+                    let found = candidates.iter().copied().find(|index| {
+                        groups[*index]
+                            .atoms
+                            .iter()
+                            .enumerate()
+                            .all(|(position, owned)| {
+                                atom(position).is_some_and(|atom| atom.same(owned))
+                            })
+                    });
+                    match found {
+                        Some(index) => index,
+                        None => {
+                            let index = groups.len();
+                            let key = plan
+                                .keys
+                                .iter()
+                                .zip(&key_values)
+                                .map(|(key, held)| match (key, held) {
+                                    (RowInput::Slot(slot), _) => current[*slot]
+                                        .map_or(Value::Null, ProjectedValueRef::to_owned),
+                                    (_, Held::Owned(value)) => value.clone(),
+                                    (_, Held::Remembered(index)) => remembered[*index].clone(),
+                                })
+                                .collect();
+                            let atoms = (0..plan.keys.len())
+                                .filter_map(|position| atom(position).map(|atom| atom.owned()))
+                                .collect();
+                            groups.push(new_group(key, atoms));
+                            candidates.push(index);
+                            index
+                        }
+                    }
+                };
+                let group = &mut groups[group];
+                'aggregates: for (aggregate, accumulator) in
+                    plan.aggregates.iter().zip(&mut group.accumulators)
+                {
+                    for condition in &aggregate.filters {
+                        if !self.evaluate_condition(document, condition)? {
+                            continue 'aggregates;
+                        }
+                    }
+                    match &aggregate.input {
+                        RowInput::Rows => accumulator.count += 1,
+                        RowInput::Slot(slot) => accumulator.push(current[*slot])?,
+                        evaluated => {
+                            match self.fold_input(evaluated, document, &current, &mut memos, &mut remembered)? {
+                                Held::Owned(value) => {
+                                    accumulator.push(Some(ProjectedValueRef::Value(&value)))?
+                                }
+                                Held::Remembered(index) => accumulator
+                                    .push(Some(ProjectedValueRef::Value(&remembered[index])))?,
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Groups come out in the order the general path produces them.
+        let mut ordered: Vec<(Vec<u8>, ColumnGroup)> = groups
+            .into_iter()
+            .map(|group| {
+                let canonical: Vec<Value> =
+                    group.key.iter().map(Self::canonical_key_value).collect();
+                bincode::serialize(&canonical)
+                    .map(|encoded| (encoded, group))
+                    .map_err(|error| OQLError::Generic {
+                        message: format!("Failed to encode group key: {}", error),
+                    })
+            })
+            .collect::<OQLResult<_>>()?;
+        ordered.sort_by(|left, right| left.0.cmp(&right.0));
+
+        let mut documents = Vec::with_capacity(ordered.len());
+        for (index, (_, group)) in ordered.into_iter().enumerate() {
+            let values: Vec<Value> = group
+                .accumulators
+                .into_iter()
+                .map(Accumulator::finish)
+                .collect();
+            if let Some(having) = &plan.having {
+                if !self.fold_condition_holds(having, &group.key, &values)? {
+                    continue;
+                }
+            }
+            let mut row = HashMap::with_capacity(plan.outputs.len());
+            for (name, output) in &plan.outputs {
+                let value = match output {
+                    FoldOutput::Key(position) => group.key[*position].clone(),
+                    FoldOutput::Aggregate(position) => values[*position].clone(),
+                };
+                row.insert(name.clone(), value);
+            }
+            documents.push(match &shape {
+                Shape::Terminal(function) => Document::with_id(
+                    format!("{function}_result"),
+                    "aggregate".to_string(),
+                    row,
+                ),
+                Shape::Select => Document::with_id(
+                    "aggregation_result".to_string(),
+                    "aggregation".to_string(),
+                    row,
+                ),
+                Shape::Grouped => Document::with_id(format!("group_{index}"), "group".to_string(), row),
+            });
+        }
+        COLUMN_FOLDS_RUN.with(|count| count.set(count.get() + 1));
+        for operation in &rest[consumed..] {
+            // No groups means no group rows to shape or filter; see the
+            // same rule in `execute_general_query`.
+            if matches!(shape, Shape::Grouped)
+                && documents.is_empty()
+                && matches!(operation, Operation::Select(_) | Operation::Having(_))
+            {
+                continue;
+            }
+            documents = self.apply_operation(documents, operation, &query.collection)?;
+        }
+        Ok(Some(documents))
+    }
+
+    /// Split leading `where` operations into the part storage evaluates and
+    /// the part left to the evaluator. Each conjunct goes to storage when
+    /// storage gives the same answer as the evaluator, and stays behind
+    /// otherwise.
+    fn split_storage_filters(
+        collection: &str,
+        schema: &Schema,
+        leading: &[Operation],
+    ) -> (Vec<ScanPredicate>, Vec<Condition>) {
+        fn conjuncts<'a>(condition: &'a Condition, parts: &mut Vec<&'a Condition>) {
+            match condition {
+                Condition::And(left, right) => {
+                    conjuncts(left, parts);
+                    conjuncts(right, parts);
+                }
+                other => parts.push(other),
+            }
+        }
         fn predicate(condition: &Condition) -> Option<ScanPredicate> {
             Some(match condition {
                 Condition::Comparison {
@@ -772,42 +1149,15 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 _ => return None,
             })
         }
-        let mut filters = Vec::new();
-        for operation in &filtered.operations {
-            let Operation::Where(block) = operation else {
-                return Ok(None);
-            };
-            // Every filtered field must be one storage can evaluate.
-            let Some(filter) = predicate(&block.condition) else {
-                return Ok(None);
-            };
-            filters.push(filter);
-        }
-        fn filter_fields<'a>(predicate: &'a ScanPredicate, names: &mut Vec<&'a str>) {
-            match predicate {
-                ScanPredicate::Comparison { field, .. } => names.push(field),
-                ScanPredicate::And(left, right) | ScanPredicate::Or(left, right) => {
-                    filter_fields(left, names);
-                    filter_fields(right, names);
-                }
-            }
-        }
-        let mut filtered_names = Vec::new();
-        filters
-            .iter()
-            .for_each(|filter| filter_fields(filter, &mut filtered_names));
-        if filtered_names.iter().any(|name| {
-            !schema.fields.contains_key(*name) || DocumentSystemField::from_name(name).is_some()
-        }) {
-            return Ok(None);
-        }
         // Storage compares stored values with the literal as given, so the
         // two must be of one plain type. A reference compared with an id, or
-        // anything compared with null, has meaning only the general path
-        // knows.
+        // anything compared with null, has meaning only the evaluator knows.
         fn plainly_typed(predicate: &ScanPredicate, schema: &Schema) -> bool {
             match predicate {
                 ScanPredicate::Comparison { field, value, .. } => {
+                    if DocumentSystemField::from_name(field).is_some() {
+                        return false;
+                    }
                     let mut declared = schema.fields.get(field);
                     while let Some(FieldType::Optional(inner)) = declared {
                         declared = Some(inner);
@@ -826,10 +1176,88 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 }
             }
         }
-        if !filters.iter().all(|filter| plainly_typed(filter, &schema)) {
+        let mut filters = Vec::new();
+        let mut residual = Vec::new();
+        for operation in leading {
+            let Operation::Where(block) = operation else {
+                continue;
+            };
+            let mut parts = Vec::new();
+            conjuncts(&block.condition, &mut parts);
+            for part in parts {
+                let pushed = Self::is_pipeline_safe_condition(part)
+                    .then(|| {
+                        Self::normalize_pipeline_literals(
+                            &OQLQuery {
+                                collection: collection.to_string(),
+                                operations: vec![Operation::Where(WhereBlock {
+                                    condition: part.clone(),
+                                })],
+                            },
+                            schema,
+                        )
+                    })
+                    .flatten()
+                    .and_then(|typed| match typed.operations.first() {
+                        Some(Operation::Where(block)) => predicate(&block.condition),
+                        _ => None,
+                    })
+                    .filter(|filter| plainly_typed(filter, schema));
+                match pushed {
+                    Some(filter) => filters.push(filter),
+                    None => residual.push(part.clone()),
+                }
+            }
+        }
+        (filters, residual)
+    }
+
+    /// Answer `where { .. }.select { .. }` by shaping each stored row
+    /// straight into its result row, without first building a row of the
+    /// fields the query reads.
+    ///
+    /// The filters are split as in [`Self::aggregate_from_columns`] and the
+    /// `select` is evaluated by the general evaluator, so the rows are the
+    /// ones the general path returns. `None` leaves the query to it.
+    fn select_from_columns(&self, query: &OQLQuery) -> OQLResult<Option<Vec<Document>>> {
+        if !COLUMN_AGGREGATION.with(|enabled| enabled.get()) {
             return Ok(None);
         }
-
+        let leading = query
+            .operations
+            .iter()
+            .take_while(|operation| matches!(operation, Operation::Where(_)))
+            .count();
+        let [Operation::Select(select), after @ ..] = &query.operations[leading..] else {
+            return Ok(None);
+        };
+        // A `select` of aggregates summarises its rows; that is a fold.
+        if select
+            .fields
+            .iter()
+            .any(|field| Self::expression_contains_aggregate(&field.expression))
+        {
+            return Ok(None);
+        }
+        let Some(schema) = self.schema_of(&query.collection)? else {
+            return Ok(None);
+        };
+        // Every field read is named, so a stored document, which holds more
+        // than a projected row would, answers alike.
+        let Some(read) = self.fields_read_by(query) else {
+            return Ok(None);
+        };
+        if self.store.has_pending_writes()? {
+            return Ok(None);
+        }
+        let (filters, residual) =
+            Self::split_storage_filters(&query.collection, &schema, &query.operations[..leading]);
+        let fields: Vec<String> = read
+            .into_iter()
+            .filter(|name| {
+                schema.fields.contains_key(name) && DocumentSystemField::from_name(name).is_none()
+            })
+            .collect();
         let Some(batches) =
             self.store
                 .scan_projected_batches(&query.collection, &filters, &fields, 4096)?
@@ -837,175 +1265,256 @@ impl<S: DocumentStore> QueryExecutor<S> {
             return Ok(None);
         };
 
-        // One state per group; ungrouped shapes have the single empty key.
-        let mut groups: Vec<ColumnGroup> = Vec::new();
-        let mut by_hash: HashMap<u64, Vec<usize>> = HashMap::new();
-        let new_group = |key: Vec<Value>, atoms: Vec<OwnedKeyAtom>| ColumnGroup {
-            key,
-            atoms,
-            rows: 0,
-            accumulators: outputs
-                .iter()
-                .map(|(_, output)| match output {
-                    ColumnOutput::Aggregate(kind, _) => Some(Accumulator::new(*kind)),
-                    ColumnOutput::Key(_) => None,
-                })
-                .collect(),
-        };
-        if keys.is_empty() {
-            groups.push(new_group(Vec::new(), Vec::new()));
-        }
+        let mut documents = Vec::new();
         let mut current: Vec<Option<ProjectedValueRef<'_>>> = vec![None; fields.len()];
-        let mut atoms: Vec<KeyAtom<'_>> = Vec::with_capacity(keys.len());
+        let mut scratch =
+            Document::with_id(String::new(), query.collection.clone(), HashMap::new());
         for batch in &batches {
-            for row in batch.rows() {
-                current.iter_mut().for_each(|value| *value = None);
-                for (name, value) in row.fields() {
-                    if let Some(index) = fields.iter().position(|field| field == name) {
-                        current[index] = Some(value);
-                    }
-                }
-                let group = if keys.is_empty() {
-                    0
-                } else {
-                    atoms.clear();
-                    for (_, index) in &keys {
-                        match KeyAtom::of(current[*index]) {
-                            Some(atom) => atoms.push(atom),
-                            // A list or object as a key: leave it to the
-                            // general path.
-                            None => return Ok(None),
+            'rows: for row in batch.rows() {
+                let document: &Document = match row.document() {
+                    Some(document) => document,
+                    None => {
+                        current.iter_mut().for_each(|value| *value = None);
+                        for (name, value) in row.fields() {
+                            if let Some(index) = fields.iter().position(|field| field == name) {
+                                current[index] = Some(value);
+                            }
                         }
-                    }
-                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                    std::hash::Hash::hash(&atoms, &mut hasher);
-                    let hash = std::hash::Hasher::finish(&hasher);
-                    let candidates = by_hash.entry(hash).or_default();
-                    match candidates
-                        .iter()
-                        .copied()
-                        .find(|index| groups[*index].matches(&atoms))
-                    {
-                        Some(index) => index,
-                        None => {
-                            let index = groups.len();
-                            let key = keys
-                                .iter()
-                                .map(|(_, slot)| {
-                                    current[*slot].map_or(Value::Null, ProjectedValueRef::to_owned)
-                                })
-                                .collect();
-                            groups.push(new_group(key, atoms.iter().map(KeyAtom::owned).collect()));
-                            candidates.push(index);
-                            index
-                        }
+                        Self::fill_scratch_row(&mut scratch, &row, &fields, &current);
+                        &scratch
                     }
                 };
-                let group = &mut groups[group];
-                group.rows += 1;
-                for ((_, output), accumulator) in outputs.iter().zip(&mut group.accumulators) {
-                    if let (ColumnOutput::Aggregate(kind, index), Some(accumulator)) =
-                        (output, accumulator)
-                    {
-                        match kind {
-                            AggregateKind::Rows => accumulator.count += 1,
-                            _ => accumulator.push(current[*index])?,
-                        }
+                for condition in &residual {
+                    if !self.evaluate_condition(document, condition)? {
+                        continue 'rows;
                     }
                 }
+                let shaped = self.select_row(document, select)?;
+                documents.push(document.with_projected_fields(shaped));
             }
         }
-
-        // Groups come out in the order the general path produces them.
-        let mut ordered: Vec<(Vec<u8>, ColumnGroup)> = groups
-            .into_iter()
-            .map(|group| {
-                let canonical: Vec<Value> =
-                    group.key.iter().map(Self::canonical_key_value).collect();
-                bincode::serialize(&canonical)
-                    .map(|encoded| (encoded, group))
-                    .map_err(|error| OQLError::Generic {
-                        message: format!("Failed to encode group key: {}", error),
-                    })
-            })
-            .collect::<OQLResult<_>>()?;
-        ordered.sort_by(|left, right| left.0.cmp(&right.0));
-
-        let mut documents = Vec::with_capacity(ordered.len());
-        for (index, (_, group)) in ordered.into_iter().enumerate() {
-            let mut row = HashMap::with_capacity(outputs.len());
-            for ((name, output), accumulator) in outputs.iter().zip(group.accumulators) {
-                let value = match (output, accumulator) {
-                    (ColumnOutput::Key(position), _) => group.key[*position].clone(),
-                    (_, Some(accumulator)) => accumulator.finish(),
-                    (_, None) => Value::Null,
-                };
-                row.insert(name.clone(), value);
-            }
-            documents.push(match shape {
-                Shape::Terminal(function) => Document::with_id(
-                    format!("{function}_result"),
-                    "aggregate".to_string(),
-                    row,
-                ),
-                Shape::Select => Document::with_id(
-                    "aggregation_result".to_string(),
-                    "aggregation".to_string(),
-                    row,
-                ),
-                Shape::Grouped => Document::with_id(format!("group_{index}"), "group".to_string(), row),
-            });
-        }
-        for operation in &rest[consumed..] {
+        COLUMN_FOLDS_RUN.with(|count| count.set(count.get() + 1));
+        for operation in after {
             documents = self.apply_operation(documents, operation, &query.collection)?;
         }
         Ok(Some(documents))
     }
 
-    /// Classify one `select` entry as a group key or a simple aggregate, with
-    /// the name it takes in the result.
-    fn column_output(
+    /// Compute a group key or an aggregate's input for one row.
+    fn fold_input(
+        &self,
+        input: &RowInput,
+        document: &Document,
+        current: &[Option<ProjectedValueRef<'_>>],
+        memos: &mut [HashMap<ObjRef, usize>],
+        remembered: &mut Vec<Value>,
+    ) -> OQLResult<Held> {
+        match input {
+            RowInput::Rows | RowInput::Slot(_) => Ok(Held::Owned(Value::Null)),
+            RowInput::Path(path) => self.get_field_value(document, path).map(Held::Owned),
+            RowInput::Expression(expression) => {
+                self.evaluate_expression(document, expression).map(Held::Owned)
+            }
+            RowInput::Through { slot, memo, path } => {
+                let reference = match current[*slot] {
+                    Some(ProjectedValueRef::Reference(reference)) => reference,
+                    Some(ProjectedValueRef::Value(Value::Reference(reference))) => *reference,
+                    _ => return self.get_field_value(document, path).map(Held::Owned),
+                };
+                if let Some(index) = memos[*memo].get(&reference) {
+                    return Ok(Held::Remembered(*index));
+                }
+                remembered.push(self.get_field_value(document, path)?);
+                memos[*memo].insert(reference, remembered.len() - 1);
+                Ok(Held::Remembered(remembered.len() - 1))
+            }
+        }
+    }
+
+    /// Make `scratch` the row a projected scan would have built for `row`,
+    /// reusing its map, its keys and its string buffers.
+    fn fill_scratch_row(
+        scratch: &mut Document,
+        row: &ProjectedRowRef<'_>,
+        names: &[String],
+        current: &[Option<ProjectedValueRef<'_>>],
+    ) {
+        scratch.id.clear();
+        scratch.id.push_str(row.id());
+        scratch.created_at = row.created_at();
+        scratch.updated_at = row.updated_at();
+        scratch.version = row.version();
+        for (name, value) in names.iter().zip(current) {
+            match value {
+                Some(value) => match scratch.fields.get_mut(name) {
+                    Some(held) => match (held, *value) {
+                        (Value::String(text), ProjectedValueRef::String(new)) => {
+                            text.clear();
+                            text.push_str(new);
+                        }
+                        (held, value) => *held = value.to_owned(),
+                    },
+                    None => {
+                        scratch.fields.insert(name.clone(), ProjectedValueRef::to_owned(*value));
+                    }
+                },
+                None => {
+                    scratch.fields.remove(name);
+                }
+            }
+        }
+    }
+
+    /// Classify one `select` entry as a group key or an aggregate, with the
+    /// name it takes in the result.
+    fn fold_output(
+        plan: &mut FoldPlan,
+        schema: &Schema,
         entry: &crate::parser::SelectField,
-        keys: &[(String, usize)],
-        slot: &mut dyn FnMut(&str) -> Option<usize>,
-    ) -> Option<(String, ColumnOutput)> {
+        grouped: bool,
+    ) -> Option<(String, FoldOutput)> {
         match &entry.expression {
             Expression::FieldAccess(FieldAccess { path }) if path.len() == 1 => {
-                let position = keys.iter().position(|(name, _)| name == &path[0])?;
+                if !grouped {
+                    return None;
+                }
+                let position = plan.key_named(&path[0])?;
                 Some((
                     entry.alias.clone().unwrap_or_else(|| path[0].clone()),
-                    ColumnOutput::Key(position),
+                    FoldOutput::Key(position),
                 ))
             }
+            expression => {
+                let position = Self::fold_aggregate(plan, schema, expression)?;
+                let name = match (&entry.alias, expression) {
+                    (Some(alias), _) => alias.clone(),
+                    (None, Expression::FunctionCall { name, .. }) => name.clone(),
+                    (None, _) => "computed".to_string(),
+                };
+                Some((name, FoldOutput::Aggregate(position)))
+            }
+        }
+    }
+
+    /// Add `expression` to the plan when it is one aggregate over the rows
+    /// in hand: `sum(.total)`, `count()`, `avg(.qty * .price)`, or
+    /// `where { .tier == "gold" }.count()`.
+    fn fold_aggregate(
+        plan: &mut FoldPlan,
+        schema: &Schema,
+        expression: &Expression,
+    ) -> Option<usize> {
+        let aggregate = match expression {
             Expression::FunctionCall { name, args } => {
-                let kind = match (name.as_str(), args.as_slice()) {
-                    ("count", []) => (AggregateKind::Rows, 0),
-                    ("count", [Expression::FieldAccess(FieldAccess { path })])
-                        if path.len() == 1 && path[0] == "*" =>
-                    {
-                        (AggregateKind::Rows, 0)
+                let input = match Self::aggregate_input(name, args).ok()?? {
+                    AggregateInput::AllRows => RowInput::Rows,
+                    AggregateInput::Path(path) => plan.input(schema, &path)?,
+                    AggregateInput::Expression(inner) => {
+                        if Self::expression_contains_aggregate(&inner) {
+                            return None;
+                        }
+                        RowInput::Expression(inner)
                     }
-                    (function, [Expression::FieldAccess(FieldAccess { path })])
-                        if path.len() == 1 =>
-                    {
-                        let kind = match function {
-                            "count" => AggregateKind::NonNull,
-                            "sum" => AggregateKind::Sum,
-                            "avg" => AggregateKind::Avg,
-                            "min" => AggregateKind::Min,
-                            "max" => AggregateKind::Max,
-                            _ => return None,
-                        };
-                        (kind, slot(&path[0])?)
+                };
+                FoldAggregate {
+                    kind: AggregateKind::named(name, matches!(input, RowInput::Rows))?,
+                    input,
+                    filters: Vec::new(),
+                }
+            }
+            Expression::CollectionExpression { source, operations }
+                if matches!(source.as_ref(), Expression::Identifier(name) if name == crate::parser::CURRENT_ROWS) =>
+            {
+                let (terminal, before) = operations.split_last()?;
+                let mut filters = Vec::with_capacity(before.len());
+                for operation in before {
+                    match operation {
+                        Operation::Where(block)
+                            if Self::is_pipeline_safe_condition(&block.condition) =>
+                        {
+                            filters.push(block.condition.clone())
+                        }
+                        _ => return None,
                     }
+                }
+                let (kind, input) = match terminal {
+                    Operation::Count => (AggregateKind::Rows, RowInput::Rows),
+                    Operation::Sum(field) => (AggregateKind::Sum, plan.input(schema, &field.path)?),
+                    Operation::Avg(field) => (AggregateKind::Avg, plan.input(schema, &field.path)?),
+                    Operation::Min(field) => (AggregateKind::Min, plan.input(schema, &field.path)?),
+                    Operation::Max(field) => (AggregateKind::Max, plan.input(schema, &field.path)?),
                     _ => return None,
                 };
-                Some((
-                    entry.alias.clone().unwrap_or_else(|| name.clone()),
-                    ColumnOutput::Aggregate(kind.0, kind.1),
-                ))
+                FoldAggregate {
+                    kind,
+                    input,
+                    filters,
+                }
             }
-            _ => None,
+            _ => return None,
+        };
+        plan.aggregates.push(aggregate);
+        Some(plan.aggregates.len() - 1)
+    }
+
+    /// A `having` condition over keys, aggregates and literals.
+    fn fold_condition(
+        &self,
+        plan: &mut FoldPlan,
+        schema: &Schema,
+        condition: &Condition,
+    ) -> Option<FoldCondition> {
+        let operand = |expression: &Expression, plan: &mut FoldPlan| match expression {
+            Expression::Literal(literal) => Some(FoldOperand::Literal(self.literal_to_value(literal))),
+            Expression::FieldAccess(FieldAccess { path }) if path.len() == 1 => {
+                plan.key_named(&path[0]).map(FoldOperand::Key)
+            }
+            other => Self::fold_aggregate(plan, schema, other).map(FoldOperand::Aggregate),
+        };
+        Some(match condition {
+            Condition::Comparison {
+                left,
+                operator,
+                right,
+            } => {
+                let left = operand(left, plan)?;
+                let right = operand(right, plan)?;
+                FoldCondition::Compare(left, operator.clone(), right)
+            }
+            Condition::And(left, right) => FoldCondition::And(
+                Box::new(self.fold_condition(plan, schema, left)?),
+                Box::new(self.fold_condition(plan, schema, right)?),
+            ),
+            Condition::Or(left, right) => FoldCondition::Or(
+                Box::new(self.fold_condition(plan, schema, left)?),
+                Box::new(self.fold_condition(plan, schema, right)?),
+            ),
+            Condition::Not(inner) => {
+                FoldCondition::Not(Box::new(self.fold_condition(plan, schema, inner)?))
+            }
+        })
+    }
+
+    fn fold_condition_holds(
+        &self,
+        condition: &FoldCondition,
+        key: &[Value],
+        aggregates: &[Value],
+    ) -> OQLResult<bool> {
+        let value = |operand: &FoldOperand| match operand {
+            FoldOperand::Key(position) => key[*position].clone(),
+            FoldOperand::Aggregate(position) => aggregates[*position].clone(),
+            FoldOperand::Literal(value) => value.clone(),
+        };
+        match condition {
+            FoldCondition::Compare(left, operator, right) => {
+                self.compare_values(&value(left), operator, &value(right))
+            }
+            FoldCondition::And(left, right) => Ok(self.fold_condition_holds(left, key, aggregates)?
+                && self.fold_condition_holds(right, key, aggregates)?),
+            FoldCondition::Or(left, right) => Ok(self.fold_condition_holds(left, key, aggregates)?
+                || self.fold_condition_holds(right, key, aggregates)?),
+            FoldCondition::Not(inner) => Ok(!self.fold_condition_holds(inner, key, aggregates)?),
         }
     }
 
@@ -1187,6 +1696,94 @@ impl<S: DocumentStore> QueryExecutor<S> {
         ))
     }
 
+    /// Give a leading `matches(.field, "^prefix..")` the range of text it
+    /// can match.
+    ///
+    /// A pattern anchored at the start matches only text beginning with a
+    /// known prefix, which is a range of the field: from the prefix up to
+    /// the next one. Stating that range beside the pattern changes no
+    /// answer, and lets storage or an index on the field leave out every
+    /// row outside it. `None` when no leading pattern gives one.
+    fn pattern_ranges(&self, query: &OQLQuery) -> OQLResult<Option<OQLQuery>> {
+        let Some(Operation::Where(block)) = query.operations.first() else {
+            return Ok(None);
+        };
+        fn conjuncts<'a>(condition: &'a Condition, parts: &mut Vec<&'a Condition>) {
+            match condition {
+                Condition::And(left, right) => {
+                    conjuncts(left, parts);
+                    conjuncts(right, parts);
+                }
+                other => parts.push(other),
+            }
+        }
+        let mut parts = Vec::new();
+        conjuncts(&block.condition, &mut parts);
+        let mut ranges = Vec::new();
+        let mut schema = None;
+        for part in &parts {
+            let Condition::Comparison {
+                left: Expression::FunctionCall { name, args },
+                operator: ComparisonOperator::Equal,
+                right: Expression::Literal(Literal::Boolean(true)),
+            } = part
+            else {
+                continue;
+            };
+            let (
+                "matches",
+                [Expression::FieldAccess(field), Expression::Literal(Literal::String(pattern))],
+            ) = (name.as_str(), args.as_slice())
+            else {
+                continue;
+            };
+            if field.path.len() != 1 {
+                continue;
+            }
+            if schema.is_none() {
+                schema = self.schema_of(&query.collection)?;
+            }
+            // Only text has a prefix; anything else matches nothing anyway.
+            let mut declared = schema
+                .as_ref()
+                .and_then(|schema| schema.fields.get(&field.path[0]));
+            while let Some(FieldType::Optional(inner)) = declared {
+                declared = Some(inner);
+            }
+            if !matches!(declared, Some(FieldType::String))
+                || DocumentSystemField::from_name(&field.path[0]).is_some()
+            {
+                continue;
+            }
+            let Some(prefix) = crate::functions::required_prefix(pattern) else {
+                continue;
+            };
+            let bound = |operator: ComparisonOperator, text: String| Condition::Comparison {
+                left: Expression::FieldAccess(field.clone()),
+                operator,
+                right: Expression::Literal(Literal::String(text)),
+            };
+            if let Some(after) = crate::functions::after_prefix(&prefix) {
+                ranges.push(bound(ComparisonOperator::LessThan, after));
+            }
+            ranges.push(bound(ComparisonOperator::GreaterEqual, prefix));
+        }
+        if ranges.is_empty() {
+            return Ok(None);
+        }
+        let condition = ranges
+            .into_iter()
+            .fold(block.condition.clone(), |rest, range| {
+                Condition::And(Box::new(range), Box::new(rest))
+            });
+        let mut operations = query.operations.clone();
+        operations[0] = Operation::Where(WhereBlock { condition });
+        Ok(Some(OQLQuery {
+            collection: query.collection.clone(),
+            operations,
+        }))
+    }
+
     /// Split a leading filter so the part storage can evaluate comes first.
     ///
     /// `where { .customer.country == "NG" && .total > 900 }` becomes
@@ -1238,7 +1835,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
     /// use all of that for its first step even though the rest of it (a
     /// grouping, a nested projection) runs here. Returns the rows and how
     /// many leading operations they already satisfy.
-    fn pipeline_prefix(&self, query: &OQLQuery) -> OQLResult<Option<(Vec<Document>, usize)>> {
+    fn pipeline_prefix(&self, query: &OQLQuery) -> OQLResult<Option<(PhysicalPlan, usize)>> {
         let leading: Vec<Operation> = query
             .operations
             .iter()
@@ -1314,7 +1911,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
         let Some(plan) = self.plan_read_with(&prefix, &schema, narrowing)? else {
             return Ok(None);
         };
-        Ok(Some((self.execute_read_plan(&plan)?, applied)))
+        Ok(Some((plan, applied)))
     }
 
     /// Plan a read made only of pipeline-safe operations.
@@ -2792,8 +3389,21 @@ impl<S: DocumentStore> QueryExecutor<S> {
         let Some((last, filters)) = operations.split_last() else {
             return Ok(None);
         };
-        if !matches!(last, Operation::Count | Operation::Exists)
-            || !filters.iter().all(|operation| {
+        // What is asked of the related rows: how many there are, or one
+        // aggregate of one of their fields.
+        let measure = match last {
+            Operation::Count | Operation::Exists => "count".to_string(),
+            Operation::Sum(field)
+            | Operation::Avg(field)
+            | Operation::Min(field)
+            | Operation::Max(field)
+                if field.path.len() == 1 =>
+            {
+                serde_json::to_string(last).unwrap_or_default()
+            }
+            _ => return Ok(None),
+        };
+        if !filters.iter().all(|operation| {
                 matches!(operation, Operation::Where(block) if Self::is_pipeline_safe_condition(&block.condition))
             })
             || !StatementGuard::active()
@@ -2803,10 +3413,11 @@ impl<S: DocumentStore> QueryExecutor<S> {
             return Ok(None);
         }
         let key = format!(
-            "{}\u{0}{}\u{0}{}",
+            "{}\u{0}{}\u{0}{}\u{0}{}",
             row.schema,
             name,
-            serde_json::to_string(filters).unwrap_or_default()
+            serde_json::to_string(filters).unwrap_or_default(),
+            measure
         );
         let known = STATEMENT.with(|scope| {
             let mut scope = scope.borrow_mut();
@@ -2823,7 +3434,9 @@ impl<S: DocumentStore> QueryExecutor<S> {
             None => return Ok(None),
             Some(Some(tally)) => tally,
             Some(None) => {
-                let tally = self.tally_related(&row.schema, name, filters)?.map(Arc::new);
+                let tally = self
+                    .tally_related(&row.schema, name, filters, last)?
+                    .map(Arc::new);
                 STATEMENT.with(|scope| {
                     scope.borrow_mut().related_counts.insert(
                         key,
@@ -2842,23 +3455,29 @@ impl<S: DocumentStore> QueryExecutor<S> {
         let Some(reference) = self.store.object_ref_of(&row.schema, &row.id)? else {
             return Ok(None);
         };
-        let count = tally.get(&reference).copied().unwrap_or(0);
+        // A document nothing refers to has no entry: its related rows are
+        // the empty collection, and each aggregate has an answer for that.
+        let found = tally.get(&reference);
         Ok(Some(match last {
-            Operation::Exists => Value::Boolean(count > 0),
-            _ => Value::Integer(count),
+            Operation::Exists => {
+                Value::Boolean(matches!(found, Some(Value::Integer(count)) if *count > 0))
+            }
+            Operation::Count | Operation::Sum(_) => found.cloned().unwrap_or(Value::Integer(0)),
+            _ => found.cloned().unwrap_or(Value::Null),
         }))
     }
 
-    /// Count the documents that refer to each document of `target` through
-    /// the relationship `name` and pass `filters`, in one pass over the
-    /// referring collection. `None` when one pass cannot give the answer the
-    /// relationship's index gives.
+    /// Count, or aggregate one field of, the documents that refer to each
+    /// document of `target` through the relationship `name` and pass
+    /// `filters`, in one pass over the referring collection. `None` when one
+    /// pass cannot give the answer the relationship's index gives.
     fn tally_related(
         &self,
         target: &str,
         name: &str,
         filters: &[Operation],
-    ) -> OQLResult<Option<HashMap<ObjRef, i64>>> {
+        measure: &Operation,
+    ) -> OQLResult<Option<HashMap<ObjRef, Value>>> {
         let ReverseRelationship::Declared { source, field } =
             self.reverse_relationship(target, name)?
         else {
@@ -2901,6 +3520,33 @@ impl<S: DocumentStore> QueryExecutor<S> {
             (None, [only]) if !embedded && plain(&schema.fields[*only], target) => (*only).clone(),
             _ => return Ok(None),
         };
+        // An aggregate of a field must be one every row can take part in:
+        // one pass meets every row, where the index meets only the rows of
+        // the documents asked about, so a value that fails must be
+        // impossible rather than merely absent so far.
+        let (function, measured) = match measure {
+            Operation::Sum(field) => ("sum", Some(field)),
+            Operation::Avg(field) => ("avg", Some(field)),
+            Operation::Min(field) => ("min", Some(field)),
+            Operation::Max(field) => ("max", Some(field)),
+            _ => ("count", None),
+        };
+        if let Some(field) = measured {
+            let mut declared = field.path.first().and_then(|name| schema.fields.get(name));
+            while let Some(FieldType::Optional(inner)) = declared {
+                declared = Some(inner);
+            }
+            let fits = match declared {
+                Some(FieldType::Integer | FieldType::Float) => true,
+                Some(FieldType::String | FieldType::DateTime) => {
+                    matches!(function, "min" | "max")
+                }
+                _ => false,
+            };
+            if !fits {
+                return Ok(None);
+            }
+        }
         let mut operations = filters.to_vec();
         operations.push(Operation::GroupBy(crate::parser::GroupByBlock {
             fields: vec![FieldAccess {
@@ -2919,8 +3565,11 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 crate::parser::SelectField {
                     alias: Some("n".to_string()),
                     expression: Expression::FunctionCall {
-                        name: "count".to_string(),
-                        args: Vec::new(),
+                        name: function.to_string(),
+                        args: measured
+                            .map(|field| Expression::FieldAccess(field.clone()))
+                            .into_iter()
+                            .collect(),
                     },
                 },
             ],
@@ -2928,15 +3577,15 @@ impl<S: DocumentStore> QueryExecutor<S> {
         let Some(groups) = self.aggregate_from_columns(&OQLQuery {
             collection: source,
             operations,
-        })?
+        }, false)?
         else {
             return Ok(None);
         };
         let mut tally = HashMap::with_capacity(groups.len());
         for group in groups {
             match (group.fields.get(&through), group.fields.get("n")) {
-                (Some(Value::Reference(reference)), Some(Value::Integer(count))) => {
-                    tally.insert(*reference, *count);
+                (Some(Value::Reference(reference)), Some(value)) => {
+                    tally.insert(*reference, value.clone());
                 }
                 (Some(Value::Null) | None, _) => {}
                 // A value that is not a reference is not something this
@@ -4000,15 +4649,23 @@ impl<S: DocumentStore> QueryExecutor<S> {
     /// so traversing `.customer.country` for every row need not decode the
     /// same customer again each time.
     fn referenced_document(&self, reference: &ObjRef) -> OQLResult<Option<Arc<Document>>> {
+        // A null reference points nowhere, and a reference the store cannot
+        // follow is left to the slower lookup by id.
+        let follow = || -> Option<Arc<Document>> {
+            if reference.is_null() {
+                return None;
+            }
+            self.store.navigate_reference_shared(reference).ok().flatten()
+        };
         if !StatementGuard::active() {
-            return Ok(self.try_fast_navigation(reference)?.map(Arc::new));
+            return Ok(follow());
         }
         if let Some(known) =
             STATEMENT.with(|scope| scope.borrow().referenced.get(reference).cloned())
         {
             return Ok(known);
         }
-        let document = self.try_fast_navigation(reference)?.map(Arc::new);
+        let document = follow();
         STATEMENT.with(|scope| {
             scope
                 .borrow_mut()
@@ -4191,29 +4848,6 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
     }
 
-    /// Try fast O(1) pointer-based navigation using Zig storage
-    ///
-    /// This is the critical path for OQL's performance advantage:
-    /// - Navigation is pointer arithmetic, not a database query
-    /// - Executes in <50ns (2-3 memory loads)
-    /// - No query planning overhead
-    ///
-    /// Returns Some(Document) if fast navigation succeeded, None otherwise.
-    fn try_fast_navigation(&self, objref: &ObjRef) -> OQLResult<Option<Document>> {
-        // Check if this is a null reference
-        if objref.is_null() {
-            return Ok(None);
-        }
-
-        // Try to use the storage engine's fast navigation if available
-        // This will use direct pointer swizzling for Zig storage
-        match self.store.navigate_reference(objref) {
-            Ok(Some(doc)) => Ok(Some(doc)),
-            Ok(None) => Ok(None),
-            Err(_) => Ok(None), // Fallback to slow path on error
-        }
-    }
-
     /// Convert a literal to a Value
     fn literal_to_value(&self, literal: &Literal) -> Value {
         match literal {
@@ -4259,6 +4893,29 @@ impl<S: DocumentStore> QueryExecutor<S> {
 
     /// Replace a reference, or references inside a list, with the id of the
     /// document referred to. A broken reference has no id.
+    /// `value` as a client outside the process can hold it: every
+    /// reference, at any depth, replaced by the id of the document it
+    /// points at, which is also how a reference is written when inserting.
+    /// A reference to a document that no longer exists becomes null.
+    pub fn with_reference_ids(&self, value: &Value) -> OQLResult<Value> {
+        Ok(match value {
+            Value::Reference(_) | Value::GlobalReference(_) => self.reference_as_id(value)?,
+            Value::List(items) => Value::List(
+                items
+                    .iter()
+                    .map(|item| self.with_reference_ids(item))
+                    .collect::<OQLResult<_>>()?,
+            ),
+            Value::Object(fields) => Value::Object(
+                fields
+                    .iter()
+                    .map(|(name, value)| Ok((name.clone(), self.with_reference_ids(value)?)))
+                    .collect::<OQLResult<_>>()?,
+            ),
+            other => other.clone(),
+        })
+    }
+
     fn reference_as_id(&self, value: &Value) -> OQLResult<Value> {
         Ok(match value {
             Value::Reference(reference) => self
@@ -4349,60 +5006,66 @@ impl<S: DocumentStore> QueryExecutor<S> {
             Ok(vec![projected_doc])
         } else {
             // Handle regular projection - return one document per input document
-            let mut projected_documents = Vec::new();
-
+            let mut projected_documents = Vec::with_capacity(documents.len());
             for document in documents {
-                let mut projected_fields = HashMap::new();
-
-                for select_field in &select_block.fields {
-                    // `*` stands for every field of the row. Entries written
-                    // after it add to, or replace, what it brought in.
-                    if select_field.alias.is_none() && Self::is_all_fields(&select_field.expression)
-                    {
-                        projected_fields.extend(
-                            document
-                                .fields
-                                .iter()
-                                .map(|(name, value)| (name.clone(), value.clone())),
-                        );
-                        continue;
-                    }
-                    // `-name` leaves out a field that `*` brought in.
-                    if matches!(&select_field.expression, Expression::Identifier(marker) if marker == crate::parser::OMITTED_FIELD)
-                    {
-                        if let Some(name) = &select_field.alias {
-                            projected_fields.remove(name);
-                        }
-                        continue;
-                    }
-                    let field_name = match &select_field.alias {
-                        Some(alias) => alias.clone(),
-                        None => {
-                            // Extract field name from expression
-                            match &select_field.expression {
-                                Expression::FieldAccess(field_access) => field_access
-                                    .path
-                                    .last()
-                                    .unwrap_or(&"unknown".to_string())
-                                    .clone(),
-                                Expression::FunctionCall { name, .. } => name.clone(),
-                                _ => "computed".to_string(),
-                            }
-                        }
-                    };
-
-                    let value = self.evaluate_expression(&document, &select_field.expression)?;
-
-                    projected_fields.insert(field_name, value);
-                }
-
-                let projected_doc = document.with_projected_fields(projected_fields);
-
-                projected_documents.push(projected_doc);
+                let projected_fields = self.select_row(&document, select_block)?;
+                projected_documents.push(document.with_projected_fields(projected_fields));
             }
-
             Ok(projected_documents)
         }
+    }
+
+    /// The fields one row takes when a `select` without aggregates shapes
+    /// it.
+    fn select_row(
+        &self,
+        document: &Document,
+        select_block: &SelectBlock,
+    ) -> OQLResult<HashMap<String, Value>> {
+        let mut projected_fields = HashMap::with_capacity(select_block.fields.len());
+
+        for select_field in &select_block.fields {
+            // `*` stands for every field of the row. Entries written
+            // after it add to, or replace, what it brought in.
+            if select_field.alias.is_none() && Self::is_all_fields(&select_field.expression)
+            {
+                projected_fields.extend(
+                    document
+                        .fields
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone())),
+                );
+                continue;
+            }
+            // `-name` leaves out a field that `*` brought in.
+            if matches!(&select_field.expression, Expression::Identifier(marker) if marker == crate::parser::OMITTED_FIELD)
+            {
+                if let Some(name) = &select_field.alias {
+                    projected_fields.remove(name);
+                }
+                continue;
+            }
+            let field_name = match &select_field.alias {
+                Some(alias) => alias.clone(),
+                None => {
+                    // Extract field name from expression
+                    match &select_field.expression {
+                        Expression::FieldAccess(field_access) => field_access
+                            .path
+                            .last()
+                            .unwrap_or(&"unknown".to_string())
+                            .clone(),
+                        Expression::FunctionCall { name, .. } => name.clone(),
+                        _ => "computed".to_string(),
+                    }
+                }
+            };
+
+            let value = self.evaluate_expression(document, &select_field.expression)?;
+
+            projected_fields.insert(field_name, value);
+        }
+        Ok(projected_fields)
     }
 
     /// Apply INSERT operation
@@ -4802,8 +5465,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
         if !batch_ids.insert(document.id.clone())
             || self
                 .store
-                .get_document(&document.schema, &document.id)?
-                .is_some()
+                .document_exists(&document.schema, &document.id)?
         {
             return Err(OQLError::SchemaValidation {
                 message: format!(
@@ -4821,30 +5483,82 @@ impl<S: DocumentStore> QueryExecutor<S> {
         collection: &str,
         insert_blocks: &[InsertBlock],
     ) -> OQLResult<Vec<Document>> {
-        let mut documents = Vec::with_capacity(insert_blocks.len());
+        // Create a temporary empty document for expression evaluation context
+        let temp_doc = Document::new(collection.to_string(), HashMap::new());
+        self.insert_rows(
+            collection,
+            insert_blocks.len(),
+            insert_blocks.iter().map(|block| {
+                block.fields.iter().map(|field| {
+                    Ok((
+                        field.name.clone(),
+                        self.evaluate_expression(&temp_doc, &field.value)?,
+                    ))
+                })
+            }),
+        )
+    }
+
+    /// Insert documents given as field values rather than as OQL text.
+    ///
+    /// This is `collection.insert [ .. ]` without the parse: the same type
+    /// conversion, defaults, validation and constraints, and one durable
+    /// write for the whole batch. A reference is given as the id it points
+    /// at and a timestamp may be given as text, as in OQL. It is the way to
+    /// load data in bulk.
+    pub fn insert_documents(
+        &self,
+        collection: &str,
+        rows: Vec<HashMap<String, Value>>,
+    ) -> OQLResult<Vec<Document>> {
+        let mut inserted = Vec::new();
+        self.store.run_atomically(&mut || {
+            let _statement = StatementGuard::enter();
+            inserted = self.insert_rows(
+                collection,
+                rows.len(),
+                rows.iter().map(|row| {
+                    row.iter()
+                        .map(|(name, value)| Ok((name.clone(), value.clone())))
+                }),
+            )?;
+            Ok(())
+        })?;
+        Ok(inserted)
+    }
+
+    /// The one implementation of a batch insert. Each row yields its fields
+    /// in turn, so a value is computed, typed and checked before the next
+    /// one is looked at.
+    fn insert_rows<Row>(
+        &self,
+        collection: &str,
+        expected: usize,
+        rows: impl Iterator<Item = Row>,
+    ) -> OQLResult<Vec<Document>>
+    where
+        Row: Iterator<Item = OQLResult<(String, Value)>>,
+    {
+        let mut documents = Vec::with_capacity(expected);
         let mut batch_ids = HashSet::new();
 
         // Get schema once for all documents
         let schema = self.store.get_schema(collection).ok().flatten();
 
-        // Create a temporary empty document for expression evaluation context
-        let temp_doc = Document::new(collection.to_string(), HashMap::new());
-
-        // Process each insert block
-        for insert_block in insert_blocks {
+        for row in rows {
             let mut fields = HashMap::new();
 
-            for insert_field in &insert_block.fields {
-                let mut value = self.evaluate_expression(&temp_doc, &insert_field.value)?;
+            for field in row {
+                let (name, mut value) = field?;
 
                 // Convert value to match schema type if needed
                 if let Some(ref schema) = schema {
-                    if let Some(field_type) = schema.get_field_type(&insert_field.name) {
+                    if let Some(field_type) = schema.get_field_type(&name) {
                         value = self.convert_to_schema_type(value, field_type, collection)?;
                     }
                 }
 
-                fields.insert(insert_field.name.clone(), value);
+                fields.insert(name, value);
             }
 
             if let Some(ref schema) = schema {
@@ -4947,21 +5661,54 @@ impl<S: DocumentStore> QueryExecutor<S> {
             let SchemaConstraint::Unique { fields, name } = constraint else {
                 continue;
             };
-            for left_index in 0..documents.len() {
-                for right_index in left_index + 1..documents.len() {
-                    let same = fields.iter().all(|field| {
-                        self.extract_field_path_value(&documents[left_index].fields, field)
-                            == self.extract_field_path_value(&documents[right_index].fields, field)
-                    });
-                    if same {
-                        return Err(OQLError::SchemaValidation {
-                            message: format!(
-                                "Unique constraint '{}' violated within insert batch on schema '{}' fields {:?}",
-                                name.clone().unwrap_or_else(|| "unnamed_unique".to_string()),
-                                schema.name,
-                                fields
-                            ),
-                        });
+            let violated = || OQLError::SchemaValidation {
+                message: format!(
+                    "Unique constraint '{}' violated within insert batch on schema '{}' fields {:?}",
+                    name.clone().unwrap_or_else(|| "unnamed_unique".to_string()),
+                    schema.name,
+                    fields
+                ),
+            };
+            // Text, whole numbers, booleans and instants are equal exactly
+            // when their encodings are, so one pass finds a repeat. A key
+            // holding anything else is compared with every other key.
+            let keys: Vec<Vec<Option<Value>>> = documents
+                .iter()
+                .map(|document| {
+                    fields
+                        .iter()
+                        .map(|field| self.extract_field_path_value(&document.fields, field))
+                        .collect()
+                })
+                .collect();
+            let plain = keys.iter().flatten().all(|value| {
+                matches!(
+                    value,
+                    None | Some(
+                        Value::Null
+                            | Value::String(_)
+                            | Value::Integer(_)
+                            | Value::Boolean(_)
+                            | Value::DateTime(_)
+                    )
+                )
+            });
+            if plain {
+                let mut seen = HashSet::with_capacity(keys.len());
+                for key in &keys {
+                    let encoded = bincode::serialize(key).map_err(|error| OQLError::Generic {
+                        message: format!("Failed to encode unique key: {}", error),
+                    })?;
+                    if !seen.insert(encoded) {
+                        return Err(violated());
+                    }
+                }
+            } else {
+                for left_index in 0..keys.len() {
+                    for right_index in left_index + 1..keys.len() {
+                        if keys[left_index] == keys[right_index] {
+                            return Err(violated());
+                        }
                     }
                 }
             }
@@ -4985,7 +5732,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
 
                 // A document is stored under its id, so the target is one
                 // lookup away.
-                if self.store.get_document(target_schema, &ref_id)?.is_some() {
+                if self.store.document_exists(target_schema, &ref_id)? {
                     if let Some(objref) = self.store.get_global_objref(target_schema, &ref_id)? {
                         return Ok(Value::GlobalReference(objref));
                     }
@@ -5005,6 +5752,15 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 } else {
                     Ok(Value::Null)
                 }
+            }
+            // A whole number is a float when a float is what the field
+            // holds, as long as the float can hold it exactly. JSON, and so
+            // every client that speaks it, writes 40.0 as 40.
+            (Value::Integer(integer), FieldType::Float)
+                if (integer as f64) as i64 == integer
+                    && integer.unsigned_abs() <= 9_007_199_254_740_992 =>
+            {
+                Ok(Value::Float(integer as f64))
             }
             // A timestamp may be written as text: RFC 3339, or a bare date
             // meaning midnight UTC.
@@ -5190,13 +5946,31 @@ impl<S: DocumentStore> QueryExecutor<S> {
         for constraint in &schema.constraints {
             match constraint {
                 SchemaConstraint::CheckExpression { expression } => {
-                    let condition = crate::parser::parse_check_condition(expression)
-                        .map_err(|error| OQLError::SchemaValidation {
-                            message: format!(
-                                "check({expression}) on '{}' is not valid: {error}",
-                                schema.name
-                            ),
-                        })?;
+                    // The same text always parses to the same condition, so
+                    // it is parsed once, not once per document checked.
+                    let known = CHECK_CONDITIONS
+                        .with(|conditions| conditions.borrow().get(expression).cloned());
+                    let condition = match known {
+                        Some(condition) => condition,
+                        None => {
+                            let condition = Arc::new(
+                                crate::parser::parse_check_condition(expression).map_err(
+                                    |error| OQLError::SchemaValidation {
+                                        message: format!(
+                                            "check({expression}) on '{}' is not valid: {error}",
+                                            schema.name
+                                        ),
+                                    },
+                                )?,
+                            );
+                            CHECK_CONDITIONS.with(|conditions| {
+                                conditions
+                                    .borrow_mut()
+                                    .insert(expression.clone(), condition.clone())
+                            });
+                            condition
+                        }
+                    };
                     if !self.evaluate_condition(document, &condition)? {
                         return Err(OQLError::SchemaValidation {
                             message: format!(
@@ -6630,6 +7404,23 @@ thread_local! {
     static COLUMN_AGGREGATION: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
+thread_local! {
+    /// `check(..)` constraints by their text, parsed.
+    static CHECK_CONDITIONS: std::cell::RefCell<HashMap<String, Arc<Condition>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+thread_local! {
+    static COLUMN_FOLDS_RUN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many queries this thread has answered by folding column batches.
+/// Intended for tests, which use it to show a query took that path.
+#[doc(hidden)]
+pub fn column_folds_run() -> u64 {
+    COLUMN_FOLDS_RUN.with(std::cell::Cell::get)
+}
+
 /// Turn the column-batch aggregation path on or off for this thread. It is
 /// an optimization only, so tests switch it off to get the reference answer.
 #[doc(hidden)]
@@ -6637,12 +7428,154 @@ pub fn set_column_aggregation(enabled: bool) {
     COLUMN_AGGREGATION.with(|flag| flag.set(enabled));
 }
 
-/// What one result field of a column-batch aggregation holds.
-enum ColumnOutput {
+/// What one result field of a fold holds.
+enum FoldOutput {
     /// The group key at this position.
     Key(usize),
-    /// An aggregate over the field in this slot.
-    Aggregate(AggregateKind, usize),
+    /// The aggregate at this position.
+    Aggregate(usize),
+}
+
+/// Where a group key or an aggregate gets its value for one row.
+enum RowInput {
+    /// The row itself: `count()`.
+    Rows,
+    /// A stored field, read straight from the column batch.
+    Slot(usize),
+    /// A path that starts at a reference held in a stored field. What it
+    /// reaches depends only on the reference, so within one statement each
+    /// distinct reference is resolved once and remembered under `memo`.
+    Through {
+        slot: usize,
+        memo: usize,
+        path: FieldAccess,
+    },
+    /// Any other path the evaluator resolves: into an object, to a
+    /// relationship.
+    Path(FieldAccess),
+    /// An expression the evaluator computes.
+    Expression(Expression),
+}
+
+struct FoldAggregate {
+    kind: AggregateKind,
+    input: RowInput,
+    /// Conditions a row must pass to count towards this aggregate.
+    filters: Vec<Condition>,
+}
+
+enum FoldOperand {
+    Key(usize),
+    Aggregate(usize),
+    Literal(Value),
+}
+
+enum FoldCondition {
+    Compare(FoldOperand, ComparisonOperator, FoldOperand),
+    And(Box<FoldCondition>, Box<FoldCondition>),
+    Or(Box<FoldCondition>, Box<FoldCondition>),
+    Not(Box<FoldCondition>),
+}
+
+/// How one query folds storage's column batches into its result.
+#[derive(Default)]
+struct FoldPlan {
+    /// The stored fields the scan decodes.
+    fields: Vec<String>,
+    /// Filters storage does not evaluate.
+    residual: Vec<Condition>,
+    keys: Vec<RowInput>,
+    /// The names a group row answers to, and the key each one holds.
+    key_names: Vec<(String, usize)>,
+    aggregates: Vec<FoldAggregate>,
+    outputs: Vec<(String, FoldOutput)>,
+    having: Option<FoldCondition>,
+    /// How many `RowInput::Through` inputs there are.
+    memos: usize,
+}
+
+/// A value computed for the row in hand: its own, or one remembered for the
+/// reference it was reached through.
+enum Held {
+    Owned(Value),
+    Remembered(usize),
+}
+
+impl FoldPlan {
+    /// The scan column for a stored field, added on first use.
+    fn slot(&mut self, schema: &Schema, name: &str) -> Option<usize> {
+        if !schema.fields.contains_key(name) || DocumentSystemField::from_name(name).is_some() {
+            return None;
+        }
+        Some(
+            self.fields
+                .iter()
+                .position(|known| known == name)
+                .unwrap_or_else(|| {
+                    self.fields.push(name.to_string());
+                    self.fields.len() - 1
+                }),
+        )
+    }
+
+    fn input(&mut self, schema: &Schema, path: &[String]) -> Option<RowInput> {
+        match path {
+            [] => None,
+            [first, ..] if first == "*" => None,
+            [name] => Some(match self.slot(schema, name) {
+                Some(slot) => RowInput::Slot(slot),
+                None => RowInput::Path(FieldAccess {
+                    path: path.to_vec(),
+                }),
+            }),
+            [first, ..] => {
+                let mut declared = schema.fields.get(first);
+                while let Some(FieldType::Optional(inner)) = declared {
+                    declared = Some(inner);
+                }
+                let path = FieldAccess {
+                    path: path.to_vec(),
+                };
+                Some(match (declared, self.slot(schema, first)) {
+                    (Some(FieldType::Reference(_)), Some(slot)) => {
+                        self.memos += 1;
+                        RowInput::Through {
+                            slot,
+                            memo: self.memos - 1,
+                            path,
+                        }
+                    }
+                    _ => RowInput::Path(path),
+                })
+            }
+        }
+    }
+
+    fn name_key(&mut self, name: String, position: usize, replace: bool) {
+        match self.key_names.iter_mut().find(|(known, _)| *known == name) {
+            Some(entry) if replace => entry.1 = position,
+            Some(_) => {}
+            None => self.key_names.push((name, position)),
+        }
+    }
+
+    fn key_named(&self, name: &str) -> Option<usize> {
+        self.key_names
+            .iter()
+            .find(|(known, _)| known == name)
+            .map(|(_, position)| *position)
+    }
+
+    /// Whether any part needs the evaluator, and so a row to give it.
+    fn needs_row(&self) -> bool {
+        let evaluated = |input: &RowInput| !matches!(input, RowInput::Rows | RowInput::Slot(_));
+        !self.residual.is_empty()
+            || self.keys.iter().any(evaluated)
+            || self
+                .aggregates
+                .iter()
+                .any(|aggregate| evaluated(&aggregate.input) || !aggregate.filters.is_empty())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -6655,6 +7588,20 @@ enum AggregateKind {
     Avg,
     Min,
     Max,
+}
+
+impl AggregateKind {
+    fn named(function: &str, counts_rows: bool) -> Option<Self> {
+        Some(match function {
+            "count" if counts_rows => Self::Rows,
+            "count" => Self::NonNull,
+            "sum" => Self::Sum,
+            "avg" => Self::Avg,
+            "min" => Self::Min,
+            "max" => Self::Max,
+            _ => return None,
+        })
+    }
 }
 
 /// The running state of one aggregate. Its results must equal what
@@ -6870,15 +7817,7 @@ struct ColumnGroup {
     /// The key as first seen, which is what the result reports.
     key: Vec<Value>,
     atoms: Vec<OwnedKeyAtom>,
-    rows: i64,
-    accumulators: Vec<Option<Accumulator>>,
-}
-
-impl ColumnGroup {
-    fn matches(&self, atoms: &[KeyAtom<'_>]) -> bool {
-        self.atoms.len() == atoms.len()
-            && atoms.iter().zip(&self.atoms).all(|(atom, owned)| atom.same(owned))
-    }
+    accumulators: Vec<Accumulator>,
 }
 
 /// Work that can be shared by everything one statement evaluates.
@@ -6928,7 +7867,7 @@ struct StatementScope {
 enum RelatedCounts {
     /// Rows that have asked so far, each answered through the index.
     Asked(usize),
-    Ready(Arc<HashMap<ObjRef, i64>>),
+    Ready(Arc<HashMap<ObjRef, Value>>),
     /// One pass cannot answer this; keep using the index.
     Unavailable,
 }

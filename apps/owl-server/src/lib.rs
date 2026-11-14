@@ -1,0 +1,462 @@
+//! Owl as a network service.
+//!
+//! One process owns the database file and answers JSON over HTTP:
+//!
+//! | Request | Does |
+//! |---|---|
+//! | `GET /v1/health` | Says the server is up. Needs no token. |
+//! | `POST /v1/query` | Runs one OQL statement, with `$name` parameters. |
+//! | `POST /v1/insert` | Inserts documents given as JSON, in one commit. |
+//! | `POST /v1/script` | Runs an OQL script: schemas, functions, statements. |
+//! | `POST /v1/transactions` | Opens a transaction and returns its id. |
+//! | `POST /v1/transactions/{id}/commit` | Commits it, or answers 409. |
+//! | `POST /v1/transactions/{id}/rollback` | Abandons it. |
+//!
+//! `query` and `insert` take an optional `"transaction": id` and are then
+//! part of that transaction. A statement outside a transaction is its own
+//! commit and is atomic by itself. A commit answered with 409 and the code
+//! `conflict` applied nothing: another commit changed a document the
+//! transaction wrote, and the client runs the transaction again.
+//!
+//! Every failure is `{"error": {"code": .., "message": ..}}`.
+
+use axum::extract::{Path, Request, State};
+use axum::http::{header, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::Router;
+use owl_db::error::OQLError;
+use owl_db::storage::RustStore;
+use owl_db::{bind_parameters, execute_oql_file, parse_oql, parse_oql_file, QueryExecutor, Value};
+use serde::Deserialize;
+use serde_json::{json, Map, Value as Json};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// How the server is run.
+#[derive(Clone, Debug)]
+pub struct Options {
+    /// When set, every request but the health check must carry it as
+    /// `Authorization: Bearer <token>`.
+    pub token: Option<String>,
+    /// A transaction no statement has touched for this long is rolled back,
+    /// so a client that went away does not hold one open for ever.
+    pub transaction_idle: Duration,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            token: None,
+            transaction_idle: Duration::from_secs(60),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Server {
+    store: Arc<RustStore>,
+    options: Arc<Options>,
+    /// Open transactions and when each was last used.
+    transactions: Arc<Mutex<HashMap<u64, Instant>>>,
+}
+
+/// The service. Call [`expire_idle_transactions`] on a timer beside it.
+pub fn router(store: Arc<RustStore>, options: Options) -> (Router, Janitor) {
+    let server = Server {
+        store,
+        options: Arc::new(options),
+        transactions: Arc::new(Mutex::new(HashMap::new())),
+    };
+    let janitor = Janitor {
+        server: server.clone(),
+    };
+    let protected = Router::new()
+        .route("/v1/query", post(query))
+        .route("/v1/insert", post(insert))
+        .route("/v1/script", post(script))
+        .route("/v1/transactions", post(begin))
+        .route("/v1/transactions/:id/commit", post(commit))
+        .route("/v1/transactions/:id/rollback", post(rollback))
+        .layer(middleware::from_fn_with_state(server.clone(), authorize));
+    let router = Router::new()
+        .route("/v1/health", get(health))
+        .merge(protected)
+        .with_state(server);
+    (router, janitor)
+}
+
+/// Rolls back transactions their clients have left idle.
+pub struct Janitor {
+    server: Server,
+}
+
+impl Janitor {
+    /// Roll back every transaction idle for longer than the configured
+    /// time, and return how many there were.
+    pub fn expire_idle_transactions(&self) -> usize {
+        let limit = self.server.options.transaction_idle;
+        let idle: Vec<u64> = {
+            let mut open = self.server.transactions.lock().expect("transaction table");
+            let idle: Vec<u64> = open
+                .iter()
+                .filter(|(_, used)| used.elapsed() >= limit)
+                .map(|(id, _)| *id)
+                .collect();
+            for id in &idle {
+                open.remove(id);
+            }
+            idle
+        };
+        for id in &idle {
+            let _ = self.server.store.rollback_transaction(*id);
+        }
+        idle.len()
+    }
+
+    /// Check for idle transactions until the process ends.
+    pub async fn run(self) {
+        let every = (self.server.options.transaction_idle / 4).max(Duration::from_millis(50));
+        let mut tick = tokio::time::interval(every);
+        loop {
+            tick.tick().await;
+            self.expire_idle_transactions();
+        }
+    }
+}
+
+/// A failure, as the client sees it.
+struct Failure {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+}
+
+impl Failure {
+    fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn invalid(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, "invalid_request", message)
+    }
+}
+
+impl From<OQLError> for Failure {
+    fn from(error: OQLError) -> Self {
+        let (status, code) = match &error {
+            OQLError::TransactionConflict { .. } => (StatusCode::CONFLICT, "conflict"),
+            OQLError::TransactionError { .. } => (StatusCode::NOT_FOUND, "no_such_transaction"),
+            OQLError::DocumentNotFound { .. } => (StatusCode::NOT_FOUND, "not_found"),
+            OQLError::SchemaValidation { .. }
+            | OQLError::TypeError { .. }
+            | OQLError::ReferenceError { .. }
+            | OQLError::ParseError { .. }
+            | OQLError::FunctionError { .. }
+            | OQLError::QueryExecution { .. } => (StatusCode::UNPROCESSABLE_ENTITY, "rejected"),
+            _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
+        };
+        Self::new(status, code, error.to_string())
+    }
+}
+
+impl IntoResponse for Failure {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            axum::Json(json!({ "error": { "code": self.code, "message": self.message } })),
+        )
+            .into_response()
+    }
+}
+
+type Answer = Result<Json, Failure>;
+
+async fn authorize(State(server): State<Server>, request: Request, next: Next) -> Response {
+    if let Some(expected) = &server.options.token {
+        let given = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "));
+        // Compare without stopping at the first difference.
+        let matches = given.is_some_and(|given| {
+            given.len() == expected.len()
+                && given
+                    .bytes()
+                    .zip(expected.bytes())
+                    .fold(0u8, |difference, (a, b)| difference | (a ^ b))
+                    == 0
+        });
+        if !matches {
+            return Failure::new(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "a valid bearer token is required",
+            )
+            .into_response();
+        }
+    }
+    next.run(request).await
+}
+
+async fn health() -> axum::Json<Json> {
+    axum::Json(json!({ "status": "ok", "version": env!("CARGO_PKG_VERSION") }))
+}
+
+/// Run database work off the async threads and shape its outcome.
+async fn blocking(work: impl FnOnce() -> Answer + Send + 'static) -> Response {
+    match tokio::task::spawn_blocking(work).await {
+        Ok(Ok(body)) => axum::Json(body).into_response(),
+        Ok(Err(failure)) => failure.into_response(),
+        Err(error) => Failure::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            format!("the request did not finish: {error}"),
+        )
+        .into_response(),
+    }
+}
+
+impl Server {
+    /// Run `work` inside the client's transaction when it named one.
+    fn within<T>(
+        &self,
+        transaction: Option<u64>,
+        work: impl FnOnce() -> Result<T, Failure>,
+    ) -> Result<T, Failure> {
+        let Some(id) = transaction else {
+            return work();
+        };
+        // Only transactions this server opened and still holds.
+        match self.transactions.lock().expect("transaction table").get_mut(&id) {
+            Some(used) => *used = Instant::now(),
+            None => {
+                return Err(Failure::new(
+                    StatusCode::NOT_FOUND,
+                    "no_such_transaction",
+                    format!("transaction {id} is not open"),
+                ))
+            }
+        }
+        let _bound = self.store.bind_transaction(id)?;
+        work()
+    }
+
+    fn executor(&self) -> QueryExecutor<RustStore> {
+        QueryExecutor::new_with_real_clock(self.store.clone())
+    }
+
+    fn forget(&self, id: u64) -> bool {
+        self.transactions
+            .lock()
+            .expect("transaction table")
+            .remove(&id)
+            .is_some()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueryRequest {
+    query: String,
+    #[serde(default)]
+    params: Map<String, Json>,
+    #[serde(default)]
+    transaction: Option<u64>,
+}
+
+async fn query(State(server): State<Server>, axum::Json(request): axum::Json<QueryRequest>) -> Response {
+    blocking(move || {
+        let parsed = parse_oql(&request.query)
+            .map_err(|error| Failure::new(StatusCode::BAD_REQUEST, "parse_error", error.to_string()))?;
+        let params = request
+            .params
+            .iter()
+            .map(|(name, value)| Ok((name.clone(), from_json(value)?)))
+            .collect::<Result<HashMap<_, _>, Failure>>()?;
+        let bound = bind_parameters(&parsed, &params).map_err(Failure::invalid)?;
+        server.within(request.transaction, || {
+            let executor = server.executor();
+            let rows = executor.execute_query(&bound)?;
+            Ok(json!({ "rows": rows_to_json(&executor, &rows)? }))
+        })
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InsertRequest {
+    collection: String,
+    documents: Vec<Map<String, Json>>,
+    #[serde(default)]
+    transaction: Option<u64>,
+}
+
+async fn insert(State(server): State<Server>, axum::Json(request): axum::Json<InsertRequest>) -> Response {
+    blocking(move || {
+        let documents = request
+            .documents
+            .iter()
+            .map(|document| {
+                document
+                    .iter()
+                    .map(|(name, value)| Ok((name.clone(), from_json(value)?)))
+                    .collect::<Result<HashMap<_, _>, Failure>>()
+            })
+            .collect::<Result<Vec<_>, Failure>>()?;
+        server.within(request.transaction, || {
+            let inserted = server
+                .executor()
+                .insert_documents(&request.collection, documents)?;
+            let ids: Vec<&str> = inserted.iter().map(|document| document.id.as_str()).collect();
+            Ok(json!({ "inserted": inserted.len(), "ids": ids }))
+        })
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScriptRequest {
+    source: String,
+}
+
+async fn script(State(server): State<Server>, axum::Json(request): axum::Json<ScriptRequest>) -> Response {
+    blocking(move || {
+        let file = parse_oql_file(&request.source)
+            .map_err(|error| Failure::new(StatusCode::BAD_REQUEST, "parse_error", error.to_string()))?;
+        let report = execute_oql_file(&file, &server.executor()).map_err(|error| {
+            Failure::new(StatusCode::UNPROCESSABLE_ENTITY, "rejected", error.to_string())
+        })?;
+        if let Some(first) = report.errors.first() {
+            return Err(Failure::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "rejected",
+                first.clone(),
+            ));
+        }
+        Ok(json!({
+            "statements": report.results.len(),
+            "schemas": report.schema_count,
+            "queries": report.query_count,
+            "functions": report.function_count,
+        }))
+    })
+    .await
+}
+
+async fn begin(State(server): State<Server>) -> Response {
+    blocking(move || {
+        let id = server.store.begin_transaction()?;
+        server
+            .transactions
+            .lock()
+            .expect("transaction table")
+            .insert(id, Instant::now());
+        Ok(json!({ "transaction": id }))
+    })
+    .await
+}
+
+async fn commit(State(server): State<Server>, Path(id): Path<u64>) -> Response {
+    blocking(move || {
+        if !server.forget(id) {
+            return Err(OQLError::TransactionError {
+                message: format!("transaction {id} is not open"),
+            }
+            .into());
+        }
+        server.store.commit_transaction(id)?;
+        Ok(json!({ "committed": true }))
+    })
+    .await
+}
+
+async fn rollback(State(server): State<Server>, Path(id): Path<u64>) -> Response {
+    blocking(move || {
+        if !server.forget(id) {
+            return Err(OQLError::TransactionError {
+                message: format!("transaction {id} is not open"),
+            }
+            .into());
+        }
+        server.store.rollback_transaction(id)?;
+        Ok(json!({ "rolled_back": true }))
+    })
+    .await
+}
+
+/// A JSON value as an Owl value. A whole number stays an integer; text
+/// stays text, and becomes a timestamp or a reference only where the
+/// schema says the field is one, exactly as in OQL.
+fn from_json(value: &Json) -> Result<Value, Failure> {
+    Ok(match value {
+        Json::Null => Value::Null,
+        Json::Bool(value) => Value::Boolean(*value),
+        Json::String(value) => Value::String(value.clone()),
+        Json::Number(number) => match (number.as_i64(), number.as_f64()) {
+            (Some(integer), _) => Value::Integer(integer),
+            (None, Some(float)) => Value::Float(float),
+            (None, None) => {
+                return Err(Failure::invalid(format!("{number} is not a number Owl can hold")))
+            }
+        },
+        Json::Array(items) => Value::List(items.iter().map(from_json).collect::<Result<_, _>>()?),
+        Json::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(name, value)| Ok((name.clone(), from_json(value)?)))
+                .collect::<Result<_, Failure>>()?,
+        ),
+    })
+}
+
+/// An Owl value as JSON. A timestamp is RFC 3339 text and a reference is
+/// the id of the document it points at.
+fn to_json(value: &Value) -> Json {
+    match value {
+        Value::Null => Json::Null,
+        Value::Boolean(value) => json!(value),
+        Value::Integer(value) => json!(value),
+        // JSON has no NaN or infinity.
+        Value::Float(value) => serde_json::Number::from_f64(*value).map_or(Json::Null, Json::Number),
+        Value::String(value) => json!(value),
+        Value::DateTime(instant) => json!(instant.to_rfc3339()),
+        Value::List(items) => Json::Array(items.iter().map(to_json).collect()),
+        Value::Object(fields) => Json::Object(
+            fields
+                .iter()
+                .map(|(name, value)| (name.clone(), to_json(value)))
+                .collect(),
+        ),
+        // Replaced by ids before this is reached.
+        Value::Reference(_) | Value::GlobalReference(_) => Json::Null,
+    }
+}
+
+fn rows_to_json(
+    executor: &QueryExecutor<RustStore>,
+    rows: &[owl_db::Document],
+) -> Result<Vec<Json>, Failure> {
+    rows.iter()
+        .map(|row| {
+            let mut object = Map::with_capacity(row.fields.len());
+            for (name, value) in &row.fields {
+                // Names starting with `_` are the executor's own.
+                if name.starts_with('_') {
+                    continue;
+                }
+                object.insert(name.clone(), to_json(&executor.with_reference_ids(value)?));
+            }
+            Ok(Json::Object(object))
+        })
+        .collect()
+}
