@@ -68,7 +68,12 @@ enum Command {
     Time {
         #[arg(long, default_value_t = 10000)]
         orders: usize,
-        /// Statements to time, each run once and then five times.
+        /// Keep running each statement for this many seconds afterwards and
+        /// report the mean, so a sampling profiler can be pointed at it.
+        #[arg(long, default_value_t = 0.0)]
+        spin: f64,
+        /// Statements to time, each run once and then five times. A name
+        /// from the benchmark, such as `q02`, stands for that query.
         queries: Vec<String>,
     },
     /// Time loading and every query on both engines.
@@ -95,9 +100,26 @@ fn main() -> Result<()> {
     match Arguments::parse().command {
         Command::Check { orders } => check(orders),
         Command::Memory { orders } => memory(orders),
-        Command::Time { orders, queries } => {
+        Command::Time { orders, spin, queries } => {
             let loaded = load(orders)?;
+            println!("loaded as pid {}", std::process::id());
             for query in queries {
+                let query = QUERIES
+                    .iter()
+                    .find(|(name, _, _)| name.starts_with(query.as_str()))
+                    .map_or(query.clone(), |(_, oql, _)| (*oql).to_string());
+                if spin > 0.0 {
+                    let started = Instant::now();
+                    let mut runs = 0u32;
+                    while started.elapsed().as_secs_f64() < spin {
+                        loaded.owl.query(&query)?;
+                        runs += 1;
+                    }
+                    println!(
+                        "{:>10.3} ms mean over {runs} runs",
+                        started.elapsed().as_secs_f64() * 1000.0 / f64::from(runs)
+                    );
+                }
                 match time(5, 30.0, || Ok(loaded.owl.query(&query)?.len())) {
                     Ok((first, median, rows)) => println!(
                         "{:>10.3} ms first {:>10.3} ms median {:>7} rows  [{}]  {}",
@@ -360,6 +382,18 @@ fn memory(orders: usize) -> Result<()> {
             None => String::new(),
         };
         println!("{name:<34} {:>9.1} MiB   {residency}", resident_mib());
+        // STOREFRONT_PAUSE holds the process for that many seconds after
+        // the stage STOREFRONT_PAUSE_AT names ("reopened" unless set), so a
+        // heap inspector can be pointed at it.
+        let pause_at = std::env::var("STOREFRONT_PAUSE_AT").unwrap_or_else(|_| "reopened".into());
+        if let Some(seconds) = std::env::var("STOREFRONT_PAUSE")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|_| pause_at == name)
+        {
+            println!("pausing {seconds}s as pid {}", std::process::id());
+            std::thread::sleep(Duration::from_secs(seconds));
+        }
         Ok(())
     };
     stage("start", None)?;
@@ -383,15 +417,6 @@ fn memory(orders: usize) -> Result<()> {
     stage("closed", None)?;
     let owl = Owl::open(&path)?;
     stage("reopened", Some(&owl))?;
-    // STOREFRONT_PAUSE holds the process here for that many seconds, so a
-    // heap inspector can be pointed at it.
-    if let Some(seconds) = std::env::var("STOREFRONT_PAUSE")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-    {
-        println!("pausing {seconds}s as pid {}", std::process::id());
-        std::thread::sleep(Duration::from_secs(seconds));
-    }
     owl.query("orders.count()")?;
     stage("counted orders", Some(&owl))?;
     for (_, oql, _) in QUERIES {

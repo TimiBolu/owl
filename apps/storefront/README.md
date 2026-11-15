@@ -59,36 +59,38 @@ times ad-hoc OQL against a loaded dataset.
 ## Results
 
 Run on 2026-11-15 on an 8-core Apple Silicon machine with 8 GB of memory, at
-100,000 orders (247,048 rows in total). Times are medians of five runs, in
-milliseconds. The machine was not idle, and figures move by tens of percent
-between runs, so treat a ratio near 1 as a tie.
+100,000 orders (247,048 rows in total). Times are medians of seven runs, in
+milliseconds. The machine was busy during this run, so both engines are
+about half again slower than in a quiet one and figures move by tens of
+percent between runs: read the ratios, and treat one near 1 as a tie.
 
 | Query | Owl | SQLite | Owl ÷ SQLite |
 |---|---:|---:|---:|
-| q01 one order with customer and items | 0.04 | 0.02 | 1.7× |
-| q02 twenty most recent paid orders | 0.15 | 0.03 | 5.8× |
-| q03 large orders from one country | 53.36 | 13.12 | 4.1× |
-| q04 customers by lifetime spend | 152.55 | 135.83 | 1.1× |
-| q05 three latest orders per gold customer | 6.41 | 1.03 | 6.3× |
-| q06 orders and revenue by status | 52.47 | 78.34 | 0.7× |
-| q07 paid revenue by month | 95.48 | 40.02 | 2.4× |
-| q08 paid revenue by customer country | 77.05 | 63.68 | 1.2× |
-| q09 best-selling products from line items | 694.18 | 663.30 | 1.0× |
-| q10 paid customers with no ticket | 28.14 | 5.66 | 5.0× |
-| q11 orders above their customer's average | 963.10 | 895.59 | 1.1× |
-| q12 category tree with statistics | 2.70 | 0.48 | 5.7× |
-| q13 customers per country | 4.70 | 2.10 | 2.2× |
-| q14 countries buying in one month | 19.86 | 6.32 | 3.1× |
-| q15 payments by method in a quarter | 32.96 | 10.11 | 3.3× |
-| q16 best-reviewed products | 31.34 | 29.69 | 1.1× |
+| q01 one order with customer and items | 0.06 | 0.03 | 1.8× |
+| q02 twenty most recent paid orders | 0.20 | 0.04 | 4.9× |
+| q03 large orders from one country | 21.95 | 19.46 | 1.1× |
+| q04 customers by lifetime spend | 188.43 | 267.82 | 0.7× |
+| q05 three latest orders per gold customer | 1.69 | 1.64 | 1.0× |
+| q06 orders and revenue by status | 80.33 | 135.71 | 0.6× |
+| q07 paid revenue by month | 138.28 | 75.70 | 1.8× |
+| q08 paid revenue by customer country | 118.18 | 189.42 | 0.6× |
+| q09 best-selling products from line items | 1332.31 | 1530.72 | 0.9× |
+| q10 paid customers with no ticket | 44.70 | 9.25 | 4.8× |
+| q11 orders above their customer's average | 1489.55 | 1541.11 | 1.0× |
+| q12 category tree with statistics | 0.83 | 0.74 | 1.1× |
+| q13 customers per country | 9.03 | 3.27 | 2.8× |
+| q14 countries buying in one month | 74.16 | 32.72 | 2.3× |
+| q15 payments by method in a quarter | 52.84 | 17.29 | 3.1× |
+| q16 best-reviewed products | 50.72 | 49.71 | 1.0× |
 
-Loading took 15 s for Owl (16,828 rows/s, 123 MiB on disk) and 15 s for
-SQLite (16,538 rows/s, 56 MiB) in this run; SQLite is usually nearer 10 s.
+Loading took 24 s for Owl (10,165 rows/s, 122 MiB on disk) and 22 s for
+SQLite (11,366 rows/s, 56 MiB) in this run; on a quiet machine both take
+10 to 15 s.
 
-Owl is level with or ahead of SQLite on six queries, within about three
-times on five, and four to six times behind on five. All sixteen return the
-same rows as SQLite. This run was on a quieter machine than the earlier
-ones, so both engines are faster than in the table of fixes below.
+Owl is level with or ahead of SQLite on nine queries, within about three
+times on five, and near five times behind on two (q02 and q10). All sixteen
+return the same rows as SQLite. Three of the queries that were four to six
+times behind are now level: q03 (was 4.1×), q05 (6.3×) and q12 (5.7×).
 
 ## How far it scales on this machine
 
@@ -101,36 +103,49 @@ with a list, an object or a vector in it lives outside the column segments,
 and by default stays decoded in memory for as long as the database is open.
 A budget on decoded documents (`RustStore::with_decoded_budget`,
 `owl-server --decoded-documents`, or the `OWL_DECODED_DOCUMENTS` environment
-variable) keeps the rest as their encoded records, decoded when read; a scan
-then decodes only the fields it filters on or returns. Every answer is the
-same: the test suites pass with a budget of zero, and so does the check
-against SQLite.
+variable) bounds what is held:
+
+- only that many rows are held decoded; the rest are decoded when read, and
+  a scan decodes only the fields it filters on or returns;
+- a row's encoded record is read back from the checkpoint files once they
+  hold it, instead of being kept in memory;
+- a writer that outruns the background checkpoints waits for them, so what
+  has been written but not yet checkpointed stays near 16 MiB of log.
+
+Every answer is the same: the test suites pass with a budget of zero, and so
+does the check against SQLite.
 
 Measured on 2026-11-15 at 100,000 orders (247,048 rows, 137 MiB on disk):
 
 | Budget | Loaded | Checkpointed | Compacted | Reopened |
 |---|---:|---:|---:|---:|
-| None | 941 MiB | 600 MiB | 502 MiB | 404 MiB |
-| 20,000 documents | 624 MiB | 322 MiB | 255 MiB | 360 MiB |
-| 0 documents | 654 MiB | 283 MiB | 219 MiB | 281 MiB |
+| None | 915 MiB | 653 MiB | 545 MiB | 288 MiB |
+| 20,000 documents | 227 MiB | 163 MiB | 167 MiB | 83 MiB |
+| 0 documents | 186 MiB | 126 MiB | 125 MiB | 78 MiB |
 
-With a budget the settled database takes about half the memory, around 1 KB
-a row instead of 2. The price is speed on large scans of the affected
-collections: measured before the latest query work, a 20,000-document
-budget took q06 from 79 ms to 214 ms and q04 from 206 ms to 463 ms, while
-queries that touch a few rows were unaffected.
+"Loaded" still includes the 55 MiB of generated data the benchmark holds
+while it loads. Before this work the same table read 941, 600, 502 and
+404 MiB with no budget; 624, 322, 255 and 360 with 20,000 documents; and
+654, 283, 219 and 281 with none.
 
-What is left with nothing decoded, in a reopened database:
+At 250,000 orders (617,329 rows, 336 MiB on disk) with a budget of 20,000
+documents: 436 MiB loaded (148 MiB of it generated data), about 300 MiB
+settled, 190 MiB reopened. That is roughly 0.5 KB a row, and it grows in
+line with the data. By that measure a million orders would load in about
+1.2 GB and reopen in under 1 GB. It has not been run: this machine had
+3 GiB of disk free, which the database and its checkpoint files would fill.
 
-- about 85 MiB is the encoded records of the rows outside the segments,
-  which are also in the checkpoint file and could be read from there;
-- about 35 MiB is one allocation of 112 bytes per row, not yet identified;
-- the rest is id directories, indexes and allocator overhead.
+What the budget costs is speed on reads that go beyond the rows held
+decoded. With a budget of zero every row read is decoded from its record,
+and a record outside the segments is read from the file: at 100,000 orders
+q12 goes from 0.5 ms to 30 ms and the large scans are five to ten times
+slower, while loading takes 20 s instead of 16 s. A budget sized to the rows
+an application touches often avoids most of that.
 
-The peak while loading barely moves, because everything written since the
-last checkpoint is held until the next one. A million orders would settle
-near 2.5 GB with a budget and peak far higher during the load, so it is
-still not a comfortable fit for this 8 GB machine.
+What is still held in memory with nothing decoded, in a reopened database:
+the directory of ids for rows outside the segments, the index of what
+refers to what (one entry per referenced document and field), and the
+directory of the checkpoint's records.
 
 ## Where the time goes
 
@@ -170,15 +185,14 @@ suite runs each shape both ways and requires identical rows.
 
 What is still behind, and why:
 
-- **q10** now counts from `index(.status, .customer)` without reading an
-  order, as SQLite does. What remains is evaluating two conditions for each
-  of 10,000 customers through the general evaluator.
-- **q03** fetches every order of the country's customers through the
-  relationship before it can tell which are large; SQLite joins on an index
-  and filters as it goes.
-- **q12** and **q05** are a handful of rows with nested results. Their cost
-  is the fixed work of each nested query, not data volume.
-- **q02** is a 0.2 ms query; what remains is planning it.
+- **q10** counts from `index(.status, .customer)` without reading an order,
+  as SQLite does. What remains is evaluating two conditions for each of
+  10,000 customers through the general evaluator.
+- **q02** is a 0.2 ms query. What remains is fixed work: parsing and
+  planning it, and shaping twenty rows.
+- **q13**, **q14** and **q15** are two to three times behind. They fold or
+  filter tens of thousands of rows through the general evaluator, where
+  SQLite runs compiled loops over an index.
 
 ## What this work already fixed
 
@@ -207,6 +221,15 @@ Measured at 10,000 orders unless noted.
 | A relationship count whose filters are equalities is answered from an index on those fields and the reference, reading no row; the index was added to both engines | q10 at 100,000 orders: 93 ms to 28 ms (SQLite: 18 ms to 6 ms) |
 | A unique index is consulted for a new key, instead of reading every document in the database | Loading 100,000 orders: 42 s to 18 s |
 | A reference is checked by looking its target up rather than copying it, a `check` constraint is parsed once, and loading hands Owl values through a prepared insert | Loading 100,000 orders: 18 s to 16 s |
+| The first rows in order of id are read in that order and the read stops at the limit, instead of filtering every row and sorting | q05 at 100,000 orders: 8.0 ms to 1.2 ms |
+| A count or aggregate over one document's related rows reads them where they lie, through one relationship or several, without copying them into a collection | q12 at 100,000 orders: 2.7 ms to 0.5 ms |
+| `sort { .. }.limit(n)` finds the best n rows without sorting the rest, and through a reference chooses them before copying any | q03 at 100,000 orders: 67 ms to 20 ms (with the two rows below) |
+| An index finds a key's page, and the key within it, by bisection instead of looking at every page and entry; a range of an index is walked in place without copying keys | (q03, and every index lookup) |
+| A sort with a tie-breaker asks for one row past the page, and looks the ties up only when that row ties | q02 at 100,000 orders: 0.15 ms to 0.12 ms |
+| Each key of an in-memory index holds its objects in place, not in a tree of its own | 112 bytes a key; 50 MiB of the load peak at 100,000 orders |
+| With a memory budget, records are read back from the checkpoint files, a writer waits for overdue checkpoints, and reopening decodes nothing beyond the budget | Load peak at 100,000 orders with a 20,000-document budget: 624 MiB to 227 MiB |
+| Declaring a schema again exactly as it stands writes nothing; before, every start of an application rebuilt each index in memory beside the checkpointed one | Reopened database at 100,000 orders: 404 MiB to 288 MiB without a budget, 360 MiB to 83 MiB with one |
+| A selected field a row has no value for is `null` in rows read through an index, as it already was in rows read by a scan | Same answer whether or not an index is used |
 
 Loading 100,000 orders took 98 s in the first benchmark.
 

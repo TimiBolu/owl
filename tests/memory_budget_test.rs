@@ -6,7 +6,7 @@
 //! their records and decoded when read. That changes how much memory the
 //! database takes and how fast it reads. It must not change one answer.
 
-use owl_db::storage::RustStore;
+use owl_db::storage::{AutoCheckpointPolicy, DocumentStore, RustStore};
 use owl_db::{execute_oql_file, parse_oql, parse_oql_file, QueryExecutor, Value};
 use std::path::Path;
 use std::sync::Arc;
@@ -119,6 +119,26 @@ const QUESTIONS: [&str; 14] = [
 
 fn answers(store: &Arc<RustStore>) -> Vec<Result<Vec<String>, String>> {
     QUESTIONS.iter().map(|question| rows(store, question)).collect()
+}
+
+/// Compare two sets of answers, naming the first question that differs.
+fn same(actual: &[Result<Vec<String>, String>], expected: &[Result<Vec<String>, String>], when: &str) {
+    for ((question, actual), expected) in QUESTIONS.iter().zip(actual).zip(expected) {
+        if actual != expected {
+            let (short_actual, short_expected) = (format!("{actual:?}"), format!("{expected:?}"));
+            let differ = short_actual
+                .chars()
+                .zip(short_expected.chars())
+                .position(|(left, right)| left != right)
+                .unwrap_or(0);
+            let from = differ.saturating_sub(80);
+            panic!(
+                "{when}: {question}\n  actual:   ..{}\n  expected: ..{}",
+                short_actual.chars().skip(from).take(200).collect::<String>(),
+                short_expected.chars().skip(from).take(200).collect::<String>()
+            );
+        }
+    }
 }
 
 /// What an unbudgeted database answers, for comparison.
@@ -270,4 +290,101 @@ fn a_backup_of_a_budgeted_database_restores_whole() {
     store.backup(&backup).unwrap();
     let restored = Arc::new(RustStore::restore(&backup, home.path().join("restored.owl"), SIZE).unwrap());
     assert_eq!(answers(&restored), after);
+}
+
+/// Under a budget, a writer that outruns the background checkpoints waits
+/// for them, so what has been written but not checkpointed stays small. The
+/// checkpoints then happen as the data is loaded, with no one asking, and
+/// the rows they cover are read back from the files.
+#[test]
+fn a_bounded_store_checkpoints_as_it_is_written_to() {
+    let home = TempDir::new().unwrap();
+    let (_unbounded, expected) = reference(home.path());
+    let path = home.path().join("bounded.owl");
+    let store = Arc::new(RustStore::with_decoded_budget(&path, SIZE, 0).unwrap());
+    // A checkpoint is due after a few kilobytes of log.
+    store
+        .configure_auto_checkpoint(AutoCheckpointPolicy { wal_bytes: 8 * 1024, commits: 0 })
+        .unwrap();
+    load(&store);
+    let status = store.maintenance_status().unwrap();
+    assert!(status.checkpoint_sequence > 0, "no checkpoint ran: {status:?}");
+    assert!(status.last_error.is_none(), "{status:?}");
+    assert_eq!(store.decoded_documents(), 0);
+    assert_eq!(answers(&store), expected);
+
+    // More writes over rows that now live only in the files.
+    for change in [
+        r#"orders.where { .status == "open" && .total < 50 }.update { note: "low" }"#,
+        r#"orders.where { .id == "o399" }.delete"#,
+        r#"orders.insert { id: "o901", customer: "c03", total: 2.5, status: "open", items: [{ sku: "z", qty: 1 }] }"#,
+    ] {
+        rows(&store, change).unwrap();
+    }
+    store.wait_for_maintenance().unwrap();
+    let after = answers(&store);
+    assert_ne!(after, expected);
+    store.verify_integrity().unwrap();
+    store.compact().unwrap();
+    assert_eq!(answers(&store), after);
+
+    // The same from the files alone, with and without a budget.
+    drop(store);
+    let reopened = Arc::new(RustStore::with_decoded_budget(&path, SIZE, 0).unwrap());
+    assert_eq!(answers(&reopened), after);
+    assert_eq!(reopened.decoded_documents(), 0);
+    drop(reopened);
+    let reopened = Arc::new(RustStore::new(&path, SIZE).unwrap());
+    assert_eq!(answers(&reopened), after);
+    reopened.verify_integrity().unwrap();
+}
+
+/// Declaring a schema again, as an application does each time it starts,
+/// leaves its indexes as they are: the same answers, through the same
+/// indexes, and nothing written for an index that did not change.
+#[test]
+fn declaring_an_unchanged_schema_again_rebuilds_nothing() {
+    let home = TempDir::new().unwrap();
+    let path = home.path().join("declared.owl");
+    let (_unbounded, expected) = reference(home.path());
+    let store = Arc::new(RustStore::with_decoded_budget(&path, SIZE, 5).unwrap());
+    load(&store);
+    same(&answers(&store), &expected, "loaded");
+    store.compact().unwrap();
+    same(&answers(&store), &expected, "compacted");
+    drop(store);
+
+    let schema = r#"
+        schema customers { id: String, name: String, tier: String, index(.tier) }
+        schema orders {
+          id: String,
+          customer: Ref(customers),
+          total: Float,
+          status: String,
+          items: List({ sku: String, qty: Integer }),
+          note: Optional(String),
+          index(.status, .total)
+        }
+    "#;
+    let store = Arc::new(RustStore::with_decoded_budget(&path, SIZE, 5).unwrap());
+    let indexes = store.list_scalar_indexes(None).unwrap();
+    same(&answers(&store), &expected, "reopened");
+    script(&store, schema);
+    same(&answers(&store), &expected, "declared once");
+    script(&store, schema);
+    assert_eq!(store.list_scalar_indexes(None).unwrap(), indexes);
+    same(&answers(&store), &expected, "declared twice");
+    store.verify_integrity().unwrap();
+
+    // A declaration that does change an index still takes effect.
+    script(
+        &store,
+        &schema.replace("index(.status, .total)", "index(.status, .total),\n index(.total)"),
+    );
+    assert_eq!(store.list_scalar_indexes(None).unwrap().len(), indexes.len() + 1);
+    same(&answers(&store), &expected, "an index added");
+    drop(store);
+    let reopened = Arc::new(RustStore::new(&path, SIZE).unwrap());
+    same(&answers(&reopened), &expected, "reopened without a budget");
+    reopened.verify_integrity().unwrap();
 }

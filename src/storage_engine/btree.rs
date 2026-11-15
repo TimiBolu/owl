@@ -16,6 +16,207 @@ pub(crate) trait OrderedIndexBase: Send + Sync {
         &self,
         visitor: &mut dyn FnMut(&[u8], &[ObjRef]) -> Result<(), String>,
     ) -> Result<(), String>;
+    /// Show `visitor` each key in the range, in order, with its postings. A
+    /// base that can lend them does so without copying.
+    fn visit_range(
+        &self,
+        start: Bound<Vec<u8>>,
+        end: Bound<Vec<u8>>,
+        visitor: &mut dyn FnMut(&[u8], &[ObjRef]),
+    ) -> Result<(), String> {
+        for (key, postings) in self.range_entries(start, end, None, false)? {
+            visitor(&key, &postings);
+        }
+        Ok(())
+    }
+}
+
+/// The objects filed under one key, in order.
+///
+/// Most keys of most indexes name one object, and an index holds one of
+/// these per key, so the common cases cost nothing beyond the entry itself:
+/// one object is held in place, a few in a sorted list. Only a key with
+/// many objects, where inserting into a list would mean moving them all,
+/// gets a tree.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Postings {
+    #[default]
+    Empty,
+    One(ObjRef),
+    Few(Vec<ObjRef>),
+    Many(BTreeSet<ObjRef>),
+}
+
+/// Above this many objects a key's postings are kept as a tree.
+const POSTINGS_LIST_LIMIT: usize = 64;
+
+pub(crate) enum PostingsIter<'a> {
+    List(std::slice::Iter<'a, ObjRef>),
+    Tree(std::collections::btree_set::Iter<'a, ObjRef>),
+}
+
+impl<'a> Iterator for PostingsIter<'a> {
+    type Item = &'a ObjRef;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::List(iter) => iter.next(),
+            Self::Tree(iter) => iter.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Self::List(iter) => iter.size_hint(),
+            Self::Tree(iter) => iter.size_hint(),
+        }
+    }
+}
+
+impl DoubleEndedIterator for PostingsIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::List(iter) => iter.next_back(),
+            Self::Tree(iter) => iter.next_back(),
+        }
+    }
+}
+
+impl Postings {
+    pub(crate) fn iter(&self) -> PostingsIter<'_> {
+        match self {
+            Self::Empty => PostingsIter::List([].iter()),
+            Self::One(only) => PostingsIter::List(std::slice::from_ref(only).iter()),
+            Self::Few(list) => PostingsIter::List(list.iter()),
+            Self::Many(tree) => PostingsIter::Tree(tree.iter()),
+        }
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::One(_) => 1,
+            Self::Few(list) => list.len(),
+            Self::Many(tree) => tree.len(),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub(crate) fn contains(&self, value: &ObjRef) -> bool {
+        match self {
+            Self::Empty => false,
+            Self::One(only) => only == value,
+            Self::Few(list) => list.binary_search(value).is_ok(),
+            Self::Many(tree) => tree.contains(value),
+        }
+    }
+
+    /// Add an object; false when it was already there.
+    pub(crate) fn insert(&mut self, value: ObjRef) -> bool {
+        match self {
+            Self::Empty => {
+                *self = Self::One(value);
+                true
+            }
+            Self::One(only) => {
+                let only = *only;
+                if only == value {
+                    return false;
+                }
+                *self = Self::Few(if only < value {
+                    vec![only, value]
+                } else {
+                    vec![value, only]
+                });
+                true
+            }
+            Self::Few(list) => {
+                let Err(position) = list.binary_search(&value) else {
+                    return false;
+                };
+                if list.len() >= POSTINGS_LIST_LIMIT {
+                    let mut tree: BTreeSet<ObjRef> = std::mem::take(list).into_iter().collect();
+                    tree.insert(value);
+                    *self = Self::Many(tree);
+                } else {
+                    list.insert(position, value);
+                }
+                true
+            }
+            Self::Many(tree) => tree.insert(value),
+        }
+    }
+
+    /// Take an object out; false when it was not there.
+    pub(crate) fn remove(&mut self, value: &ObjRef) -> bool {
+        match self {
+            Self::Empty => false,
+            Self::One(only) => {
+                if only != value {
+                    return false;
+                }
+                *self = Self::Empty;
+                true
+            }
+            Self::Few(list) => {
+                let Ok(position) = list.binary_search(value) else {
+                    return false;
+                };
+                list.remove(position);
+                match list.as_slice() {
+                    [] => *self = Self::Empty,
+                    [only] => *self = Self::One(*only),
+                    _ => {}
+                }
+                true
+            }
+            Self::Many(tree) => tree.remove(value),
+        }
+    }
+}
+
+impl FromIterator<ObjRef> for Postings {
+    fn from_iter<Objects: IntoIterator<Item = ObjRef>>(objects: Objects) -> Self {
+        let mut list: Vec<ObjRef> = objects.into_iter().collect();
+        list.sort_unstable();
+        list.dedup();
+        match list.as_slice() {
+            [] => Self::Empty,
+            [only] => Self::One(*only),
+            _ if list.len() > POSTINGS_LIST_LIMIT => Self::Many(list.into_iter().collect()),
+            _ => {
+                list.shrink_to_fit();
+                Self::Few(list)
+            }
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a Postings {
+    type Item = &'a ObjRef;
+    type IntoIter = PostingsIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl IntoIterator for Postings {
+    type Item = ObjRef;
+    type IntoIter = std::vec::IntoIter<ObjRef>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        match self {
+            Self::Empty => Vec::new(),
+            Self::One(only) => vec![only],
+            Self::Few(list) => list,
+            Self::Many(tree) => tree.into_iter().collect(),
+        }
+        .into_iter()
+    }
 }
 
 /// Ordered postings index.
@@ -31,7 +232,7 @@ pub struct BTreeIndex {
 
 #[derive(Default)]
 struct BTreeIndexInner {
-    entries: BTreeMap<Vec<u8>, BTreeSet<ObjRef>>,
+    entries: BTreeMap<Vec<u8>, Postings>,
     tombstones: BTreeSet<Vec<u8>>,
     dirty: BTreeSet<Vec<u8>>,
     base: Option<Arc<dyn OrderedIndexBase>>,
@@ -286,6 +487,55 @@ impl BTreeIndex {
         ))
     }
 
+    /// Show `visitor` every posting whose key is in the range, in order of
+    /// key and then of posting, without copying keys where the index can
+    /// lend them.
+    pub(crate) fn visit_range(
+        &self,
+        start: Bound<Vec<u8>>,
+        end: Bound<Vec<u8>>,
+        visitor: &mut dyn FnMut(&[u8], ObjRef),
+    ) -> Result<(), String> {
+        let inner = self
+            .inner
+            .read()
+            .map_err(|_| "B-tree read lock poisoned".to_string())?;
+        // The entries in memory are newer than the checkpoint beneath them:
+        // a key held here replaces the checkpointed one, and a tombstone
+        // removes it. The two are walked together, in key order.
+        let mut newer = inner
+            .entries
+            .range((start.clone(), end.clone()))
+            .peekable();
+        if let Some(base) = &inner.base {
+            base.visit_range(start, end, &mut |key, postings| {
+                while let Some((newer_key, newer_postings)) =
+                    newer.next_if(|(newer_key, _)| newer_key.as_slice() < key)
+                {
+                    for object_ref in newer_postings {
+                        visitor(newer_key, *object_ref);
+                    }
+                }
+                if newer
+                    .peek()
+                    .is_some_and(|(newer_key, _)| newer_key.as_slice() == key)
+                    || inner.tombstones.contains(key)
+                {
+                    return;
+                }
+                for object_ref in postings {
+                    visitor(key, *object_ref);
+                }
+            })?;
+        }
+        for (key, postings) in newer {
+            for object_ref in postings {
+                visitor(key, *object_ref);
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn range_entry_page(
         &self,
         mut start: Bound<Vec<u8>>,
@@ -411,6 +661,57 @@ impl BTreeIndex {
             let next = has_more.then(|| page.last().cloned()).flatten();
             return Ok((page, next));
         }
+        // With nothing checkpointed beneath them, the entries held in memory
+        // are the whole index and are read where they lie.
+        {
+            let inner = self
+                .inner
+                .read()
+                .map_err(|_| "B-tree read lock poisoned".to_string())?;
+            if inner.base.is_none() {
+                let wanted = take.unwrap_or(usize::MAX);
+                let mut page = Vec::new();
+                let passes = |key: &[u8], object_ref: ObjRef| {
+                    after.is_none_or(|(cursor_key, cursor_ref)| {
+                        if descending {
+                            key < cursor_key || (key == cursor_key && object_ref < cursor_ref)
+                        } else {
+                            key > cursor_key || (key == cursor_key && object_ref > cursor_ref)
+                        }
+                    })
+                };
+                let range = inner.entries.range((start, end));
+                if descending {
+                    'keys: for (key, postings) in range.rev() {
+                        for object_ref in postings.iter().rev().copied() {
+                            if page.len() >= wanted {
+                                break 'keys;
+                            }
+                            if passes(key, object_ref) {
+                                page.push((key.clone(), object_ref));
+                            }
+                        }
+                    }
+                } else {
+                    'keys: for (key, postings) in range {
+                        for object_ref in postings.iter().copied() {
+                            if page.len() >= wanted {
+                                break 'keys;
+                            }
+                            if passes(key, object_ref) {
+                                page.push((key.clone(), object_ref));
+                            }
+                        }
+                    }
+                }
+                let has_more = limit.is_some_and(|limit| page.len() > limit);
+                if has_more {
+                    page.pop();
+                }
+                let next = has_more.then(|| page.last().cloned()).flatten();
+                return Ok((page, next));
+            }
+        }
         let entries = self.merged_entries(start.clone(), end.clone(), take, descending)?;
         let mut page = if descending {
             let values = entries
@@ -475,7 +776,7 @@ impl BTreeIndex {
         end: Bound<Vec<u8>>,
         limit: Option<usize>,
         descending: bool,
-    ) -> Result<BTreeMap<Vec<u8>, BTreeSet<ObjRef>>, String> {
+    ) -> Result<BTreeMap<Vec<u8>, Postings>, String> {
         let (base, local, tombstones) = {
             let inner = self
                 .inner
@@ -664,6 +965,105 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn postings_stay_ordered_and_distinct_at_every_size() {
+        let object = |id: u32| ObjRef::from_parts(1, id, 1);
+        let mut postings = Postings::default();
+        let mut expected = BTreeSet::new();
+        // Past the size at which a list gives way to a tree, and back.
+        let ids: Vec<u32> = (1..=200).map(|step| (step * 37) % 211 + 1).collect();
+        for id in &ids {
+            assert_eq!(postings.insert(object(*id)), expected.insert(object(*id)));
+            assert!(!postings.insert(object(*id)), "a second insert adds nothing");
+            assert_eq!(postings.len(), expected.len());
+            assert!(postings.iter().copied().eq(expected.iter().copied()));
+            assert!(postings.iter().rev().copied().eq(expected.iter().rev().copied()));
+        }
+        assert!(postings.contains(&object(ids[0])) && !postings.contains(&object(999)));
+        assert!(!postings.remove(&object(999)));
+        for id in &ids {
+            assert_eq!(postings.remove(&object(*id)), expected.remove(&object(*id)));
+            assert!(postings.iter().copied().eq(expected.iter().copied()));
+        }
+        assert!(postings.is_empty());
+
+        // Collected from any order, with repeats.
+        let collected: Postings = [object(3), object(1), object(3), object(2)].into_iter().collect();
+        assert_eq!(collected.into_iter().collect::<Vec<_>>(), vec![object(1), object(2), object(3)]);
+        assert_eq!([object(7)].into_iter().collect::<Postings>(), Postings::One(object(7)));
+    }
+
+    #[test]
+    fn visiting_a_range_sees_what_a_page_of_it_holds() {
+        let object = |id: u32| ObjRef::from_parts(1, id, 1);
+        let visited = |index: &BTreeIndex, start: Bound<Vec<u8>>, end: Bound<Vec<u8>>| {
+            let mut seen = Vec::new();
+            index
+                .visit_range(start, end, &mut |key, object_ref| seen.push((key.to_vec(), object_ref)))
+                .unwrap();
+            seen
+        };
+        let paged = |index: &BTreeIndex, start: Bound<Vec<u8>>, end: Bound<Vec<u8>>| {
+            index.range_entry_page(start, end, None, None, false).unwrap().0
+        };
+        let ranges = || {
+            vec![
+                (Bound::Unbounded, Bound::Unbounded),
+                (Bound::Included(b"b".to_vec()), Bound::Excluded(b"e".to_vec())),
+                (Bound::Excluded(b"b".to_vec()), Bound::Included(b"e".to_vec())),
+                (Bound::Included(b"bb".to_vec()), Bound::Unbounded),
+                (Bound::Included(b"x".to_vec()), Bound::Included(b"z".to_vec())),
+            ]
+        };
+
+        // Entries in memory only.
+        let memory = BTreeIndex::default();
+        for (key, id) in [("a", 1), ("b", 2), ("b", 3), ("d", 4), ("e", 5)] {
+            memory.insert_key(key.as_bytes().to_vec(), object(id), false).unwrap();
+        }
+        // A checkpoint alone, then the same with newer entries over it: one
+        // key replaced, one removed, one added between and one after.
+        let base = || {
+            Arc::new(TestBase(BTreeMap::from([
+                (b"a".to_vec(), vec![object(1)]),
+                (b"b".to_vec(), vec![object(2), object(3)]),
+                (b"c".to_vec(), vec![object(6)]),
+                (b"e".to_vec(), vec![object(5)]),
+            ])))
+        };
+        let checkpointed = BTreeIndex::with_base(base());
+        let layered = BTreeIndex::with_base(base());
+        layered.insert_key(b"b".to_vec(), object(9), false).unwrap();
+        assert!(layered.delete_key(b"c", object(6)).unwrap());
+        layered.insert_key(b"bb".to_vec(), object(7), false).unwrap();
+        layered.insert_key(b"f".to_vec(), object(8), false).unwrap();
+
+        for index in [&memory, &checkpointed, &layered] {
+            for (start, end) in ranges() {
+                assert_eq!(
+                    visited(index, start.clone(), end.clone()),
+                    paged(index, start.clone(), end.clone()),
+                    "{start:?}..{end:?}"
+                );
+            }
+        }
+        assert_eq!(
+            visited(&layered, Bound::Unbounded, Bound::Unbounded)
+                .iter()
+                .map(|(key, object_ref)| (String::from_utf8(key.clone()).unwrap(), *object_ref))
+                .collect::<Vec<_>>(),
+            vec![
+                ("a".to_string(), object(1)),
+                ("b".to_string(), object(2)),
+                ("b".to_string(), object(3)),
+                ("b".to_string(), object(9)),
+                ("bb".to_string(), object(7)),
+                ("e".to_string(), object(5)),
+                ("f".to_string(), object(8)),
+            ]
+        );
     }
 
     #[test]
