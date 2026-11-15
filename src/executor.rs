@@ -308,11 +308,55 @@ impl<S: DocumentStore> QueryExecutor<S> {
             }
             if let Some(plan) = self.try_plan_safe_read(query)? {
                 self.validate_declared_paths(query)?;
-                return self.execute_read_plan(&plan);
+                let mut rows = self.execute_read_plan(&plan)?;
+                Self::name_absent_selected_fields(query, &mut rows);
+                return Ok(rows);
             }
 
             self.execute_general_query(query)
         })
+    }
+
+    /// A `select` names its fields in every row: one a row has no value for
+    /// is `null` there, not missing. Rows fetched through an index carry
+    /// only the values their records hold, so the rest are named here, as
+    /// they already are in rows read by a scan.
+    fn name_absent_selected_fields(query: &OQLQuery, rows: &mut [Document]) {
+        // Only when the `select` is what shapes the result: nothing after it
+        // but filters, a sort or a limit.
+        let Some(at) = query
+            .operations
+            .iter()
+            .rposition(|operation| matches!(operation, Operation::Select(_)))
+        else {
+            return;
+        };
+        let shaped_later = query.operations[at + 1..].iter().any(|operation| {
+            !matches!(operation, Operation::Where(_) | Operation::Sort(_) | Operation::Limit(_))
+        });
+        let Operation::Select(select) = &query.operations[at] else {
+            return;
+        };
+        if shaped_later {
+            return;
+        }
+        let names: Vec<&String> = select
+            .fields
+            .iter()
+            .filter_map(|field| match &field.expression {
+                Expression::FieldAccess(access) if access.path.len() == 1 && access.path[0] != "*" => {
+                    Some(field.alias.as_ref().unwrap_or(&access.path[0]))
+                }
+                _ => None,
+            })
+            .collect();
+        for row in rows {
+            for name in &names {
+                if !row.fields.contains_key(*name) {
+                    row.fields.insert((*name).clone(), Value::Null);
+                }
+            }
+        }
     }
 
     /// Execute a read while retaining Owl's batch-native result representation.
@@ -429,7 +473,10 @@ impl<S: DocumentStore> QueryExecutor<S> {
         // For non-INSERT operations, start by scanning the collection
         if !is_insert_only {
             let scanned_docs =
-                if let Some(prefiltered) = self.prefilter_documents_for_query(query)? {
+                if let Some((rows, applied)) = self.first_rows_by_id(query)? {
+                    filters_applied = applied;
+                    rows
+                } else if let Some(prefiltered) = self.prefilter_documents_for_query(query)? {
                     prefiltered
                 } else if let Some(rows) = self.rows_through_reference(query)? {
                     // Only rows that can pass the filter; it still runs.
@@ -472,7 +519,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
 
         // Apply operations in sequence
         let mut grouped = false;
-        for operation in &query.operations[filters_applied..] {
+        for (position, operation) in query.operations.iter().enumerate().skip(filters_applied) {
             // Grouping an empty collection yields no groups, so there is no
             // group row to project or filter. Without this, an aggregate
             // `select` would see no rows and summarise the whole (empty)
@@ -484,7 +531,15 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 continue;
             }
             let temp_docs = std::mem::take(&mut documents);
-            documents = self.apply_operation(temp_docs, operation, &query.collection)?;
+            documents = match operation {
+                // Only the rows the following `limit` keeps are put in order.
+                Operation::Sort(sort) => self.sort_keeping(
+                    temp_docs,
+                    sort,
+                    Self::rows_kept_after_sort(&query.operations, position),
+                )?,
+                _ => self.apply_operation(temp_docs, operation, &query.collection)?,
+            };
             grouped |= matches!(operation, Operation::GroupBy(_));
         }
 
@@ -1642,13 +1697,18 @@ impl<S: DocumentStore> QueryExecutor<S> {
         })?;
         // Following the relationship costs more per row than scanning, so it
         // pays only when the test keeps a minority of the documents.
-        let total = self.execute_query(&OQLQuery {
-            collection: target.clone(),
-            operations: vec![Operation::Count],
-        })?;
-        let total = match total.first().and_then(|row| row.get_field("count")) {
-            Some(Value::Integer(count)) => *count as usize,
-            _ => return Ok(None),
+        let total = match self.store.collection_len(&target)? {
+            Some(total) => total,
+            None => {
+                let total = self.execute_query(&OQLQuery {
+                    collection: target.clone(),
+                    operations: vec![Operation::Count],
+                })?;
+                match total.first().and_then(|row| row.get_field("count")) {
+                    Some(Value::Integer(count)) => *count as usize,
+                    _ => return Ok(None),
+                }
+            }
         };
         if matching.len().saturating_mul(4) > total {
             return Ok(None);
@@ -1681,13 +1741,52 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 _ => None,
             })
             .collect();
-        let mut rows = Vec::new();
+        // The chosen test holds for every row reached through a document
+        // that passed it, so it is not asked again here.
+        let mut remaining = Vec::new();
+        for condition in &leading {
+            conjuncts(condition, &mut remaining);
+        }
+        remaining.retain(|part| !std::ptr::eq(*part, test));
+        let mut passing = Vec::with_capacity(related.len());
         'documents: for document in &related {
-            for condition in &leading {
+            for condition in &remaining {
                 if !self.evaluate_condition(document, condition)? {
                     continue 'documents;
                 }
             }
+            passing.push(document);
+        }
+        // `sort { .. }.limit(n)` straight after the filters keeps `n` of
+        // these rows. Choosing them here, by the fields the sort names,
+        // means only they are copied. They stay in order of id; the sort
+        // itself still runs on them.
+        if let (Some(Operation::Sort(sort)), Some(keep)) = (
+            query.operations.get(leading.len()),
+            Self::rows_kept_after_sort(&query.operations, leading.len()),
+        ) {
+            let plain = sort.fields.iter().all(|field| {
+                matches!(&field.expression, Expression::FieldAccess(access) if access.path.len() == 1)
+            });
+            if plain && keep < passing.len() && COLUMN_AGGREGATION.with(|enabled| enabled.get()) {
+                // Rows are compared where they lie; most pairs are settled
+                // by the first key, so nothing is worked out ahead of need.
+                let mut kept: Vec<usize> = (0..passing.len()).collect();
+                if keep == 0 {
+                    kept.clear();
+                } else {
+                    kept.select_nth_unstable_by(keep - 1, |left, right| {
+                        self.compare_stored_rows(sort, passing[*left], passing[*right])
+                            .then(left.cmp(right))
+                    });
+                    kept.truncate(keep);
+                }
+                kept.sort_unstable();
+                passing = kept.into_iter().map(|position| passing[position]).collect();
+            }
+        }
+        let mut rows = Vec::with_capacity(passing.len());
+        for document in passing {
             rows.push(match &fields {
                 None => document.as_ref().clone(),
                 Some(fields) => document.with_projected_fields(
@@ -1836,6 +1935,54 @@ impl<S: DocumentStore> QueryExecutor<S> {
             collection: query.collection.clone(),
             operations,
         })
+    }
+
+    /// `where { .. }.sort { .id.asc }.limit(n)`: a collection is read in
+    /// order of id, so the first `n` rows that pass the filter are the
+    /// answer and the read can stop there. Returns those rows and how many
+    /// leading filters they already satisfy; the sort and limit still run.
+    /// `None` when the shape does not apply.
+    fn first_rows_by_id(&self, query: &OQLQuery) -> OQLResult<Option<(Vec<Document>, usize)>> {
+        if !COLUMN_AGGREGATION.with(|enabled| enabled.get()) {
+            return Ok(None);
+        }
+        let leading = query
+            .operations
+            .iter()
+            .take_while(|operation| matches!(operation, Operation::Where(_)))
+            .count();
+        let (Some(Operation::Sort(sort)), Some(Operation::Limit(limit))) = (
+            query.operations.get(leading),
+            query.operations.get(leading + 1),
+        ) else {
+            return Ok(None);
+        };
+        let [key] = sort.fields.as_slice() else {
+            return Ok(None);
+        };
+        let by_id = matches!(key.direction, crate::parser::SortDirection::Asc)
+            && matches!(&key.expression, Expression::FieldAccess(field) if field.path == ["id"]);
+        if !by_id || *limit > 10_000 {
+            return Ok(None);
+        }
+        let Some(schema) = self.schema_of(&query.collection)? else {
+            return Ok(None);
+        };
+        let (filters, residual) =
+            Self::split_storage_filters(&query.collection, &schema, &query.operations[..leading]);
+        if !residual.is_empty() {
+            return Ok(None);
+        }
+        let fields: Option<Vec<String>> = self.fields_read_by(query).map(|fields| {
+            fields
+                .into_iter()
+                .filter(|name| schema.fields.contains_key(name))
+                .collect()
+        });
+        Ok(self
+            .store
+            .scan_first_documents(&query.collection, &filters, fields.as_deref(), *limit as usize)?
+            .map(|rows| (rows, leading)))
     }
 
     /// Fetch the root rows of a general query through the physical pipeline.
@@ -1998,7 +2145,9 @@ impl<S: DocumentStore> QueryExecutor<S> {
         first_rows.push(Operation::Sort(SortBlock {
             fields: vec![sort.fields[0].clone()],
         }));
-        first_rows.push(Operation::Limit(*limit));
+        // One row more than asked for shows whether the last place is
+        // contested.
+        first_rows.push(Operation::Limit(*limit + 1));
         let Some(plan) = self.plan_read(
             &OQLQuery {
                 collection: query.collection.clone(),
@@ -2019,7 +2168,23 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
 
         let mut candidates = self.execute_read_plan(&plan)?;
-        if candidates.len() as u64 >= *limit {
+        // The row past the page, when there is one. The index yields equal
+        // values together, so if it differs from the last row of the page
+        // then every row sharing that last value is already in hand.
+        let beyond = if candidates.len() as u64 > *limit {
+            candidates.pop()
+        } else {
+            None
+        };
+        let contested = match (&beyond, candidates.last()) {
+            (Some(beyond), Some(last)) => {
+                let boundary = self.get_field_value(last, leading_key)?;
+                boundary.is_null()
+                    || self.values_equal(&self.get_field_value(beyond, leading_key)?, &boundary)
+            }
+            _ => false,
+        };
+        if contested {
             let boundary = self.get_field_value(
                 candidates.last().expect("a full page has a last row"),
                 leading_key,
@@ -3382,6 +3547,9 @@ impl<S: DocumentStore> QueryExecutor<S> {
             if let Some(answer) = self.related_count(scope_document, &field.path, operations)? {
                 return Ok(answer);
             }
+            if let Some(answer) = self.related_directly(scope_document, &field.path, operations)? {
+                return Ok(answer);
+            }
         }
         let (documents, single) = match source {
             // An operation written with no receiver, evaluated for a group
@@ -3548,6 +3716,136 @@ impl<S: DocumentStore> QueryExecutor<S> {
             }
             Operation::Count | Operation::Sum(_) => found.cloned().unwrap_or(Value::Integer(0)),
             _ => found.cloned().unwrap_or(Value::Null),
+        }))
+    }
+
+    /// Answer `.relationship.where { .. }.count()`, or another aggregate of
+    /// one field, for one row by reading the related rows where storage
+    /// holds them, without copying them into a collection first.
+    ///
+    /// The path may pass through several relationships, as in
+    /// `.children.products.count()`. The rows are the ones the general path
+    /// reaches, through the same index, so the answer is the same. `None`
+    /// leaves the question to it.
+    fn related_directly(
+        &self,
+        row: &Document,
+        path: &[String],
+        operations: &[Operation],
+    ) -> OQLResult<Option<Value>> {
+        let Some((last, filters)) = operations.split_last() else {
+            return Ok(None);
+        };
+        let (function, measured) = match last {
+            Operation::Count | Operation::Exists => ("count", None),
+            Operation::Sum(field) if field.path.len() == 1 => ("sum", Some(&field.path[0])),
+            Operation::Avg(field) if field.path.len() == 1 => ("avg", Some(&field.path[0])),
+            Operation::Min(field) if field.path.len() == 1 => ("min", Some(&field.path[0])),
+            Operation::Max(field) if field.path.len() == 1 => ("max", Some(&field.path[0])),
+            _ => return Ok(None),
+        };
+        let mut conditions = Vec::with_capacity(filters.len());
+        for operation in filters {
+            match operation {
+                Operation::Where(block) if Self::is_pipeline_safe_condition(&block.condition) => {
+                    conditions.push(&block.condition)
+                }
+                _ => return Ok(None),
+            }
+        }
+        if path.is_empty() || !COLUMN_AGGREGATION.with(|enabled| enabled.get()) {
+            return Ok(None);
+        }
+        let Some(kind) = AggregateKind::named(function, measured.is_none()) else {
+            return Ok(None);
+        };
+
+        // Follow each step from every row reached so far. A step must be a
+        // relationship: a stored field of that name is read differently.
+        let mut reached: Option<Vec<Arc<Document>>> = None;
+        let mut source_schema = String::new();
+        for segment in path {
+            if DocumentSystemField::from_name(segment).is_some() {
+                return Ok(None);
+            }
+            let mut next = Vec::new();
+            let mut follow = |document: &Document| -> OQLResult<bool> {
+                if document.fields.contains_key(segment) {
+                    return Ok(false);
+                }
+                let ReverseRelationship::Declared { source, field } =
+                    self.reverse_relationship(&document.schema, segment)?
+                else {
+                    return Ok(false);
+                };
+                next.extend(self.store.scan_referencing_documents_shared(
+                    &document.schema,
+                    &document.id,
+                    Some(&source),
+                    field.as_deref(),
+                )?);
+                if source_schema != source {
+                    source_schema = source;
+                }
+                Ok(true)
+            };
+            let followed = match &reached {
+                None => follow(row)?,
+                Some(documents) => {
+                    let mut all = true;
+                    for document in documents {
+                        if !follow(document)? {
+                            all = false;
+                            break;
+                        }
+                    }
+                    all
+                }
+            };
+            if !followed {
+                return Ok(None);
+            }
+            reached = Some(next);
+        }
+        let related = reached.unwrap_or_default();
+
+        // An aggregate of a field is taken only where the field's declared
+        // type makes it one the accumulator and the evaluator agree on.
+        if let Some(name) = measured {
+            let Some(schema) = self.schema_of(&source_schema)? else {
+                return Ok(None);
+            };
+            let mut declared = schema.fields.get(name);
+            while let Some(FieldType::Optional(inner)) = declared {
+                declared = Some(inner);
+            }
+            let fits = match declared {
+                Some(FieldType::Integer | FieldType::Float) => true,
+                Some(FieldType::String | FieldType::DateTime) => matches!(function, "min" | "max"),
+                _ => false,
+            };
+            if !fits || related.iter().any(|document| document.schema != source_schema) {
+                return Ok(None);
+            }
+        }
+
+        let mut accumulator = Accumulator::new(kind);
+        'related: for document in &related {
+            for condition in &conditions {
+                if !self.evaluate_condition(document, condition)? {
+                    continue 'related;
+                }
+            }
+            match measured {
+                None => accumulator.count += 1,
+                Some(name) => {
+                    accumulator.push(document.fields.get(name).map(ProjectedValueRef::Value))?
+                }
+            }
+        }
+        Ok(Some(match last {
+            Operation::Exists => Value::Boolean(accumulator.count > 0),
+            _ => accumulator.finish(),
         }))
     }
 
@@ -3826,9 +4124,16 @@ impl<S: DocumentStore> QueryExecutor<S> {
             .iter()
             .any(|operation| matches!(operation, Operation::First));
 
-        for operation in operations {
+        for (position, operation) in operations.iter().enumerate() {
             let materialized = self.materialize_operation_with_scope(operation, scope_document)?;
-            documents = self.apply_operation(documents, &materialized, collection_scope)?;
+            documents = match &materialized {
+                Operation::Sort(sort) => self.sort_keeping(
+                    documents,
+                    sort,
+                    Self::rows_kept_after_sort(operations, position),
+                )?,
+                _ => self.apply_operation(documents, &materialized, collection_scope)?,
+            };
         }
 
         let aggregate_field = operations.last().and_then(Self::scalar_result_field);
@@ -5349,6 +5654,9 @@ impl<S: DocumentStore> QueryExecutor<S> {
         };
         let existing = self.store.get_schema(&schema.name)?;
         let mut rewritten = Vec::new();
+        // Declared again exactly as it stands, as an application does each
+        // time it starts, a schema is not written again.
+        let unchanged = existing.as_ref() == Some(&schema);
 
         if let Some(old) = existing.filter(|old| old != &schema) {
             let rows = self.store.scan_documents(&schema.name)?;
@@ -5444,7 +5752,9 @@ impl<S: DocumentStore> QueryExecutor<S> {
 
         let (scalar_indexes, vector_indexes) =
             crate::parser::schema_definition_indexes(definition, &schema)?;
-        self.store.put_schema(&schema)?;
+        if !unchanged {
+            self.store.put_schema(&schema)?;
+        }
         if !rewritten.is_empty() {
             self.store.put_documents(&rewritten)?;
         }
@@ -7467,35 +7777,141 @@ impl<S: DocumentStore> QueryExecutor<S> {
     /// Apply SORT operation to documents
     fn apply_sort_operation(
         &self,
-        mut documents: Vec<Document>,
+        documents: Vec<Document>,
         sort_block: &SortBlock,
     ) -> OQLResult<Vec<Document>> {
-        // Sort documents by the specified fields
-        documents.sort_by(|a, b| {
-            for sort_field in &sort_block.fields {
-                // Evaluate the expression for both documents
-                let a_value = self
-                    .evaluate_expression(a, &sort_field.expression)
-                    .unwrap_or(Value::Null);
-                let b_value = self
-                    .evaluate_expression(b, &sort_field.expression)
-                    .unwrap_or(Value::Null);
+        self.sort_keeping(documents, sort_block, None)
+    }
 
-                let comparison = self.compare_values_for_sort(&a_value, &b_value);
+    /// What a row is sorted by: the value of each sort expression, with one
+    /// that cannot be evaluated counting as null.
+    fn sort_keys(&self, document: &Document, sort_block: &SortBlock) -> Vec<Value> {
+        sort_block
+            .fields
+            .iter()
+            .map(|field| {
+                self.evaluate_expression(document, &field.expression)
+                    .unwrap_or(Value::Null)
+            })
+            .collect()
+    }
 
-                let result = match sort_field.direction {
-                    crate::parser::SortDirection::Asc => comparison,
-                    crate::parser::SortDirection::Desc => comparison.reverse(),
-                };
-
-                if result != std::cmp::Ordering::Equal {
-                    return result;
+    /// Order two stored rows as `sort` does, reading each key only when
+    /// the keys before it tie, and copying only what cannot be lent.
+    fn compare_stored_rows(
+        &self,
+        sort_block: &SortBlock,
+        left: &Document,
+        right: &Document,
+    ) -> std::cmp::Ordering {
+        for field in &sort_block.fields {
+            let name = match &field.expression {
+                Expression::FieldAccess(access) if access.path.len() == 1 => Some(&access.path[0]),
+                _ => None,
+            };
+            let comparison = match name {
+                Some(name) if name == "id" => left.id.cmp(&right.id),
+                Some(name)
+                    if DocumentSystemField::from_name(name).is_none()
+                        && left.fields.contains_key(name)
+                        && right.fields.contains_key(name) =>
+                {
+                    self.compare_values_for_sort(&left.fields[name], &right.fields[name])
                 }
+                _ => self.compare_values_for_sort(
+                    &self
+                        .evaluate_expression(left, &field.expression)
+                        .unwrap_or(Value::Null),
+                    &self
+                        .evaluate_expression(right, &field.expression)
+                        .unwrap_or(Value::Null),
+                ),
+            };
+            let result = match field.direction {
+                crate::parser::SortDirection::Asc => comparison,
+                crate::parser::SortDirection::Desc => comparison.reverse(),
+            };
+            if result != std::cmp::Ordering::Equal {
+                return result;
             }
-            std::cmp::Ordering::Equal
-        });
+        }
+        std::cmp::Ordering::Equal
+    }
 
-        Ok(documents)
+    fn compare_sort_keys<Key: std::borrow::Borrow<Value>>(
+        &self,
+        sort_block: &SortBlock,
+        left: &[Key],
+        right: &[Key],
+    ) -> std::cmp::Ordering {
+        for ((field, left), right) in sort_block.fields.iter().zip(left).zip(right) {
+            let comparison = self.compare_values_for_sort(left.borrow(), right.borrow());
+            let result = match field.direction {
+                crate::parser::SortDirection::Asc => comparison,
+                crate::parser::SortDirection::Desc => comparison.reverse(),
+            };
+            if result != std::cmp::Ordering::Equal {
+                return result;
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+
+    /// The positions of the rows with these keys in sorted order, rows with
+    /// equal keys staying in the order they came. With `keep`, only the
+    /// first that many positions, found without sorting the rest.
+    fn sorted_positions<Key: std::borrow::Borrow<Value>>(
+        &self,
+        keys: &[Vec<Key>],
+        sort_block: &SortBlock,
+        keep: Option<usize>,
+    ) -> Vec<usize> {
+        let mut order: Vec<usize> = (0..keys.len()).collect();
+        let compare = |left: &usize, right: &usize| {
+            self.compare_sort_keys(sort_block, &keys[*left], &keys[*right])
+                .then(left.cmp(right))
+        };
+        if let Some(keep) = keep.filter(|keep| *keep < order.len()) {
+            if keep == 0 {
+                return Vec::new();
+            }
+            order.select_nth_unstable_by(keep - 1, compare);
+            order.truncate(keep);
+        }
+        order.sort_unstable_by(compare);
+        order
+    }
+
+    /// Sort rows, evaluating each row's sort expressions once. With `keep`,
+    /// return only the first that many rows of the sorted order: what
+    /// `sort { .. }.limit(keep)` asks for.
+    fn sort_keeping(
+        &self,
+        documents: Vec<Document>,
+        sort_block: &SortBlock,
+        keep: Option<usize>,
+    ) -> OQLResult<Vec<Document>> {
+        let keys: Vec<Vec<Value>> = documents
+            .iter()
+            .map(|document| self.sort_keys(document, sort_block))
+            .collect();
+        let order = self.sorted_positions(&keys, sort_block, keep);
+        let mut rows: Vec<Option<Document>> = documents.into_iter().map(Some).collect();
+        Ok(order
+            .into_iter()
+            .filter_map(|position| rows[position].take())
+            .collect())
+    }
+
+    /// How many rows the operation after a `sort` keeps, when it is a
+    /// `limit`.
+    fn rows_kept_after_sort(operations: &[Operation], sort_at: usize) -> Option<usize> {
+        match (operations.get(sort_at), operations.get(sort_at + 1)) {
+            (Some(Operation::Sort(_)), Some(Operation::Limit(limit))) => {
+                usize::try_from(*limit).ok()
+            }
+            _ => None,
+        }
     }
 
     /// Apply LIMIT operation to documents

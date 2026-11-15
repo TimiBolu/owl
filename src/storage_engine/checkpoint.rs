@@ -813,6 +813,11 @@ pub(crate) struct FileIndexBase {
     name: String,
     unique: bool,
     pages: Vec<IndexPageDescriptor>,
+    /// Every page states its first and last key, the pages follow one
+    /// another in key order, and no page read so far holds keys out of
+    /// order, so a key is found by bisection. Cleared for good the moment a
+    /// page says otherwise; every read then looks at each entry.
+    ordered: std::sync::atomic::AtomicBool,
     page_cache: Mutex<HashMap<usize, Arc<Vec<(Vec<u8>, Vec<ObjRef>)>>>>,
 }
 
@@ -828,8 +833,18 @@ impl FileIndexBase {
             .iter_mut()
             .enumerate()
             .filter_map(|(index, page)| page.cached_entries.take().map(|entries| (index, entries)))
-            .collect();
+            .collect::<HashMap<_, _>>();
+        let ordered = page_cache.values().all(|entries| keys_ascend(entries))
+            && pages.iter().all(|page| {
+            page.first_key
+                .as_deref()
+                .zip(page.last_key.as_deref())
+                .is_some_and(|(first, last)| first <= last)
+        }) && pages
+            .windows(2)
+            .all(|pair| pair[0].last_key < pair[1].first_key);
         Self {
+            ordered: std::sync::atomic::AtomicBool::new(ordered),
             filesystem,
             schema,
             name,
@@ -871,6 +886,10 @@ impl FileIndexBase {
         if page.schema != self.schema || page.name != self.name || page.unique != self.unique {
             return Err("checkpoint index page identity changed after recovery".into());
         }
+        if !keys_ascend(&page.entries) {
+            self.ordered
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
         let entries = Arc::new(page.entries);
         self.page_cache
             .lock()
@@ -880,8 +899,40 @@ impl FileIndexBase {
     }
 }
 
+/// Whether each key of a page is greater than the one before it.
+fn keys_ascend(entries: &[(Vec<u8>, Vec<ObjRef>)]) -> bool {
+    entries.windows(2).all(|pair| pair[0].0 < pair[1].0)
+}
+
+impl FileIndexBase {
+    fn is_ordered(&self) -> bool {
+        self.ordered.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 impl OrderedIndexBase for FileIndexBase {
     fn search_key(&self, key: &[u8]) -> Result<Vec<ObjRef>, String> {
+        if self.is_ordered() {
+            let page_index = self
+                .pages
+                .partition_point(|page| page.last_key.as_deref().is_some_and(|last| last < key));
+            let holds = self
+                .pages
+                .get(page_index)
+                .and_then(|page| page.first_key.as_deref())
+                .is_some_and(|first| first <= key);
+            if !holds {
+                return Ok(Vec::new());
+            }
+            let entries = self.read_page(page_index)?;
+            // Reading the page may have found it out of order.
+            if self.is_ordered() {
+                return Ok(entries
+                    .binary_search_by(|(candidate, _)| candidate.as_slice().cmp(key))
+                    .map(|position| entries[position].1.clone())
+                    .unwrap_or_default());
+            }
+        }
         let Some(page_index) = self.pages.iter().position(|page| {
             page.first_key
                 .as_deref()
@@ -905,19 +956,41 @@ impl OrderedIndexBase for FileIndexBase {
         descending: bool,
     ) -> Result<Vec<(Vec<u8>, Vec<ObjRef>)>, String> {
         let mut entries = Vec::new();
-        let mut page_indexes = self
-            .pages
-            .iter()
-            .enumerate()
-            .filter_map(|(index, descriptor)| {
-                descriptor
-                    .first_key
-                    .as_deref()
-                    .zip(descriptor.last_key.as_deref())
-                    .filter(|(first, last)| page_intersects(first, last, &start, &end))
-                    .map(|_| index)
-            })
-            .collect::<Vec<_>>();
+        let before_start = |key: &[u8]| match &start {
+            Bound::Included(value) => key < value.as_slice(),
+            Bound::Excluded(value) => key <= value.as_slice(),
+            Bound::Unbounded => false,
+        };
+        let within_end = |key: &[u8]| match &end {
+            Bound::Included(value) => key <= value.as_slice(),
+            Bound::Excluded(value) => key < value.as_slice(),
+            Bound::Unbounded => true,
+        };
+        let mut page_indexes = if self.is_ordered() {
+            // The pages the range touches lie together: from the first whose
+            // last key reaches the start, to the last whose first key is
+            // still within the end.
+            let from = self
+                .pages
+                .partition_point(|page| page.last_key.as_deref().is_some_and(before_start));
+            let to = self
+                .pages
+                .partition_point(|page| page.first_key.as_deref().is_some_and(within_end));
+            (from..to.max(from)).collect::<Vec<_>>()
+        } else {
+            self.pages
+                .iter()
+                .enumerate()
+                .filter_map(|(index, descriptor)| {
+                    descriptor
+                        .first_key
+                        .as_deref()
+                        .zip(descriptor.last_key.as_deref())
+                        .filter(|(first, last)| page_intersects(first, last, &start, &end))
+                        .map(|_| index)
+                })
+                .collect::<Vec<_>>()
+        };
         if descending {
             page_indexes.reverse();
         }
@@ -934,13 +1007,18 @@ impl OrderedIndexBase for FileIndexBase {
             if !page_intersects(first, last, &start, &end) {
                 continue;
             }
-            let page_entries = self
-                .read_page(page_index)?
-                .iter()
-                .filter(|(key, _)| key_in_bounds(key, &start, &end))
-                .cloned()
-                .collect::<Vec<_>>();
-            let mut page_entries = page_entries;
+            let page = self.read_page(page_index)?;
+            let mut page_entries = if self.is_ordered() {
+                // Keys within a page are in order too.
+                let from = page.partition_point(|(key, _)| before_start(key));
+                let to = page.partition_point(|(key, _)| within_end(key));
+                page[from..to.max(from)].to_vec()
+            } else {
+                page.iter()
+                    .filter(|(key, _)| key_in_bounds(key, &start, &end))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
             if descending {
                 page_entries.reverse();
             }
@@ -954,6 +1032,53 @@ impl OrderedIndexBase for FileIndexBase {
             }
         }
         Ok(entries)
+    }
+
+    fn visit_range(
+        &self,
+        start: Bound<Vec<u8>>,
+        end: Bound<Vec<u8>>,
+        visitor: &mut dyn FnMut(&[u8], &[ObjRef]),
+    ) -> Result<(), String> {
+        if !self.is_ordered() {
+            for (key, postings) in self.range_entries(start, end, None, false)? {
+                visitor(&key, &postings);
+            }
+            return Ok(());
+        }
+        let before_start = |key: &[u8]| match &start {
+            Bound::Included(value) => key < value.as_slice(),
+            Bound::Excluded(value) => key <= value.as_slice(),
+            Bound::Unbounded => false,
+        };
+        let within_end = |key: &[u8]| match &end {
+            Bound::Included(value) => key <= value.as_slice(),
+            Bound::Excluded(value) => key < value.as_slice(),
+            Bound::Unbounded => true,
+        };
+        let from = self
+            .pages
+            .partition_point(|page| page.last_key.as_deref().is_some_and(before_start));
+        let to = self
+            .pages
+            .partition_point(|page| page.first_key.as_deref().is_some_and(within_end));
+        for page_index in from..to.max(from) {
+            let page = self.read_page(page_index)?;
+            if self.is_ordered() {
+                let from = page.partition_point(|(key, _)| before_start(key));
+                let to = page.partition_point(|(key, _)| within_end(key));
+                for (key, postings) in &page[from..to.max(from)] {
+                    visitor(key, postings);
+                }
+            } else {
+                for (key, postings) in page.iter() {
+                    if key_in_bounds(key, &start, &end) {
+                        visitor(key, postings);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn visit_entries(
@@ -2752,6 +2877,23 @@ impl BaseSegmentHandle {
             records_start,
             records_len,
         })
+    }
+
+    /// Whether this segment holds a record for the object, from its
+    /// directory alone.
+    pub(crate) fn contains(&self, object_ref: ObjRef) -> OQLResult<bool> {
+        let mut low = 0usize;
+        let mut high = self.entry_count;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let entry = self.directory_start + middle * DIRECTORY_ENTRY_LEN;
+            match ObjRef::new(get_u64(&self.prefix, entry)?).cmp(&object_ref) {
+                std::cmp::Ordering::Less => low = middle + 1,
+                std::cmp::Ordering::Greater => high = middle,
+                std::cmp::Ordering::Equal => return Ok(true),
+            }
+        }
+        Ok(false)
     }
 
     pub(crate) fn lookup(&self, object_ref: ObjRef) -> OQLResult<Option<Arc<[u8]>>> {

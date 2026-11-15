@@ -482,6 +482,10 @@ struct State {
     /// Decoded documents in the order they were taken in, kept only while
     /// there is a budget. It may name documents since removed.
     decoded_order: VecDeque<ObjRef>,
+    /// The checkpoint files, for reading back a record whose bytes are no
+    /// longer held in memory. Absent while a store is being recovered.
+    /// Locked only after the state, never before it.
+    checkpoint_records: Option<Arc<Mutex<CheckpointReadHandles>>>,
 }
 
 impl State {
@@ -495,7 +499,8 @@ impl State {
 /// Drop the bytes of records a checkpoint file holds.
 ///
 /// With a budget, a row outside the column segments that is not held
-/// decoded has only its record to be decoded from, so those are kept.
+/// decoded is decoded from its record, so a record the checkpoint files do
+/// not hold is kept.
 fn evict_clean_records(state: &mut State) {
     let State {
         object_records,
@@ -503,16 +508,23 @@ fn evict_clean_records(state: &mut State) {
         object_directory,
         typed_row_locations,
         decoded_budget,
+        checkpoint_records: state_checkpoint_records,
         ..
     } = state;
     if decoded_budget.is_none() {
         object_records.evict_clean();
         return;
     }
+    // Such a row is read back from the checkpoint files when they hold it,
+    // and only then can its bytes go.
+    let files = state_checkpoint_records.as_ref().and_then(|files| files.lock().ok());
     object_records.evict_clean_unless(|object_ref| {
         object_schema_versions.contains_key(object_ref)
             && !object_directory.contains_key(object_ref)
             && !typed_row_locations.contains_key(object_ref).unwrap_or(true)
+            && !files
+                .as_ref()
+                .is_some_and(|files| files.holds(*object_ref).unwrap_or(false))
     });
 }
 
@@ -540,8 +552,19 @@ fn enforce_decoded_budget(state: &mut State) -> OQLResult<()> {
         let Some(document) = state.object_directory.get(&candidate) else {
             continue;
         };
+        // A row with no column segment behind it is decoded again from its
+        // record: the one in memory, or the one in the checkpoint files.
+        let on_file = !state.object_records.is_dirty(&candidate)
+            && match &state.checkpoint_records {
+                Some(files) => files
+                    .lock()
+                    .map_err(|_| OQLError::generic("checkpoint read handle lock poisoned"))?
+                    .holds(candidate)?,
+                None => false,
+            };
         if !state.typed_row_locations.contains_key(&candidate)?
             && state.object_records.get(&candidate).is_none()
+            && !on_file
         {
             let compiled = state
                 .object_schema_versions
@@ -1750,6 +1773,60 @@ struct CheckpointReadHandles {
     base_segment: Option<BaseSegmentHandle>,
 }
 
+impl CheckpointReadHandles {
+    /// The record the checkpoint files hold for a live object, newest file
+    /// first. `None` when they hold none.
+    fn record(&self, object_ref: ObjRef) -> OQLResult<Option<Arc<[u8]>>> {
+        for root in &self.generation_record_roots {
+            match root.lookup(object_ref)? {
+                RecordDeltaLookup::Put(record) => return Ok(Some(record)),
+                RecordDeltaLookup::Delete => {
+                    return Err(OQLError::storage_error(
+                        "live object is deleted by an immutable generation",
+                        None,
+                    ));
+                }
+                RecordDeltaLookup::Missing => {}
+            }
+        }
+        match self
+            .record_root
+            .as_ref()
+            .map(|root| root.lookup(object_ref))
+            .transpose()?
+        {
+            Some(RecordDeltaLookup::Put(record)) => return Ok(Some(record)),
+            Some(RecordDeltaLookup::Delete) => {
+                return Err(OQLError::storage_error(
+                    "live object is deleted by its checkpoint record root",
+                    None,
+                ));
+            }
+            Some(RecordDeltaLookup::Missing) | None => {}
+        }
+        self.base_segment
+            .as_ref()
+            .map(|base| base.lookup(object_ref))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    /// Whether [`Self::record`] would find a record for this object. The
+    /// base segment answers from its directory, without reading the record.
+    fn holds(&self, object_ref: ObjRef) -> OQLResult<bool> {
+        for root in self.generation_record_roots.iter().chain(&self.record_root) {
+            match root.lookup(object_ref)? {
+                RecordDeltaLookup::Put(_) => return Ok(true),
+                RecordDeltaLookup::Delete => return Ok(false),
+                RecordDeltaLookup::Missing => {}
+            }
+        }
+        self.base_segment
+            .as_ref()
+            .map_or(Ok(false), |base| base.contains(object_ref))
+    }
+}
+
 /// The initial, entirely Rust-owned Owl storage engine.
 ///
 /// Between checkpoints the WAL is the durable mutation stream. Opening a store
@@ -1771,7 +1848,7 @@ pub struct StoreCore {
     generation_root_paths: [PathBuf; 2],
     generation_prefix: PathBuf,
     record_delta_paths: [PathBuf; 2],
-    checkpoint_read_handles: Mutex<CheckpointReadHandles>,
+    checkpoint_read_handles: Arc<Mutex<CheckpointReadHandles>>,
     index_delta_paths: [PathBuf; 2],
     wal_delta_paths: [PathBuf; 2],
     max_size_bytes: usize,
@@ -2167,6 +2244,11 @@ impl RustStore {
 
         let recovered_commits = state.committed_lsn.saturating_sub(record_delta_base_lsn);
         let recovered_lsn = state.committed_lsn;
+        // The state reads evicted records back through the same handles the
+        // store keeps current.
+        let checkpoint_read_handles = Arc::new(Mutex::new(CheckpointReadHandles::default()));
+        let mut state = state;
+        state.checkpoint_records = Some(checkpoint_read_handles.clone());
         let core = Arc::new(StoreCore {
             filesystem,
             wal_path,
@@ -2176,7 +2258,7 @@ impl RustStore {
             generation_root_paths,
             generation_prefix,
             record_delta_paths,
-            checkpoint_read_handles: Mutex::new(CheckpointReadHandles::default()),
+            checkpoint_read_handles,
             index_delta_paths,
             wal_delta_paths,
             max_size_bytes,
@@ -2375,7 +2457,41 @@ impl RustStore {
         // therefore reported through status and must not turn this write into
         // a false negative that callers might retry.
         self.schedule_maintenance();
+        // With a memory budget, what has been written since the last
+        // checkpoint is held in memory until the next one. A writer that
+        // outruns the checkpoints waits here for them to catch up, so that
+        // what is held stays bounded.
+        if self.checkpoints_are_behind().unwrap_or(false) {
+            let _ = self.wait_for_maintenance();
+        }
         Ok(lsn)
+    }
+
+    /// Whether a memory budget is set and the log has grown to several
+    /// times the size at which a checkpoint is due.
+    fn checkpoints_are_behind(&self) -> OQLResult<bool> {
+        const TIMES_OVERDUE: u64 = 1;
+        let bounded = self
+            .state
+            .read()
+            .map_err(|_| OQLError::generic("storage state lock poisoned"))?
+            .decoded_budget
+            .is_some();
+        if !bounded {
+            return Ok(false);
+        }
+        let policy = *self
+            .auto_checkpoint_policy
+            .lock()
+            .map_err(|_| OQLError::generic("checkpoint policy lock poisoned"))?;
+        if policy.wal_bytes == 0 {
+            return Ok(false);
+        }
+        let wal_bytes = self
+            .filesystem
+            .file_size(&self.wal_path)
+            .map_err(|error| storage_io("inspect WAL", &self.wal_path, error))?;
+        Ok(wal_bytes >= policy.wal_bytes.saturating_mul(TIMES_OVERDUE))
     }
 
     /// Check, plan, log and apply one batch, without waiting for the log
@@ -3052,21 +3168,30 @@ impl StoreCore {
                 .map(|object_ref| {
                     typed_locator
                         .get(object_ref)
-                        .map(|location| location.map(|_| object_ref))
+                        .map(|location| location.map(|location| (object_ref, location)))
                 })
                 .collect::<OQLResult<Vec<_>>>()?
                 .into_iter()
                 .flatten()
                 .collect::<Vec<_>>();
-            for object_ref in &retired {
-                let document = logical_document(&state, *object_ref)?.ok_or_else(|| {
-                    OQLError::storage_error("a row being retired to a segment is missing", None)
+            for (object_ref, (segment_index, row)) in &retired {
+                // The segment the row moved to names it. Its record may be
+                // nowhere else by now: gone from memory, and left out of the
+                // checkpoint's records because the segment holds the row.
+                let segment = state.typed_segments.get(*segment_index).ok_or_else(|| {
+                    OQLError::storage_error("a row was retired to a missing segment", None)
                 })?;
+                let schema = state
+                    .compiled_schemas
+                    .get(&(segment.collection_id(), segment.schema_version()))
+                    .map(|compiled| compiled.name.clone())
+                    .ok_or_else(|| OQLError::storage_error("compiled schema is missing", None))?;
+                let id = segment.document_id(*row)?;
                 state.object_directory.remove(object_ref);
-                if let Some(rows) = state.collection_rows.get_mut(&document.schema) {
-                    rows.remove(&document.id);
+                if let Some(rows) = state.collection_rows.get_mut(&schema) {
+                    rows.remove(&id);
                     if rows.is_empty() {
-                        state.collection_rows.remove(&document.schema);
+                        state.collection_rows.remove(&schema);
                     }
                 }
                 state.object_schema_versions.remove(object_ref);
@@ -6508,18 +6633,36 @@ fn record_document(
     let Some(version) = state.object_schema_versions.get(&object_ref) else {
         return Ok(None);
     };
-    // Such a row always has one or the other in memory. Saying it does not
-    // exist would lose it silently, so its absence is an error.
-    let record = state.object_records.get(&object_ref).ok_or_else(|| {
-        OQLError::storage_error("a live row is neither decoded nor held as a record", None)
-    })?;
+    // Such a row always has its record in memory or in the checkpoint
+    // files. Saying it does not exist would lose it silently, so finding
+    // it in neither is an error.
+    let record = match state.object_records.get(&object_ref) {
+        Some(record) => record.clone(),
+        None => state
+            .checkpoint_records
+            .as_ref()
+            .map(|files| {
+                files
+                    .lock()
+                    .map_err(|_| OQLError::generic("checkpoint read handle lock poisoned"))?
+                    .record(object_ref)
+            })
+            .transpose()?
+            .flatten()
+            .ok_or_else(|| {
+                OQLError::storage_error(
+                    "a live row is neither decoded nor held as a record",
+                    None,
+                )
+            })?,
+    };
     let compiled = state
         .compiled_schemas
         .get(&(object_ref.collection_id(), *version))
         .ok_or_else(|| OQLError::storage_error("compiled schema is missing", None))?;
     Ok(Some((
-        Arc::new(RecordCodec::decode(record, compiled)?),
-        record.clone(),
+        Arc::new(RecordCodec::decode(&record, compiled)?),
+        record,
     )))
 }
 
@@ -6842,10 +6985,17 @@ fn restore_checkpoint(
     }
     state.decoded_budget = decoded_budget;
     records.for_each_chunk(filesystem.as_ref(), 4_096, |records| {
+        // With a budget, only as many rows as it has room for are decoded.
+        // The rest are known by the schema and id their records state, and
+        // decoded if they are ever asked for.
+        let room = state
+            .decoded_budget
+            .map_or(usize::MAX, |budget| budget.saturating_sub(state.object_directory.len()));
+        let records: Vec<(usize, (ObjRef, Arc<[u8]>))> = records.into_iter().enumerate().collect();
         let hydrated = {
             let compiled_schemas = &state.compiled_schemas;
             let next_object_ids = &state.next_object_ids;
-            let decode_record = |(object_ref, record): (ObjRef, Arc<[u8]>)| {
+            let decode_record = |(position, (object_ref, record)): (usize, (ObjRef, Arc<[u8]>))| {
                 let header = RecordCodec::header(&record)?;
                 if header.object_ref != object_ref {
                     return Err(OQLError::storage_error(
@@ -6861,7 +7011,15 @@ fn restore_checkpoint(
                             None,
                         )
                     })?;
-                let document = RecordCodec::decode(&record, compiled)?;
+                let (schema, id, document) = if position < room {
+                    let document = RecordCodec::decode(&record, compiled)?;
+                    (document.schema.clone(), document.id.clone(), Some(document))
+                } else {
+                    let id = RecordCodec::trusted_view(&record, compiled)?
+                        .external_id()?
+                        .to_string();
+                    (compiled.name.clone(), id, None)
+                };
                 let next = next_object_ids
                     .get(&object_ref.collection_id())
                     .copied()
@@ -6877,7 +7035,7 @@ fn restore_checkpoint(
                         None,
                     ));
                 }
-                Ok((object_ref, record, document, header.schema_version))
+                Ok((object_ref, record, schema, id, document, header.schema_version))
             };
             if records.len() >= 1_024 {
                 records
@@ -6891,13 +7049,13 @@ fn restore_checkpoint(
                     .collect::<OQLResult<Vec<_>>>()?
             }
         };
-        for (object_ref, record, document, schema_version) in hydrated {
-            if lookup_object_ref(&state, &document.schema, &document.id)?.is_some()
+        for (object_ref, record, schema, id, document, schema_version) in hydrated {
+            if lookup_object_ref(&state, &schema, &id)?.is_some()
                 || state
                     .collection_rows
-                    .entry(document.schema.clone())
+                    .entry(schema)
                     .or_default()
-                    .insert(document.id.clone(), object_ref)
+                    .insert(id, object_ref)
                     .is_some()
                 || {
                     // Past the budget the row is left as its record, which
@@ -6905,12 +7063,15 @@ fn restore_checkpoint(
                     let room = state
                         .decoded_budget
                         .map_or(true, |budget| state.object_directory.len() < budget);
-                    room && {
-                        state.note_decoded(object_ref);
-                        state
-                            .object_directory
-                            .insert(object_ref, Arc::new(document))
-                            .is_some()
+                    match document {
+                        Some(document) if room => {
+                            state.note_decoded(object_ref);
+                            state
+                                .object_directory
+                                .insert(object_ref, Arc::new(document))
+                                .is_some()
+                        }
+                        _ => false,
                     }
                 }
                 || state
@@ -9048,6 +9209,68 @@ impl DocumentStore for RustStore {
         Ok(documents)
     }
 
+    fn collection_len(&self, schema: &str) -> OQLResult<Option<usize>> {
+        if !self.pending_operations()?.is_empty() {
+            return Ok(None);
+        }
+        let state = self
+            .state
+            .read()
+            .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+        Ok(Some(logical_collection_count(&state, schema)))
+    }
+
+    fn scan_first_documents(
+        &self,
+        schema: &str,
+        filters: &[ScanPredicate],
+        fields: Option<&[String]>,
+        limit: usize,
+    ) -> OQLResult<Option<Vec<Document>>> {
+        // Uncommitted writes are overlaid by the general route.
+        if !self.pending_operations()?.is_empty() {
+            return Ok(None);
+        }
+        let state = self
+            .state
+            .read()
+            .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+        // A collection's rows are listed in order of id, so the first that
+        // pass are the ones with the smallest ids.
+        let rows = logical_collection_object_refs(&state, schema)?;
+        let mut documents = Vec::with_capacity(limit.min(1024));
+        for object_ref in &rows {
+            if documents.len() >= limit {
+                break;
+            }
+            let Some(document) = logical_document(&state, *object_ref)? else {
+                continue;
+            };
+            if !filters
+                .iter()
+                .all(|filter| decoded_scan_predicate_matches(&document, filter))
+            {
+                continue;
+            }
+            documents.push(match fields {
+                Some(fields) => document.with_projected_fields(
+                    fields
+                        .iter()
+                        .filter_map(|field| {
+                            document
+                                .fields
+                                .get(field)
+                                .cloned()
+                                .map(|value| (field.clone(), value))
+                        })
+                        .collect(),
+                ),
+                None => document.as_ref().clone(),
+            });
+        }
+        Ok(Some(documents))
+    }
+
     fn scan_documents_filtered_projection(
         &self,
         schema: &str,
@@ -9488,6 +9711,24 @@ impl DocumentStore for RustStore {
     }
 
     fn upsert_scalar_index(&self, index: ScalarIndexDefinition) -> OQLResult<()> {
+        // Declaring an index that already exists exactly as declared changes
+        // nothing. Writing it again would build it afresh in memory beside
+        // the copy a checkpoint already holds.
+        if self.pending_operations()?.is_empty() {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+            let unchanged = catalog_values(&state.scalar_indexes, Some(&index.schema))
+                .iter()
+                .any(|existing| existing == &index)
+                && state
+                    .scalar_index_data
+                    .contains_key(&(index.schema.clone(), index.name.clone()));
+            if unchanged {
+                return Ok(());
+            }
+        }
         self.queue_or_commit(WriteOperation::PutScalarIndex(index))
     }
 
@@ -9780,18 +10021,22 @@ impl DocumentStore for RustStore {
             .checked_add(1)
             .map(|next| Bound::Excluded(next.to_be_bytes().to_vec()))
             .unwrap_or(Bound::Unbounded);
-        let (rows, _) = state
+        // The postings under this target, through the wanted field when one
+        // is named. The keys are only looked at, never kept.
+        let mut rows = Vec::new();
+        state
             .reverse_reference_index
-            .range_entry_page(Bound::Included(prefix), end, None, None, false)
-            .map_err(|error| OQLError::storage_error(&error, None))?;
-        let mut seen = HashSet::new();
-        let mut documents = Vec::with_capacity(rows.len());
-        for (key, source) in rows {
-            if let Some(expected) = field_path {
-                if key.get(8..).unwrap_or_default() != expected.as_bytes() {
-                    continue;
+            .visit_range(Bound::Included(prefix), end, &mut |key, source| {
+                if field_path.is_none_or(|expected| {
+                    key.get(8..).unwrap_or_default() == expected.as_bytes()
+                }) {
+                    rows.push(source);
                 }
-            }
+            })
+            .map_err(|error| OQLError::storage_error(&error, None))?;
+        let mut found = Vec::with_capacity(rows.len());
+        let mut documents = Vec::with_capacity(rows.len());
+        for source in rows {
             // A source already held decoded names itself, with nothing
             // copied; one that is not is asked for its identity.
             let held = state.object_directory.get(&source);
@@ -9820,17 +10065,24 @@ impl DocumentStore for RustStore {
                     None => continue,
                 },
             };
-            if !seen.insert(current) {
-                continue;
+            let document = match held {
+                Some(document) if current == source => Some(document.clone()),
+                _ => shared_document(&state, current, &mut decoded)?,
+            };
+            if let Some(document) = document {
+                found.push(current);
+                documents.push(document);
             }
-            match held {
-                Some(document) if current == source => documents.push(document.clone()),
-                _ => {
-                    if let Some(document) = shared_document(&state, current, &mut decoded)? {
-                        documents.push(document);
-                    }
-                }
-            }
+        }
+        // Each document once, where it first appears. Two postings naming
+        // one document are rare, so that is looked for before paying to
+        // remove them.
+        let mut ordered = found.clone();
+        ordered.sort_unstable();
+        if ordered.windows(2).any(|pair| pair[0] == pair[1]) {
+            let mut seen = HashSet::with_capacity(found.len());
+            let mut current = found.iter();
+            documents.retain(|_| current.next().is_some_and(|current| seen.insert(*current)));
         }
         drop(state);
         self.keep_decoded(decoded)?;

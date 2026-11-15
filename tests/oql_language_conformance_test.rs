@@ -2961,6 +2961,110 @@ fn shop_ledger() -> Db {
     db
 }
 
+/// Some questions are answered by reading fewer rows than they are asked
+/// of: the first few in order of id, the best few of the rows reached
+/// through a reference, the rows related to one document counted where they
+/// lie. Each must give the answer that reading every row gives.
+#[test]
+fn reading_fewer_rows_changes_no_answer() {
+    let db = shop_ledger();
+    // One shop in five is "rare", so a filter on it is answered by following
+    // the reference. Its sales tie on price and on quantity.
+    db.script(
+        r#"
+        shops.insert { id: "s5", region: "g3", tier: "rare", opened: "2026-04-01T00:00:00Z", tags: [] }
+        sales.insert [
+          { id: "w01", shop: "s5", qty: 2, price: 9.5, state: "paid", at: "2026-05-01T08:00:00Z" },
+          { id: "w02", shop: "s5", qty: 2, price: 30.5, state: "open", at: "2026-05-02T08:00:00Z", memo: "m" },
+          { id: "w03", shop: "s5", qty: 5, price: 30.5, state: "paid", at: "2026-05-03T08:00:00Z" },
+          { id: "w04", shop: "s5", backup: "s5", qty: 5, price: 9.5, state: "void", at: "2026-05-04T08:00:00Z" },
+          { id: "w05", shop: "s5", qty: 1, price: 30.5, state: "paid", at: "2026-05-05T08:00:00Z", memo: "a" },
+          { id: "w06", shop: "s5", qty: 2, price: 12.5, state: "open", at: "2026-05-06T08:00:00Z" },
+          { id: "w07", shop: "s5", backup: "s1", qty: 7, price: 30.5, state: "paid", at: "2026-05-07T08:00:00Z" }
+        ]
+        "#,
+    );
+    let shape = |rows: Result<Vec<Document>, String>| {
+        rows.map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    let mut fields: Vec<(String, Value)> = row
+                        .fields
+                        .iter()
+                        .map(|(name, value)| (name.clone(), value.clone()))
+                        .collect();
+                    fields.sort_by(|left, right| left.0.cmp(&right.0));
+                    fields
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    // Each question once with the shorter reads switched off, once on.
+    let compare = |query: &str| {
+        owl_db::executor::set_column_aggregation(false);
+        let reference = shape(db.try_rows(query));
+        owl_db::executor::set_column_aggregation(true);
+        assert_eq!(shape(db.try_rows(query)), reference, "{query}");
+        reference.unwrap_or_else(|error| panic!("{error}\n{query}"))
+    };
+
+    // `sort { .. }.limit(n)` is the first n rows of the sort without it.
+    let sorted = [
+        ("sales.where { state == \"paid\" }.sort { .id.asc }", "select { id, qty }"),
+        ("sales.sort { .id.asc }", "select { id }"),
+        ("sales.where { qty > 3 && state == \"open\" }.sort { .id.asc }", "select { id, tier: .shop.tier }"),
+        ("sales.where { qty > 3 || memo == \"m\" }.where { price < 30 }.sort { .id.asc }", "select { id, price }"),
+        ("sales.where { .shop.tier == \"rare\" }.sort { .price.desc, .id.asc }", "select { id, price }"),
+        ("sales.where { .shop.tier == \"rare\" }.sort { .qty.asc }", "select { id, qty }"),
+        ("sales.where { .shop.tier == \"rare\" && qty > 1 }.sort { .memo.asc, .id.desc }", "select { id, memo }"),
+        ("sales.where { .shop.tier == \"rare\" }.sort { .backup.tier.desc, .price.asc }", "select { id }"),
+        ("sales.sort { .price.desc }", "select { id, price }"),
+        ("sales.sort { .state.asc, .qty.desc }", "select { id }"),
+        ("sales.sort { .memo.desc, .at.asc }", "select { id, memo }"),
+    ];
+    for (rows, select) in sorted {
+        let all = compare(&format!("{rows}.{select}"));
+        assert!(all.len() > 3, "{rows}");
+        for keep in [0, 1, 3, 5, all.len(), all.len() + 4] {
+            let kept = compare(&format!("{rows}.limit({keep}).{select}"));
+            assert_eq!(kept, all[..keep.min(all.len())], "{rows}.limit({keep})");
+        }
+    }
+
+    // Related rows counted and aggregated for one document at a time,
+    // through one relationship and through two.
+    let related = [
+        "shops.sort { .id.asc }.select { id, n: .sales.count(), units: .sales.sum(.qty), mean: .sales.avg(.price), top: .sales.max(.price), first: .sales.min(.at) }",
+        "shops.sort { .id.asc }.select { id, paid: .sales.where { .state == \"paid\" }.count(), any: .sales.where { .qty > 6 }.exists(), none: .sales.where { .qty > 60 }.exists() }",
+        "shops.sort { .id.asc }.select { id, dear: .sales.where { .price > 30 && .state == \"paid\" }.sum(.qty), nothing: .sales.where { .qty > 60 }.max(.price), zero: .sales.where { .qty > 60 }.sum(.qty) }",
+        "regions.sort { .id.asc }.select { id, shops: .shops.count(), n: .shops.sales.count(), units: .shops.sales.sum(.qty), top: .shops.sales.where { .state == \"void\" }.max(.price) }",
+        "shops.where { .sales.where { .state == \"paid\" }.count() > 7 }.sort { .id.asc }.select { id }",
+        "shops.sort { .id.asc }.select { id, best: .sales.sort { .price.desc, .id.asc }.limit(2).select { id, price } }",
+        // An aggregate of text, and a filter the shorter read declines.
+        "shops.sort { .id.asc }.select { id, memo: .sales.max(.memo), backed: .sales.where { .backup != null }.count() }",
+    ];
+    for query in related {
+        assert!(!compare(query).is_empty(), "{query}");
+    }
+    // A sale that names one shop twice, as its shop and as its backup, is
+    // one of that shop's sales.
+    assert_eq!(
+        db.scalar("shops.where { id == \"s5\" }.select { n: .sales.count() }", "n"),
+        Value::Integer(7)
+    );
+    // Errors are errors either way.
+    for query in [
+        "shops.select { id, bad: .sales.sum(.state) }",
+        "shops.select { id, bad: .visits.count() }",
+    ] {
+        owl_db::executor::set_column_aggregation(false);
+        let reference = db.try_rows(query).is_err();
+        owl_db::executor::set_column_aggregation(true);
+        assert_eq!(db.try_rows(query).is_err(), reference, "{query}");
+        assert!(reference, "{query}");
+    }
+}
+
 #[test]
 fn folding_with_the_evaluator_matches_aggregating_rows() {
     let db = shop_ledger();
@@ -3010,11 +3114,6 @@ fn folding_with_the_evaluator_matches_aggregating_rows() {
         "sales.group_by { .shop.region.name }.select { name, units: sum(.qty) }.sort { .units.desc, .name.asc }.limit(2)",
         "sales.group_by { .state }.select { state, n: count() }.where { n > 29 }.count()",
         // Nothing to fold.
-        "sales.where { .shop.tier == \"none\" }.count()",
-        "sales.where { .shop.tier == \"none\" }.sum(.qty * .price)",
-        "sales.where { .shop.tier == \"none\" }.avg(.qty * .price)",
-        "sales.where { .shop.tier == \"none\" }.group_by { .state }.select { state, n: count() }",
-        "sales.where { .shop.tier == \"none\" }.select { n: count(), top: max(.qty * .price) }",
         "nothing.group_by { size: .amount * 2 }.select { size, n: count() }",
         "nothing.group_by { .kind }.having { count() > 0 }.select { kind, n: count() }",
         "nothing.select { total: sum(.amount * 2) }",
@@ -3023,6 +3122,16 @@ fn folding_with_the_evaluator_matches_aggregating_rows() {
         "shops.where { .sales.where { state == \"paid\" }.count() > 7 }.count()",
         "entries.group_by { week: .day / 2 }.select { week, n: count(), total: sum(.amount) }",
         "entries.where { kind == \"debit\" }.group_by { .day }.select { day, late: where { .at >= \"2026-01-15\" }.count() }",
+    ];
+    // A filter through a reference that no document passes is answered by
+    // following the reference, which finds no rows: each of these then
+    // summarises nothing, and must say what the evaluator says of nothing.
+    let through_reference = [
+        "sales.where { .shop.tier == \"none\" }.count()",
+        "sales.where { .shop.tier == \"none\" }.sum(.qty * .price)",
+        "sales.where { .shop.tier == \"none\" }.avg(.qty * .price)",
+        "sales.where { .shop.tier == \"none\" }.group_by { .state }.select { state, n: count() }",
+        "sales.where { .shop.tier == \"none\" }.select { n: count(), top: max(.qty * .price) }",
     ];
     // Shapes the fold declines, which must still answer, and the same
     // written with a bare field name inside a nested filter.
@@ -3072,6 +3181,10 @@ fn folding_with_the_evaluator_matches_aggregating_rows() {
         assert!(folded, "not folded: {query}");
         let rows = reference.unwrap_or_else(|error| panic!("{error}\n{query}"));
         answered += usize::from(!rows.is_empty());
+    }
+    for query in through_reference {
+        let (reference, _) = compare(query);
+        assert!(reference.is_ok(), "{query}");
     }
     for query in declined {
         let (reference, folded) = compare(query);

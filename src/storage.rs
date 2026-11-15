@@ -614,6 +614,23 @@ pub trait DocumentStore: Send + Sync + 'static {
     ) -> OQLResult<Option<Vec<Document>>> {
         Ok(None)
     }
+    /// How many documents a collection holds, when the store knows without
+    /// reading them.
+    fn collection_len(&self, _schema: &str) -> OQLResult<Option<usize>> {
+        Ok(None)
+    }
+
+    /// The first `limit` rows, in order of id, that pass `filters`, reading
+    /// no further than the last of them. `None` asks the executor to scan.
+    fn scan_first_documents(
+        &self,
+        _schema: &str,
+        _filters: &[ScanPredicate],
+        _fields: Option<&[String]>,
+        _limit: usize,
+    ) -> OQLResult<Option<Vec<Document>>> {
+        Ok(None)
+    }
     /// Attempt the same pushed scan while retaining projected fields in
     /// column-major batches. Stores should return batches in authoritative scan
     /// order and keep each batch reasonably cache-sized.

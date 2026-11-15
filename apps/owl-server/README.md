@@ -14,7 +14,7 @@ cargo run --release -p owl-server -- --data shop.owl --listen 127.0.0.1:7878 --t
 | `--token` | `OWL_TOKEN` | none | Bearer token every request but the health check must carry |
 | `--max-gib` | | 64 | The most the database may grow to |
 | `--transaction-idle-seconds` | | 60 | Roll back a transaction left untouched this long |
-| `--decoded-documents` | `OWL_DECODED_DOCUMENTS` | none | Hold at most this many documents decoded in memory; the rest are kept as records and decoded when read |
+| `--decoded-documents` | `OWL_DECODED_DOCUMENTS` | none | Hold at most this many documents decoded in memory. The rest are decoded when read, from records read back from the checkpoint files, and a writer waits for overdue checkpoints so that memory stays bounded while loading |
 | `--backup-dir` | `OWL_BACKUP_DIR` | none | Where `POST /v1/backups` writes backups |
 | `--restore-from` | | none | Restore this backup as `--data` before serving; `--data` must not exist |
 
