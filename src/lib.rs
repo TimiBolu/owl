@@ -18,7 +18,6 @@ pub mod optimizer;
 pub mod oql_runner;
 pub mod parser;
 pub mod planner;
-pub mod reference;
 pub mod schema;
 pub mod simulation;
 pub mod storage;
@@ -35,14 +34,11 @@ pub mod observability;
 pub mod profiling;
 
 // Task 11: Columnar projections for analytical workloads
-pub mod columnar_planner;
-pub mod columnar_tracker;
 
 // Task 12: Batch operations for efficient bulk inserts
 pub mod batch_operations;
 
 // Task 14: Backup and recovery coordination
-pub mod backup_coordinator;
 
 // Task 16: Admin tools for cluster management
 pub mod admin;
@@ -78,7 +74,6 @@ pub use parser::{
     SelectField, StatementResult, Token, TokenizeError, Tokenizer, UpsertBlock, ValueBinding,
     WhereBlock,
 };
-pub use reference::{create_reference_id, parse_field_path, ReferenceResolver};
 pub use schema::{
     evolution::{
         CompatibilityCheck, CompatibilityLevel, EvolutionError, FieldChange, SchemaEvolution,

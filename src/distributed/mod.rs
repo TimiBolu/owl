@@ -12,7 +12,6 @@ pub mod global_objref;
 pub mod oql_distributed;
 pub mod query_planner;
 pub mod raft;
-pub mod raft_cluster;
 pub mod shard_manager;
 pub mod storage_adapter;
 pub mod wal;
@@ -27,7 +26,6 @@ pub use raft::{
     LogIndex, NodeId, RaftConfig, RaftNode, RaftState, RequestVote, RequestVoteResponse,
     SnapshotMetadata, Term,
 };
-pub use raft_cluster::{ClusterStatus, NodeStatus, RaftCluster};
 pub use shard_manager::{ClusterHealth, NodeInfo, ShardInfo, ShardManager};
 pub use storage_adapter::{CacheStats, DistributedStorage, Network};
 pub use wal::{CheckpointMetadata, DistributedWAL, TxnId, WALEntry, WALEntryType, LSN};

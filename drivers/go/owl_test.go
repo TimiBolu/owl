@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -443,6 +444,22 @@ func BenchmarkAtomicUpdateOneDocument(b *testing.B) {
 	b.RunParallel(func(run *testing.PB) {
 		for run.Next() {
 			if _, err := db.Query(ctx, `items.where { .id == "i00001" }.update { stock: .stock - 1 }`, nil); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+}
+
+// Every goroutine updates a document of its own: no conflicts, so what
+// limits them is how many durable commits can share one disk sync.
+func BenchmarkAtomicUpdateOwnDocument(b *testing.B) {
+	db, ctx := benchShop(b)
+	var next atomic.Int64
+	b.ResetTimer()
+	b.RunParallel(func(run *testing.PB) {
+		id := fmt.Sprintf("i%05d", next.Add(1))
+		for run.Next() {
+			if _, err := db.Query(ctx, `items.where { .id == $id }.update { stock: .stock - 1 }`, owl.Params{"id": id}); err != nil {
 				b.Fatal(err)
 			}
 		}

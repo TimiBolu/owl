@@ -58,6 +58,12 @@ enum Command {
         #[arg(long, default_value_t = 2000)]
         orders: usize,
     },
+    /// Report Owl's memory at each stage of loading, checkpointing,
+    /// reopening and querying a dataset. SQLite is not involved.
+    Memory {
+        #[arg(long, default_value_t = 100000)]
+        orders: usize,
+    },
     /// Time ad-hoc OQL statements against a loaded dataset.
     Time {
         #[arg(long, default_value_t = 10000)]
@@ -88,6 +94,7 @@ enum Command {
 fn main() -> Result<()> {
     match Arguments::parse().command {
         Command::Check { orders } => check(orders),
+        Command::Memory { orders } => memory(orders),
         Command::Time { orders, queries } => {
             let loaded = load(orders)?;
             for query in queries {
@@ -307,5 +314,64 @@ fn bench(
         std::fs::write(path, serde_json::to_string_pretty(&Json::Array(report))?)?;
         println!("\nreport written to {}", path.display());
     }
+    Ok(())
+}
+
+/// This process's resident memory, in MiB.
+fn resident_mib() -> f64 {
+    std::process::Command::new("ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|text| text.trim().parse::<f64>().ok())
+        .map_or(0.0, |kib| kib / 1024.0)
+}
+
+fn memory(orders: usize) -> Result<()> {
+    let directory = tempfile::TempDir::new()?;
+    let path = directory.path().join("storefront.owl");
+    let stage = |name: &str, owl: Option<&Owl>| -> Result<()> {
+        let residency = match owl {
+            Some(owl) => {
+                let (live, resident, lazy) = owl.residency("orders")?;
+                format!("orders: {live} live, {resident} decoded in memory, {lazy} in segments only")
+            }
+            None => String::new(),
+        };
+        println!("{name:<34} {:>9.1} MiB   {residency}", resident_mib());
+        Ok(())
+    };
+    stage("start", None)?;
+    let data = data::generate(orders);
+    let rows = data.rows();
+    stage("data generated", None)?;
+    let owl = Owl::open(&path)?;
+    owl.load(&data)?;
+    stage("loaded", Some(&owl))?;
+    drop(data);
+    stage("generated data dropped", Some(&owl))?;
+    owl.checkpoint()?;
+    stage("checkpointed", Some(&owl))?;
+    owl.compact()?;
+    stage("compacted", Some(&owl))?;
+    for (_, oql, _) in QUERIES {
+        owl.query(oql)?;
+    }
+    stage("all 16 queries run", Some(&owl))?;
+    drop(owl);
+    stage("closed", None)?;
+    let owl = Owl::open(&path)?;
+    stage("reopened", Some(&owl))?;
+    owl.query("orders.count()")?;
+    stage("counted orders", Some(&owl))?;
+    for (_, oql, _) in QUERIES {
+        owl.query(oql)?;
+    }
+    stage("all 16 queries run", Some(&owl))?;
+    println!(
+        "{rows} rows, {:.1} MiB on disk",
+        directory_bytes(directory.path())? as f64 / (1024.0 * 1024.0)
+    );
     Ok(())
 }

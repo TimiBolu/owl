@@ -601,19 +601,39 @@ pub fn get_profiler() -> &'static Mutex<HotPathProfiler> {
     GLOBAL_PROFILER.get_or_init(|| Mutex::new(HotPathProfiler::new()))
 }
 
-/// Macro for profiling function calls
+/// Whether [`profile_call!`] records anything. Off unless switched on.
+static PROFILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Switch call profiling on or off for the whole process. While it is on,
+/// every profiled call reads the clock twice and takes the profiler's lock,
+/// which is far more than a field read costs, so it is for diagnosis only.
+pub fn set_profiling(enabled: bool) {
+    PROFILING.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether call profiling is on.
+#[inline]
+pub fn profiling() -> bool {
+    PROFILING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Run a block, recording how long it took when profiling is on.
 #[macro_export]
 macro_rules! profile_call {
     ($func_name:expr, $code:block) => {{
-        let start = std::time::Instant::now();
-        let result = $code;
-        let duration = start.elapsed().as_nanos() as u64;
+        if $crate::hot_path_optimizations::profiling() {
+            let start = std::time::Instant::now();
+            let result = $code;
+            let duration = start.elapsed().as_nanos() as u64;
 
-        if let Ok(mut profiler) = $crate::hot_path_optimizations::get_profiler().lock() {
-            profiler.record_call($func_name, duration);
+            if let Ok(mut profiler) = $crate::hot_path_optimizations::get_profiler().lock() {
+                profiler.record_call($func_name, duration);
+            }
+
+            result
+        } else {
+            $code
         }
-
-        result
     }};
 }
 

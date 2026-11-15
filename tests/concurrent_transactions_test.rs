@@ -656,3 +656,59 @@ fn statements_inside_a_transaction_wait_for_its_commit() {
     db.store.commit_transaction(transaction).unwrap();
     assert_eq!(db.balance("a"), 102);
 }
+
+/// Commits that arrive together share one sync of the log. Whatever they
+/// share, a commit that was acknowledged is on disk: after a crash that
+/// loses everything unsynced, each one is still there.
+#[test]
+fn every_acknowledged_commit_survives_a_crash_however_many_shared_a_sync() {
+    use owl_db::simulation::SimulatedFileSystem;
+    use owl_db::storage::DocumentStore;
+    use std::collections::HashMap;
+
+    let filesystem = Arc::new(SimulatedFileSystem::new(7));
+    let path = "crash/db.owl";
+    let threads = 8;
+    let each = 40;
+    {
+        let store = Arc::new(RustStore::new_with_fs(path, 32 << 20, filesystem.clone()).unwrap());
+        let start = Arc::new(Barrier::new(threads));
+        let workers: Vec<_> = (0..threads)
+            .map(|worker| {
+                let (store, start) = (store.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    for round in 0..each {
+                        let document = Document::with_id(
+                            format!("w{worker}-{round:03}"),
+                            "events".to_string(),
+                            HashMap::from([("n".to_string(), Value::Integer(round as i64))]),
+                        );
+                        // Returning is the acknowledgement.
+                        store.put_document(&document).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(store.scan_documents("events").unwrap().len(), threads * each);
+        // No clean shutdown: the store is simply gone.
+        std::mem::forget(store);
+    }
+    filesystem.crash();
+    filesystem.recover();
+    let reopened = RustStore::new_with_fs(path, 32 << 20, filesystem).unwrap();
+    let survived = reopened.scan_documents("events").unwrap();
+    assert_eq!(survived.len(), threads * each);
+    for worker in 0..threads {
+        for round in 0..each {
+            let id = format!("w{worker}-{round:03}");
+            assert!(
+                reopened.get_document("events", &id).unwrap().is_some(),
+                "{id} was acknowledged and is gone"
+            );
+        }
+    }
+}

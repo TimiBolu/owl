@@ -11,6 +11,7 @@
 //! | `POST /v1/transactions` | Opens a transaction and returns its id. |
 //! | `POST /v1/transactions/{id}/commit` | Commits it, or answers 409. |
 //! | `POST /v1/transactions/{id}/rollback` | Abandons it. |
+//! | `POST /v1/backups` | Takes a backup into the server's backup directory. |
 //!
 //! `query` and `insert` take an optional `"transaction": id` and are then
 //! part of that transaction. A statement outside a transaction is its own
@@ -44,6 +45,10 @@ pub struct Options {
     /// A transaction no statement has touched for this long is rolled back,
     /// so a client that went away does not hold one open for ever.
     pub transaction_idle: Duration,
+    /// Where `POST /v1/backups` puts backups, each in a directory of its
+    /// own. Without it the server takes none: a client never chooses where
+    /// on the server's disk files are written.
+    pub backup_directory: Option<std::path::PathBuf>,
 }
 
 impl Default for Options {
@@ -51,6 +56,7 @@ impl Default for Options {
         Self {
             token: None,
             transaction_idle: Duration::from_secs(60),
+            backup_directory: None,
         }
     }
 }
@@ -80,6 +86,7 @@ pub fn router(store: Arc<RustStore>, options: Options) -> (Router, Janitor) {
         .route("/v1/transactions", post(begin))
         .route("/v1/transactions/:id/commit", post(commit))
         .route("/v1/transactions/:id/rollback", post(rollback))
+        .route("/v1/backups", post(backup))
         .layer(middleware::from_fn_with_state(server.clone(), authorize));
     let router = Router::new()
         .route("/v1/health", get(health))
@@ -390,6 +397,40 @@ async fn rollback(State(server): State<Server>, Path(id): Path<u64>) -> Response
         }
         server.store.rollback_transaction(id)?;
         Ok(json!({ "rolled_back": true }))
+    })
+    .await
+}
+
+async fn backup(State(server): State<Server>) -> Response {
+    blocking(move || {
+        let Some(directory) = &server.options.backup_directory else {
+            return Err(Failure::new(
+                StatusCode::CONFLICT,
+                "backups_disabled",
+                "this server was started without a backup directory",
+            ));
+        };
+        // A name of the server's choosing: when it was taken, and a
+        // sequence that keeps two taken in the same second apart.
+        let taken = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs());
+        let mut sequence = 0;
+        let (name, destination) = loop {
+            let name = format!("backup-{taken}-{sequence}");
+            let destination = directory.join(&name);
+            if !destination.exists() {
+                break (name, destination);
+            }
+            sequence += 1;
+        };
+        let info = server.store.backup(&destination)?;
+        Ok(json!({
+            "name": name,
+            "committed_lsn": info.committed_lsn,
+            "files": info.files.len(),
+            "bytes": info.bytes(),
+        }))
     })
     .await
 }

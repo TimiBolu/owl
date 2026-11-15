@@ -67,6 +67,24 @@ impl Owl {
         })
     }
 
+    /// Rewrite everything into a fresh base generation of column segments.
+    pub fn compact(&self) -> Result<()> {
+        self.store
+            .compact()
+            .map(|_| ())
+            .map_err(|error| anyhow!("compact: {error}"))
+    }
+
+    /// How many of a collection's rows are held as decoded documents, and
+    /// how many live only in column segments.
+    pub fn residency(&self, collection: &str) -> Result<(usize, usize, usize)> {
+        let stats = self
+            .store
+            .storage_layout_stats(collection)
+            .map_err(|error| anyhow!("layout: {error}"))?;
+        Ok((stats.live_rows, stats.resident_documents, stats.lazy_typed_rows))
+    }
+
     pub fn checkpoint(&self) -> Result<()> {
         self.store
             .checkpoint()

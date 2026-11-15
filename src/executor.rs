@@ -1670,30 +1670,40 @@ impl<S: DocumentStore> QueryExecutor<S> {
         // A scan yields rows by id, each once.
         related.sort_by(|left, right| left.id.cmp(&right.id));
         related.dedup_by(|left, right| left.id == right.id);
-        Ok(Some(
-            related
-                .iter()
-                .map(|document| match &fields {
-                    None => document.as_ref().clone(),
-                    Some(fields) => Document {
-                        fields: fields
-                            .iter()
-                            .filter_map(|name| {
-                                document
-                                    .fields
-                                    .get_key_value(name)
-                                    .map(|(name, value)| (name.clone(), value.clone()))
-                            })
-                            .collect(),
-                        ..Document::with_id(
-                            document.id.to_string(),
-                            document.schema.clone(),
-                            HashMap::new(),
-                        )
-                    },
-                })
-                .collect(),
-        ))
+        // The leading filters run again on what is returned. Running them
+        // here first, against the stored documents, means only rows that
+        // pass are copied.
+        let leading: Vec<&Condition> = query
+            .operations
+            .iter()
+            .map_while(|operation| match operation {
+                Operation::Where(block) => Some(&block.condition),
+                _ => None,
+            })
+            .collect();
+        let mut rows = Vec::new();
+        'documents: for document in &related {
+            for condition in &leading {
+                if !self.evaluate_condition(document, condition)? {
+                    continue 'documents;
+                }
+            }
+            rows.push(match &fields {
+                None => document.as_ref().clone(),
+                Some(fields) => document.with_projected_fields(
+                    fields
+                        .iter()
+                        .filter_map(|name| {
+                            document
+                                .fields
+                                .get_key_value(name)
+                                .map(|(name, value)| (name.clone(), value.clone()))
+                        })
+                        .collect(),
+                ),
+            });
+        }
+        Ok(Some(rows))
     }
 
     /// Give a leading `matches(.field, "^prefix..")` the range of text it
@@ -2049,6 +2059,48 @@ impl<S: DocumentStore> QueryExecutor<S> {
             documents = self.apply_operation(documents, operation, &query.collection)?;
         }
         Ok(Some(documents))
+    }
+
+    /// [`Self::fields_read_by`] for the operations of a nested expression,
+    /// worked out once per statement. A `select` evaluates the same nested
+    /// expression for every row, and working out what it reads means
+    /// walking it whole.
+    fn fields_read_by_operations(
+        &self,
+        collection: &str,
+        operations: &[Operation],
+    ) -> Option<Vec<String>> {
+        let compute = || {
+            self.fields_read_by(&OQLQuery {
+                collection: collection.to_string(),
+                operations: operations.to_vec(),
+            })
+        };
+        if !StatementGuard::active() {
+            return compute();
+        }
+        // Found by where the operations are, confirmed by what they are:
+        // an address can be reused within a statement.
+        let place = (operations.as_ptr() as usize, operations.len());
+        let known = STATEMENT.with(|scope| {
+            scope
+                .borrow()
+                .fields_read
+                .get(&place)
+                .filter(|(remembered, _)| remembered.as_slice() == operations)
+                .map(|(_, fields)| fields.clone())
+        });
+        if let Some(fields) = known {
+            return fields;
+        }
+        let fields = compute();
+        STATEMENT.with(|scope| {
+            scope
+                .borrow_mut()
+                .fields_read
+                .insert(place, (operations.to_vec(), fields.clone()))
+        });
+        fields
     }
 
     /// The top-level fields of the root collection that `query` can read, or
@@ -3347,10 +3399,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
             }
             Expression::FieldAccess(field) if field.path != ["*"] => {
                 // What the operations read of the rows they are given.
-                let fields = self.fields_read_by(&OQLQuery {
-                    collection: collection_scope.clone(),
-                    operations: operations.to_vec(),
-                });
+                let fields = self.fields_read_by_operations(&collection_scope, operations);
                 self.path_source_rows_reading(scope_document, &field.path, fields.as_deref())?
             }
             _ => {
@@ -3547,53 +3596,63 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 return Ok(None);
             }
         }
-        let mut operations = filters.to_vec();
-        operations.push(Operation::GroupBy(crate::parser::GroupByBlock {
-            fields: vec![FieldAccess {
-                path: vec![through.clone()],
-            }],
-            computed: Vec::new(),
-        }));
-        operations.push(Operation::Select(SelectBlock {
-            fields: vec![
-                crate::parser::SelectField {
-                    alias: None,
-                    expression: Expression::FieldAccess(FieldAccess {
-                        path: vec![through.clone()],
-                    }),
-                },
-                crate::parser::SelectField {
-                    alias: Some("n".to_string()),
-                    expression: Expression::FunctionCall {
-                        name: function.to_string(),
-                        args: measured
-                            .map(|field| Expression::FieldAccess(field.clone()))
-                            .into_iter()
-                            .collect(),
-                    },
-                },
-            ],
-        }));
-        let Some(groups) = self.aggregate_from_columns(&OQLQuery {
-            collection: source,
-            operations,
-        }, false)?
+        // One pass over the referring collection, counting or aggregating
+        // per referenced document. The tests switch this off with the other
+        // column paths to get the answer the index gives.
+        if !COLUMN_AGGREGATION.with(|enabled| enabled.get()) || self.store.has_pending_writes()? {
+            return Ok(None);
+        }
+        let (predicates, residual) = Self::split_storage_filters(&source, &schema, filters);
+        if !residual.is_empty() {
+            return Ok(None);
+        }
+        let Some(kind) = AggregateKind::named(function, measured.is_none()) else {
+            return Ok(None);
+        };
+        let mut fields = vec![through.clone()];
+        fields.extend(measured.and_then(|field| field.path.first().cloned()));
+        let Some(batches) =
+            self.store
+                .scan_projected_batches(&source, &predicates, &fields, 4096)?
         else {
             return Ok(None);
         };
-        let mut tally = HashMap::with_capacity(groups.len());
-        for group in groups {
-            match (group.fields.get(&through), group.fields.get("n")) {
-                (Some(Value::Reference(reference)), Some(value)) => {
-                    tally.insert(*reference, value.clone());
+        let mut tally: HashMap<ObjRef, Accumulator> = HashMap::new();
+        for batch in &batches {
+            for row in batch.rows() {
+                let (mut referenced, mut value) = (None, None);
+                for (name, cell) in row.fields() {
+                    if name == through {
+                        referenced = Some(cell);
+                    } else {
+                        value = Some(cell);
+                    }
                 }
-                (Some(Value::Null) | None, _) => {}
-                // A value that is not a reference is not something this
-                // tally understands.
-                _ => return Ok(None),
+                let reference = match referenced {
+                    Some(ProjectedValueRef::Reference(reference)) => reference,
+                    Some(ProjectedValueRef::Value(Value::Reference(reference))) => *reference,
+                    None | Some(ProjectedValueRef::Null | ProjectedValueRef::Value(Value::Null)) => {
+                        continue
+                    }
+                    // A value that is not a reference is not something this
+                    // tally understands.
+                    Some(_) => return Ok(None),
+                };
+                let accumulator = tally
+                    .entry(reference)
+                    .or_insert_with(|| Accumulator::new(kind));
+                match measured {
+                    None => accumulator.count += 1,
+                    Some(_) => accumulator.push(value)?,
+                }
             }
         }
-        Ok(Some(tally))
+        Ok(Some(
+            tally
+                .into_iter()
+                .map(|(reference, accumulator)| (reference, accumulator.finish()))
+                .collect(),
+        ))
     }
 
     /// Apply operations to rows already in hand and shape the result as a
@@ -7861,6 +7920,8 @@ struct StatementScope {
     /// Per relationship and filter: how many referring documents each
     /// document has.
     related_counts: HashMap<String, RelatedCounts>,
+    /// What a nested expression's operations read, by where they are.
+    fields_read: HashMap<(usize, usize), (Vec<Operation>, Option<Vec<String>>)>,
 }
 
 /// The state of one relationship tally within a statement.
