@@ -1,20 +1,18 @@
 // Integration tests for comprehensive error handling
 
 use owl_db::{
-    Document, DocumentStore, QueryExecutor, Value,
+    QueryExecutor,
     error::{OQLError, ErrorContext, ErrorSeverity, PartialResult, ErrorRecovery},
-    storage::RocksDBStore,
-    schema::{Schema, FieldType},
+    storage::RustStore,
 };
-use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
 
 #[test]
 fn test_enhanced_error_handling_integration() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = TempDir::new()?;
-    let store = Arc::new(RocksDBStore::new(temp_dir.path())?);
-    let executor = QueryExecutor::new(store.clone());
+    let store = Arc::new(RustStore::new(temp_dir.path().join("db.owl"), 64 << 20)?);
+    let _executor = QueryExecutor::new_with_real_clock(store.clone());
 
     // Test 1: Enhanced error creation with full context
     let context = ErrorContext::new("integration_test")
@@ -125,7 +123,6 @@ fn test_error_severity_classification() {
         context: None,
         severity: ErrorSeverity::Critical,
         recovery: None,
-        source: None,
     };
     assert!(critical_error.is_critical());
     assert!(!critical_error.is_warning());

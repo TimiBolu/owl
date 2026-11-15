@@ -1,7 +1,7 @@
 // Schema-aware parser tests for type checking during parsing
 
 use owl_db::{
-    parser::{parse_oql_with_schema, Tokenizer, Parser},
+    parser::parse_oql_with_schema,
     schema::{Schema, SchemaRegistry, FieldType, ReferenceType, CascadeBehavior},
 };
 use std::collections::HashMap;

@@ -62,6 +62,28 @@ impl Arena {
         Ok(())
     }
 
+    /// Put back bytes that were allocated at `offset` before a restart.
+    ///
+    /// A fresh arena has allocated nothing, so replaying a logged write has
+    /// to claim the space as well as fill it. The arena grows to hold the
+    /// bytes, and later allocations start after them.
+    pub(crate) fn restore_at(&self, offset: u64, bytes: &[u8]) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|_| "arena lock poisoned")?;
+        let start = offset as usize;
+        let end = start
+            .checked_add(bytes.len())
+            .ok_or("arena offset overflow")?;
+        if end > self.capacity {
+            return Err("arena capacity exceeded".to_string());
+        }
+        if end > state.bytes.len() {
+            state.bytes.resize(end, 0);
+        }
+        state.bytes[start..end].copy_from_slice(bytes);
+        state.allocations.insert(ObjRef::new(offset), bytes.len());
+        Ok(())
+    }
+
     pub(crate) fn read_at(&self, offset: u64, output: &mut [u8]) -> Result<usize, String> {
         let state = self.state.lock().map_err(|_| "arena lock poisoned")?;
         let start = offset as usize;

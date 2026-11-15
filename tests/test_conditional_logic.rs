@@ -4,20 +4,20 @@ use owl_db::{
     document::{Document, Value},
     executor::QueryExecutor,
     parser::parse_oql,
-    storage::{RocksDBStore, DocumentStore},
+    storage::{RustStore, DocumentStore},
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
 
-fn create_test_executor() -> (QueryExecutor<RocksDBStore>, TempDir) {
+fn create_test_executor() -> (QueryExecutor<RustStore>, TempDir) {
     let temp_dir = TempDir::new().unwrap();
-    let store = Arc::new(RocksDBStore::new(temp_dir.path()).unwrap());
-    let executor = QueryExecutor::new(store);
+    let store = Arc::new(RustStore::new(temp_dir.path().join("db.owl"), 64 << 20).unwrap());
+    let executor = QueryExecutor::new_with_real_clock(store);
     (executor, temp_dir)
 }
 
-fn setup_test_data(executor: &QueryExecutor<RocksDBStore>) {
+fn setup_test_data(executor: &QueryExecutor<RustStore>) {
     let customers = vec![
         Document::with_id("cust_1".to_string(), "customers".to_string(), {
             let mut fields = HashMap::new();

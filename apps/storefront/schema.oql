@@ -38,6 +38,7 @@ schema orders {
   total: Float,
   items: List({ product: Ref(products), qty: Integer, price: Float }),
   index(.status, .placed),
+  index(.status, .customer),
   index(.placed)
 }
 
@@ -66,5 +67,6 @@ schema tickets {
   order: Optional(Ref(orders)),
   status: String,
   priority: Integer,
-  opened: DateTime
+  opened: DateTime,
+  index(.customer)
 }

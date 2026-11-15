@@ -3,12 +3,11 @@
 // These tests verify that the QueryExecutor works correctly with RustStore
 // and achieves the expected performance improvements through O(1) navigation.
 
-use owl_db::document::{Document, Value, ObjRef};
-use owl_db::error::OQLResult;
+use owl_db::document::{Document, Value};
 use owl_db::executor::QueryExecutor;
 use owl_db::parser::parse_oql;
 use owl_db::schema::{Schema, FieldType};
-use owl_db::storage::{create_storage, DocumentStore};
+use owl_db::storage::DocumentStore;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -18,7 +17,7 @@ fn create_test_executor() -> (QueryExecutor<owl_db::storage::RustStore>, TempDir
     let temp_dir = TempDir::new().unwrap();
     let path = temp_dir.path().join("test.owl");
     let storage = owl_db::storage::RustStore::new(path, 100 * 1024 * 1024).unwrap();
-    let executor = QueryExecutor::new(Arc::new(storage));
+    let executor = QueryExecutor::new_with_real_clock(Arc::new(storage));
     (executor, temp_dir)
 }
 
@@ -284,7 +283,7 @@ fn test_concurrent_queries_with_zig_storage() {
     for thread_id in 0..4 {
         let storage_clone = Arc::clone(&storage);
         let handle = thread::spawn(move || {
-            let executor = QueryExecutor::new(storage_clone);
+            let executor = QueryExecutor::new_with_real_clock(storage_clone);
             let query = parse_oql(r#"users.where { .value >= 50 }"#).unwrap();
             let results = executor.execute_query(&query).unwrap();
             assert!(results.len() >= 50);

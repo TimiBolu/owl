@@ -54,7 +54,7 @@ fn test_query_executor_with_simulated_clock() {
 #[test]
 fn test_simulation_framework_integration() {
     // Test that the full simulation framework works
-    let mut sim = Simulation::new(42);
+    let sim = Simulation::new(42);
     
     // Test that we can get simulation components
     let clock = sim.clock();

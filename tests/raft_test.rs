@@ -1,3 +1,6 @@
+// Carried over from before these tests were compiled regularly.
+#![allow(dead_code, unused_comparisons, private_interfaces, unused_imports)]
+
 // Standalone Raft tests
 use std::sync::Arc;
 use std::time::Duration;

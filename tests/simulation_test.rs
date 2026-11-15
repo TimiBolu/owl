@@ -108,25 +108,25 @@ fn test_crash_recovery() {
     let mut file = fs.create(path).unwrap();
     file.write(b"Unsynced data").unwrap();
     
-    // Crash the system
+    // Crash the system. Nothing answers until it has recovered.
     fs.crash();
-    
-    // Data should be lost
-    assert!(!fs.exists(path));
-    
-    // Recover and try again with sync
     fs.recover();
+
+    // The file was never synced, so the crash took it.
+    assert!(!fs.exists(path));
+
+    // Try again with sync
     let mut file = fs.create(path).unwrap();
     file.write(b"Synced data").unwrap();
     file.sync().unwrap();
-    
+
     // Crash again
     fs.crash();
-    
+    fs.recover();
+
     // Synced data should survive
     assert!(fs.exists(path));
-    
-    fs.recover();
+
     let mut file = fs.open(path).unwrap();
     let mut buf = vec![0u8; 11];
     file.read(&mut buf).unwrap();

@@ -4248,6 +4248,31 @@ impl Parser {
                 self.advance();
                 Ok(Expression::Identifier(name))
             }
+            // `contains`, `starts_with` and `ends_with` are operators between
+            // two values and also functions: followed by `(` where a value
+            // is expected, they are a call like any other.
+            Some(Token::Contains | Token::StartsWith | Token::EndsWith)
+                if matches!(self.peek_token(), Some(Token::LeftParen)) =>
+            {
+                let name = match self.current_token() {
+                    Some(Token::Contains) => "contains",
+                    Some(Token::StartsWith) => "starts_with",
+                    _ => "ends_with",
+                }
+                .to_string();
+                self.advance();
+                self.advance(); // consume left paren
+                let mut args = Vec::new();
+                if !matches!(self.current_token(), Some(Token::RightParen)) {
+                    args.push(self.parse_expression()?);
+                    while matches!(self.current_token(), Some(Token::Comma)) {
+                        self.advance();
+                        args.push(self.parse_expression()?);
+                    }
+                }
+                self.expect_token(Token::RightParen)?;
+                Ok(Expression::FunctionCall { name, args })
+            }
             Some(Token::Identifier(name)) => {
                 let name = name.clone();
                 self.advance();

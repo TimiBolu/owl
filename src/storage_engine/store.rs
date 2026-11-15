@@ -449,7 +449,6 @@ struct State {
     collection_ids: HashMap<String, u16>,
     next_collection_id: u16,
     next_object_ids: HashMap<u16, u32>,
-    documents: HashMap<(String, DocumentId), ObjRef>,
     /// Stable collection scan order, derived from live document identities.
     /// This is rebuilt during recovery and maintained atomically with writes.
     collection_rows: HashMap<String, BTreeMap<DocumentId, ObjRef>>,
@@ -1901,7 +1900,7 @@ impl RustStore {
             typed_authoritative_segments,
             typed_authoritative_rows,
             row_overflow_rows: live_rows.saturating_sub(typed_authoritative_rows),
-            external_id_hash_rows: state.documents.len(),
+            external_id_hash_rows: 0,
             ordered_id_tree_rows: state.collection_rows.values().map(BTreeMap::len).sum(),
             objref_locator_rows: state.typed_row_locations.len(),
             objref_locator_cached_pages,
@@ -2300,7 +2299,7 @@ impl RustStore {
             .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
         validate_state_integrity(&state)?;
         if state.committed_lsn != recovered.committed_lsn
-            || state.documents != recovered.documents
+            || state.collection_rows != recovered.collection_rows
             || logical_document_map(&state)? != logical_document_map(&recovered)?
             || state.scalar_indexes != recovered.scalar_indexes
         {
@@ -3036,7 +3035,6 @@ impl StoreCore {
             state.decoded_order.clear();
             let directories = (
                 std::mem::take(&mut state.object_directory),
-                std::mem::take(&mut state.documents),
                 std::mem::take(&mut state.collection_rows),
                 std::mem::take(&mut state.object_schema_versions),
             );
@@ -3065,9 +3063,6 @@ impl StoreCore {
                     OQLError::storage_error("a row being retired to a segment is missing", None)
                 })?;
                 state.object_directory.remove(object_ref);
-                state
-                    .documents
-                    .remove(&(document.schema.clone(), document.id.clone()));
                 if let Some(rows) = state.collection_rows.get_mut(&document.schema) {
                     rows.remove(&document.id);
                     if rows.is_empty() {
@@ -5050,9 +5045,6 @@ impl RustStore {
                     let delta_schema = document.schema.clone();
                     let delta_id = document.id.clone();
                     state
-                        .documents
-                        .insert((document.schema.clone(), document.id.clone()), object_ref);
-                    state
                         .collection_rows
                         .entry(document.schema.clone())
                         .or_default()
@@ -5098,7 +5090,6 @@ impl RustStore {
                             state.collection_rows.remove(&schema);
                         }
                     }
-                    state.documents.remove(&(schema.clone(), id.clone()));
                     state.object_directory.remove(&object_ref);
                     state.typed_row_locations.remove(&object_ref)?;
                     state.object_schema_versions.remove(&object_ref);
@@ -6903,10 +6894,6 @@ fn restore_checkpoint(
         for (object_ref, record, document, schema_version) in hydrated {
             if lookup_object_ref(&state, &document.schema, &document.id)?.is_some()
                 || state
-                    .documents
-                    .insert((document.schema.clone(), document.id.clone()), object_ref)
-                    .is_some()
-                || state
                     .collection_rows
                     .entry(document.schema.clone())
                     .or_default()
@@ -7849,7 +7836,11 @@ fn require_complete_wal(filesystem: &dyn FileSystem, path: &Path, valid_len: u64
 }
 
 fn validate_state_integrity(state: &State) -> OQLResult<()> {
-    for ((schema, id), object_ref) in &state.documents {
+    for (schema, id, object_ref) in state
+        .collection_rows
+        .iter()
+        .flat_map(|(schema, rows)| rows.iter().map(move |(id, object_ref)| (schema, id, object_ref)))
+    {
         let document = logical_document(state, *object_ref)?.ok_or_else(|| {
             OQLError::storage_error("document identity points to a missing object", None)
         })?;
@@ -7877,16 +7868,6 @@ fn validate_state_integrity(state: &State) -> OQLResult<()> {
             ));
         }
     }
-    for (schema, rows) in &state.collection_rows {
-        for (id, object_ref) in rows {
-            if state.documents.get(&(schema.clone(), id.clone())) != Some(object_ref) {
-                return Err(OQLError::storage_error(
-                    "ordered collection directory conflicts with document identity",
-                    None,
-                ));
-            }
-        }
-    }
     for (object_ref, document) in &state.object_directory {
         // A decoded copy of a row a column segment holds is only a cache;
         // the segment's own directory answers for it.
@@ -7894,8 +7875,9 @@ fn validate_state_integrity(state: &State) -> OQLResult<()> {
             continue;
         }
         if state
-            .documents
-            .get(&(document.schema.clone(), document.id.clone()))
+            .collection_rows
+            .get(&document.schema)
+            .and_then(|rows| rows.get(&document.id))
             != Some(object_ref)
         {
             return Err(OQLError::storage_error(
@@ -8936,10 +8918,11 @@ impl DocumentStore for RustStore {
                 .read()
                 .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
             state
-                .documents
-                .iter()
-                .filter(|((candidate, _), _)| candidate == schema)
-                .map(|(_, object_ref)| {
+                .collection_rows
+                .get(schema)
+                .into_iter()
+                .flat_map(BTreeMap::values)
+                .map(|object_ref| {
                     logical_document(&state, *object_ref).and_then(|document| {
                         document
                             .map(|document| document.as_ref().clone())
@@ -9026,10 +9009,11 @@ impl DocumentStore for RustStore {
                 .read()
                 .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
             state
-                .documents
-                .iter()
-                .filter(|((candidate, _), _)| candidate == schema)
-                .map(|(_, object_ref)| {
+                .collection_rows
+                .get(schema)
+                .into_iter()
+                .flat_map(BTreeMap::values)
+                .map(|object_ref| {
                     logical_document(&state, *object_ref).and_then(|document| {
                         document
                             .map(|document| (document.id.clone(), project(&document, fields)))
@@ -9902,14 +9886,13 @@ impl DocumentStore for RustStore {
         object_ref: &ObjRef,
         fields: &[String],
     ) -> OQLResult<Option<Document>> {
-        if !self
-            .state
-            .read()
-            .map_err(|_| OQLError::generic("storage state lock poisoned"))?
-            .documents
-            .values()
-            .any(|candidate| candidate == object_ref)
-        {
+        if !object_is_live(
+            &*self
+                .state
+                .read()
+                .map_err(|_| OQLError::generic("storage state lock poisoned"))?,
+            *object_ref,
+        )? {
             return Ok(None);
         }
         let record = self.read_compiled_record(*object_ref)?;
@@ -11118,8 +11101,9 @@ mod tests {
             assert_eq!(scan(&store).len(), 2);
             let state = store.state.read().unwrap();
             let object_ref = state
-                .documents
-                .get(&("events".to_string(), "old".to_string()))
+                .collection_rows
+                .get("events")
+                .and_then(|rows| rows.get("old"))
                 .unwrap();
             assert!(state.object_records.get(object_ref).is_none());
         }

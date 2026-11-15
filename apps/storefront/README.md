@@ -65,29 +65,30 @@ between runs, so treat a ratio near 1 as a tie.
 
 | Query | Owl | SQLite | Owl ÷ SQLite |
 |---|---:|---:|---:|
-| q01 one order with customer and items | 0.06 | 0.03 | 1.6× |
-| q02 twenty most recent paid orders | 0.23 | 0.04 | 5.6× |
-| q03 large orders from one country | 75.66 | 16.44 | 4.6× |
-| q04 customers by lifetime spend | 199.92 | 208.90 | 1.0× |
-| q05 three latest orders per gold customer | 7.03 | 1.65 | 4.3× |
-| q06 orders and revenue by status | 75.95 | 125.81 | 0.6× |
-| q07 paid revenue by month | 126.62 | 61.87 | 2.0× |
-| q08 paid revenue by customer country | 116.66 | 135.83 | 0.9× |
-| q09 best-selling products from line items | 1029.41 | 1079.66 | 1.0× |
-| q10 paid customers with no ticket | 92.77 | 17.66 | 5.3× |
-| q11 orders above their customer's average | 1468.26 | 1409.25 | 1.0× |
-| q12 category tree with statistics | 4.32 | 0.76 | 5.7× |
-| q13 customers per country | 5.40 | 3.34 | 1.6× |
-| q14 countries buying in one month | 28.46 | 9.80 | 2.9× |
-| q15 payments by method in a quarter | 36.81 | 16.08 | 2.3× |
-| q16 best-reviewed products | 39.12 | 46.95 | 0.8× |
+| q01 one order with customer and items | 0.04 | 0.02 | 1.7× |
+| q02 twenty most recent paid orders | 0.15 | 0.03 | 5.8× |
+| q03 large orders from one country | 53.36 | 13.12 | 4.1× |
+| q04 customers by lifetime spend | 152.55 | 135.83 | 1.1× |
+| q05 three latest orders per gold customer | 6.41 | 1.03 | 6.3× |
+| q06 orders and revenue by status | 52.47 | 78.34 | 0.7× |
+| q07 paid revenue by month | 95.48 | 40.02 | 2.4× |
+| q08 paid revenue by customer country | 77.05 | 63.68 | 1.2× |
+| q09 best-selling products from line items | 694.18 | 663.30 | 1.0× |
+| q10 paid customers with no ticket | 28.14 | 5.66 | 5.0× |
+| q11 orders above their customer's average | 963.10 | 895.59 | 1.1× |
+| q12 category tree with statistics | 2.70 | 0.48 | 5.7× |
+| q13 customers per country | 4.70 | 2.10 | 2.2× |
+| q14 countries buying in one month | 19.86 | 6.32 | 3.1× |
+| q15 payments by method in a quarter | 32.96 | 10.11 | 3.3× |
+| q16 best-reviewed products | 31.34 | 29.69 | 1.1× |
 
-Loading took 18 s for Owl (13,791 rows/s, 120 MiB on disk) and 9 s for
-SQLite (26,264 rows/s, 54 MiB).
+Loading took 15 s for Owl (16,828 rows/s, 123 MiB on disk) and 15 s for
+SQLite (16,538 rows/s, 56 MiB) in this run; SQLite is usually nearer 10 s.
 
 Owl is level with or ahead of SQLite on six queries, within about three
 times on five, and four to six times behind on five. All sixteen return the
-same rows as SQLite.
+same rows as SQLite. This run was on a quieter machine than the earlier
+ones, so both engines are faster than in the table of fixes below.
 
 ## How far it scales on this machine
 
@@ -95,56 +96,41 @@ same rows as SQLite.
 cargo run --release -p storefront -- memory --orders 100000
 ```
 
-reports Owl's memory alone at each stage. Measured on 2026-11-15 at 100,000
-orders (247,048 rows, 134 MiB on disk):
+reports Owl's memory alone (its physical footprint) at each stage. A row
+with a list, an object or a vector in it lives outside the column segments,
+and by default stays decoded in memory for as long as the database is open.
+A budget on decoded documents (`RustStore::with_decoded_budget`,
+`owl-server --decoded-documents`, or the `OWL_DECODED_DOCUMENTS` environment
+variable) keeps the rest as their encoded records, decoded when read; a scan
+then decodes only the fields it filters on or returns. Every answer is the
+same: the test suites pass with a budget of zero, and so does the check
+against SQLite.
 
-| Stage | Memory | Rows held decoded |
-|---|---:|---:|
-| Loaded | 737 MiB | 247,048 |
-| Checkpointed | 683 MiB | 247,048 |
-| Compacted | 546 MiB | 112,000 |
-| Closed and reopened | 426 MiB | 112,000 |
+Measured on 2026-11-15 at 100,000 orders (247,048 rows, 137 MiB on disk):
 
-Owl holds about 2.8 KB of memory per row while loading, five times what the
-row takes on disk, and the whole benchmark process (with SQLite and the
-generated data) peaks at 1.2 GB for 100,000 orders and 2.1 GB for 200,000.
-A million orders would need about 10 GB, which this 8 GB machine cannot
-hold; at 200,000 both engines were already slowed by memory pressure.
+| Budget | Loaded | Checkpointed | Compacted | Reopened |
+|---|---:|---:|---:|---:|
+| None | 941 MiB | 600 MiB | 502 MiB | 404 MiB |
+| 20,000 documents | 624 MiB | 322 MiB | 255 MiB | 360 MiB |
+| 0 documents | 654 MiB | 283 MiB | 219 MiB | 281 MiB |
 
-The ceiling is memory, not time, and the table shows why. A row lives in
-memory as a decoded document until a compaction moves it into a column
-segment. Compaction can only do that for collections whose fields are all
-plain values: the 112,000 rows it leaves decoded are the orders and the
-products, which hold a list of line items and a vector.
+With a budget the settled database takes about half the memory, around 1 KB
+a row instead of 2. The price is speed on large scans of the affected
+collections: measured before the latest query work, a 20,000-document
+budget took q06 from 79 ms to 214 ms and q04 from 206 ms to 463 ms, while
+queries that touch a few rows were unaffected.
 
-### A budget on decoded documents
+What is left with nothing decoded, in a reopened database:
 
-Those rows no longer have to stay decoded. Opened with a budget
-(`RustStore::with_decoded_budget`, `owl-server --decoded-documents`, or the
-`OWL_DECODED_DOCUMENTS` environment variable), Owl holds at most that many
-documents decoded. The rest are kept as their encoded records and decoded
-when read, and a scan decodes only the fields it filters on or returns.
-Every answer is the same: the whole test suite passes with a budget of zero,
-and so does the check against SQLite.
+- about 85 MiB is the encoded records of the rows outside the segments,
+  which are also in the checkpoint file and could be read from there;
+- about 35 MiB is one allocation of 112 bytes per row, not yet identified;
+- the rest is id directories, indexes and allocator overhead.
 
-Measured at 100,000 orders:
-
-| Budget | After compaction | After reopening | q06 | q04 | q10 |
-|---|---:|---:|---:|---:|---:|
-| None | 608 MiB | 538 MiB | 79 ms | 206 ms | 106 ms |
-| 20,000 documents | 475 MiB | 299 MiB | 214 ms | 463 ms | 242 ms |
-| 0 documents | 348 MiB | 350 MiB | 238 ms | 763 ms | 496 ms |
-
-A budget of 20,000 roughly halves the memory of an opened database and
-makes scans of the affected collections two to three times slower. Queries
-that touch a few rows are unaffected.
-
-It does not remove the ceiling. With nothing held decoded Owl still uses
-about 350 MiB for these 247,048 rows, around 1.4 KB a row, and loading peaks
-far higher. What is left is everything else held in memory for every row:
-the records themselves, the indexes, and three directories keyed by id. A
-million orders is still out of reach of this machine until those can live
-on disk too.
+The peak while loading barely moves, because everything written since the
+last checkpoint is held until the next one. A million orders would settle
+near 2.5 GB with a budget and peak far higher during the load, so it is
+still not a comfortable fit for this 8 GB machine.
 
 ## Where the time goes
 
@@ -184,8 +170,9 @@ suite runs each shape both ways and requires identical rows.
 
 What is still behind, and why:
 
-- **q10** reads every order once to learn which customers have a paid one.
-  SQLite answers from an index and reads no order.
+- **q10** now counts from `index(.status, .customer)` without reading an
+  order, as SQLite does. What remains is evaluating two conditions for each
+  of 10,000 customers through the general evaluator.
 - **q03** fetches every order of the country's customers through the
   relationship before it can tell which are large; SQLite joins on an index
   and filters as it goes.
@@ -217,6 +204,7 @@ Measured at 10,000 orders unless noted.
 | A lookup by id searches the ordered directory by borrowed text instead of building a key from two new strings | (with the above) |
 | Rows reached through a relationship are filtered before they are copied, and name themselves without copying | q12 at 100,000 orders: 9.4 ms to 4.3 ms; q05: 9.7 ms to 7.0 ms |
 | A relationship tally accumulates per referenced document directly, building no group rows | q10 at 100,000 orders: 142 ms to 93 ms; q04: 298 ms to 200 ms |
+| A relationship count whose filters are equalities is answered from an index on those fields and the reference, reading no row; the index was added to both engines | q10 at 100,000 orders: 93 ms to 28 ms (SQLite: 18 ms to 6 ms) |
 | A unique index is consulted for a new key, instead of reading every document in the database | Loading 100,000 orders: 42 s to 18 s |
 | A reference is checked by looking its target up rather than copying it, a `check` constraint is parsed once, and loading hands Owl values through a prepared insert | Loading 100,000 orders: 18 s to 16 s |
 

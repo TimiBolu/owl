@@ -5,25 +5,25 @@ use owl_db::{
     document::{Document, Value},
     executor::QueryExecutor,
     parser::parse_oql,
-    storage::{DocumentStore, RocksDBStore},
+    storage::{DocumentStore, RustStore},
 };
-use chrono::{DateTime, Utc, TimeZone};
+use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
 
 /// Test fixture for function tests
 struct FunctionTestFixture {
-    executor: QueryExecutor<RocksDBStore>,
-    store: Arc<RocksDBStore>,
+    executor: QueryExecutor<RustStore>,
+    store: Arc<RustStore>,
     _temp_dir: TempDir,
 }
 
 impl FunctionTestFixture {
     fn new() -> Self {
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
-        let store = Arc::new(RocksDBStore::new(temp_dir.path()).expect("Failed to create store"));
-        let executor = QueryExecutor::new(store.clone());
+        let store = Arc::new(RustStore::new(temp_dir.path().join("db.owl"), 64 << 20).expect("Failed to create store"));
+        let executor = QueryExecutor::new_with_real_clock(store.clone());
         
         Self {
             executor,
