@@ -23,6 +23,18 @@ struct Arguments {
     /// The most the database may grow to, in GiB.
     #[arg(long, default_value_t = 64)]
     max_gib: usize,
+    /// Hold at most this many documents decoded in memory. Rows beyond it
+    /// are kept as their records and decoded when read: less memory,
+    /// slower scans. Without it every row stays decoded.
+    #[arg(long, env = "OWL_DECODED_DOCUMENTS")]
+    decoded_documents: Option<usize>,
+    /// Where `POST /v1/backups` writes backups. Without it none are taken.
+    #[arg(long, env = "OWL_BACKUP_DIR")]
+    backup_dir: Option<PathBuf>,
+    /// Before serving, restore this backup as the database at --data,
+    /// which must not exist yet.
+    #[arg(long)]
+    restore_from: Option<PathBuf>,
     /// Roll back a transaction left untouched for this many seconds.
     #[arg(long, default_value_t = 60)]
     transaction_idle_seconds: u64,
@@ -42,21 +54,38 @@ async fn main() -> Result<()> {
         .max_gib
         .checked_mul(1 << 30)
         .ok_or_else(|| anyhow!("--max-gib is too large"))?;
-    let store = Arc::new(
-        RustStore::new(&arguments.data, max_size)
+    let store = Arc::new(match &arguments.restore_from {
+        Some(backup) => {
+            let store = RustStore::restore(backup, &arguments.data, max_size)
+                .with_context(|| format!("restore {}", backup.display()))?;
+            println!(
+                "restored {} as {} at commit {}",
+                backup.display(),
+                arguments.data.display(),
+                store.committed_lsn()
+            );
+            store
+        }
+        None => RustStore::new(&arguments.data, max_size)
             .with_context(|| format!("open Owl database {}", arguments.data.display()))?,
-    );
+    });
     let (app, janitor) = router(
         store.clone(),
         Options {
             token: arguments.token,
             transaction_idle: Duration::from_secs(arguments.transaction_idle_seconds.max(1)),
+            backup_directory: arguments.backup_dir,
         },
     );
     tokio::spawn(janitor.run());
     let listener = tokio::net::TcpListener::bind(arguments.listen)
         .await
         .with_context(|| format!("listen on {}", arguments.listen))?;
+    if let Some(budget) = arguments.decoded_documents {
+        store
+            .set_decoded_budget(Some(budget))
+            .context("apply --decoded-documents")?;
+    }
     println!(
         "owl-server is ready at http://{} serving {}",
         listener.local_addr()?,

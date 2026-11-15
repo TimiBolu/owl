@@ -437,3 +437,61 @@ async fn many_clients_at_once_lose_no_update() {
         40.0 + (clients * each) as f64
     );
 }
+
+#[tokio::test]
+async fn a_backup_is_taken_where_the_server_was_told_and_restores() {
+    let backups = TempDir::new().unwrap();
+    let service = Service::start(Options {
+        backup_directory: Some(backups.path().to_path_buf()),
+        ..Options::default()
+    });
+    service
+        .ok("/v1/script", json!({ "source": "schema notes { id: String, text: String }" }))
+        .await;
+    service
+        .ok(
+            "/v1/insert",
+            json!({ "collection": "notes", "documents": [{ "id": "n1", "text": "kept" }, { "id": "n2", "text": "kept too" }] }),
+        )
+        .await;
+
+    let first = service.ok("/v1/backups", json!({})).await;
+    assert!(first["bytes"].as_u64().unwrap() > 0, "{first}");
+    // What happens next is not in it.
+    service
+        .ok("/v1/query", json!({ "query": r#"notes.where { .id == "n1" }.delete"# }))
+        .await;
+    let second = service.ok("/v1/backups", json!({})).await;
+    assert_ne!(first["name"], second["name"]);
+    assert!(second["committed_lsn"].as_u64() > first["committed_lsn"].as_u64());
+
+    // A client cannot say where a backup goes.
+    let (status, _) = service.post("/v1/backups", json!({ "directory": "/tmp/elsewhere" })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(std::fs::read_dir(backups.path()).unwrap().count(), 3);
+
+    // The first backup restores to the database as it was then.
+    let home = TempDir::new().unwrap();
+    let restored = Arc::new(
+        RustStore::restore(
+            backups.path().join(first["name"].as_str().unwrap()),
+            home.path().join("restored.owl"),
+            16 << 20,
+        )
+        .unwrap(),
+    );
+    let (app, janitor) = router(restored, Options::default());
+    let copy = Service {
+        _directory: home,
+        app,
+        janitor,
+        token: None,
+    };
+    assert_eq!(copy.rows("notes.count()").await[0]["count"], 2);
+    assert_eq!(service.rows("notes.count()").await[0]["count"], 1);
+
+    // A server started without a backup directory takes none.
+    let plain = Service::start(Options::default());
+    let (status, body) = plain.post("/v1/backups", json!({})).await;
+    assert_eq!((status, code(&body)), (StatusCode::CONFLICT, "backups_disabled"));
+}

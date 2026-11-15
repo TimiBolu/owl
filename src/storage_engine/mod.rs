@@ -5,6 +5,7 @@
 //! not depend on an FFI allocator or expose physical file offsets as identity.
 
 mod arena;
+mod backup;
 mod btree;
 mod checkpoint;
 mod column_segment;
@@ -28,6 +29,7 @@ pub use group_commit::GroupCommitter;
 pub use key::TypedKey;
 pub use object_ref::ObjRef;
 pub(crate) use record::{BorrowedRecordValue, CompiledSchema, RecordCodec, RecordView};
+pub use backup::{BackupFile, BackupInfo};
 pub use store::{
     AutoCheckpointPolicy, IntegrityReport, MaintenanceStatus, ReclamationReport, RustStore,
     StorageLayoutStats, TransactionBinding, WriteOperation,

@@ -120,6 +120,14 @@ path = "tests/oql_language_conformance_test.rs"
 name = "concurrent_transactions_test"
 path = "tests/concurrent_transactions_test.rs"
 
+[[test]]
+name = "backup_restore_test"
+path = "tests/backup_restore_test.rs"
+
+[[test]]
+name = "memory_budget_test"
+path = "tests/memory_budget_test.rs"
+
 [[bench]]
 name = "index_scan_bench"
 path = "benches/index_scan_bench.rs"

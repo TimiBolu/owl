@@ -107,13 +107,37 @@ impl CowRecordDirectory {
     }
 
     pub(crate) fn evict_clean(&mut self) {
+        self.evict_clean_unless(|_| false);
+    }
+
+    /// Drop the bytes of every clean record, which a checkpoint file
+    /// holds, except those `keep` asks for.
+    pub(crate) fn evict_clean_unless(&mut self, keep: impl Fn(&ObjRef) -> bool) {
         let dirty = &self.dirty;
         let mut len = 0;
         for shard in &mut self.shards {
-            Arc::make_mut(shard).retain(|object_ref, _| dirty.contains(object_ref));
+            // Leave a shard with nothing to drop as it is, shared.
+            if shard
+                .keys()
+                .all(|object_ref| dirty.contains(object_ref) || keep(object_ref))
+            {
+                len += shard.len();
+                continue;
+            }
+            Arc::make_mut(shard)
+                .retain(|object_ref, _| dirty.contains(object_ref) || keep(object_ref));
             len += shard.len();
         }
         self.len = len;
+    }
+
+    /// Hold the bytes of a record a checkpoint file already has, without
+    /// marking it for the next checkpoint to write again.
+    pub(crate) fn insert_clean(&mut self, object_ref: ObjRef, record: impl Into<Arc<[u8]>>) {
+        let shard = Arc::make_mut(&mut self.shards[shard_for(object_ref)]);
+        if shard.insert(object_ref, record.into()).is_none() {
+            self.len += 1;
+        }
     }
 }
 
