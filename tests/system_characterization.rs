@@ -1,3 +1,6 @@
+// Carried over from before these tests were compiled regularly.
+#![allow(dead_code, unused_comparisons, private_interfaces, unused_imports)]
+
 use owl_db::document::{Document, Value};
 use owl_db::simulation::SimulatedFileSystem;
 use owl_db::storage::{create_storage, create_storage_with_fs, DocumentStore};

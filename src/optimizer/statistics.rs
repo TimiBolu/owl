@@ -162,14 +162,18 @@ impl StatisticsManager {
         let documents = store.scan_documents(schema)?;
 
         if documents.is_empty() {
-            return Ok(TableStatistics {
+            // An empty collection has statistics too: zero rows. Remember
+            // them like any others, so asking for its size is answered.
+            let stats = TableStatistics {
                 schema: schema.to_string(),
                 row_count: 0,
                 avg_row_size: 0,
                 total_size: 0,
                 field_stats: HashMap::new(),
                 last_updated: current_timestamp(),
-            });
+            };
+            self.store_table_statistics(&stats)?;
+            return Ok(stats);
         }
 
         // Sample documents if needed

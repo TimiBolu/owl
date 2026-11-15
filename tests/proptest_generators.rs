@@ -1,8 +1,10 @@
+// Carried over from before these tests were compiled regularly.
+#![allow(dead_code, unused_comparisons, private_interfaces, unused_imports)]
+
 // Property-based test generators for Owl distributed system
 // Validates: Requirements 17
 
 use proptest::prelude::*;
-use owl_db::simulation::*;
 use std::collections::HashMap;
 
 /// Generator for random seeds (for deterministic simulation)

@@ -295,6 +295,8 @@ Present today:
 
 - **Text:** `trim upper lower length substring concat replace split starts_with ends_with contains pad_left pad_right`
 - **Math:** `abs round floor ceil sqrt pow min max sin cos tan log ln exp random`
+  (`min(a, b)` and `max(a, b)` are the lesser and greater of two values; with
+  one argument they are the aggregates of section 11)
 - **Time:** see 5.2
 - **Utility:** `coalesce if_null to_string to_int to_float type_of`
 - **Existence:** `exists is_null is_missing is_broken_ref`

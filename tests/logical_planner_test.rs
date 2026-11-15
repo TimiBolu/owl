@@ -1,15 +1,13 @@
 // Tests for logical query planner
 
-use owl_db::document::Value;
-use owl_db::error::OQLResult;
 use owl_db::parser::{ComparisonOperator, Condition, Expression, FieldAccess, Literal, OQLQuery, Operation, SelectBlock, SelectField, SortBlock, SortDirection, SortField, WhereBlock, GroupByBlock, InsertBlock, InsertField, UpdateBlock, UpdateField};
-use owl_db::planner::logical::{LogicalPlanner, LogicalPlan};
+use owl_db::planner::logical::LogicalPlanner;
 use owl_db::planner::types::{PlanType, AggregateFunction};
 use owl_db::schema::{FieldType, ReferenceType, Schema, SchemaRegistry};
 use std::collections::HashMap;
 
 fn create_test_schema_registry() -> SchemaRegistry {
-    let mut registry = SchemaRegistry::new();
+    let registry = SchemaRegistry::new();
     
     // Create users schema
     let mut users_fields = HashMap::new();
@@ -174,7 +172,8 @@ fn test_group_by_plan() {
                         path: vec!["age".to_string()],
                     },
                 ],
-            }),
+            computed: Vec::new(),
+        }),
         ],
     };
     

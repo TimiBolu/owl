@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn test_error_context_preservation() {
-        let mut error = ZigError::new(ZigErrorCode::InvalidTransaction, "Invalid transaction".to_string())
+        let error = ZigError::new(ZigErrorCode::InvalidTransaction, "Invalid transaction".to_string())
             .with_shard(1)
             .with_transaction(456)
             .with_context("operation".to_string(), "prepare".to_string())

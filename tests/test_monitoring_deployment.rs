@@ -1,13 +1,15 @@
+// Carried over from before these tests were compiled regularly.
+#![allow(dead_code, unused_comparisons, private_interfaces, unused_imports)]
+
 // Comprehensive tests for monitoring and deployment features
 
 use owl_db::{
     change_streams::{ChangeFilter, ChangeType, ChangeTrackingStore, Trigger, TriggerAction},
     config::{BackupManager, BackupConfig, DatabaseConfig, Environment, MigrationManager, ConfigFormat, CompressionType},
     document::{Document, Value},
-    error::OQLResult,
     monitoring::{MonitoringSystem, MonitoringConfig, QueryMetrics, SystemMetrics, Alert, AlertSeverity},
     parser::{OQLQuery, Operation, WhereBlock, Condition, Expression, FieldAccess, ComparisonOperator, Literal},
-    storage::{RocksDBStore, DocumentStore},
+    storage::{RustStore, DocumentStore},
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -51,7 +53,7 @@ mod change_stream_tests {
     #[test]
     fn test_change_stream_basic_functionality() {
         let temp_dir = TempDir::new().unwrap();
-        let store = Arc::new(RocksDBStore::new(temp_dir.path()).unwrap());
+        let store = Arc::new(RustStore::new(temp_dir.path().join("db.owl"), 64 << 20).unwrap());
         let change_store = ChangeTrackingStore::new(store);
 
         // Subscribe to changes for orders schema
@@ -93,7 +95,7 @@ mod change_stream_tests {
     #[test]
     fn test_change_stream_filtering() {
         let temp_dir = TempDir::new().unwrap();
-        let store = Arc::new(RocksDBStore::new(temp_dir.path()).unwrap());
+        let store = Arc::new(RustStore::new(temp_dir.path().join("db.owl"), 64 << 20).unwrap());
         let change_store = ChangeTrackingStore::new(store);
 
         // Subscribe only to update changes
@@ -125,7 +127,7 @@ mod change_stream_tests {
     #[test]
     fn test_change_stream_delete_tracking() {
         let temp_dir = TempDir::new().unwrap();
-        let store = Arc::new(RocksDBStore::new(temp_dir.path()).unwrap());
+        let store = Arc::new(RustStore::new(temp_dir.path().join("db.owl"), 64 << 20).unwrap());
         let change_store = ChangeTrackingStore::new(store);
 
         // Subscribe to all change types
@@ -158,7 +160,7 @@ mod change_stream_tests {
     #[test]
     fn test_change_history() {
         let temp_dir = TempDir::new().unwrap();
-        let store = Arc::new(RocksDBStore::new(temp_dir.path()).unwrap());
+        let store = Arc::new(RustStore::new(temp_dir.path().join("db.owl"), 64 << 20).unwrap());
         let change_store = ChangeTrackingStore::new(store);
 
         // Perform several operations
@@ -192,7 +194,7 @@ mod change_stream_tests {
     #[test]
     fn test_trigger_registration_and_execution() {
         let temp_dir = TempDir::new().unwrap();
-        let store = Arc::new(RocksDBStore::new(temp_dir.path()).unwrap());
+        let store = Arc::new(RustStore::new(temp_dir.path().join("db.owl"), 64 << 20).unwrap());
         let change_store = ChangeTrackingStore::new(store);
 
         // Register a trigger for order status changes
@@ -235,7 +237,7 @@ mod change_stream_tests {
     #[test]
     fn test_multiple_subscribers() {
         let temp_dir = TempDir::new().unwrap();
-        let store = Arc::new(RocksDBStore::new(temp_dir.path()).unwrap());
+        let store = Arc::new(RustStore::new(temp_dir.path().join("db.owl"), 64 << 20).unwrap());
         let change_store = ChangeTrackingStore::new(store);
 
         // Create multiple subscribers with different filters
@@ -851,7 +853,7 @@ mod integration_tests {
     #[test]
     fn test_monitoring_with_change_streams() {
         let temp_dir = TempDir::new().unwrap();
-        let store = Arc::new(RocksDBStore::new(temp_dir.path()).unwrap());
+        let store = Arc::new(RustStore::new(temp_dir.path().join("db.owl"), 64 << 20).unwrap());
         let change_store = ChangeTrackingStore::new(store);
 
         // Set up monitoring
@@ -952,7 +954,7 @@ mod integration_tests {
         dev_config.storage.data_dir = temp_dir.path().join("dev_data");
         
         // 2. Set up change tracking and monitoring
-        let store = Arc::new(RocksDBStore::new(&dev_config.storage.data_dir).unwrap());
+        let store = Arc::new(RustStore::new(&dev_config.storage.data_dir, 64 << 20).unwrap());
         let change_store = ChangeTrackingStore::new(store);
         let monitoring = MonitoringSystem::new(dev_config.monitoring.clone());
 
@@ -988,7 +990,7 @@ mod integration_tests {
 
         // 6. Validate migration
         let migration_manager = MigrationManager::new(dev_config.clone(), prod_config.clone());
-        let issues = migration_manager.validate_migration().unwrap();
+        let _issues = migration_manager.validate_migration().unwrap();
         
         // May have warnings about configuration differences (not required)
         // assert!(!issues.is_empty());

@@ -28,6 +28,7 @@ CREATE TABLE orders (
 );
 CREATE INDEX orders_by_customer ON orders(customer);
 CREATE INDEX orders_by_status_placed ON orders(status, placed);
+CREATE INDEX orders_by_status_customer ON orders(status, customer);
 CREATE INDEX orders_by_placed ON orders(placed);
 
 CREATE TABLE order_items (

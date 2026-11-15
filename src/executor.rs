@@ -3440,18 +3440,16 @@ impl<S: DocumentStore> QueryExecutor<S> {
         };
         // What is asked of the related rows: how many there are, or one
         // aggregate of one of their fields.
-        let measure = match last {
-            Operation::Count | Operation::Exists => "count".to_string(),
-            Operation::Sum(field)
-            | Operation::Avg(field)
-            | Operation::Min(field)
-            | Operation::Max(field)
-                if field.path.len() == 1 =>
-            {
-                serde_json::to_string(last).unwrap_or_default()
-            }
-            _ => return Ok(None),
-        };
+        if !matches!(
+            last,
+            Operation::Count | Operation::Exists
+        ) && !matches!(
+            last,
+            Operation::Sum(field) | Operation::Avg(field) | Operation::Min(field) | Operation::Max(field)
+                if field.path.len() == 1
+        ) {
+            return Ok(None);
+        }
         if !filters.iter().all(|operation| {
                 matches!(operation, Operation::Where(block) if Self::is_pipeline_safe_condition(&block.condition))
             })
@@ -3461,13 +3459,50 @@ impl<S: DocumentStore> QueryExecutor<S> {
         {
             return Ok(None);
         }
-        let key = format!(
-            "{}\u{0}{}\u{0}{}\u{0}{}",
-            row.schema,
-            name,
-            serde_json::to_string(filters).unwrap_or_default(),
-            measure
-        );
+        // The name the tally goes under says what was asked. Every row of a
+        // statement asks through the same expression, so the name is made
+        // once for it: found by where the operations are, confirmed by
+        // what they are.
+        let place = (operations.as_ptr() as usize, operations.len());
+        let remembered = STATEMENT.with(|scope| {
+            scope
+                .borrow()
+                .related_keys
+                .get(&place)
+                .filter(|(asked, schema, relationship, _)| {
+                    asked.as_slice() == operations && *schema == row.schema && relationship == name
+                })
+                .map(|(_, _, _, key)| key.clone())
+        });
+        let key = match remembered {
+            Some(key) => key,
+            None => {
+                let measure = match last {
+                    Operation::Count | Operation::Exists => "count".to_string(),
+                    other => serde_json::to_string(other).unwrap_or_default(),
+                };
+                let key: Arc<str> = format!(
+                    "{}\u{0}{}\u{0}{}\u{0}{}",
+                    row.schema,
+                    name,
+                    serde_json::to_string(filters).unwrap_or_default(),
+                    measure
+                )
+                .into();
+                STATEMENT.with(|scope| {
+                    scope.borrow_mut().related_keys.insert(
+                        place,
+                        (
+                            operations.to_vec(),
+                            row.schema.clone(),
+                            name.clone(),
+                            key.clone(),
+                        ),
+                    )
+                });
+                key
+            }
+        };
         let known = STATEMENT.with(|scope| {
             let mut scope = scope.borrow_mut();
             match scope.related_counts.entry(key.clone()).or_insert(RelatedCounts::Asked(0)) {
@@ -3609,6 +3644,14 @@ impl<S: DocumentStore> QueryExecutor<S> {
         let Some(kind) = AggregateKind::named(function, measured.is_none()) else {
             return Ok(None);
         };
+        // Counting needs only which document each row refers to. When an
+        // index holds that after the filtered fields, it answers without a
+        // row being read.
+        if measured.is_none() {
+            if let Some(tally) = self.tally_from_index(&source, &through, &predicates)? {
+                return Ok(Some(tally));
+            }
+        }
         let mut fields = vec![through.clone()];
         fields.extend(measured.and_then(|field| field.path.first().cloned()));
         let Some(batches) =
@@ -3651,6 +3694,117 @@ impl<S: DocumentStore> QueryExecutor<S> {
             tally
                 .into_iter()
                 .map(|(reference, accumulator)| (reference, accumulator.finish()))
+                .collect(),
+        ))
+    }
+
+    /// Count referring rows per referenced document from an index alone.
+    ///
+    /// The filters must all be equalities, and some index of the referring
+    /// collection must be on exactly those fields followed by the reference:
+    /// `index(.status, .customer)` for `.orders.where { .status == "paid" }`.
+    /// Its entries under the filtered values then name, in their keys, the
+    /// document each matching row refers to. `None` when no index fits.
+    fn tally_from_index(
+        &self,
+        source: &str,
+        through: &str,
+        predicates: &[ScanPredicate],
+    ) -> OQLResult<Option<HashMap<ObjRef, Value>>> {
+        use crate::storage::{ScalarIndexBound, ScalarIndexDirection, ScalarIndexRange};
+
+        fn equalities<'a>(
+            predicate: &'a ScanPredicate,
+            found: &mut Vec<(&'a str, &'a Value)>,
+        ) -> bool {
+            match predicate {
+                ScanPredicate::Comparison {
+                    field,
+                    operator: ComparisonOperator::Equal,
+                    value,
+                } => {
+                    found.push((field.as_str(), value));
+                    true
+                }
+                ScanPredicate::And(left, right) => {
+                    equalities(left, found) && equalities(right, found)
+                }
+                _ => false,
+            }
+        }
+        let mut equal = Vec::new();
+        if !predicates
+            .iter()
+            .all(|predicate| equalities(predicate, &mut equal))
+        {
+            return Ok(None);
+        }
+        // One value per field: `.a == 1 && .a == 2` is not a prefix.
+        let distinct: HashSet<&str> = equal.iter().map(|(field, _)| *field).collect();
+        if distinct.len() != equal.len() {
+            return Ok(None);
+        }
+        let plain = |field: &String| field.trim_start_matches('.').to_string();
+        let indexes = self.store.list_scalar_indexes(Some(source))?;
+        let Some(index) = indexes.iter().find(|index| {
+            index.fields.len() == equal.len() + 1
+                && index.fields.last().map(plain).as_deref() == Some(through)
+                && index.fields[..equal.len()]
+                    .iter()
+                    .all(|field| distinct.contains(plain(field).as_str()))
+        }) else {
+            return Ok(None);
+        };
+        let prefix: Vec<Value> = index.fields[..equal.len()]
+            .iter()
+            .filter_map(|field| {
+                let name = plain(field);
+                equal
+                    .iter()
+                    .find(|(candidate, _)| *candidate == name)
+                    .map(|(_, value)| (*value).clone())
+            })
+            .collect();
+        if prefix.len() != equal.len() {
+            return Ok(None);
+        }
+        let bound = |prefix_end: bool| {
+            (!prefix.is_empty()).then(|| ScalarIndexBound {
+                values: prefix.clone(),
+                inclusive: !prefix_end,
+                prefix_end,
+            })
+        };
+        let mut range = ScalarIndexRange {
+            lower: bound(false),
+            upper: bound(true),
+            limit: None,
+            after: None,
+            direction: ScalarIndexDirection::Ascending,
+        };
+        let mut tally: HashMap<ObjRef, i64> = HashMap::new();
+        loop {
+            let Some(page) = self.store.scan_scalar_index(source, &index.name, &range)? else {
+                return Ok(None);
+            };
+            for key in &page.encoded_keys {
+                match crate::storage_engine::TypedKey::decode_component(key, equal.len())? {
+                    Value::Reference(reference) => *tally.entry(reference).or_insert(0) += 1,
+                    Value::Null => {}
+                    // A reference in another form is not one this counts by.
+                    _ => return Ok(None),
+                }
+            }
+            match page.next_cursor {
+                Some(cursor) => range.after = Some(cursor),
+                None => break,
+            }
+        }
+        INDEX_TALLIES_RUN.with(|count| count.set(count.get() + 1));
+        Ok(Some(
+            tally
+                .into_iter()
+                .map(|(reference, count)| (reference, Value::Integer(count)))
                 .collect(),
         ))
     }
@@ -6431,6 +6585,11 @@ impl<S: DocumentStore> QueryExecutor<S> {
         if !matches!(name, "count" | "sum" | "avg" | "min" | "max") {
             return Ok(None);
         }
+        // `min(a, b)` and `max(a, b)` are the lesser and greater of two
+        // values, not an aggregate over rows.
+        if matches!(name, "min" | "max") && args.len() == 2 {
+            return Ok(None);
+        }
         match args {
             [] if name == "count" => Ok(Some(AggregateInput::AllRows)),
             [Expression::FieldAccess(field)] if field.path.len() == 1 && field.path[0] == "*" => {
@@ -6473,7 +6632,9 @@ impl<S: DocumentStore> QueryExecutor<S> {
     fn expression_contains_aggregate(expression: &Expression) -> bool {
         match expression {
             Expression::FunctionCall { name, args } => {
-                matches!(name.as_str(), "count" | "sum" | "avg" | "min" | "max")
+                let of_two_values = matches!(name.as_str(), "min" | "max") && args.len() == 2;
+                (matches!(name.as_str(), "count" | "sum" | "avg" | "min" | "max")
+                    && !of_two_values)
                     || args.iter().any(Self::expression_contains_aggregate)
             }
             Expression::IfThenElse {
@@ -7470,6 +7631,17 @@ thread_local! {
 }
 
 thread_local! {
+    static INDEX_TALLIES_RUN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many relationship tallies this thread has answered from an index
+/// alone. Intended for tests, which use it to show a query took that path.
+#[doc(hidden)]
+pub fn index_tallies_run() -> u64 {
+    INDEX_TALLIES_RUN.with(std::cell::Cell::get)
+}
+
+thread_local! {
     static COLUMN_FOLDS_RUN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -7919,7 +8091,10 @@ struct StatementScope {
     reverse_relationships: HashMap<(String, String), ReverseRelationship>,
     /// Per relationship and filter: how many referring documents each
     /// document has.
-    related_counts: HashMap<String, RelatedCounts>,
+    related_counts: HashMap<Arc<str>, RelatedCounts>,
+    /// The name each relationship question's tally goes under, by where
+    /// the question's operations are.
+    related_keys: HashMap<(usize, usize), (Vec<Operation>, String, String, Arc<str>)>,
     /// What a nested expression's operations read, by where they are.
     fields_read: HashMap<(usize, usize), (Vec<Operation>, Option<Vec<String>>)>,
 }

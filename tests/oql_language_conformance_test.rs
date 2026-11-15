@@ -3566,6 +3566,125 @@ fn sorting_whole_rows_keeps_every_field() {
 }
 
 #[test]
+fn counting_related_rows_from_an_index_matches_counting_them_from_rows() {
+    let db = Db::new();
+    db.script(
+        r#"
+        schema people { id: String, name: String }
+        schema tasks {
+          id: String,
+          owner: Ref(people) as owned,
+          reviewer: Optional(Ref(people)) as reviewing,
+          state: String,
+          effort: Integer,
+          urgent: Boolean,
+          index(.state, .owner),
+          index(.urgent, .state, .owner),
+          index(.reviewer)
+        }
+        "#,
+    );
+    let mut people = String::from("people.insert [\n");
+    for index in 0..120 {
+        people.push_str(&format!("  {{ id: \"p{index:03}\", name: \"P{index}\" }},\n"));
+    }
+    people.truncate(people.len() - 2);
+    people.push_str("\n]");
+    db.script(&people);
+    let mut tasks = String::from("tasks.insert [\n");
+    for index in 0..600 {
+        let reviewer = if index % 3 == 0 {
+            format!(", reviewer: \"p{:03}\"", (index * 11) % 120)
+        } else {
+            String::new()
+        };
+        tasks.push_str(&format!(
+            "  {{ id: \"k{index:03}\", owner: \"p{:03}\", state: \"{}\", effort: {}, urgent: {}{reviewer} }},\n",
+            // Some people own nothing.
+            (index * 7) % 100,
+            ["open", "done", "done", "blocked"][index % 4],
+            index % 9,
+            index % 5 == 0,
+        ));
+    }
+    tasks.truncate(tasks.len() - 2);
+    tasks.push_str("\n]");
+    db.script(&tasks);
+
+    // Answered from an index: every filter an equality, and an index on
+    // those fields followed by the reference.
+    let indexed = [
+        "people.select { id, n: .owned.where { .state == \"done\" }.count() }",
+        "people.where { .owned.where { .state == \"blocked\" }.exists() }.select { id }",
+        "people.select { id, n: .owned.where { .state == \"open\" && .urgent == true }.count() }",
+        "people.select { id, n: .owned.where { .urgent == false }.where { .state == \"done\" }.count() }",
+        "people.where { !.reviewing.exists() }.count()",
+        "people.select { id, r: .reviewing.count() }",
+        "people.select { id, none: .owned.where { .state == \"never\" }.count() }",
+        "people.where { .owned.where { .state == \"done\" }.exists() && !.reviewing.exists() }.count()",
+    ];
+    // Not answered from one, and still right: a range, a field outside the
+    // index, an aggregate of a field, no index that ends in the reference.
+    let scanned = [
+        "people.select { id, n: .owned.where { .effort > 4 }.count() }",
+        "people.select { id, n: .owned.where { .state == \"done\" && .effort == 3 }.count() }",
+        "people.select { id, total: .owned.where { .state == \"done\" }.sum(.effort) }",
+        "people.select { id, n: .owned.count() }",
+        "people.select { id, n: .owned.where { .state == \"done\" || .state == \"open\" }.count() }",
+    ];
+    let rows = |query: &str, fast: bool| {
+        owl_db::executor::set_column_aggregation(fast);
+        let before = owl_db::executor::index_tallies_run();
+        let rows: Vec<String> = db
+            .rows(query)
+            .iter()
+            .map(|row| serde_json::to_value(&row.fields).unwrap().to_string())
+            .collect();
+        owl_db::executor::set_column_aggregation(true);
+        (rows, owl_db::executor::index_tallies_run() > before)
+    };
+    let check = |when: &str| {
+        for query in indexed {
+            let (reference, _) = rows(query, false);
+            let (fast, from_index) = rows(query, true);
+            assert!(!reference.is_empty(), "{query}");
+            assert_eq!(fast, reference, "{when}: {query}");
+            assert!(from_index, "{when}: not answered from an index: {query}");
+        }
+        for query in scanned {
+            let (reference, _) = rows(query, false);
+            let (fast, from_index) = rows(query, true);
+            assert_eq!(fast, reference, "{when}: {query}");
+            assert!(!from_index, "{when}: answered from an index: {query}");
+        }
+    };
+    check("as loaded");
+    assert_eq!(
+        db.scalar("people.where { .owned.where { .state == \"blocked\" }.exists() }.count()", "count"),
+        Value::Integer(25)
+    );
+
+    // The index follows every change, so the answers do.
+    db.script(
+        r#"
+        tasks.where { .id == "k001" }.update { owner: "p119", state: "blocked" }
+        tasks.where { .id == "k003" }.update { reviewer: "p118" }
+        tasks.where { .state == "blocked" && .effort > 6 }.delete
+        tasks.where { .id == "k002" }.update { urgent: true }
+        tasks.where { .id == "k006" }.update { reviewer: null }
+        tasks.insert { id: "k900", owner: "p117", state: "done", effort: 1, urgent: false }
+        "#,
+    );
+    check("after changes");
+    assert_eq!(
+        db.scalar("people.where { .id == \"p117\" }.select { n: .owned.where { .state == \"done\" }.count() }", "n"),
+        Value::Integer(1)
+    );
+    db.executor.store().compact().unwrap();
+    check("after compaction");
+}
+
+#[test]
 fn related_rows_are_the_same_however_few_fields_are_read() {
     let db = graph();
     let value = |query: &str| {

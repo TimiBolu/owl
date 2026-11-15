@@ -31,7 +31,6 @@ fn test_error_severity_classification() {
         context: None,
         severity: ErrorSeverity::Critical,
         recovery: None,
-        source: None,
     };
     assert_eq!(critical_error.severity(), ErrorSeverity::Critical);
     assert!(critical_error.is_critical());
@@ -73,7 +72,6 @@ fn test_partial_results() {
         context: None,
         severity: ErrorSeverity::Warning,
         recovery: None,
-        source: None,
     };
     partial.add_error(warning);
 
@@ -83,7 +81,6 @@ fn test_partial_results() {
         context: None,
         severity: ErrorSeverity::Error,
         recovery: None,
-        source: None,
     };
     partial.add_error(error);
 

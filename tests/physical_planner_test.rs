@@ -12,7 +12,7 @@ use owl_db::schema::{FieldType, ReferenceType, Schema, SchemaRegistry};
 use std::collections::HashMap;
 
 fn create_test_schema_registry() -> SchemaRegistry {
-    let mut registry = SchemaRegistry::new();
+    let registry = SchemaRegistry::new();
     
     // Create users schema
     let mut users_fields = HashMap::new();
@@ -209,6 +209,7 @@ fn test_group_by_operator() {
             fields: vec![FieldAccess {
                 path: vec!["age".to_string()],
             }],
+            computed: Vec::new(),
         })],
     };
     

@@ -153,6 +153,18 @@ pub struct PersistedIndexCatalog {
     pub indexes: Vec<PersistedIndexDefinition>,
 }
 
+impl std::fmt::Debug for IndexDefinition {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IndexDefinition")
+            .field("name", &self.name)
+            .field("schema", &self.schema)
+            .field("fields", &self.fields)
+            .field("unique", &self.unique)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Index definition with metadata
 #[derive(Clone)]
 pub struct IndexDefinition {

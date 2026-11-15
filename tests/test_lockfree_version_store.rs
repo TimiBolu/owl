@@ -1,10 +1,13 @@
+// Carried over from before these tests were compiled regularly.
+#![allow(dead_code, unused_comparisons, private_interfaces, unused_imports)]
+
 // Standalone test for lock-free version store implementation
 // This tests the core functionality without depending on the full codebase
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use std::ptr;
 use std::thread;
 

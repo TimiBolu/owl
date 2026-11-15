@@ -2,7 +2,7 @@
 name = "owl_db"
 version = "0.1.0"
 edition = "2021"
-autotests = false
+autotests = true
 autoexamples = false
 autobenches = false
 

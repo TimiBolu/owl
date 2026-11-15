@@ -1,3 +1,6 @@
+// Carried over from before these tests were compiled regularly.
+#![allow(dead_code, unused_comparisons, private_interfaces, unused_imports)]
+
 // Simple test for hot path optimizations
 //
 // This tests the core optimization components without dependencies

@@ -379,7 +379,7 @@ impl WALFirstStorage {
                     let payload = self.encode_serialized_doc(&serialized_doc)?;
                     let local_objref = entry.objref.to_local();
                     self.arena
-                        .write_at(local_objref.offset(), &payload)
+                        .restore_at(local_objref.offset(), &payload)
                         .map_err(|e| {
                             OQLError::storage_error(
                                 &format!("Failed to replay write: {:?}", e),
@@ -848,7 +848,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "WALFirstStorage replays a logged write at its original offset into a new arena that has not allocated it, and fails with 'arena write exceeds allocation'; recovery needs to allocate before it writes"]
     fn test_wal_recovery() {
         let temp_dir = TempDir::new().unwrap();
         let arena_path = temp_dir.path().join("arena.owl");
@@ -883,7 +882,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "WALFirstStorage replays a logged write at its original offset into a new arena that has not allocated it, and fails with 'arena write exceeds allocation'; recovery needs to allocate before it writes"]
     fn test_wal_recovery_restores_delete_metadata() {
         let temp_dir = TempDir::new().unwrap();
         let arena_path = temp_dir.path().join("arena_del.owl");

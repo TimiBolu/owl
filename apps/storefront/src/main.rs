@@ -317,15 +317,35 @@ fn bench(
     Ok(())
 }
 
-/// This process's resident memory, in MiB.
+/// This process's memory, in MiB: its physical footprint where the system
+/// reports one, which leaves out pages it has freed, and otherwise its
+/// resident size, which does not.
 fn resident_mib() -> f64 {
-    std::process::Command::new("ps")
-        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-        .output()
-        .ok()
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .and_then(|text| text.trim().parse::<f64>().ok())
-        .map_or(0.0, |kib| kib / 1024.0)
+    let pid = std::process::id().to_string();
+    let run = |program: &str, arguments: &[&str]| {
+        std::process::Command::new(program)
+            .args(arguments)
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+    };
+    // "name [pid]: 64-bit    Footprint: 1233 KB (...)"
+    let footprint = run("footprint", &[&pid]).and_then(|text| {
+        let line = text.lines().find(|line| line.contains("Footprint:"))?;
+        let mut words = line.split("Footprint:").nth(1)?.split_whitespace();
+        let amount = words.next()?.parse::<f64>().ok()?;
+        Some(match words.next()? {
+            "KB" => amount / 1024.0,
+            "MB" => amount,
+            "GB" => amount * 1024.0,
+            _ => return None,
+        })
+    });
+    footprint.unwrap_or_else(|| {
+        run("ps", &["-o", "rss=", "-p", &pid])
+            .and_then(|text| text.trim().parse::<f64>().ok())
+            .map_or(0.0, |kib| kib / 1024.0)
+    })
 }
 
 fn memory(orders: usize) -> Result<()> {
@@ -363,6 +383,15 @@ fn memory(orders: usize) -> Result<()> {
     stage("closed", None)?;
     let owl = Owl::open(&path)?;
     stage("reopened", Some(&owl))?;
+    // STOREFRONT_PAUSE holds the process here for that many seconds, so a
+    // heap inspector can be pointed at it.
+    if let Some(seconds) = std::env::var("STOREFRONT_PAUSE")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        println!("pausing {seconds}s as pid {}", std::process::id());
+        std::thread::sleep(Duration::from_secs(seconds));
+    }
     owl.query("orders.count()")?;
     stage("counted orders", Some(&owl))?;
     for (_, oql, _) in QUERIES {

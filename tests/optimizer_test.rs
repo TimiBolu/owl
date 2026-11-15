@@ -1,17 +1,15 @@
 // Tests for Cost-Based Query Optimizer
 
-use owl_db::document::{Document, Value};
 use owl_db::error::OQLResult;
 use owl_db::optimizer::{
     CostModel, CostParameters, QueryOptimizer, StatisticsManager,
 };
 use owl_db::parser::{ComparisonOperator, Expression, FieldAccess, Literal};
-use owl_db::planner::logical::{LogicalPlan, LogicalPlanner};
+use owl_db::planner::logical::LogicalPlan;
 use owl_db::planner::operators::*;
-use owl_db::planner::physical::{PhysicalPlan, PhysicalPlanner, Statistics};
-use owl_db::planner::types::{FilterCondition, PlanNode, PlanType, ProjectionField, SortSpec};
+use owl_db::planner::physical::PhysicalPlan;
+use owl_db::planner::types::{FilterCondition, PlanNode, PlanType, ProjectionField};
 use owl_db::schema::{FieldType, Schema, SchemaRegistry};
-use owl_db::storage::create_storage;
 use std::collections::HashMap;
 
 #[test]
@@ -372,7 +370,7 @@ fn test_optimizer_with_real_query() -> OQLResult<()> {
     
     let schema = Schema::new("users".to_string(), fields);
     
-    let mut registry = SchemaRegistry::new();
+    let registry = SchemaRegistry::new();
     registry.register(schema)?;
     
     // Create optimizer with statistics

@@ -10,7 +10,7 @@
 use owl_db::document::{Document, Value};
 use owl_db::optimizer::{
     StatisticsManager, StatisticsConfig, HistogramType, HistogramBuilder,
-    IndexStatistics, estimate_selectivity_from_histogram, estimate_range_selectivity,
+    IndexStatistics, estimate_range_selectivity,
 };
 use owl_db::storage::create_storage;
 use std::collections::HashMap;
