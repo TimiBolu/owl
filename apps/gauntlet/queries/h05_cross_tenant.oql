@@ -1,0 +1,7 @@
+// Assignments where the person and the project belong to different
+// tenants: two references compared with each other, then grouped.
+assignments
+  .where { .person.org != .project.org }
+  .group_by { org: .project.org.id }
+  .select { org, n: count(), hours: sum(.hours) }
+  .sort { .org.asc }

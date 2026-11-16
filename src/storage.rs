@@ -614,6 +614,13 @@ pub trait DocumentStore: Send + Sync + 'static {
     ) -> OQLResult<Option<Vec<Document>>> {
         Ok(None)
     }
+    /// Every document of a collection, shared rather than copied when the
+    /// store already holds it, in the order `scan_documents` gives. `None`
+    /// when the store cannot lend them, as while a transaction has writes
+    /// of its own to overlay.
+    fn scan_documents_shared(&self, _schema: &str) -> OQLResult<Option<Vec<Arc<Document>>>> {
+        Ok(None)
+    }
     /// How many documents a collection holds, when the store knows without
     /// reading them.
     fn collection_len(&self, _schema: &str) -> OQLResult<Option<usize>> {

@@ -1,0 +1,2 @@
+// Page far into an ordered collection.
+events.sort { .at.asc, .id.asc }.offset(15000).limit(10).select { id, at }

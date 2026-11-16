@@ -1,0 +1,16 @@
+// Gaps and islands: a person's events form a session until six hours
+// pass with none. How many sessions each person has, and the longest.
+events
+  .sort { .person.id.asc, .at.asc, .id.asc }
+  .partition_by { .person }
+  .select {
+    person: .person.id,
+    session: running_sum(
+      if prev(.at) == null || seconds_until(prev(.at), .at) >= 21600 then 1 else 0)
+  }
+  .group_by { .person, .session }
+  .select { person, session, events: count() }
+  .group_by { .person }
+  .select { person, sessions: count(), longest: max(.events) }
+  .sort { .sessions.desc, .person.asc }
+  .limit(20)

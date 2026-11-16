@@ -1,0 +1,13 @@
+// A monthly report with three conditional aggregates, one of which looks
+// inside a list on each row.
+tasks
+  .group_by { month: format_date(.opened, "%Y-%m") }
+  .select {
+    month,
+    opened: count(),
+    closed: where { .closed != null }.count(),
+    unowned: where { .assignee == null }.count(),
+    urgent: where { .labels contains "urgent" }.count(),
+    points: sum(.points)
+  }
+  .sort { .month.asc }

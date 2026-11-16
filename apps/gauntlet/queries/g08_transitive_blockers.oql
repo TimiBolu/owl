@@ -1,0 +1,7 @@
+// Everything that has to finish before one task can start: the blockers
+// of its blockers, to any depth, through a many-to-many relationship.
+tasks
+  .where { .id == "t0002717" }
+  .walk(.blocked_by.blocker)
+  .sort { .id.asc }
+  .select { id, state, depth: ._depth }

@@ -1,0 +1,6 @@
+// A walk stopped after two steps: direct reports and theirs.
+people
+  .where { .level >= 6 }
+  .sort { .id.asc }
+  .limit(20)
+  .select { id, team: .walk(.reports, 2).count() }

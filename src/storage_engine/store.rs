@@ -753,7 +753,13 @@ struct Durability {
 #[derive(Debug, Default)]
 struct PendingTransaction {
     operations: Vec<WriteOperation>,
+    /// References promised to documents this transaction has written, so
+    /// that its later writes can point at them before it commits.
+    reserved: ReservedRefs,
 }
+
+/// The reference each not-yet-committed document will be stored under.
+type ReservedRefs = HashMap<(String, DocumentId), ObjRef>;
 
 struct PendingCheckpoint {
     image: CheckpointImage,
@@ -2051,6 +2057,77 @@ impl RustStore {
             .map(|(_, id)| id)
     }
 
+    /// The reference of a document the open transaction has written and not
+    /// yet committed, promised now so its later writes can point at it.
+    ///
+    /// The object id is taken from the collection's counter at once. If the
+    /// transaction is abandoned the id is never used, which is harmless: the
+    /// counter only ever needs to stay ahead of what is stored.
+    fn reserve_pending_ref(&self, schema: &str, id: &DocumentId) -> OQLResult<Option<ObjRef>> {
+        let Some(transaction) = self.current_transaction() else {
+            return Ok(None);
+        };
+        let key = (schema.to_string(), id.clone());
+        {
+            let active = self
+                .transactions
+                .lock()
+                .map_err(|_| OQLError::generic("transaction lock poisoned"))?;
+            let Some(pending) = active.get(&transaction) else {
+                return Ok(None);
+            };
+            if let Some(promised) = pending.reserved.get(&key) {
+                return Ok(Some(*promised));
+            }
+            // The last thing the transaction did to the document decides.
+            let written = pending.operations.iter().rev().find_map(|operation| match operation {
+                WriteOperation::PutDocument(document)
+                    if document.schema == schema && document.id == *id =>
+                {
+                    Some(true)
+                }
+                WriteOperation::DeleteDocument { schema: deleted, id: deleted_id }
+                    if deleted == schema && deleted_id == id =>
+                {
+                    Some(false)
+                }
+                _ => None,
+            });
+            if written != Some(true) {
+                return Ok(None);
+            }
+        }
+        let promised = {
+            let mut state = self
+                .state
+                .write()
+                .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+            // Another commit may have stored the same id meanwhile; then
+            // that is the document a reference means.
+            if let Some(stored) = lookup_object_ref(&state, schema, id)? {
+                return Ok(Some(stored));
+            }
+            let Some(collection_id) = state.collection_ids.get(schema).copied() else {
+                return Ok(None);
+            };
+            let next = state.next_object_ids.entry(collection_id).or_insert(1);
+            let object_id = *next;
+            *next = next.checked_add(1).ok_or_else(|| {
+                OQLError::storage_error("object identifier space exhausted", None)
+            })?;
+            ObjRef::from_parts(collection_id, object_id, 1)
+        };
+        if let Some(pending) = self
+            .transactions
+            .lock()
+            .map_err(|_| OQLError::generic("transaction lock poisoned"))?
+            .get_mut(&transaction)
+        {
+            pending.reserved.insert(key, promised);
+        }
+        Ok(Some(promised))
+    }
+
     fn not_open(id: u64) -> OQLError {
         OQLError::TransactionError {
             message: format!("transaction {id} is not open"),
@@ -2421,7 +2498,7 @@ impl RustStore {
     }
 
     pub fn write_batch(&self, operations: Vec<WriteOperation>) -> OQLResult<u64> {
-        self.write_batch_for(operations, None)
+        self.write_batch_for(operations, None, &ReservedRefs::new())
     }
 
     /// Commit a batch, on behalf of a transaction when one is given. A
@@ -2432,6 +2509,7 @@ impl RustStore {
         &self,
         operations: Vec<WriteOperation>,
         transaction: Option<u64>,
+        reserved: &ReservedRefs,
     ) -> OQLResult<u64> {
         if self.poisoned.load(Ordering::Acquire) {
             return Err(OQLError::storage_error(
@@ -2445,7 +2523,7 @@ impl RustStore {
         // Tell whoever syncs next that another frame is on its way, so it
         // can wait a moment and cover this one too.
         self.commits_in_flight.fetch_add(1, Ordering::AcqRel);
-        let written = self.write_and_apply(operations, transaction);
+        let written = self.write_and_apply(operations, transaction, reserved);
         self.commits_in_flight.fetch_sub(1, Ordering::AcqRel);
         let lsn = written?;
         // The commit is applied and visible; it is answered only once it
@@ -2504,6 +2582,7 @@ impl RustStore {
         &self,
         operations: Vec<WriteOperation>,
         transaction: Option<u64>,
+        reserved: &ReservedRefs,
     ) -> OQLResult<u64> {
         let _commit = self
             .commit_lock
@@ -2524,7 +2603,7 @@ impl RustStore {
         let lsn = state.committed_lsn.checked_add(1).ok_or_else(|| {
             OQLError::storage_error("commit sequence number space exhausted", None)
         })?;
-        let mutations = Self::plan_mutations(&state, operations)?;
+        let mutations = Self::plan_mutations(&state, operations, reserved)?;
         let batch = WalBatch { lsn, mutations };
         Self::validate_batch(&state, &batch)?;
         let payload = bincode::serialize(&batch).map_err(|e| {
@@ -4365,7 +4444,8 @@ impl RustStore {
         if transaction.operations.is_empty() {
             return self.close_transaction(id);
         }
-        let outcome = self.write_batch_for(transaction.operations, Some(id));
+        let outcome =
+            self.write_batch_for(transaction.operations, Some(id), &transaction.reserved);
         // A successful commit closed it; a refused one still has to be.
         self.close_transaction(id)?;
         outcome.map(|_| ())
@@ -4501,7 +4581,11 @@ impl RustStore {
         Ok(())
     }
 
-    fn plan_mutations(state: &State, operations: Vec<WriteOperation>) -> OQLResult<Vec<Mutation>> {
+    fn plan_mutations(
+        state: &State,
+        operations: Vec<WriteOperation>,
+        reserved: &ReservedRefs,
+    ) -> OQLResult<Vec<Mutation>> {
         let mut collection_ids = state.collection_ids.clone();
         let mut next_collection_id = state.next_collection_id.max(1);
         let mut next_object_ids = state.next_object_ids.clone();
@@ -4531,6 +4615,10 @@ impl RustStore {
                         .unwrap_or(lookup_object_ref(state, &document.schema, &document.id)?);
                     let object_ref = if let Some(existing) = existing {
                         existing
+                    } else if let Some(promised) = reserved.get(&key) {
+                        // Other documents of this transaction already point
+                        // at it under this reference.
+                        *promised
                     } else {
                         let next = next_object_ids.entry(collection_id).or_insert(1);
                         let object_id = *next;
@@ -9271,6 +9359,28 @@ impl DocumentStore for RustStore {
         Ok(Some(documents))
     }
 
+    fn scan_documents_shared(&self, schema: &str) -> OQLResult<Option<Vec<Arc<Document>>>> {
+        if !self.pending_operations()?.is_empty() {
+            return Ok(None);
+        }
+        let state = self
+            .state
+            .read()
+            .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+        let object_refs = logical_collection_object_refs(&state, schema)?;
+        let mut documents = Vec::with_capacity(object_refs.len());
+        for object_ref in object_refs {
+            match sourced_document(&state, object_ref)? {
+                Some((document, DocumentSource::Held)) => documents.push(document),
+                // A row that would have to be decoded to be lent is better
+                // read by a scan that decodes only the fields it needs.
+                Some(_) => return Ok(None),
+                None => {}
+            }
+        }
+        Ok(Some(documents))
+    }
+
     fn scan_documents_filtered_projection(
         &self,
         schema: &str,
@@ -10265,11 +10375,17 @@ impl DocumentStore for RustStore {
     }
 
     fn get_objref(&self, schema: &str, id: &DocumentId) -> OQLResult<Option<ObjRef>> {
-        let state = self
-            .state
-            .read()
-            .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
-        lookup_object_ref(&state, schema, id)
+        let stored = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+            lookup_object_ref(&state, schema, id)?
+        };
+        match stored {
+            Some(object_ref) => Ok(Some(object_ref)),
+            None => self.reserve_pending_ref(schema, id),
+        }
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

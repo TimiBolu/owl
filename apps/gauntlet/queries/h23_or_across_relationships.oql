@@ -1,0 +1,8 @@
+// Three alternatives, each needing a different access path.
+people
+  .where {
+    .level >= 6
+      || .reports.count() > 8
+      || .owned.where { .state == "active" }.count() >= 2
+  }
+  .count()

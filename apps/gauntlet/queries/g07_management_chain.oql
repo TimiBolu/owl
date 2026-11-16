@@ -1,0 +1,6 @@
+// One person's managers, all the way up.
+people
+  .where { .id == "p001998" }
+  .walk(.manager)
+  .sort { ._depth.asc }
+  .select { id, level, depth: ._depth }

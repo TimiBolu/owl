@@ -1,0 +1,11 @@
+// Six totals per tenant over four different relationships. A join of all
+// of them would multiply rows and inflate every sum.
+orgs.sort { .id.asc }.select {
+  id,
+  people: .people.count(),
+  payroll: .people.sum(.salary),
+  projects: .projects.count(),
+  tasks: .projects.tasks.count(),
+  open_points: .projects.tasks.where { .state == "open" }.sum(.points),
+  hours: .projects.assignments.sum(.hours)
+}

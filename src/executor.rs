@@ -449,6 +449,96 @@ impl<S: DocumentStore> QueryExecutor<S> {
             });
         }
         self.validate_declared_paths(query)?;
+        // Everything before the first operation that only this route knows
+        // runs as a query of its own, with every shortcut open to it; the
+        // rest is applied to its rows one operation at a time.
+        let limited = Self::limit_before_select(query);
+        let query = limited.as_ref().unwrap_or(query);
+        let origin = Self::step_keeping_origin(query);
+        let plain = query.operations.iter().position(Self::runs_plainly);
+        let split = match (plain, &origin) {
+            (Some(plain), Some((step, _))) => Some(plain.min(*step)),
+            (plain, origin) => plain.or(origin.as_ref().map(|(step, _)| *step)),
+        };
+        if let Some(at) = split {
+            let (before, after) = query.operations.split_at(at);
+            let mut documents = self.execute_general_query(&OQLQuery {
+                collection: query.collection.clone(),
+                operations: before.to_vec(),
+            })?;
+            let mut grouped = before
+                .iter()
+                .any(|operation| matches!(operation, Operation::GroupBy(_)));
+            for (position, operation) in after.iter().enumerate() {
+                if grouped
+                    && documents.is_empty()
+                    && matches!(operation, Operation::Select(_) | Operation::Having(_))
+                {
+                    continue;
+                }
+                documents = match operation {
+                    Operation::Sort(sort) => self.sort_keeping(
+                        documents,
+                        sort,
+                        Self::rows_kept_after_sort(after, position),
+                    )?,
+                    Operation::Combine { how, other } => {
+                        let whole = |operations: &[Operation]| {
+                            operations.iter().all(|operation| {
+                                matches!(
+                                    operation,
+                                    Operation::Where(_)
+                                        | Operation::Sort(_)
+                                        | Operation::Limit(_)
+                                        | Operation::Offset(_)
+                                        | Operation::Distinct
+                                        | Operation::Combine { .. }
+                                )
+                            })
+                        };
+                        let same_rows = whole(&query.operations[..at + position])
+                            && match other {
+                                Expression::QueryExpression { query: theirs } => {
+                                    theirs.collection == query.collection
+                                        && whole(&theirs.operations)
+                                        && !theirs.operations.iter().any(|operation| {
+                                            matches!(operation, Operation::Combine { .. })
+                                        })
+                                }
+                                Expression::Identifier(name) => *name == query.collection,
+                                _ => false,
+                            };
+                        // An earlier combination with shaped rows would have
+                        // left rows that are not this collection's.
+                        let same_rows = same_rows
+                            && query.operations[..at + position].iter().all(|operation| {
+                                match operation {
+                                    Operation::Combine { other, .. } => match other {
+                                        Expression::QueryExpression { query: theirs } => {
+                                            theirs.collection == query.collection
+                                                && whole(&theirs.operations)
+                                        }
+                                        Expression::Identifier(name) => *name == query.collection,
+                                        _ => false,
+                                    },
+                                    _ => true,
+                                }
+                            });
+                        self.apply_combine(documents, how, other, &query.collection, same_rows)?
+                    }
+                    Operation::Step(path) if origin.is_some() => {
+                        let wanted = origin
+                            .as_ref()
+                            .filter(|(step, _)| *step == at + position)
+                            .map(|(_, paths)| paths.as_slice());
+                        self.step_from_origin(documents, path, &query.collection, wanted)?
+                    }
+                    _ => self.apply_operation(documents, operation, &query.collection)?,
+                };
+                grouped |= matches!(operation, Operation::GroupBy(_));
+            }
+            return Ok(documents);
+        }
         let ranged = self.pattern_ranges(query)?;
         let query = ranged.as_ref().unwrap_or(query);
         let reordered = Self::storage_filter_first(query);
@@ -488,16 +578,31 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 } else if let Some((plan, applied)) = self.pipeline_prefix(query)? {
                     // An index that narrows the read beats visiting every
                     // row; without one, shaping rows as they are read does.
+                    let mut lent = None;
                     if !Self::contains_native_index_scan(&plan.root) {
                         if let Some(documents) = self.select_from_columns(query)? {
                             return Ok(documents);
                         }
+                        // Every row is visited either way. Filtering the
+                        // rows the store holds copies only those that pass.
+                        lent = self.rows_by_reference(query)?;
                     }
-                    // Storage already applied the leading filters.
-                    filters_applied = applied;
-                    self.execute_read_plan(&plan)?
+                    match lent {
+                        Some((rows, done)) => {
+                            filters_applied = done;
+                            rows
+                        }
+                        None => {
+                            // Storage already applied the leading filters.
+                            filters_applied = applied;
+                            self.execute_read_plan(&plan)?
+                        }
+                    }
                 } else if let Some(documents) = self.select_from_columns(query)? {
                     return Ok(documents);
+                } else if let Some((rows, applied)) = self.rows_by_reference(query)? {
+                    filters_applied = applied;
+                    rows
                 } else if let Some(fields) = self.fields_read_by(query) {
                     // The query shapes its own output and names every field
                     // it reads, so the rest need not be decoded.
@@ -544,6 +649,274 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
 
         Ok(documents)
+    }
+
+    /// The first path step of a query whose later operations name the
+    /// collection to read the row an element came from, as in
+    /// `tasks.worklog.group_by { .state, task: tasks.state }`, with the
+    /// paths they read.
+    fn step_keeping_origin(query: &OQLQuery) -> Option<(usize, Vec<Vec<String>>)> {
+        let step = query
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Step(_)))?;
+        // `collection.a.b` is a chain of accesses that bottoms out in the
+        // collection's name.
+        fn collect(node: &serde_json::Value, collection: &str, paths: &mut Vec<Vec<String>>) {
+            let mut path = Vec::new();
+            let mut current = node;
+            while let Some(access) = current.get("ChainedAccess") {
+                path.extend(access.get("field").and_then(|field| field.as_str()).map(str::to_string));
+                current = access.get("base").unwrap_or(&serde_json::Value::Null);
+            }
+            if !path.is_empty()
+                && current.get("Identifier").and_then(|name| name.as_str()) == Some(collection)
+            {
+                path.reverse();
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
+                return;
+            }
+            match node {
+                serde_json::Value::Object(fields) => {
+                    fields.values().for_each(|value| collect(value, collection, paths))
+                }
+                serde_json::Value::Array(items) => {
+                    items.iter().for_each(|value| collect(value, collection, paths))
+                }
+                _ => {}
+            }
+        }
+        let mut paths = Vec::new();
+        let after = serde_json::to_value(&query.operations[step + 1..]).ok()?;
+        collect(&after, &query.collection, &mut paths);
+        (!paths.is_empty()).then_some((step, paths))
+    }
+
+    /// A path step that lets the rows it reaches still answer for the row
+    /// they came from. `wanted` are the paths to keep from each row of
+    /// `collection`; without it, what an earlier step kept is passed on.
+    fn step_from_origin(
+        &self,
+        documents: Vec<Document>,
+        path: &FieldAccess,
+        collection: &str,
+        wanted: Option<&[Vec<String>]>,
+    ) -> OQLResult<Vec<Document>> {
+        let mut reached = Vec::new();
+        for document in &documents {
+            let origin = match wanted {
+                Some(paths) => {
+                    let mut kept = HashMap::with_capacity(paths.len() + 1);
+                    kept.insert(ORIGIN_NAME.to_string(), Value::String(collection.to_string()));
+                    for path in paths {
+                        kept.insert(
+                            path.join("."),
+                            self.get_field_value(document, &FieldAccess { path: path.clone() })?,
+                        );
+                    }
+                    Some(Value::Object(kept))
+                }
+                None => document.fields.get(ORIGIN_FIELD).cloned(),
+            };
+            for mut row in self.path_source_rows(document, &path.path)?.0 {
+                if let Some(origin) = &origin {
+                    row.fields.insert(ORIGIN_FIELD.to_string(), origin.clone());
+                }
+                reached.push(row);
+            }
+        }
+        Ok(reached)
+    }
+
+    /// Run a query's leading filters, and the operation after them when it
+    /// is a count, a path step or a sort with a limit, against the stored
+    /// rows themselves. Only rows that survive are copied, and for a count
+    /// none are. Returns the rows and how many operations they account for.
+    fn rows_by_reference(&self, query: &OQLQuery) -> OQLResult<Option<(Vec<Document>, usize)>> {
+        let operations = &query.operations;
+        let conditions: Vec<&Condition> = operations
+            .iter()
+            .map_while(|operation| match operation {
+                Operation::Where(block) => Some(&block.condition),
+                _ => None,
+            })
+            .collect();
+        let filters = conditions.len();
+        let next = operations.get(filters);
+        // A sort whose result is cut to a few rows: with or without an
+        // offset before the limit.
+        let cut = match (next, operations.get(filters + 1), operations.get(filters + 2)) {
+            (Some(Operation::Sort(sort)), Some(Operation::Limit(limit)), _) => {
+                Some((sort, 0usize, *limit as usize, 2))
+            }
+            (Some(Operation::Sort(sort)), Some(Operation::Offset(offset)), Some(Operation::Limit(limit))) => {
+                Some((sort, *offset as usize, *limit as usize, 3))
+            }
+            _ => None,
+        };
+        if filters == 0 && cut.is_none() && !matches!(next, Some(Operation::Step(_))) {
+            return Ok(None);
+        }
+        let Some(stored) = self.store.scan_documents_shared(&query.collection)? else {
+            return Ok(None);
+        };
+        let passes = |row: &Document| -> OQLResult<bool> {
+            for condition in &conditions {
+                if !self.evaluate_condition(row, condition)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
+        // A row that is kept is copied, down to the fields the query reads
+        // when it names them all.
+        let wanted = self.fields_read_by(query);
+        let keep = |row: &Document| match &wanted {
+            Some(fields) => row.with_projected_fields(
+                fields
+                    .iter()
+                    .filter_map(|field| Some((field.clone(), row.fields.get(field)?.clone())))
+                    .collect(),
+            ),
+            None => row.clone(),
+        };
+        match (next, operations.get(filters + 1)) {
+            (Some(Operation::Count), None) => {
+                let mut count = 0usize;
+                for row in &stored {
+                    count += usize::from(passes(row)?);
+                }
+                Ok(Some((
+                    self.apply_count_operation(Vec::new()).map(|mut rows| {
+                        rows[0]
+                            .fields
+                            .insert("count".to_string(), Value::Integer(count as i64));
+                        rows
+                    })?,
+                    operations.len(),
+                )))
+            }
+            (Some(Operation::Step(path)), _) if Self::step_keeping_origin(query).is_none() => {
+                // What follows the step says which fields of the rows it
+                // reaches are read.
+                let read = self.fields_read_by_operations(&query.collection, &operations[filters + 1..]);
+                let mut reached = Vec::new();
+                for row in &stored {
+                    if passes(row)? {
+                        reached.extend(
+                            self.path_source_rows_reading(row, &path.path, read.as_deref())?.0,
+                        );
+                    }
+                }
+                Ok(Some((reached, filters + 1)))
+            }
+            // A costly filter ahead of a sort on plain fields and a limit:
+            // putting the rows in order first means the filter runs only
+            // until enough rows have passed it.
+            (Some(Operation::Sort(sort)), Some(Operation::Limit(limit)))
+                if sort.fields.iter().all(|field| {
+                    matches!(&field.expression, Expression::FieldAccess(access) if access.path.len() == 1)
+                }) && conditions.iter().any(|condition| Self::condition_is_nested(condition)) =>
+            {
+                let keys: Vec<Vec<Value>> =
+                    stored.iter().map(|row| self.sort_keys(row, sort)).collect();
+                let mut kept = Vec::new();
+                for position in self.sorted_positions(&keys, sort, None) {
+                    if kept.len() as u64 >= *limit {
+                        break;
+                    }
+                    if passes(&stored[position])? {
+                        kept.push(keep(&stored[position]));
+                    }
+                }
+                Ok(Some((kept, filters + 2)))
+            }
+            // Any other sort that is cut short: the rows are put in order
+            // by their keys alone, and only those kept are copied.
+            _ if cut.is_some() => {
+                let (sort, offset, limit, taken) = cut.expect("checked just above");
+                let mut passing = Vec::new();
+                for row in &stored {
+                    if passes(row)? {
+                        passing.push(row);
+                    }
+                }
+                let keys: Vec<Vec<Value>> =
+                    passing.iter().map(|row| self.sort_keys(row, sort)).collect();
+                let kept = self
+                    .sorted_positions(&keys, sort, Some(offset.saturating_add(limit)))
+                    .into_iter()
+                    .skip(offset)
+                    .map(|position| keep(passing[position]))
+                    .collect();
+                Ok(Some((kept, filters + taken)))
+            }
+            _ => {
+                let mut kept = Vec::new();
+                for row in &stored {
+                    if passes(row)? {
+                        kept.push(keep(row));
+                    }
+                }
+                Ok(Some((kept, filters)))
+            }
+        }
+    }
+
+    /// Whether a condition runs a query or walks a collection for each row
+    /// it is asked about, which makes it the costly part of a query.
+    fn condition_is_nested(condition: &Condition) -> bool {
+        match condition {
+            Condition::Comparison { left, right, .. } => {
+                Self::expression_is_nested(left) || Self::expression_is_nested(right)
+            }
+            Condition::And(left, right) | Condition::Or(left, right) => {
+                Self::condition_is_nested(left) || Self::condition_is_nested(right)
+            }
+            Condition::Not(inner) => Self::condition_is_nested(inner),
+        }
+    }
+
+    /// [`Self::condition_is_nested`] for an expression.
+    fn expression_is_nested(expression: &Expression) -> bool {
+        match expression {
+            Expression::QueryExpression { .. } | Expression::CollectionExpression { .. } => true,
+            Expression::FunctionCall { args, .. } => args.iter().any(Self::expression_is_nested),
+            Expression::IfThenElse { condition, then_expr, else_expr } => {
+                Self::condition_is_nested(condition)
+                    || Self::expression_is_nested(then_expr)
+                    || Self::expression_is_nested(else_expr)
+            }
+            Expression::LogicalAnd(left, right)
+            | Expression::LogicalOr(left, right)
+            | Expression::BinaryOp { left, right, .. } => {
+                Self::expression_is_nested(left) || Self::expression_is_nested(right)
+            }
+            Expression::LogicalNot(inner) => Self::expression_is_nested(inner),
+            Expression::ConditionExpr(condition) => Self::condition_is_nested(condition),
+            Expression::ArrayLiteral(items) | Expression::Block(items) => {
+                items.iter().any(Self::expression_is_nested)
+            }
+            Expression::ObjectLiteral(fields) => fields
+                .iter()
+                .any(|field| Self::expression_is_nested(&field.value)),
+            _ => false,
+        }
+    }
+
+    /// Operations no shortcut understands: they are applied to rows in
+    /// hand, in the order written.
+    fn runs_plainly(operation: &Operation) -> bool {
+        match operation {
+            Operation::Combine { .. } | Operation::Walk { .. } | Operation::PartitionBy(_) => true,
+            Operation::Select(block) => block
+                .fields
+                .iter()
+                .any(|field| Self::expression_uses_position(&field.expression)),
+            _ => false,
+        }
     }
 
     /// How many nested queries this thread has actually executed, as
@@ -1893,6 +2266,128 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }))
     }
 
+    /// Move a `limit`, an `offset`, or a `sort` on fields the `select`
+    /// passes through unchanged, from after a `select` to before it.
+    ///
+    /// `projects.select { id, team: .assignments.count() }.sort { .id.asc }.limit(10)`
+    /// is the same ten rows as sorting and limiting first, and then only
+    /// ten rows are shaped instead of all of them. `None` when nothing moves.
+    fn limit_before_select(query: &OQLQuery) -> Option<OQLQuery> {
+        if CallFrame::any_active() {
+            return None;
+        }
+        let mut operations = query.operations.clone();
+        let mut moved = false;
+        // A select that gives one row per row, in the same order.
+        let row_for_row = |operations: &[Operation], at: usize| match &operations[at] {
+            Operation::Select(block) => {
+                !operations[..at].iter().any(|before| {
+                    matches!(before, Operation::GroupBy(_) | Operation::PartitionBy(_))
+                }) && !block.fields.iter().any(|field| {
+                    Self::expression_contains_aggregate(&field.expression)
+                        || Self::expression_uses_position(&field.expression)
+                })
+                // A select of plain fields is shaped as rows are read, which
+                // is cheaper still; only one that asks a question per row
+                // is worth shaping late.
+                && block
+                    .fields
+                    .iter()
+                    .any(|field| Self::expression_is_nested(&field.expression))
+            }
+            _ => false,
+        };
+        // The select hands this field on under its own name, untouched.
+        let passes_through = |block: &SelectBlock, name: &str| {
+            block.fields.iter().filter(|field| {
+                field.alias.as_deref() == Some(name)
+                    || matches!(&field.expression,
+                        Expression::FieldAccess(access) if access.path.last().map(String::as_str) == Some(name))
+                    || matches!(&field.expression, Expression::Identifier(bare) if bare == name)
+                    || Self::is_all_fields(&field.expression)
+            }).count() == 1
+                && block.fields.iter().any(|field| {
+                    field.alias.is_none()
+                        && match &field.expression {
+                            Expression::FieldAccess(access) => access.path.len() == 1 && access.path[0] == name,
+                            Expression::Identifier(bare) => bare == name && !bare.starts_with('$'),
+                            _ => false,
+                        }
+                })
+        };
+        // Position functions that only look back give a row the same
+        // values whether or not later rows exist, so a limit can come
+        // before the select that uses them, and before the `partition_by`
+        // that serves it. That leaves the limit next to the sort.
+        let looks_back_only = |operation: &Operation| match operation {
+            Operation::PartitionBy(_) => true,
+            Operation::Select(block) => {
+                block.fields.iter().all(|field| {
+                    !Self::expression_contains_aggregate(&field.expression)
+                        && !Self::expression_calls(&field.expression, "next")
+                }) && block
+                    .fields
+                    .iter()
+                    .any(|field| Self::expression_uses_position(&field.expression))
+            }
+            _ => false,
+        };
+        let mut hop = operations.len();
+        while hop > 1 {
+            hop -= 1;
+            let mut limit = hop;
+            while limit > 0
+                && matches!(operations[limit], Operation::Limit(_))
+                && looks_back_only(&operations[limit - 1])
+                && !operations[..limit - 1]
+                    .iter()
+                    .any(|before| matches!(before, Operation::GroupBy(_)))
+            {
+                operations.swap(limit - 1, limit);
+                moved = true;
+                limit -= 1;
+            }
+        }
+        let mut at = 0;
+        while at + 1 < operations.len() {
+            if !row_for_row(&operations, at) {
+                at += 1;
+                continue;
+            }
+            let Operation::Select(block) = &operations[at] else {
+                unreachable!("row_for_row matched a select");
+            };
+            let next_moves = match &operations[at + 1] {
+                Operation::Limit(_) | Operation::Offset(_) => true,
+                // A sort moves only together with the limit that makes
+                // moving it worthwhile.
+                Operation::Sort(sort) => {
+                    matches!(
+                        operations.get(at + 2),
+                        Some(Operation::Limit(_) | Operation::Offset(_))
+                    ) && sort.fields.iter().all(|field| match &field.expression {
+                        Expression::FieldAccess(access) if access.path.len() == 1 => {
+                            passes_through(block, &access.path[0])
+                        }
+                        _ => false,
+                    })
+                }
+                _ => false,
+            };
+            if !next_moves {
+                at += 1;
+                continue;
+            }
+            operations.swap(at, at + 1);
+            moved = true;
+            at += 1;
+        }
+        moved.then(|| OQLQuery {
+            collection: query.collection.clone(),
+            operations,
+        })
+    }
+
     /// Split a leading filter so the part storage can evaluate comes first.
     ///
     /// `where { .customer.country == "NG" && .total > 900 }` becomes
@@ -2304,6 +2799,9 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 | Operation::Explain => return None,
                 // Comparing whole rows needs whole rows.
                 Operation::Distinct if !shaped => return None,
+                // So does combining them with another query's, and a walk
+                // returns rows that nothing has shaped.
+                Operation::Combine { .. } | Operation::Walk { .. } => return None,
                 operation => shaped |= shapes_rows(operation),
             }
         }
@@ -2955,6 +3453,11 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 self.apply_limit_operation(documents, count)
             }
             Operation::Distinct => self.apply_distinct_operation(documents),
+            Operation::Combine { how, other } => {
+                self.apply_combine(documents, how, other, collection, false)
+            }
+            Operation::Walk { path, depth } => self.apply_walk(documents, path, depth.as_ref(), None),
+            Operation::PartitionBy(block) => self.apply_partition_by(documents, block),
             Operation::Step(path) => {
                 let mut reached = Vec::new();
                 for document in &documents {
@@ -3371,6 +3874,29 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 operator,
                 right,
             } => {
+                // A plain field of the row against a constant, the commonest
+                // comparison there is: the field is compared where it lies
+                // instead of being copied out first.
+                if let (Expression::FieldAccess(access), Expression::Literal(literal)) = (left, right) {
+                    if let [name] = access.path.as_slice() {
+                        if DocumentSystemField::from_name(name).is_none() {
+                            if let Some(
+                                stored @ (Value::String(_)
+                                | Value::Integer(_)
+                                | Value::Float(_)
+                                | Value::Boolean(_)
+                                | Value::DateTime(_)),
+                            ) = document.fields.get(name)
+                            {
+                                return Ok(crate::value_semantics::matches(
+                                    stored,
+                                    operator,
+                                    &self.literal_to_value(literal),
+                                ));
+                            }
+                        }
+                    }
+                }
                 let left_value = self.evaluate_expression(document, left)?;
                 let right_value = self.evaluate_expression(document, right)?;
                 self.compare_values(&left_value, operator, &right_value)
@@ -3489,6 +4015,17 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 if let Some((row, path)) = Self::row_parameter_path(expression) {
                     return self.get_field_value(&row, &FieldAccess { path });
                 }
+                // `tasks.state` on a row that a path step reached from a
+                // task is that task's state.
+                if let Some(Value::Object(origin)) = document.fields.get(ORIGIN_FIELD) {
+                    if let Some(Value::String(collection)) = origin.get(ORIGIN_NAME) {
+                        if let Some(kept) = Self::extract_scoped_path(expression, collection)
+                            .and_then(|path| origin.get(&path.join(".")))
+                        {
+                            return Ok(kept.clone());
+                        }
+                    }
+                }
                 let base_value = self.evaluate_expression(document, base)?;
                 self.get_field_from_value(&base_value, field)
             }
@@ -3543,6 +4080,352 @@ impl<S: DocumentStore> QueryExecutor<S> {
             Expression::Identifier(name) => name.clone(),
             _ => "$collection".to_string(),
         };
+        // `.project.assignments.where { .. }.exists()` asks about the
+        // project, not about the row holding the reference. Every row that
+        // points at the same project gets the same answer, so it is worked
+        // out once per project in a statement.
+        if let Some(key) = Self::through_reference_key(scope_document, source, operations) {
+            if let Some(known) =
+                STATEMENT.with(|scope| scope.borrow().through_reference.get(&key).cloned())
+            {
+                return Ok(known);
+            }
+            let answer =
+                self.evaluate_collection_from(scope_document, source, operations, collection_scope)?;
+            STATEMENT.with(|scope| {
+                scope
+                    .borrow_mut()
+                    .through_reference
+                    .insert(key, answer.clone())
+            });
+            return Ok(answer);
+        }
+        self.evaluate_collection_from(scope_document, source, operations, collection_scope)
+    }
+
+    /// Count the objects of an embedded list that pass a filter, or say
+    /// whether any does, without making a row of each.
+    ///
+    /// One row is reused: for each element, the fields the filter reads are
+    /// put into it in place of the last element's. `None` when the question
+    /// is not of this shape, and the general route answers it.
+    fn count_list_elements(
+        &self,
+        scope_document: &Document,
+        path: &[String],
+        operations: &[Operation],
+        collection_scope: &str,
+    ) -> OQLResult<Option<Value>> {
+        let [name] = path else {
+            return Ok(None);
+        };
+        let Some((last, filters)) = operations.split_last() else {
+            return Ok(None);
+        };
+        if !matches!(last, Operation::Count | Operation::Exists) {
+            return Ok(None);
+        }
+        let Some(Value::List(items)) = scope_document.fields.get(name) else {
+            return Ok(None);
+        };
+        let mut conditions = Vec::with_capacity(filters.len());
+        for operation in filters {
+            match operation {
+                Operation::Where(block) if !Self::operation_names(operation, &scope_document.schema) => {
+                    conditions.push(&block.condition)
+                }
+                _ => return Ok(None),
+            }
+        }
+        if !items.iter().all(|item| matches!(item, Value::Object(_))) {
+            return Ok(None);
+        }
+        let Some(read) = self.fields_read_by_operations(collection_scope, operations) else {
+            return Ok(None);
+        };
+        let reads_id = read.iter().any(|field| field == "id");
+        let mut row = Document::with_id(String::new(), name.clone(), HashMap::with_capacity(read.len()));
+        let mut count = 0i64;
+        'items: for (position, item) in items.iter().enumerate() {
+            let Value::Object(fields) = item else {
+                continue;
+            };
+            for field in &read {
+                match (fields.get(field), row.fields.get_mut(field)) {
+                    (Some(value), Some(slot)) => slot.clone_from(value),
+                    (Some(value), None) => {
+                        row.fields.insert(field.clone(), value.clone());
+                    }
+                    (None, Some(_)) => {
+                        row.fields.remove(field);
+                    }
+                    (None, None) => {}
+                }
+            }
+            // An element with no id of its own is known by its place.
+            if reads_id {
+                row.id = position.to_string();
+            }
+            for condition in &conditions {
+                if !self.evaluate_condition(&row, condition)? {
+                    continue 'items;
+                }
+            }
+            count += 1;
+            if matches!(last, Operation::Exists) {
+                break;
+            }
+        }
+        Ok(Some(match last {
+            Operation::Exists => Value::Boolean(count > 0),
+            _ => Value::Integer(count),
+        }))
+    }
+
+    /// The rows of a relationship that also refer to one named document,
+    /// found from that document's side.
+    ///
+    /// `.assignments.where { .person == "p1" }` on a project asks which of
+    /// the project's assignments are p1's. A project may have hundreds of
+    /// assignments and p1 a handful, and the same person is usually asked
+    /// about for many projects. So p1's assignments are read once in a
+    /// statement and arranged by project, and each project is then one
+    /// lookup. `None` when the question does not have this shape. The rows
+    /// returned still have the filter applied to them.
+    fn related_also_referring(
+        &self,
+        scope_document: &Document,
+        path: &[String],
+        operations: &[Operation],
+    ) -> OQLResult<Option<Vec<Document>>> {
+        let Some(Operation::Where(block)) = operations.first() else {
+            return Ok(None);
+        };
+        if !StatementGuard::active() || CallFrame::any_active() {
+            return Ok(None);
+        }
+        // `.field == "id"` among the conditions that must all hold.
+        fn named<'a>(condition: &'a Condition) -> Option<(&'a str, &'a str)> {
+            match condition {
+                Condition::Comparison {
+                    left: Expression::FieldAccess(access),
+                    operator: ComparisonOperator::Equal,
+                    right: Expression::Literal(Literal::String(id)),
+                } if access.path.len() == 1 => Some((access.path[0].as_str(), id.as_str())),
+                Condition::And(left, right) => named(left).or_else(|| named(right)),
+                _ => None,
+            }
+        }
+        let Some((other_field, other_id)) = named(&block.condition) else {
+            return Ok(None);
+        };
+        // The row the relationship is asked of: this one, or the one a
+        // single reference leads to.
+        let lent;
+        let (holder, relationship): (&Document, &String) = match path {
+            [relationship] => (scope_document, relationship),
+            [reference, relationship] => {
+                let Some(Value::Reference(target)) = scope_document.fields.get(reference) else {
+                    return Ok(None);
+                };
+                let Some(target) = self.referenced_document(target)? else {
+                    return Ok(None);
+                };
+                lent = target;
+                (&lent, relationship)
+            }
+            _ => return Ok(None),
+        };
+        if holder.fields.contains_key(relationship) {
+            return Ok(None);
+        }
+        let ReverseRelationship::Declared { source, field } =
+            self.reverse_relationship(&holder.schema, relationship)?
+        else {
+            return Ok(None);
+        };
+        let Some(source_schema) = self.schema_of(&source)? else {
+            return Ok(None);
+        };
+        let target_of = |name: &str| {
+            let mut declared = source_schema.fields.get(name);
+            while let Some(FieldType::Optional(inner)) = declared {
+                declared = Some(inner);
+            }
+            match declared {
+                Some(FieldType::Reference(reference)) => Some(reference.target_schema.clone()),
+                _ => None,
+            }
+        };
+        let Some(other_target) = target_of(other_field) else {
+            return Ok(None);
+        };
+        // The one field through which the relationship's rows refer to the
+        // holder.
+        let through = match field {
+            Some(field) => field,
+            None => {
+                let mut referring = source_schema
+                    .fields
+                    .keys()
+                    .filter(|name| target_of(name).as_deref() == Some(holder.schema.as_str()));
+                match (referring.next(), referring.next()) {
+                    (Some(only), None) => only.clone(),
+                    _ => return Ok(None),
+                }
+            }
+        };
+        if through == other_field || target_of(&through).as_deref() != Some(holder.schema.as_str()) {
+            return Ok(None);
+        }
+
+        let key = format!("{source}\u{0}{through}\u{0}{other_field}\u{0}{other_id}");
+        let known = STATEMENT.with(|scope| scope.borrow().also_referring.get(&key).cloned());
+        let by_holder = match known {
+            Some(by_holder) => by_holder,
+            None => {
+                let rows = self.store.scan_referencing_documents_shared(
+                    &other_target,
+                    &other_id.to_string(),
+                    Some(&source),
+                    Some(other_field),
+                )?;
+                let mut by_holder: HashMap<String, Vec<Arc<Document>>> = HashMap::new();
+                for row in rows {
+                    let Some(reference @ Value::Reference(_)) = row.fields.get(&through) else {
+                        continue;
+                    };
+                    if let Value::String(holder_id) = self.reference_as_id(reference)? {
+                        by_holder.entry(holder_id).or_default().push(row);
+                    }
+                }
+                let by_holder = Arc::new(by_holder);
+                STATEMENT.with(|scope| {
+                    scope
+                        .borrow_mut()
+                        .also_referring
+                        .insert(key, by_holder.clone())
+                });
+                by_holder
+            }
+        };
+        Ok(Some(
+            by_holder
+                .get(&holder.id)
+                .map(|rows| rows.iter().map(|row| row.as_ref().clone()).collect())
+                .unwrap_or_default(),
+        ))
+    }
+
+    /// Whether an operation reads the enclosing row by naming its
+    /// collection, as `.salary > people.salary` does inside a `people`
+    /// query. One that does not is the same for every enclosing row. An
+    /// operation this does not know how to look through counts as naming it.
+    fn operation_names(operation: &Operation, collection: &str) -> bool {
+        let expression = |node: &Expression| Self::expression_names(node, collection);
+        match operation {
+            Operation::Where(block) => Self::condition_names(&block.condition, collection),
+            Operation::Having(block) => Self::condition_names(&block.condition, collection),
+            Operation::Select(block) => block.fields.iter().any(|field| expression(&field.expression)),
+            Operation::Sort(block) => block.fields.iter().any(|field| expression(&field.expression)),
+            Operation::GroupBy(block) | Operation::PartitionBy(block) => {
+                block.computed.iter().any(|key| expression(&key.expression))
+            }
+            Operation::AggregateExpr { input, .. } => expression(input),
+            Operation::LimitExpr(count) | Operation::OffsetExpr(count) => expression(count),
+            Operation::Limit(_)
+            | Operation::Offset(_)
+            | Operation::Distinct
+            | Operation::Step(_)
+            | Operation::First
+            | Operation::Exists
+            | Operation::Count
+            | Operation::Sum(_)
+            | Operation::Avg(_)
+            | Operation::Min(_)
+            | Operation::Max(_) => false,
+            _ => true,
+        }
+    }
+
+    fn condition_names(condition: &Condition, collection: &str) -> bool {
+        match condition {
+            Condition::Comparison { left, right, .. } => {
+                Self::expression_names(left, collection) || Self::expression_names(right, collection)
+            }
+            Condition::And(left, right) | Condition::Or(left, right) => {
+                Self::condition_names(left, collection) || Self::condition_names(right, collection)
+            }
+            Condition::Not(inner) => Self::condition_names(inner, collection),
+        }
+    }
+
+    fn expression_names(expression: &Expression, collection: &str) -> bool {
+        let names = |node: &Expression| Self::expression_names(node, collection);
+        match expression {
+            Expression::Identifier(name) => name == collection,
+            Expression::FieldAccess(access) => access.path.len() == 1 && access.path[0] == collection,
+            // A nested query is given the enclosing row's values when it
+            // runs, not when the operation holding it is prepared.
+            Expression::Literal(_) | Expression::QueryExpression { .. } => false,
+            Expression::CollectionExpression { source, operations } => {
+                names(source)
+                    || operations
+                        .iter()
+                        .any(|operation| Self::operation_names(operation, collection))
+            }
+            Expression::FunctionCall { args, .. } => args.iter().any(names),
+            Expression::IfThenElse { condition, then_expr, else_expr } => {
+                Self::condition_names(condition, collection) || names(then_expr) || names(else_expr)
+            }
+            Expression::LogicalAnd(left, right)
+            | Expression::LogicalOr(left, right)
+            | Expression::BinaryOp { left, right, .. } => names(left) || names(right),
+            Expression::LogicalNot(inner) => names(inner),
+            Expression::ArrayAccess { array, index } => names(array) || names(index),
+            Expression::ChainedAccess { base, .. } => names(base),
+            Expression::Block(items) | Expression::ArrayLiteral(items) => items.iter().any(names),
+            Expression::ObjectLiteral(fields) => fields.iter().any(|field| names(&field.value)),
+            Expression::ConditionExpr(condition) => Self::condition_names(condition, collection),
+            Expression::Match { .. } => true,
+        }
+    }
+
+    /// What identifies the answer of a collection expression that starts by
+    /// following a single reference: the document referred to, the rest of
+    /// the path and the operations. `None` when the answer also depends on
+    /// the row asking, because the operations name its collection.
+    fn through_reference_key(
+        scope_document: &Document,
+        source: &Expression,
+        operations: &[Operation],
+    ) -> Option<(u64, Vec<u8>)> {
+        let Expression::FieldAccess(field) = source else {
+            return None;
+        };
+        let (first, rest) = field.path.split_first()?;
+        if rest.is_empty() || !StatementGuard::active() || CallFrame::any_active() {
+            return None;
+        }
+        let Some(Value::Reference(target)) = scope_document.fields.get(first) else {
+            return None;
+        };
+        let asked = bincode::serialize(&(rest, operations, &scope_document.schema)).ok()?;
+        let names_asker = operations
+            .iter()
+            .any(|operation| Self::operation_names(operation, &scope_document.schema));
+        (!names_asker).then(|| (target.packed(), asked))
+    }
+
+    /// [`Self::evaluate_collection_expression`] without looking for an
+    /// answer already given.
+    fn evaluate_collection_from(
+        &self,
+        scope_document: &Document,
+        source: &Expression,
+        operations: &[Operation],
+        collection_scope: String,
+    ) -> OQLResult<Value> {
         if let Expression::FieldAccess(field) = source {
             if let Some(answer) = self.related_count(scope_document, &field.path, operations)? {
                 return Ok(answer);
@@ -3551,6 +4434,19 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 return Ok(answer);
             }
         }
+        if let Expression::FieldAccess(field) = source {
+            if let Some(answer) =
+                self.count_list_elements(scope_document, &field.path, operations, &collection_scope)?
+            {
+                return Ok(answer);
+            }
+        }
+        let from_other_side = match source {
+            Expression::FieldAccess(field) if field.path != ["*"] => {
+                self.related_also_referring(scope_document, &field.path, operations)?
+            }
+            _ => None,
+        };
         let (documents, single) = match source {
             // An operation written with no receiver, evaluated for a group
             // row, applies to that group's rows.
@@ -3563,7 +4459,45 @@ impl<S: DocumentStore> QueryExecutor<S> {
                             .to_string(),
                     });
                 }
-                (Self::group_rows(scope_document)?.as_ref().clone(), false)
+                // The group's rows are shared by everything asked of the
+                // group. Leading filters run against them where they are,
+                // so only rows that pass are copied, and none for a count.
+                let rows = Self::group_rows(scope_document)?;
+                let filters = operations
+                    .iter()
+                    .take_while(|operation| {
+                        matches!(operation, Operation::Where(_))
+                            && !Self::operation_names(operation, &scope_document.schema)
+                    })
+                    .count();
+                if filters == 0 {
+                    (rows.as_ref().clone(), false)
+                } else {
+                    let mut passing = Vec::new();
+                    'rows: for row in rows.iter() {
+                        for operation in &operations[..filters] {
+                            if let Operation::Where(block) = operation {
+                                if !self.evaluate_condition(row, &block.condition)? {
+                                    continue 'rows;
+                                }
+                            }
+                        }
+                        passing.push(row);
+                    }
+                    if matches!(&operations[filters..], [Operation::Count]) {
+                        return Ok(Value::Integer(passing.len() as i64));
+                    }
+                    return self.run_collection_operations(
+                        passing.into_iter().cloned().collect(),
+                        false,
+                        &operations[filters..],
+                        scope_document,
+                        &collection_scope,
+                    );
+                }
+            }
+            Expression::FieldAccess(_) if from_other_side.is_some() => {
+                (from_other_side.unwrap_or_default(), false)
             }
             Expression::FieldAccess(field) if field.path != ["*"] => {
                 // What the operations read of the rows they are given.
@@ -3618,8 +4552,14 @@ impl<S: DocumentStore> QueryExecutor<S> {
         ) {
             return Ok(None);
         }
+        // A filter storage can apply serves any of these. One that only
+        // the evaluator can apply serves a count, provided it asks nothing
+        // of the row whose related rows are being counted.
+        let counting = matches!(last, Operation::Count | Operation::Exists);
         if !filters.iter().all(|operation| {
-                matches!(operation, Operation::Where(block) if Self::is_pipeline_safe_condition(&block.condition))
+                matches!(operation, Operation::Where(block)
+                    if Self::is_pipeline_safe_condition(&block.condition)
+                        || (counting && !Self::operation_names(operation, &row.schema)))
             })
             || !StatementGuard::active()
             || row.fields.contains_key(name)
@@ -3671,12 +4611,29 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 key
             }
         };
+        // A tally with a filter only the evaluator can apply evaluates it
+        // for every referring row, so it has to be asked for by a fair
+        // share of that many rows before it is the cheaper way.
+        let evaluated = !filters.iter().all(|operation| {
+            matches!(operation, Operation::Where(block) if Self::is_pipeline_safe_condition(&block.condition))
+        });
+        let worth_it = if !evaluated {
+            ROWS_BEFORE_TALLY
+        } else {
+            match self.reverse_relationship(&row.schema, name)? {
+                ReverseRelationship::Declared { source, .. } => self
+                    .store
+                    .collection_len(&source)?
+                    .map_or(usize::MAX, |rows| (rows / 16).max(ROWS_BEFORE_TALLY)),
+                _ => usize::MAX,
+            }
+        };
         let known = STATEMENT.with(|scope| {
             let mut scope = scope.borrow_mut();
             match scope.related_counts.entry(key.clone()).or_insert(RelatedCounts::Asked(0)) {
                 RelatedCounts::Asked(times) => {
                     *times += 1;
-                    (*times > ROWS_BEFORE_TALLY).then_some(None)
+                    (*times > worth_it).then_some(None)
                 }
                 RelatedCounts::Unavailable => None,
                 RelatedCounts::Ready(tally) => Some(Some(tally.clone())),
@@ -3747,7 +4704,13 @@ impl<S: DocumentStore> QueryExecutor<S> {
         let mut conditions = Vec::with_capacity(filters.len());
         for operation in filters {
             match operation {
-                Operation::Where(block) if Self::is_pipeline_safe_condition(&block.condition) => {
+                // Any condition will do that asks nothing of the row whose
+                // related rows these are: it is evaluated for each related
+                // row exactly as it would be once they were copied.
+                Operation::Where(block)
+                    if Self::is_pipeline_safe_condition(&block.condition)
+                        || !Self::operation_names(operation, &row.schema) =>
+                {
                     conditions.push(&block.condition)
                 }
                 _ => return Ok(None),
@@ -3841,6 +4804,10 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 Some(name) => {
                     accumulator.push(document.fields.get(name).map(ProjectedValueRef::Value))?
                 }
+            }
+            // One row is enough to know that some exist.
+            if matches!(last, Operation::Exists) {
+                break;
             }
         }
         Ok(Some(match last {
@@ -3937,7 +4904,40 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
         let (predicates, residual) = Self::split_storage_filters(&source, &schema, filters);
         if !residual.is_empty() {
-            return Ok(None);
+            // A filter storage cannot apply: count with the evaluator, over
+            // the rows where the store holds them.
+            if measured.is_some() {
+                return Ok(None);
+            }
+            let Some(stored) = self.store.scan_documents_shared(&source)? else {
+                return Ok(None);
+            };
+            let mut tally: HashMap<ObjRef, i64> = HashMap::new();
+            'rows: for row in &stored {
+                let Some(Value::Reference(reference)) = row.fields.get(&through) else {
+                    continue;
+                };
+                for operation in filters {
+                    let Operation::Where(block) = operation else {
+                        return Ok(None);
+                    };
+                    // A row that cannot be judged might belong to a
+                    // document nobody asks about; leave it to the route
+                    // that looks only at the rows asked for.
+                    match self.evaluate_condition(row, &block.condition) {
+                        Ok(true) => {}
+                        Ok(false) => continue 'rows,
+                        Err(_) => return Ok(None),
+                    }
+                }
+                *tally.entry(*reference).or_insert(0) += 1;
+            }
+            return Ok(Some(
+                tally
+                    .into_iter()
+                    .map(|(reference, count)| (reference, Value::Integer(count)))
+                    .collect(),
+            ));
         }
         let Some(kind) = AggregateKind::named(function, measured.is_none()) else {
             return Ok(None);
@@ -4125,14 +5125,41 @@ impl<S: DocumentStore> QueryExecutor<S> {
             .any(|operation| matches!(operation, Operation::First));
 
         for (position, operation) in operations.iter().enumerate() {
-            let materialized = self.materialize_operation_with_scope(operation, scope_document)?;
-            documents = match &materialized {
+            // With no rows there is nothing for the enclosing row's values
+            // to be compared with, so the operation is used as written.
+            let materialized = if (documents.is_empty()
+                && !matches!(operation, Operation::Combine { .. }))
+                || !Self::operation_names(operation, &scope_document.schema)
+            {
+                std::borrow::Cow::Borrowed(operation)
+            } else {
+                std::borrow::Cow::Owned(
+                    self.materialize_operation_with_scope(operation, scope_document)?,
+                )
+            };
+            documents = match materialized.as_ref() {
                 Operation::Sort(sort) => self.sort_keeping(
                     documents,
                     sort,
                     Self::rows_kept_after_sort(operations, position),
                 )?,
-                _ => self.apply_operation(documents, &materialized, collection_scope)?,
+                // What follows a step says which fields of the rows it
+                // reaches are read; the rest need not be copied.
+                Operation::Step(path) => {
+                    let read = self.fields_read_by_operations(collection_scope, &operations[position + 1..]);
+                    let mut reached = Vec::new();
+                    for document in &documents {
+                        reached.extend(
+                            self.path_source_rows_reading(document, &path.path, read.as_deref())?.0,
+                        );
+                    }
+                    reached
+                }
+                Operation::Walk { path, depth } => {
+                    let read = self.fields_read_by_operations(collection_scope, &operations[position + 1..]);
+                    self.apply_walk(documents, path, depth.as_ref(), read.as_deref())?
+                }
+                other => self.apply_operation(documents, other, collection_scope)?,
             };
         }
 
@@ -4246,79 +5273,133 @@ impl<S: DocumentStore> QueryExecutor<S> {
         fields: Option<&[String]>,
     ) -> OQLResult<(Vec<Document>, bool)> {
         let last = path.len().saturating_sub(1);
-        let mut rows = vec![SourceRow::stored(scope_document.clone())];
+        // The first step reads the starting row where it is; only the rows
+        // reached are copied.
+        let mut rows: Vec<SourceRow> = Vec::new();
         let mut single = true;
         for (position, segment) in path.iter().enumerate() {
             let wanted = fields.filter(|_| position == last);
             let mut next = Vec::new();
-            for row in rows {
-                let stored_value = match DocumentSystemField::from_name(segment) {
-                    Some(system_field) if row.stored => Some(system_field.value(&row.document)),
-                    _ => row.document.get_field(segment).cloned(),
-                };
-                match stored_value {
-                    Some(value) => {
-                        single &= !matches!(value, Value::List(_));
-                        self.push_source_rows(value, segment, &mut next)?;
-                    }
-                    // An embedded value has no identity for anything to
-                    // refer to, so an absent field is simply absent.
-                    None if !row.stored => {}
-                    None => match self.reverse_relationship(&row.document.schema, segment)? {
-                        relationship @ (ReverseRelationship::Declared { .. }
-                        | ReverseRelationship::Unknowable) => {
-                            let (source, field) = match &relationship {
-                                ReverseRelationship::Declared { source, field } => {
-                                    (source.as_str(), field.as_deref())
-                                }
-                                _ => (segment.as_str(), None),
-                            };
-                            single = false;
-                            let related = self.store.scan_referencing_documents_shared(
-                                &row.document.schema,
-                                &row.document.id,
-                                Some(source),
-                                field,
-                            )?;
-                            next.extend(related.iter().map(|document| {
-                                SourceRow::stored(match wanted {
-                                    None => document.as_ref().clone(),
-                                    Some(wanted) => Document {
-                                        fields: wanted
-                                            .iter()
-                                            .filter_map(|name| {
-                                                document
-                                                    .fields
-                                                    .get_key_value(name)
-                                                    .map(|(name, value)| (name.clone(), value.clone()))
-                                            })
-                                            .collect(),
-                                        ..Document::with_id(
-                                            document.id.to_string(),
-                                            document.schema.clone(),
-                                            HashMap::new(),
-                                        )
-                                    },
-                                })
-                            }));
-                        }
-                        // A declared field that this row does not carry.
-                        ReverseRelationship::AbsentField => {}
-                        ReverseRelationship::Unknown => {
-                            return Err(OQLError::SchemaValidation {
-                                message: format!(
-                                    "'{}' has no field '{}', and no collection named '{}' \
-                                     references it",
-                                    row.document.schema, segment, segment
-                                ),
-                            });
-                        }
-                    },
+            if position == 0 {
+                self.step_one_row(scope_document, true, segment, wanted, &mut next, &mut single)?;
+            } else {
+                for row in &rows {
+                    self.step_one_row(row.row(), row.stored, segment, wanted, &mut next, &mut single)?;
                 }
             }
             rows = next;
         }
-        Ok((rows.into_iter().map(|row| row.document).collect(), single))
+        if path.is_empty() {
+            rows.push(SourceRow::stored(scope_document.clone()));
+        }
+        Ok((rows.into_iter().map(SourceRow::into_document).collect(), single))
+    }
+
+    /// The rows one step of a path reaches from one row.
+    fn step_one_row(
+        &self,
+        document: &Document,
+        stored: bool,
+        segment: &String,
+        wanted: Option<&[String]>,
+        next: &mut Vec<SourceRow>,
+        single: &mut bool,
+    ) -> OQLResult<()> {
+        // The objects of an embedded list, when only some of their fields
+        // will be read, are copied down to those fields.
+        if let (Some(wanted), Some(Value::List(items))) = (wanted, document.get_field(segment)) {
+            *single = false;
+            for item in items {
+                match item {
+                    Value::Object(fields) => next.push(SourceRow::embedded(Document::with_id(
+                        next.len().to_string(),
+                        segment.to_string(),
+                        wanted
+                            .iter()
+                            .filter_map(|name| {
+                                fields
+                                    .get_key_value(name)
+                                    .map(|(name, value)| (name.clone(), value.clone()))
+                            })
+                            .collect(),
+                    ))),
+                    other => self.push_source_rows(other.clone(), segment, next)?,
+                }
+            }
+            return Ok(());
+        }
+        let stored_value = match DocumentSystemField::from_name(segment) {
+            Some(system_field) if stored => Some(system_field.value(document)),
+            _ => document.get_field(segment).cloned(),
+        };
+        // A referenced row is a stepping stone as often as a destination,
+        // so it is borrowed from the store and copied only if it is kept.
+        if let Some(Value::Reference(reference)) = &stored_value {
+            if let Some(target) = self.referenced_document(reference)? {
+                next.push(SourceRow::lent(target));
+                return Ok(());
+            }
+        }
+        match stored_value {
+            Some(value) => {
+                *single &= !matches!(value, Value::List(_));
+                self.push_source_rows(value, segment, next)?;
+            }
+            // An embedded value has no identity for anything to
+            // refer to, so an absent field is simply absent.
+            None if !stored => {}
+            None => match self.reverse_relationship(&document.schema, segment)? {
+                relationship @ (ReverseRelationship::Declared { .. }
+                | ReverseRelationship::Unknowable) => {
+                    let (source, field) = match &relationship {
+                        ReverseRelationship::Declared { source, field } => {
+                            (source.as_str(), field.as_deref())
+                        }
+                        _ => (segment.as_str(), None),
+                    };
+                    *single = false;
+                    let related = self.store.scan_referencing_documents_shared(
+                        &document.schema,
+                        &document.id,
+                        Some(source),
+                        field,
+                    )?;
+                    next.extend(related.iter().map(|document| {
+                        SourceRow::stored(match wanted {
+                            None => document.as_ref().clone(),
+                            Some(wanted) => Document {
+                                fields: wanted
+                                    .iter()
+                                    .filter_map(|name| {
+                                        document
+                                            .fields
+                                            .get_key_value(name)
+                                            .map(|(name, value)| (name.clone(), value.clone()))
+                                    })
+                                    .collect(),
+                                ..Document::with_id(
+                                    document.id.to_string(),
+                                    document.schema.clone(),
+                                    HashMap::new(),
+                                )
+                            },
+                        })
+                    }));
+                }
+                // A declared field that this row does not carry.
+                ReverseRelationship::AbsentField => {}
+                ReverseRelationship::Unknown => {
+                    return Err(OQLError::SchemaValidation {
+                        message: format!(
+                            "'{}' has no field '{}', and no collection named '{}' \
+                             references it",
+                            document.schema, segment, segment
+                        ),
+                    });
+                }
+            },
+        }
+        Ok(())
     }
 
     /// Decide what an absent name on a stored row means.
@@ -4599,6 +5680,31 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 k: block.k,
                 num_candidates: block.num_candidates,
                 exact: block.exact,
+            }),
+            Operation::Combine { how, other } => Operation::Combine {
+                how: how.clone(),
+                other: self.materialize_expression_with_scope(other, scope_document)?,
+            },
+            Operation::Walk { path, depth } => Operation::Walk {
+                path: path.clone(),
+                depth: depth
+                    .as_ref()
+                    .map(|depth| self.materialize_expression_with_scope(depth, scope_document))
+                    .transpose()?,
+            },
+            Operation::PartitionBy(block) => Operation::PartitionBy(GroupByBlock {
+                fields: block.fields.clone(),
+                computed: block
+                    .computed
+                    .iter()
+                    .map(|key| {
+                        Ok(crate::parser::ComputedGroupKey {
+                            name: key.name.clone(),
+                            expression: self
+                                .materialize_expression_with_scope(&key.expression, scope_document)?,
+                        })
+                    })
+                    .collect::<OQLResult<Vec<_>>>()?,
             }),
             _ => operation.clone(),
         })
@@ -5135,6 +6241,14 @@ impl<S: DocumentStore> QueryExecutor<S> {
             Value::Null => Ok(PathState::Missing),
             Value::Object(object) => self.resolve_object_path_state(&object, remaining),
             Value::Reference(reference) => {
+                // The row referred to is read where the store holds it.
+                if let Some(target) = self.referenced_document(&reference)? {
+                    return if remaining.is_empty() {
+                        Ok(PathState::Present(Value::Reference(reference)))
+                    } else {
+                        self.resolve_path_state(&target, remaining)
+                    };
+                }
                 let Some(target) = self.resolve_objref_target(&reference)? else {
                     return Ok(PathState::BrokenReference);
                 };
@@ -5436,10 +6550,13 @@ impl<S: DocumentStore> QueryExecutor<S> {
 
     fn reference_as_id(&self, value: &Value) -> OQLResult<Value> {
         Ok(match value {
-            Value::Reference(reference) => self
-                .resolve_objref_target(reference)?
-                .map(|document| Value::String(document.id))
-                .unwrap_or(Value::Null),
+            Value::Reference(reference) => match self.referenced_document(reference)? {
+                Some(document) => Value::String(document.id.clone()),
+                None => self
+                    .resolve_objref_target(reference)?
+                    .map(|document| Value::String(document.id))
+                    .unwrap_or(Value::Null),
+            },
             Value::GlobalReference(reference) => self
                 .store
                 .navigate_global_reference(reference)?
@@ -5523,6 +6640,13 @@ impl<S: DocumentStore> QueryExecutor<S> {
 
             Ok(vec![projected_doc])
         } else {
+            if select_block
+                .fields
+                .iter()
+                .any(|field| Self::expression_uses_position(&field.expression))
+            {
+                return self.select_by_position(documents, select_block);
+            }
             // Handle regular projection - return one document per input document
             let mut projected_documents = Vec::with_capacity(documents.len());
             for document in documents {
@@ -5531,6 +6655,268 @@ impl<S: DocumentStore> QueryExecutor<S> {
             }
             Ok(projected_documents)
         }
+    }
+
+    /// A `select` that uses position functions: every row is shaped with
+    /// the rows around it in reach.
+    fn select_by_position(
+        &self,
+        documents: Vec<Document>,
+        select_block: &SelectBlock,
+    ) -> OQLResult<Vec<Document>> {
+        let frame = std::rc::Rc::new(WindowFrame::new(documents)?);
+        WINDOWS.with(|frames| frames.borrow_mut().push(frame.clone()));
+        let _guard = WindowGuard;
+        let mut projected = Vec::with_capacity(frame.rows.len());
+        for (position, row) in frame.rows.iter().enumerate() {
+            frame.position.set(position);
+            projected.push(row.with_projected_fields(self.select_row(row, select_block)?));
+        }
+        Ok(projected)
+    }
+
+    /// Whether an expression calls a position function on the rows of the
+    /// select it is written in. A nested query or collection has its own
+    /// rows, so it is not looked into.
+    fn expression_uses_position(expression: &Expression) -> bool {
+        let any = |expressions: &[Expression]| expressions.iter().any(Self::expression_uses_position);
+        match expression {
+            Expression::FunctionCall { name, args } => {
+                WindowFrame::is_position_function(name) || any(args)
+            }
+            Expression::IfThenElse { condition, then_expr, else_expr } => {
+                Self::condition_uses_position(condition)
+                    || Self::expression_uses_position(then_expr)
+                    || Self::expression_uses_position(else_expr)
+            }
+            Expression::Match { expr, arms } => {
+                Self::expression_uses_position(expr)
+                    || arms.iter().any(|arm| {
+                        arm.guard.as_ref().is_some_and(Self::condition_uses_position)
+                            || Self::expression_uses_position(&arm.body)
+                    })
+            }
+            Expression::LogicalAnd(left, right) | Expression::LogicalOr(left, right) => {
+                Self::expression_uses_position(left) || Self::expression_uses_position(right)
+            }
+            Expression::BinaryOp { left, right, .. } => {
+                Self::expression_uses_position(left) || Self::expression_uses_position(right)
+            }
+            Expression::LogicalNot(inner) => Self::expression_uses_position(inner),
+            Expression::ArrayAccess { array, index } => {
+                Self::expression_uses_position(array) || Self::expression_uses_position(index)
+            }
+            Expression::ChainedAccess { base, .. } => Self::expression_uses_position(base),
+            Expression::Block(items) | Expression::ArrayLiteral(items) => any(items),
+            Expression::ObjectLiteral(fields) => fields
+                .iter()
+                .any(|field| Self::expression_uses_position(&field.value)),
+            Expression::ConditionExpr(condition) => Self::condition_uses_position(condition),
+            Expression::Identifier(_)
+            | Expression::FieldAccess(_)
+            | Expression::Literal(_)
+            | Expression::QueryExpression { .. }
+            | Expression::CollectionExpression { .. } => false,
+        }
+    }
+
+    /// Whether an expression calls the function `wanted` on the rows of the
+    /// select it is written in. Anything this cannot see into counts.
+    fn expression_calls(expression: &Expression, wanted: &str) -> bool {
+        let calls = |node: &Expression| Self::expression_calls(node, wanted);
+        fn condition(node: &Condition, wanted: &str, calls: &dyn Fn(&Expression) -> bool) -> bool {
+            match node {
+                Condition::Comparison { left, right, .. } => calls(left) || calls(right),
+                Condition::And(left, right) | Condition::Or(left, right) => {
+                    condition(left, wanted, calls) || condition(right, wanted, calls)
+                }
+                Condition::Not(inner) => condition(inner, wanted, calls),
+            }
+        }
+        match expression {
+            Expression::FunctionCall { name, args } => name == wanted || args.iter().any(calls),
+            Expression::IfThenElse { condition: test, then_expr, else_expr } => {
+                condition(test, wanted, &calls) || calls(then_expr) || calls(else_expr)
+            }
+            Expression::LogicalAnd(left, right)
+            | Expression::LogicalOr(left, right)
+            | Expression::BinaryOp { left, right, .. } => calls(left) || calls(right),
+            Expression::LogicalNot(inner) => calls(inner),
+            Expression::ArrayAccess { array, index } => calls(array) || calls(index),
+            Expression::ChainedAccess { base, .. } => calls(base),
+            Expression::Block(items) | Expression::ArrayLiteral(items) => items.iter().any(calls),
+            Expression::ObjectLiteral(fields) => fields.iter().any(|field| calls(&field.value)),
+            Expression::ConditionExpr(test) => condition(test, wanted, &calls),
+            Expression::Identifier(_)
+            | Expression::FieldAccess(_)
+            | Expression::Literal(_)
+            | Expression::QueryExpression { .. }
+            | Expression::CollectionExpression { .. } => false,
+            Expression::Match { .. } => true,
+        }
+    }
+
+    fn condition_uses_position(condition: &Condition) -> bool {
+        match condition {
+            Condition::Comparison { left, right, .. } => {
+                Self::expression_uses_position(left) || Self::expression_uses_position(right)
+            }
+            Condition::And(left, right) | Condition::Or(left, right) => {
+                Self::condition_uses_position(left) || Self::condition_uses_position(right)
+            }
+            Condition::Not(inner) => Self::condition_uses_position(inner),
+        }
+    }
+
+    /// Evaluate a position function for the row its select is shaping.
+    fn evaluate_position_function(&self, name: &str, args: &[Expression]) -> OQLResult<Value> {
+        let Some(frame) = WINDOWS.with(|frames| frames.borrow().last().cloned()) else {
+            return Err(OQLError::FunctionError {
+                message: format!(
+                    "{name}() depends on a row's position among the rows being selected, so it \
+                     belongs in a select"
+                ),
+            });
+        };
+        let arity = |expected: std::ops::RangeInclusive<usize>, form: &str| {
+            if expected.contains(&args.len()) {
+                Ok(())
+            } else {
+                Err(OQLError::FunctionError {
+                    message: format!("{name} is written {form}"),
+                })
+            }
+        };
+        let position = frame.position.get();
+        let (partition, place) = frame.place[position];
+        let members = &frame.members[partition];
+        // Evaluate for another row of the frame as if it were being shaped.
+        let at = |row: usize, expression: &Expression| {
+            frame.position.set(row);
+            let value = self.evaluate_expression(&frame.rows[row], expression);
+            frame.position.set(position);
+            value
+        };
+        match name {
+            "row_number" => {
+                arity(0..=0, "row_number()")?;
+                Ok(Value::Integer(place as i64 + 1))
+            }
+            "prev" | "next" => {
+                arity(1..=2, "prev(value) or prev(value, rows)")?;
+                let distance = match args.get(1) {
+                    Some(distance) => self.evaluate_row_count(name, distance)? as usize,
+                    None => 1,
+                };
+                let target = if name == "prev" {
+                    place.checked_sub(distance)
+                } else {
+                    place.checked_add(distance)
+                };
+                match target.and_then(|target| members.get(target)) {
+                    Some(row) => at(*row, &args[0]),
+                    None => Ok(Value::Null),
+                }
+            }
+            _ => {
+                if name == "running_count" {
+                    arity(0..=1, "running_count() or running_count(value)")?;
+                } else {
+                    arity(1..=1, "with one value, as in running_sum(.amount)")?;
+                }
+                // One state per call site and partition. The call is known
+                // by where its name is held, which the query keeps in place.
+                let key = (name.as_ptr() as usize, partition);
+                let mut state = frame.running.borrow_mut().remove(&key).unwrap_or_default();
+                // An earlier row asked after a later one: start over.
+                if state.taken > place + 1 {
+                    state = Running::default();
+                }
+                while state.taken <= place {
+                    let value = match args.first() {
+                        Some(expression) => at(members[state.taken], expression)?,
+                        None => Value::Boolean(true),
+                    };
+                    self.take_into_running(name, &mut state, value)?;
+                    state.taken += 1;
+                }
+                let answer = match name {
+                    "running_count" => Value::Integer(state.count),
+                    "running_sum" if state.has_float => {
+                        Value::Float(state.float_sum + state.integer_sum as f64)
+                    }
+                    "running_sum" => Value::Integer(state.integer_sum),
+                    "running_avg" if state.count == 0 => Value::Null,
+                    "running_avg" => Value::Float(
+                        (state.float_sum + state.integer_sum as f64) / state.count as f64,
+                    ),
+                    "running_min" | "running_max" => state.extreme.clone().unwrap_or(Value::Null),
+                    "rank" => Value::Integer(state.rank),
+                    _ => Value::Integer(state.dense_rank),
+                };
+                frame.running.borrow_mut().insert(key, state);
+                Ok(answer)
+            }
+        }
+    }
+
+    /// Take one more row's value into a running function's state.
+    fn take_into_running(&self, name: &str, state: &mut Running, value: Value) -> OQLResult<()> {
+        if matches!(name, "rank" | "dense_rank") {
+            // Rows that follow one another with equal values share a rank.
+            let tied = match &state.last {
+                Some(last) => self.values_equal(last, &value),
+                None => false,
+            };
+            if !tied {
+                state.rank = state.taken as i64 + 1;
+                state.dense_rank += 1;
+            }
+            state.last = Some(value);
+            return Ok(());
+        }
+        if value.is_null() {
+            return Ok(());
+        }
+        state.count += 1;
+        match name {
+            "running_sum" | "running_avg" => match value {
+                Value::Integer(integer) => {
+                    state.integer_sum = state.integer_sum.checked_add(integer).ok_or_else(|| {
+                        OQLError::FunctionError {
+                            message: format!("{name} overflowed a whole number"),
+                        }
+                    })?;
+                }
+                Value::Float(float) => {
+                    state.float_sum += float;
+                    state.has_float = true;
+                }
+                other => {
+                    return Err(OQLError::TypeError {
+                        expected: "numeric type".to_string(),
+                        actual: other.type_name().to_string(),
+                    })
+                }
+            },
+            "running_min" | "running_max" => {
+                let replaces = match &state.extreme {
+                    None => true,
+                    Some(current) => self.compare_ordered_values(&value, current, |order| {
+                        if name == "running_min" {
+                            order.is_lt()
+                        } else {
+                            order.is_gt()
+                        }
+                    })?,
+                };
+                if replaces {
+                    state.extreme = Some(value);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// The fields one row takes when a `select` without aggregates shapes
@@ -6064,6 +7450,8 @@ impl<S: DocumentStore> QueryExecutor<S> {
     {
         let mut documents = Vec::with_capacity(expected);
         let mut batch_ids = HashSet::new();
+        // How many of `documents` are already written.
+        let mut stored = 0;
 
         // Get schema once for all documents
         let schema = self.store.get_schema(collection).ok().flatten();
@@ -6077,6 +7465,18 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 // Convert value to match schema type if needed
                 if let Some(ref schema) = schema {
                     if let Some(field_type) = schema.get_field_type(&name) {
+                        // A row may refer to an earlier row of its own
+                        // batch, as the rows of a tree do. A reference is
+                        // resolved against what is stored, so the earlier
+                        // rows are written first; the statement still
+                        // commits as a whole.
+                        if !documents.is_empty()
+                            && Self::refers_into(&value, field_type, collection, &batch_ids)
+                        {
+                            self.validate_insert_batch_constraints(schema, &documents[stored..])?;
+                            self.store.put_documents(&documents[stored..])?;
+                            stored = documents.len();
+                        }
                         value = self.convert_to_schema_type(value, field_type, collection)?;
                     }
                 }
@@ -6102,15 +7502,36 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
 
         if let Some(ref schema) = schema {
-            self.validate_insert_batch_constraints(schema, &documents)?;
+            self.validate_insert_batch_constraints(schema, &documents[stored..])?;
         }
 
         // RustStore commits this as one WAL frame and one sync. Compatibility
         // stores retain the DocumentStore default while they migrate.
-        self.store.put_documents(&documents)?;
+        self.store.put_documents(&documents[stored..])?;
 
         // Return all created documents
         Ok(documents)
+    }
+
+    /// Whether a value being written holds a reference to one of `ids` in
+    /// `collection`: a row of the batch that is being inserted.
+    fn refers_into(
+        value: &Value,
+        field_type: &crate::schema::FieldType,
+        collection: &str,
+        ids: &HashSet<String>,
+    ) -> bool {
+        use crate::schema::FieldType;
+        match (value, field_type) {
+            (_, FieldType::Optional(inner)) => Self::refers_into(value, inner, collection, ids),
+            (Value::String(id), FieldType::Reference(reference)) => {
+                reference.target_schema == collection && ids.contains(id)
+            }
+            (Value::List(items), FieldType::List(inner)) => items
+                .iter()
+                .any(|item| Self::refers_into(item, inner, collection, ids)),
+            _ => false,
+        }
     }
 
     fn apply_upsert_operation(
@@ -6861,6 +8282,18 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 };
                 Ok(Value::Boolean(result))
             }
+            // A function the user defined under one of these names is theirs.
+            name if WindowFrame::is_position_function(name)
+                && self.functions.get_user_function(name).is_none() =>
+            {
+                self.evaluate_position_function(name, args)
+            }
+            "count_distinct" | "median" | "percentile" => Err(OQLError::FunctionError {
+                message: format!(
+                    "{name}() has no collection here; use it in select or having, or call it \
+                     on a collection as in .orders.{name}(..)"
+                ),
+            }),
             "count" => self.evaluate_count_function(document, args),
             "sum" if args.len() == 1 => self.evaluate_sum_function(document, args),
             "avg" if args.len() == 1 => self.evaluate_avg_function(document, args),
@@ -6892,13 +8325,27 @@ impl<S: DocumentStore> QueryExecutor<S> {
     /// What an aggregate call such as `sum(.amount)` aggregates, or `None`
     /// when `name` is not an aggregate.
     fn aggregate_input(name: &str, args: &[Expression]) -> OQLResult<Option<AggregateInput>> {
-        if !matches!(name, "count" | "sum" | "avg" | "min" | "max") {
+        if !Self::is_aggregate_name(name) {
             return Ok(None);
         }
         // `min(a, b)` and `max(a, b)` are the lesser and greater of two
         // values, not an aggregate over rows.
         if matches!(name, "min" | "max") && args.len() == 2 {
             return Ok(None);
+        }
+        if name == "percentile" {
+            // The value and the fraction travel together as a pair, so
+            // every form of an aggregate carries both.
+            return match args {
+                [_, _] => Ok(Some(AggregateInput::Expression(Expression::ArrayLiteral(
+                    args.to_vec(),
+                )))),
+                _ => Err(OQLError::FunctionError {
+                    message: "percentile expects a value and a fraction, as in \
+                              percentile(.salary, 0.9)"
+                        .to_string(),
+                }),
+            };
         }
         match args {
             [] if name == "count" => Ok(Some(AggregateInput::AllRows)),
@@ -6929,6 +8376,47 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
     }
 
+    /// Functions that reduce a collection of rows to one value.
+    fn is_aggregate_name(name: &str) -> bool {
+        matches!(
+            name,
+            "count" | "sum" | "avg" | "min" | "max" | "count_distinct" | "median" | "percentile"
+        )
+    }
+
+    /// The value at `fraction` of the way through the sorted numbers, between
+    /// the two nearest when it falls between them. Null for no numbers.
+    fn percentile_of(mut numbers: Vec<f64>, fraction: f64) -> OQLResult<Value> {
+        if !(0.0..=1.0).contains(&fraction) {
+            return Err(OQLError::FunctionError {
+                message: format!("a percentile fraction is between 0 and 1, not {fraction}"),
+            });
+        }
+        if numbers.is_empty() {
+            return Ok(Value::Null);
+        }
+        numbers.sort_by(f64::total_cmp);
+        let position = fraction * (numbers.len() - 1) as f64;
+        let below = position.floor() as usize;
+        let above = position.ceil() as usize;
+        let share = position - below as f64;
+        Ok(Value::Float(
+            numbers[below] + (numbers[above] - numbers[below]) * share,
+        ))
+    }
+
+    fn number_for_aggregate(value: &Value) -> OQLResult<Option<f64>> {
+        match value {
+            Value::Integer(integer) => Ok(Some(*integer as f64)),
+            Value::Float(float) => Ok(Some(*float)),
+            Value::Null => Ok(None),
+            other => Err(OQLError::TypeError {
+                expected: "numeric type".to_string(),
+                actual: other.type_name().to_string(),
+            }),
+        }
+    }
+
     fn aggregate_input_value(&self, row: &Document, input: &AggregateInput) -> OQLResult<Value> {
         match input {
             AggregateInput::AllRows => Ok(Value::Null),
@@ -6943,8 +8431,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
         match expression {
             Expression::FunctionCall { name, args } => {
                 let of_two_values = matches!(name.as_str(), "min" | "max") && args.len() == 2;
-                (matches!(name.as_str(), "count" | "sum" | "avg" | "min" | "max")
-                    && !of_two_values)
+                (Self::is_aggregate_name(name) && !of_two_values)
                     || args.iter().any(Self::expression_contains_aggregate)
             }
             Expression::IfThenElse {
@@ -7501,6 +8988,62 @@ impl<S: DocumentStore> QueryExecutor<S> {
 
                 Ok(max_value.unwrap_or(Value::Null))
             }
+            "count_distinct" => {
+                if matches!(input, AggregateInput::AllRows) {
+                    return Err(OQLError::FunctionError {
+                        message: "count_distinct expects a value to tell rows apart by, as in \
+                                  count_distinct(.customer)"
+                            .to_string(),
+                    });
+                }
+                let mut seen = HashSet::new();
+                for doc in documents {
+                    let value = self.aggregate_input_value(doc, input)?;
+                    if value.is_null() {
+                        continue;
+                    }
+                    let key = bincode::serialize(&Self::canonical_key_value(&value)).map_err(
+                        |error| OQLError::Generic {
+                            message: format!("Failed to compare values for count_distinct: {error}"),
+                        },
+                    )?;
+                    seen.insert(key);
+                }
+                Ok(Value::Integer(seen.len() as i64))
+            }
+            "median" => {
+                let mut numbers = Vec::with_capacity(documents.len());
+                for doc in documents {
+                    let value = self.aggregate_input_value(doc, input)?;
+                    numbers.extend(Self::number_for_aggregate(&value)?);
+                }
+                Self::percentile_of(numbers, 0.5)
+            }
+            "percentile" => {
+                let mut numbers = Vec::with_capacity(documents.len());
+                let mut fraction = None;
+                for doc in documents {
+                    let Value::List(pair) = self.aggregate_input_value(doc, input)? else {
+                        return Err(OQLError::FunctionError {
+                            message: "percentile expects a value and a fraction".to_string(),
+                        });
+                    };
+                    let [value, wanted] = pair.as_slice() else {
+                        return Err(OQLError::FunctionError {
+                            message: "percentile expects a value and a fraction".to_string(),
+                        });
+                    };
+                    numbers.extend(Self::number_for_aggregate(value)?);
+                    fraction = Self::number_for_aggregate(wanted)?;
+                }
+                match fraction {
+                    Some(fraction) => Self::percentile_of(numbers, fraction),
+                    None if documents.is_empty() => Ok(Value::Null),
+                    None => Err(OQLError::FunctionError {
+                        message: "percentile needs a fraction between 0 and 1".to_string(),
+                    }),
+                }
+            }
             _ => Err(OQLError::Generic {
                 message: format!("Unknown aggregation function: {}", function_name),
             }),
@@ -7672,20 +9215,182 @@ impl<S: DocumentStore> QueryExecutor<S> {
         let mut seen = HashSet::new();
         let mut distinct = Vec::new();
         for document in documents {
-            let mut fields: Vec<(&String, Value)> = document
-                .fields
-                .iter()
-                .map(|(name, value)| (name, Self::canonical_key_value(value)))
-                .collect();
-            fields.sort_by(|left, right| left.0.cmp(right.0));
-            let key = bincode::serialize(&fields).map_err(|error| OQLError::Generic {
-                message: format!("Failed to compare rows for distinct: {error}"),
-            })?;
-            if seen.insert(key) {
+            if seen.insert(Self::row_key(&document)?) {
                 distinct.push(document);
             }
         }
         Ok(distinct)
+    }
+
+    /// Bytes that are the same for two rows exactly when all their fields
+    /// are equal.
+    fn row_key(document: &Document) -> OQLResult<Vec<u8>> {
+        let mut fields: Vec<(&String, Value)> = document
+            .fields
+            .iter()
+            .map(|(name, value)| (name, Self::canonical_key_value(value)))
+            .collect();
+        fields.sort_by(|left, right| left.0.cmp(right.0));
+        bincode::serialize(&fields).map_err(|error| OQLError::Generic {
+            message: format!("Failed to compare rows: {error}"),
+        })
+    }
+
+    /// `union`, `intersect` and `except`: these rows and another query's,
+    /// as sets. The result keeps the order of the rows it is called on,
+    /// then, for a union, the order of the other query's.
+    fn apply_combine(
+        &self,
+        documents: Vec<Document>,
+        how: &str,
+        other: &Expression,
+        collection: &str,
+        by_identity: bool,
+    ) -> OQLResult<Vec<Document>> {
+        // Whole rows of one collection are the same row exactly when they
+        // have the same id, which is far less to compare than every field.
+        let row_key = |document: &Document| -> OQLResult<Vec<u8>> {
+            if by_identity {
+                Ok(document.id.as_bytes().to_vec())
+            } else {
+                Self::row_key(document)
+            }
+        };
+        let others: Vec<Document> = match other {
+            // Rows of a query keep their collection and identity, so what
+            // follows can still traverse from them.
+            Expression::QueryExpression { query } => self.execute_query(query)?,
+            // A bare name is a whole collection.
+            Expression::Identifier(name) if CallFrame::value(name).is_none() => {
+                self.execute_query(&OQLQuery {
+                    collection: name.clone(),
+                    operations: Vec::new(),
+                })?
+            }
+            other => {
+                let scope = Document::with_id(String::new(), String::new(), HashMap::new());
+                let mut rows = Vec::new();
+                self.push_source_rows(self.evaluate_expression(&scope, other)?, collection, &mut rows)?;
+                rows.into_iter().map(|row| row.document).collect()
+            }
+        };
+        let mut seen = HashSet::new();
+        let mut combined = Vec::new();
+        match how {
+            "union" => {
+                for document in documents.into_iter().chain(others) {
+                    if seen.insert(row_key(&document)?) {
+                        combined.push(document);
+                    }
+                }
+            }
+            "intersect" | "except" => {
+                let theirs = others
+                    .iter()
+                    .map(&row_key)
+                    .collect::<OQLResult<HashSet<_>>>()?;
+                for document in documents {
+                    let key = row_key(&document)?;
+                    if theirs.contains(&key) == (how == "intersect") && seen.insert(key) {
+                        combined.push(document);
+                    }
+                }
+            }
+            other => {
+                return Err(OQLError::Generic {
+                    message: format!("Unknown set operation: {other}"),
+                })
+            }
+        }
+        Ok(combined)
+    }
+
+    /// `walk(.path)`: every row reached by following `path` from these rows
+    /// one or more times. A row is returned once, at the fewest steps that
+    /// reach it, so a cycle ends the walk rather than repeating it.
+    fn apply_walk(
+        &self,
+        documents: Vec<Document>,
+        path: &FieldAccess,
+        depth: Option<&Expression>,
+        read: Option<&[String]>,
+    ) -> OQLResult<Vec<Document>> {
+        // The rows reached need the fields that are read of them, the field
+        // the walk continues through, and what tells them apart.
+        let wanted: Option<Vec<String>> = read.map(|fields| {
+            let mut wanted = fields.to_vec();
+            wanted.extend(path.path.iter().cloned());
+            wanted.push("id".to_string());
+            wanted
+        });
+        let limit = match depth {
+            Some(depth) => self.evaluate_row_count("walk", depth)?,
+            None => u64::MAX,
+        };
+        // A stored row is known by its collection and id; a row with no id
+        // of its own, by everything it holds.
+        let identity = |row: &Document| -> OQLResult<Vec<u8>> {
+            let key = match row.fields.get("id") {
+                Some(id) => (row.schema.as_str(), Self::canonical_key_value(id), Vec::new()),
+                None => (row.schema.as_str(), Value::String(row.id.clone()), Self::row_key(row)?),
+            };
+            bincode::serialize(&key).map_err(|error| OQLError::Generic {
+                message: format!("Failed to compare rows for walk: {error}"),
+            })
+        };
+        let mut seen = HashSet::new();
+        // Every row reached so far; the last step's rows are at the end.
+        let mut reached: Vec<Document> = Vec::new();
+        let mut frontier = 0;
+        let mut steps = 0u64;
+        while steps < limit {
+            steps += 1;
+            let mut next = Vec::new();
+            let from = if steps == 1 { &documents[..] } else { &reached[frontier..] };
+            for row in from {
+                for mut found in self
+                    .path_source_rows_reading(row, &path.path, wanted.as_deref())?
+                    .0
+                {
+                    if seen.insert(identity(&found)?) {
+                        found
+                            .fields
+                            .insert(WALK_DEPTH_FIELD.to_string(), Value::Integer(steps as i64));
+                        next.push(found);
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = reached.len();
+            reached.extend(next);
+        }
+        Ok(reached)
+    }
+
+    /// `partition_by { keys }`: note on each row which partition it is in.
+    /// The next `select` reads the note; nothing else changes.
+    fn apply_partition_by(
+        &self,
+        mut documents: Vec<Document>,
+        block: &GroupByBlock,
+    ) -> OQLResult<Vec<Document>> {
+        for document in &mut documents {
+            let mut key = Vec::with_capacity(block.fields.len() + block.computed.len());
+            for field in &block.fields {
+                key.push(Self::canonical_key_value(&self.get_field_value(document, field)?));
+            }
+            for computed in &block.computed {
+                key.push(Self::canonical_key_value(
+                    &self.evaluate_expression(document, &computed.expression)?,
+                ));
+            }
+            document
+                .fields
+                .insert(PARTITION_FIELD.to_string(), Value::List(key));
+        }
+        Ok(documents)
     }
 
     /// A form of a value in which equal values are identical, for use as a
@@ -8031,6 +9736,112 @@ impl<S: DocumentStore> QueryExecutor<S> {
 /// The field that carries a scalar when a list of scalars is treated as a
 /// collection. It is not a legal field name, so it cannot collide with data.
 const SCALAR_ROW_FIELD: &str = "$value";
+
+/// Where `partition_by` notes a row's partition for the next `select`. Not
+/// a legal field name, so it cannot collide with data.
+const PARTITION_FIELD: &str = "$partition";
+
+/// Where a row reached by a path step keeps the values of the row it came
+/// from that the rest of the query asks for by the collection's name.
+const ORIGIN_FIELD: &str = "$origin";
+/// Within [`ORIGIN_FIELD`], the collection the values belong to.
+const ORIGIN_NAME: &str = "$name";
+
+/// The steps `walk` took to reach a row, readable as `._depth`.
+const WALK_DEPTH_FIELD: &str = "_depth";
+
+/// The rows a `select` is shaping, for the functions that depend on a row's
+/// position among them: `row_number`, `prev`, `running_sum` and the rest.
+struct WindowFrame {
+    rows: Vec<Document>,
+    /// The row being shaped.
+    position: std::cell::Cell<usize>,
+    /// Each partition's rows, as positions in `rows`, in order.
+    members: Vec<Vec<usize>>,
+    /// For each row: its partition, and its place within it.
+    place: Vec<(usize, usize)>,
+    /// What each running function has accumulated, per call and partition.
+    running: std::cell::RefCell<HashMap<(usize, usize), Running>>,
+}
+
+/// The state of one running function over one partition.
+#[derive(Default)]
+struct Running {
+    /// How many of the partition's rows have been taken in.
+    taken: usize,
+    count: i64,
+    integer_sum: i64,
+    float_sum: f64,
+    has_float: bool,
+    extreme: Option<Value>,
+    /// For `rank` and `dense_rank`: the value of the last row taken in.
+    last: Option<Value>,
+    rank: i64,
+    dense_rank: i64,
+}
+
+impl WindowFrame {
+    fn new(rows: Vec<Document>) -> OQLResult<Self> {
+        let mut partitions: HashMap<Vec<u8>, usize> = HashMap::new();
+        let mut members: Vec<Vec<usize>> = Vec::new();
+        let mut place = Vec::with_capacity(rows.len());
+        for (position, row) in rows.iter().enumerate() {
+            let key = match row.fields.get(PARTITION_FIELD) {
+                Some(key) => bincode::serialize(key).map_err(|error| OQLError::Generic {
+                    message: format!("Failed to encode partition key: {error}"),
+                })?,
+                None => Vec::new(),
+            };
+            let next = members.len();
+            let partition = *partitions.entry(key).or_insert(next);
+            if partition == next {
+                members.push(Vec::new());
+            }
+            place.push((partition, members[partition].len()));
+            members[partition].push(position);
+        }
+        Ok(Self {
+            rows,
+            position: std::cell::Cell::new(0),
+            members,
+            place,
+            running: std::cell::RefCell::new(HashMap::new()),
+        })
+    }
+
+    fn is_position_function(name: &str) -> bool {
+        matches!(
+            name,
+            "row_number"
+                | "rank"
+                | "dense_rank"
+                | "prev"
+                | "next"
+                | "running_sum"
+                | "running_count"
+                | "running_avg"
+                | "running_min"
+                | "running_max"
+        )
+    }
+}
+
+thread_local! {
+    /// The frames of the selects being evaluated, innermost last.
+    static WINDOWS: std::cell::RefCell<Vec<std::rc::Rc<WindowFrame>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Removes a select's frame when the select is done, however it ends.
+struct WindowGuard;
+
+impl Drop for WindowGuard {
+    fn drop(&mut self) {
+        WINDOWS.with(|frames| {
+            frames.borrow_mut().pop();
+        });
+    }
+}
 
 thread_local! {
     static NESTED_QUERIES_RUN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -8513,6 +10324,12 @@ struct StatementScope {
     related_keys: HashMap<(usize, usize), (Vec<Operation>, String, String, Arc<str>)>,
     /// What a nested expression's operations read, by where they are.
     fields_read: HashMap<(usize, usize), (Vec<Operation>, Option<Vec<String>>)>,
+    /// Answers of collection expressions that start by following a
+    /// reference, by the document referred to and what was asked of it.
+    through_reference: HashMap<(u64, Vec<u8>), Value>,
+    /// The rows of one collection that refer to one named document,
+    /// arranged by the document they refer to through another field.
+    also_referring: HashMap<String, Arc<HashMap<String, Vec<Arc<Document>>>>>,
 }
 
 /// The state of one relationship tally within a statement.
@@ -8585,6 +10402,9 @@ struct SourceRow {
     /// identity that other documents can reference. False for an object or
     /// scalar embedded in another document.
     stored: bool,
+    /// The row itself when it is the store's own copy, in which case
+    /// `document` is empty.
+    lent: Option<Arc<Document>>,
 }
 
 impl SourceRow {
@@ -8592,6 +10412,7 @@ impl SourceRow {
         Self {
             document,
             stored: true,
+            lent: None,
         }
     }
 
@@ -8599,6 +10420,34 @@ impl SourceRow {
         Self {
             document,
             stored: false,
+            lent: None,
+        }
+    }
+
+    /// A stored row that the store still holds.
+    fn lent(document: Arc<Document>) -> Self {
+        Self {
+            document: Document {
+                id: String::new(),
+                schema: String::new(),
+                fields: HashMap::new(),
+                created_at: document.created_at,
+                updated_at: document.updated_at,
+                version: document.version,
+            },
+            stored: true,
+            lent: Some(document),
+        }
+    }
+
+    fn row(&self) -> &Document {
+        self.lent.as_deref().unwrap_or(&self.document)
+    }
+
+    fn into_document(self) -> Document {
+        match self.lent {
+            Some(lent) => lent.as_ref().clone(),
+            None => self.document,
         }
     }
 }

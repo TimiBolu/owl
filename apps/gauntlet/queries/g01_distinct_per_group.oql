@@ -1,0 +1,6 @@
+// Distinct counts inside a group: how many different people and roles
+// each tenant's projects draw on.
+assignments
+  .group_by { org: .project.org.id }
+  .select { org, people: count_distinct(.person), roles: count_distinct(.role), n: count() }
+  .sort { .org.asc }

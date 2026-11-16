@@ -7,7 +7,7 @@ autoexamples = false
 autobenches = false
 
 [workspace]
-members = [".", "apps/loggr", "apps/storefront", "apps/owl-server"]
+members = [".", "apps/loggr", "apps/storefront", "apps/owl-server", "apps/gauntlet"]
 resolver = "2"
 
 [features]

@@ -1,0 +1,5 @@
+// Top three per group, for every group.
+units.sort { .id.asc }.select {
+  id,
+  top: .people.sort { .salary.desc, .id.asc }.limit(3).select { id, salary }
+}

@@ -1,0 +1,8 @@
+// Headcount at each of the first three levels below every root unit.
+units.where { .parent == null }.sort { .id.asc }.select {
+  id,
+  direct: .people.count(),
+  below_1: .children.people.count(),
+  below_2: .children.children.people.count(),
+  below_3: .children.children.children.people.count()
+}

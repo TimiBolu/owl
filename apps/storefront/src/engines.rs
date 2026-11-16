@@ -20,17 +20,22 @@ pub struct Owl {
 
 impl Owl {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with(path, include_str!("../schema.oql"))
+    }
+
+    /// Open a database and declare `schema`, a script of schema statements.
+    pub fn open_with(path: &Path, schema: &str) -> Result<Self> {
         let store = Arc::new(
             RustStore::new(path, 64 << 30).map_err(|error| anyhow!("open Owl: {error}"))?,
         );
         let executor = QueryExecutor::new_with_real_clock(store.clone());
         let owl = Self { store, executor };
-        let schema = parse_oql_file(include_str!("../schema.oql"))
-            .map_err(|error| anyhow!("schema.oql: {error}"))?;
+        let schema =
+            parse_oql_file(schema).map_err(|error| anyhow!("schema: {error}"))?;
         let report = execute_oql_file(&schema, &owl.executor)
-            .map_err(|error| anyhow!("schema.oql: {error}"))?;
+            .map_err(|error| anyhow!("schema: {error}"))?;
         if !report.errors.is_empty() {
-            return Err(anyhow!("schema.oql: {}", report.errors.join("; ")));
+            return Err(anyhow!("schema: {}", report.errors.join("; ")));
         }
         Ok(owl)
     }
@@ -209,6 +214,18 @@ impl Owl {
         })
     }
 
+    /// Insert rows of field values as one durable commit.
+    pub fn insert_rows(
+        &self,
+        collection: &str,
+        rows: Vec<std::collections::HashMap<String, Value>>,
+    ) -> Result<()> {
+        self.executor
+            .insert_documents(collection, rows)
+            .map(|_| ())
+            .map_err(|error| anyhow!("loading {collection}: {error}"))
+    }
+
     fn insert<T>(
         &self,
         collection: &str,
@@ -258,13 +275,23 @@ pub struct Sqlite {
 
 impl Sqlite {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with(path, include_str!("../schema.sql"))
+    }
+
+    /// Open a database and run `schema`, a batch of `CREATE` statements.
+    pub fn open_with(path: &Path, schema: &str) -> Result<Self> {
         let connection = rusqlite::Connection::open(path)?;
         // The same promise Owl makes: a commit is on disk before it returns.
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        connection.execute_batch(include_str!("../schema.sql"))?;
+        connection.execute_batch(schema)?;
         Ok(Self { connection })
+    }
+
+    /// The connection, for a loader that prepares its own statements.
+    pub fn connection(&mut self) -> &mut rusqlite::Connection {
+        &mut self.connection
     }
 
     pub fn query(&self, source: &str) -> Result<Vec<Json>> {

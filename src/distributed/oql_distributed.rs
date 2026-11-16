@@ -477,6 +477,9 @@ impl DistributedOQLEngine {
                 | Operation::LimitExpr(_)
                 | Operation::OffsetExpr(_)
                 | Operation::Distinct
+                | Operation::Combine { .. }
+                | Operation::Walk { .. }
+                | Operation::PartitionBy(_)
                 | Operation::AggregateExpr { .. }
                 | Operation::Explain
                 | Operation::Step(_)
@@ -554,6 +557,9 @@ impl DistributedOQLEngine {
                 | Operation::LimitExpr(_)
                 | Operation::OffsetExpr(_)
                 | Operation::Distinct
+                | Operation::Combine { .. }
+                | Operation::Walk { .. }
+                | Operation::PartitionBy(_)
                 | Operation::AggregateExpr { .. }
                 | Operation::Explain
                 | Operation::Step(_)

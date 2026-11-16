@@ -1,0 +1,11 @@
+// Each row compared with its neighbours: the longest silence between two
+// of a person's events, and how often a deploy came next.
+events
+  .sort { .person.id.asc, .at.asc, .id.asc }
+  .partition_by { .person }
+  .select { person: .person.id, gap: seconds_until(prev(.at), .at), after: next(.kind) }
+  .where { .gap != null }
+  .group_by { .person }
+  .select { person, longest: max(.gap), deploys_next: where { .after == "deploy" }.count() }
+  .sort { .longest.desc, .person.asc }
+  .limit(20)

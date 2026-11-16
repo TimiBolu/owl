@@ -1,0 +1,2 @@
+// People paid over 1.2 times their own unit's average.
+people.where { .salary > .unit.people.avg(.salary) * 1.2 }.count()

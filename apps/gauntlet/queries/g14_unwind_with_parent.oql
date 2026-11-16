@@ -1,0 +1,7 @@
+// List elements grouped by a field of the row they came from: minutes by
+// the task's state and the entry's. After the step into `worklog`, the
+// name `tasks` is the task each entry belongs to.
+tasks.worklog
+  .group_by { task_state: tasks.state, entry_state: .state }
+  .select { task_state, entry_state, entries: count(), minutes: sum(.minutes) }
+  .sort { .task_state.asc, .entry_state.asc }

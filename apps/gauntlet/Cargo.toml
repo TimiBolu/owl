@@ -1,0 +1,15 @@
+[package]
+name = "gauntlet"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+owl_db = { path = "../.." }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1"
+# The engine wrappers and the result comparison are the storefront's.
+storefront = { path = "../storefront" }
+tempfile = "3"

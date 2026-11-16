@@ -1,0 +1,6 @@
+// Managers with a report who earns more than they do.
+people
+  .where { .reports.max(.salary) > .salary }
+  .sort { .id.asc }
+  .limit(20)
+  .select { id, salary, best_report: .reports.max(.salary), reports: .reports.count() }

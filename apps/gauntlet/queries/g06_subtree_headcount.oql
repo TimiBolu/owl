@@ -1,0 +1,8 @@
+// Each root unit's whole subtree, however deep: how many units, how far
+// down, and everyone in them.
+units.where { .parent == null }.sort { .id.asc }.select {
+  id,
+  units: .walk(.children).count(),
+  deepest: .walk(.children).max(._depth),
+  people: .people.count() + .walk(.children).people.count()
+}

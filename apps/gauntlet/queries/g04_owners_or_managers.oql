@@ -1,0 +1,8 @@
+// Three sets combined: people who own an active project or manage five
+// or more people, leaving out those who have left.
+people.where { .owned.where { .state == "active" }.exists() }
+  .union(people.where { .reports.count() >= 5 })
+  .except(people.where { .departed != null })
+  .sort { .id.asc }
+  .limit(30)
+  .select { id, name }

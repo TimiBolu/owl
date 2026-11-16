@@ -1,0 +1,7 @@
+// A histogram over the elements of a list of text.
+tasks
+  .where { .state != "done" }
+  .labels
+  .group_by { label: . }
+  .select { label, n: count() }
+  .sort { .n.desc, .label.asc }

@@ -1,0 +1,6 @@
+// Every work log entry of every task, regrouped by who wrote it.
+tasks.worklog
+  .group_by { .author.id }
+  .select { author_id, entries: count(), minutes: sum(.minutes) }
+  .sort { .minutes.desc, .author_id.asc }
+  .limit(20)

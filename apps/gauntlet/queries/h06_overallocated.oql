@@ -1,0 +1,6 @@
+// People on at least three projects with more than a hundred hours.
+people
+  .where { .assignments.count() >= 3 && .assignments.sum(.hours) > 100 }
+  .select { id, projects: .assignments.count(), hours: .assignments.sum(.hours) }
+  .sort { .hours.desc, .id.asc }
+  .limit(20)

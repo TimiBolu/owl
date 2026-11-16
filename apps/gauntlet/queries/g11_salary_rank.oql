@@ -1,0 +1,10 @@
+// The three best-paid people of every unit with their rank, where equal
+// salaries share one. The filter is on the computed position.
+people
+  .sort { .unit.id.asc, .salary.desc, .id.asc }
+  .partition_by { .unit }
+  .select {
+    id, unit: .unit.id, salary,
+    position: row_number(), rank: rank(.salary), dense: dense_rank(.salary)
+  }
+  .where { .position <= 3 }

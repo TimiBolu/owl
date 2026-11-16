@@ -1,0 +1,83 @@
+// Gauntlet: a workspace model built to be hard on a query engine.
+// Three hierarchies of unknown depth (units, managers, subtasks), two
+// many-to-many relationships (assignments, links), optional references,
+// lists of scalars, a wide embedded list, and data skewed towards one tenant.
+
+schema orgs {
+  id: String,
+  name: String,
+  plan: String,
+  region: String
+}
+
+schema units {
+  id: String,
+  org: Ref(orgs),
+  name: String,
+  parent: Optional(Ref(units)) as children,
+  budget: Float
+}
+
+schema people {
+  id: String,
+  org: Ref(orgs),
+  unit: Ref(units),
+  manager: Optional(Ref(people)) as reports,
+  name: String,
+  level: Integer,
+  salary: Float,
+  hired: DateTime,
+  departed: Optional(DateTime),
+  skills: List(String),
+  index(.level)
+}
+
+schema projects {
+  id: String,
+  org: Ref(orgs),
+  owner: Ref(people) as owned,
+  name: String,
+  state: String,
+  budget: Float,
+  started: DateTime,
+  tags: List(String),
+  index(.state)
+}
+
+schema assignments {
+  id: String,
+  person: Ref(people),
+  project: Ref(projects),
+  role: String,
+  hours: Integer
+}
+
+schema tasks {
+  id: String,
+  project: Ref(projects),
+  assignee: Optional(Ref(people)) as assigned,
+  parent: Optional(Ref(tasks)) as subtasks,
+  state: String,
+  points: Integer,
+  opened: DateTime,
+  closed: Optional(DateTime),
+  labels: List(String),
+  worklog: List({ at: DateTime, author: Ref(people), state: String, minutes: Integer }),
+  index(.state, .opened)
+}
+
+schema links {
+  id: String,
+  blocker: Ref(tasks) as blocks,
+  blocked: Ref(tasks) as blocked_by,
+  kind: String
+}
+
+schema events {
+  id: String,
+  person: Ref(people),
+  kind: String,
+  at: DateTime,
+  amount: Integer,
+  index(.at)
+}

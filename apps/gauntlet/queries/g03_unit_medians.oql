@@ -1,0 +1,5 @@
+// The same aggregates reached through a relationship and used in a filter.
+units
+  .where { .people.count() >= 20 && .people.median(.salary) > 50000 }
+  .sort { .id.asc }
+  .select { id, median: .people.median(.salary), skills: .people.count_distinct(.level) }

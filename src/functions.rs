@@ -222,6 +222,7 @@ impl FunctionRegistry {
         self.register("diff_days", text_or_datetime_diff_days);
         self.register("days_until", datetime_days_until);
         self.register("days_since", datetime_days_since);
+        self.register("seconds_until", datetime_seconds_until);
     }
 
     /// Register utility functions
@@ -1773,6 +1774,14 @@ fn two_timestamps(name: &str, args: &[Value]) -> OQLResult<Option<(DateTime<Utc>
 fn datetime_days_until(args: &[Value]) -> OQLResult<Value> {
     Ok(two_timestamps("days_until", args)?
         .map(|(from, to)| Value::Integer((to - from).num_days()))
+        .unwrap_or(Value::Null))
+}
+
+/// Whole seconds from the first timestamp until the second, for gaps too
+/// short to count in days: `prev(.at).seconds_until(.at)`.
+fn datetime_seconds_until(args: &[Value]) -> OQLResult<Value> {
+    Ok(two_timestamps("seconds_until", args)?
+        .map(|(from, to)| Value::Integer((to - from).num_seconds()))
         .unwrap_or(Value::Null))
 }
 
