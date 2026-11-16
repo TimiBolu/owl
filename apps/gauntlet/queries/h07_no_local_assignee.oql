@@ -1,0 +1,8 @@
+// Active projects with nobody assigned from the owner's own unit: an
+// anti-join whose inner condition refers back to the outer row.
+projects
+  .where {
+    .state == "active"
+      && !.assignments.where { .person.unit == projects.owner.unit }.exists()
+  }
+  .count()

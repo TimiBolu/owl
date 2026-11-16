@@ -1,0 +1,6 @@
+// How many different people hold an open task.
+tasks
+  .where { .state == "open" && .assignee != null }
+  .select { who: .assignee.id }
+  .distinct()
+  .count()

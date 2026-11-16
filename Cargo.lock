@@ -544,6 +544,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "gauntlet"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "owl_db",
+ "rusqlite",
+ "serde_json",
+ "storefront",
+ "tempfile",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

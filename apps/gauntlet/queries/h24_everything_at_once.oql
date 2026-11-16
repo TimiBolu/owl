@@ -1,0 +1,14 @@
+// Per tenant: the three projects with the most unfinished points among
+// those with an unfinished blocked task, each with its two busiest people.
+orgs.sort { .id.asc }.select {
+  id,
+  top: .projects
+    .where { .tasks.where { .state != "done" && .blocked_by.exists() }.exists() }
+    .select {
+      id,
+      open_points: .tasks.where { .state != "done" }.sum(.points),
+      team: .assignments.sort { .hours.desc, .id.asc }.limit(2).select { who: .person.name, hours }
+    }
+    .sort { .open_points.desc, .id.asc }
+    .limit(3)
+}

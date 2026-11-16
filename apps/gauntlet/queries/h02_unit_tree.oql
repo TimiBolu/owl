@@ -1,0 +1,13 @@
+// A result nested four levels deep: unit, child units, their best-paid
+// people, and each person's project assignments.
+units.where { .org == "g03" && .parent == null }.select {
+  id, name,
+  children: .children.sort { .id.asc }.select {
+    id,
+    headcount: .people.count(),
+    people: .people.sort { .salary.desc, .id.asc }.limit(3).select {
+      id, salary,
+      projects: .assignments.sort { .id.asc }.select { project: .project.name, hours }
+    }
+  }
+}

@@ -31,6 +31,9 @@ pub enum Token {
     Nearest,
     Distinct,
     Explain,
+    /// One of [`STAGE_WORDS`] applied as an operation: followed by `(` or
+    /// `{`. Anywhere else the same text is an ordinary name.
+    Stage(String),
 
     // Function definition
     Fn,
@@ -109,6 +112,24 @@ pub enum Token {
 /// identifier, so it cannot collide with a binding or a field.
 pub const CURRENT_ROWS: &str = "$rows";
 
+/// Operations and aggregates that are words only where they are applied, so
+/// that data may still have fields called `median` or `union`.
+pub const STAGE_WORDS: [&str; 8] = [
+    "count_distinct",
+    "median",
+    "percentile",
+    "union",
+    "intersect",
+    "except",
+    "walk",
+    "partition_by",
+];
+
+/// The aggregates among [`STAGE_WORDS`].
+fn is_aggregate_stage(word: &str) -> bool {
+    matches!(word, "count_distinct" | "median" | "percentile")
+}
+
 /// The marker the parser gives a `select` entry written `-name`: the named
 /// field is left out of the result.
 pub const OMITTED_FIELD: &str = "$omit";
@@ -153,6 +174,7 @@ impl Token {
             Token::StartsWith => "starts_with",
             Token::EndsWith => "ends_with",
             Token::In => "in",
+            Token::Stage(word) => return STAGE_WORDS.iter().find(|known| *known == word).copied(),
             _ => return None,
         })
     }
@@ -178,6 +200,7 @@ impl Token {
                 | Token::Nearest
                 | Token::Distinct
                 | Token::Explain
+                | Token::Stage(_)
                 | Token::Count
                 | Token::Sum
                 | Token::Avg
@@ -250,6 +273,7 @@ impl Tokenizer {
             Self::parse_parameter,
             Self::parse_field_access,
             Self::parse_keyword,
+            Self::parse_stage_word,
             Self::parse_identifier,
             Self::parse_punctuation,
         ))(input)
@@ -535,7 +559,23 @@ impl Tokenizer {
     /// True when `input` starts with an operation keyword followed by what
     /// that operation takes: a block, an argument list, a list of documents
     /// for `insert`, `on` for `upsert`, or a bare count for `limit`/`offset`.
+    /// One of [`STAGE_WORDS`] followed by its `(` or `{`.
+    fn parse_stage_word(input: &str) -> IResult<&str, Token> {
+        let (rest, name) = Self::parse_identifier_name(input)?;
+        if STAGE_WORDS.contains(&name.as_str()) && rest.trim_start().starts_with(['(', '{']) {
+            Ok((rest, Token::Stage(name)))
+        } else {
+            Err(nom::Err::Error(nom::error::Error::new(
+                input,
+                nom::error::ErrorKind::Tag,
+            )))
+        }
+    }
+
     fn is_operation_applied(input: &str) -> bool {
+        if Self::parse_stage_word(input).is_ok() {
+            return true;
+        }
         let Ok((rest, token)) = Self::parse_keyword(input) else {
             return false;
         };
@@ -796,6 +836,24 @@ pub enum Operation {
         function: String,
         input: Expression,
     },
+    /// `union(q)`, `intersect(q)` or `except(q)`: combine these rows with
+    /// the rows of another query, as sets. Rows are the same when all
+    /// their fields are equal, as for `distinct()`.
+    Combine {
+        how: String,
+        other: Expression,
+    },
+    /// `walk(.path)`: every row reached by following the path one or more
+    /// times, each once, nearest first. A second argument limits how many
+    /// times. Each row carries `_depth`, the steps taken to reach it.
+    Walk {
+        path: FieldAccess,
+        depth: Option<Expression>,
+    },
+    /// `partition_by { keys }`: the position functions of the next `select`
+    /// (`row_number`, `prev`, `running_sum` and the rest) start again for
+    /// each distinct key. The rows and their order are unchanged.
+    PartitionBy(GroupByBlock),
     First,
     Exists,
     Nearest(NearestBlock),
@@ -2285,6 +2343,30 @@ impl Parser {
                 num_candidates: block.num_candidates,
                 exact: block.exact,
             }),
+            Operation::Combine { how, other } => Operation::Combine {
+                how: how.clone(),
+                other: Self::substitute_scoped_locals_expression(other, locals),
+            },
+            Operation::Walk { path, depth } => Operation::Walk {
+                path: path.clone(),
+                depth: depth
+                    .as_ref()
+                    .map(|depth| Self::substitute_scoped_locals_expression(depth, locals)),
+            },
+            Operation::PartitionBy(block) => Operation::PartitionBy(GroupByBlock {
+                fields: block.fields.clone(),
+                computed: block
+                    .computed
+                    .iter()
+                    .map(|key| ComputedGroupKey {
+                        name: key.name.clone(),
+                        expression: Self::substitute_scoped_locals_expression(
+                            &key.expression,
+                            locals,
+                        ),
+                    })
+                    .collect(),
+            }),
             other => other.clone(),
         }
     }
@@ -2891,6 +2973,9 @@ impl Parser {
             | Operation::LimitExpr(_)
             | Operation::OffsetExpr(_)
             | Operation::Distinct
+            | Operation::Combine { .. }
+            | Operation::Walk { .. }
+            | Operation::PartitionBy(_)
             | Operation::AggregateExpr { .. }
             | Operation::Explain
             | Operation::Step(_)
@@ -4204,6 +4289,17 @@ impl Parser {
                 }
                 Ok(Expression::FieldAccess(FieldAccess { path }))
             }
+            // `.walk(.children)` starts from the current row.
+            Some(Token::Dot)
+                if matches!(self.peek_token(), Some(Token::Stage(word)) if word == "walk") =>
+            {
+                self.advance();
+                let operation = self.parse_operation()?;
+                Ok(Expression::CollectionExpression {
+                    source: Box::new(Expression::FieldAccess(FieldAccess { path: Vec::new() })),
+                    operations: vec![operation],
+                })
+            }
             // A lone `.` is the current row or value itself, as in
             // `.tags.where { . == "beta" }`.
             Some(Token::Dot)
@@ -4213,6 +4309,13 @@ impl Parser {
             {
                 self.advance();
                 Ok(Expression::FieldAccess(FieldAccess { path: Vec::new() }))
+            }
+            // `median(.salary)` where a value is expected is a call, like
+            // `sum(.salary)`.
+            Some(Token::Stage(name)) if is_aggregate_stage(name) => {
+                let name = name.clone();
+                self.advance();
+                self.parse_function_call(name)
             }
             // An operation with no receiver applies to the collection the
             // expression is evaluated over: the rows of the group in a
@@ -4226,6 +4329,7 @@ impl Parser {
                 | Token::Select
                 | Token::First
                 | Token::Distinct
+                | Token::Stage(_)
                 | Token::GroupBy,
             ) if matches!(
                 self.peek_token(),
@@ -4375,6 +4479,64 @@ impl Parser {
             self.expect_token(Token::LeftParen)?;
             self.expect_token(Token::RightParen)?;
             return Ok(Some(Operation::Explain));
+        }
+        if let Some(Token::Stage(name)) = self.current_token() {
+            let name = name.clone();
+            match name.as_str() {
+                "union" | "intersect" | "except" => {
+                    self.advance();
+                    self.expect_token(Token::LeftParen)?;
+                    let other = self.parse_expression()?;
+                    self.expect_token(Token::RightParen)?;
+                    return Ok(Some(Operation::Combine { how: name, other }));
+                }
+                "walk" => {
+                    self.advance();
+                    self.expect_token(Token::LeftParen)?;
+                    let path = self.parse_field_access_expression()?;
+                    let depth = if matches!(self.current_token(), Some(Token::Comma)) {
+                        self.advance();
+                        Some(self.parse_expression()?)
+                    } else {
+                        None
+                    };
+                    self.expect_token(Token::RightParen)?;
+                    return Ok(Some(Operation::Walk { path, depth }));
+                }
+                "partition_by" => {
+                    self.advance();
+                    return Ok(Some(Operation::PartitionBy(self.parse_group_by_block()?)));
+                }
+                _ => {}
+            }
+        }
+        // The aggregates that are not keywords always take this form.
+        if let Some(Token::Stage(name)) = self.current_token() {
+            if is_aggregate_stage(name) && matches!(self.peek_token(), Some(Token::LeftParen)) {
+                let function = name.clone();
+                self.advance();
+                self.expect_token(Token::LeftParen)?;
+                let mut arguments = vec![self.parse_expression()?];
+                while matches!(self.current_token(), Some(Token::Comma)) {
+                    self.advance();
+                    arguments.push(self.parse_expression()?);
+                }
+                self.expect_token(Token::RightParen)?;
+                let expected = if function == "percentile" { 2 } else { 1 };
+                if arguments.len() != expected {
+                    return Err(ParseError::InvalidSyntax(format!(
+                        "{function} takes {expected} argument(s), not {}",
+                        arguments.len()
+                    )));
+                }
+                // A percentile's value and fraction travel as a pair.
+                let input = if function == "percentile" {
+                    Expression::ArrayLiteral(arguments)
+                } else {
+                    arguments.remove(0)
+                };
+                return Ok(Some(Operation::AggregateExpr { function, input }));
+            }
         }
         let function = match self.current_token() {
             Some(Token::Sum) => "sum",
@@ -4903,6 +5065,9 @@ fn operation_uses_legacy_outer(operation: &Operation) -> bool {
         | Operation::LimitExpr(_)
         | Operation::OffsetExpr(_)
         | Operation::Distinct
+        | Operation::Combine { .. }
+        | Operation::Walk { .. }
+        | Operation::PartitionBy(_)
         | Operation::AggregateExpr { .. }
         | Operation::Explain
         | Operation::Step(_)

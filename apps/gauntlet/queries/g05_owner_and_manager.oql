@@ -1,0 +1,2 @@
+// The overlap of two sets.
+people.where { .owned.exists() }.intersect(people.where { .reports.exists() }).count()

@@ -130,6 +130,7 @@ words (`if then else match and or not in`) as bare names without a leading
 | Value must match the declared type | Works |
 | `Integer` given for `Float` is widened | Works *(not probed for every path)* |
 | A `Ref` must point at an existing document | Works |
+| A `Ref` may point at a document written earlier in the same statement or transaction | Works: the rows of a tree can be inserted in one batch, parents before children, and a transaction can insert a row and then rows that refer to it. |
 | `id` identifies a document uniquely within its collection | Works. An insert with an existing `id` is rejected, including within one batch; `id` cannot be changed by an update. |
 
 ### 4.4 Identity and system fields
@@ -231,6 +232,7 @@ A change the rules above cannot express is done in two steps with an ordinary
 | Compare a `DateTime` with an RFC 3339 string, by instant | Works |
 | `now()`, `today()`, `days_ago(n)`, `hours_ago(n)`, `minutes_ago(n)` | Works |
 | `year month day hour minute second weekday`, `format_date`, `parse_date`, `add_days`, `add_hours`, `diff_days` | Works on `DateTime` values |
+| `seconds_until(from, to)` | Works: whole seconds between two timestamps, for gaps too short to count in days. Null when either is absent. |
 | Write a `DateTime` field from text | Works: `events.insert { at: "2026-01-05T10:00:00Z" }`, in inserts, updates and lists. Unparseable text is an error. |
 | Date-only text `"2026-03-01"` | Works: midnight UTC on that day, for writes and comparisons. |
 | Time functions on a timestamp stored as `String` | Works |
@@ -328,6 +330,7 @@ Gaps found:
 | A single referenced or embedded object | `.team.select { name }`, `.profile.select { city }` | Works: yields one object, and shaping can traverse onward (`.team.select { name, org: .org.name }`). |
 | A collection reached through a collection | `.teams.users`, `.teams.users.orders` on an org | Works: each step maps over the rows reached so far and flattens. |
 | A path step in a chain | `orders.where { .status == "paid" }.items.group_by { .product.id }`, `orgs.teams.users.count()` | Works, at the top level and between operations in an expression. Every row is replaced by the rows its path leads to, which is how a query reaches the line items inside its orders. |
+| The row an element came from | `orders.items.group_by { status: orders.status, .product.id }` | Works at the top level. After a path step, the collection's name is the row each element was reached from, until a `select` or `group_by` reshapes the rows. This is what `$unwind` and a join back to the parent are for elsewhere. |
 
 ### 6.2 Operations
 
@@ -370,6 +373,9 @@ orders.group_by { .status }.select {
 | Nearest neighbours | `.nearest { field, query, metric, k }` | Works (section 18) |
 | Distinct | `.distinct()` | Works. Rows are equal when all their fields are equal by value (`1` and `1.0` are one value; an object's field order is irrelevant). The first of each set is kept, so input order survives. |
 | Order of operations is the order written | `limit(2).where {..}` filters the first two rows | Works |
+| Set operations | `.union(query)`, `.intersect(query)`, `.except(query)` | Works. The argument is a query, a collection name or a list. Rows are equal as for `distinct()`, and the result is a set: a row appears once. The order is that of the rows the operation is called on, then, for a union, the other query's. Rows keep their collection and identity, so relationships can be followed from them. |
+| Walk a relationship to any depth | `.walk(.children)`, `.walk(.manager)`, `.walk(.blocked_by.blocker)`, `.walk(.children, 2)` | Works, at the top level and from a row (`below: .walk(.children).count()`). Every row reached by following the path one or more times, each once, nearest first, so a cycle ends the walk. The starting rows are included only if the path leads back to them. `._depth` is the number of steps that reached a row. A second argument limits the steps. |
+| Partition for position functions | `.partition_by { .person }` | Works (section 11.1). Rows and their order are unchanged. |
 
 ### 6.3 Aggregate results on empty input
 
@@ -389,6 +395,16 @@ is an error. All of this works and is the same in every form.
 Still open: a misspelt *scalar* path such as `.nmae` on a schema'd collection
 reads as `null` when it is not used as a collection. It should be the same
 error.
+
+Also open, both found by the gauntlet suite (`apps/gauntlet`):
+
+- A comparison whose left side passes through a collection, such as
+  `people.where { .assignments.project.id == "j1" }`, is false for every row
+  rather than an error or "any of them". The explicit form works:
+  `.assignments.where { .project.id == "j1" }.exists()`.
+- `.children*.id` parses as a multiplication and fails with a message about
+  multiplying. It should say that `*` is not a path operator and point at
+  `walk`.
 
 ---
 
@@ -504,6 +520,8 @@ collide.
 | Group by a function call | `.group_by { year(.placed) }` | Works. The key is named after the function (`year`). |
 | Name a group key | `.group_by { month: format_date(.placed, "%Y-%m"), big: .amount > 100 }` | Works. Any other expression must be named. Two keys with one name are an error. |
 | Count distinct | `.select { status }.distinct().count()` | Works |
+| Count distinct as an aggregate | `count_distinct(.customer)`, `.orders.count_distinct(.status)` | Works in every form an aggregate takes. Absent values are not counted. |
+| Median and percentiles | `median(.salary)`, `percentile(.salary, 0.9)`, `.people.median(.salary)` | Works in every form an aggregate takes. The fraction is between 0 and 1; a value that falls between two rows is interpolated between them. Null for no rows. |
 | The rows of a group as a collection | `top: sort { .amount.desc }.limit(3).select { id }`, `big: where { .amount > 100 }.count()` | Works (6.2) |
 | Grouping an empty collection gives no rows | | Works |
 | `1` and `1.0` are one group | | Works |
@@ -511,8 +529,47 @@ collide.
 Time-bucketed reporting, the main reporting gap named in the coverage review,
 needed no new feature: `orders.group_by { month: format_date(.placed, "%Y-%m") }`.
 
-Ranking within a partition, rollups, cubes and histogram families stay out of
-the core (section 22). Top-k per parent is already expressible (section 8).
+Rollups, cubes and histogram families stay out of the core (section 22).
+Top-k per parent is already expressible (section 8).
+
+### 11.1 Position functions
+
+A `select` shapes its rows in order, and these functions answer for a row by
+its position among them. They are what window functions are for in SQL.
+
+```oql
+events
+  .sort { .person.id.asc, .at.asc }
+  .partition_by { .person }
+  .select {
+    id,
+    n: row_number(),
+    total_so_far: running_sum(.amount),
+    gap: seconds_until(prev(.at), .at),
+    session: running_sum(if prev(.at) == null || seconds_until(prev(.at), .at) >= 21600 then 1 else 0)
+  }
+```
+
+| Function | Meaning | Status |
+|---|---|---|
+| `row_number()` | The row's place, from 1 | Works |
+| `prev(value)`, `next(value)`, `prev(value, n)` | The value for the row `n` places before or after, null past the edge | Works |
+| `running_sum(value)`, `running_avg`, `running_min`, `running_max` | Over the rows up to and including this one | Works |
+| `running_count()`, `running_count(value)` | Rows so far, or rows so far with a value | Works |
+| `rank(value)`, `dense_rank(value)` | Rows that follow one another with equal values share a rank; `rank` then skips, `dense_rank` does not | Works |
+
+| Rule | Status |
+|---|---|
+| The order is the order of the rows: `sort` before the `select` | Works |
+| `partition_by { keys }` makes the functions of the next `select` start again for each distinct key. A partition is all the rows with that key, wherever they fall | Works |
+| With no `partition_by` the rows are one sequence | Works |
+| The rows of a relationship are their own sequence: `.events.sort { .at.asc }.select { running_sum(.amount) }` | Works |
+| One function may be used inside another | Works |
+| A computed position can be filtered, grouped and sorted on by what follows the `select` | Works |
+| Outside a `select` a position function is an error | Works |
+
+A query that uses these runs on the general executor from the first such
+operation on; what precedes it still uses indexes and column reads.
 
 ---
 
@@ -700,7 +757,7 @@ P partial or wrong in some form, N missing.
 | Filtering | equality, comparison, boolean logic, null checks, membership, existence, prefix and suffix and substring | | regex |
 | Projection | fields, aliases, computed, object and list construction, nested projection, all-fields `*`, exclusion | | |
 | Relationships | forward, reverse, deep traversal, nested property access, collection through collection, object-valued select | | |
-| Aggregation | count, sum, avg, min, max, group by, having, sort by aggregate, distinct, expression keys, aggregates over expressions, conditional aggregates, top-k per group | | window functions (out) |
+| Aggregation | count, sum, avg, min, max, group by, having, sort by aggregate, distinct, expression keys, aggregates over expressions, conditional aggregates, top-k per group, distinct count, median and percentiles, position (window) functions, set operations, recursive traversal | | |
 | Ordering | sort, limit, offset, parameterised paging | | |
 | Transactions | atomic blocks, rollback, read-your-writes | | isolation levels (out) |
 | Update semantics | partial, nested, increment, list append and removal | | |
@@ -716,8 +773,9 @@ Stated so that their absence is a decision, not an oversight.
 - Join syntax. Relationships are navigated.
 - A separate array language (`any`, `map`, `unwind`, `$elemMatch`).
 - Update operator families (`$set`, `$push`, `$inc`). Shaped updates and `+=` cover them.
-- Window functions, `ROLLUP`, `CUBE`, facets, histogram families.
-- Set operations (`union`, `intersect`). Bindings and `in` cover the common cases.
+- `ROLLUP`, `CUBE`, facets, histogram families. Window functions and set
+  operations were on this list and no longer are: analytical queries cannot
+  be written without them (sections 6.2 and 11.1).
 - Regex as an operator. One function at most.
 - `between`, block comments, nested transactions, isolation-level syntax.
 - Full-text and geospatial search.

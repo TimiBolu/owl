@@ -1,0 +1,9 @@
+// Tasks blocked by a task that is itself blocked by an open task: two
+// steps along a many-to-many graph.
+tasks
+  .where {
+    .blocked_by.where {
+      .blocker.blocked_by.where { .blocker.state == "open" }.exists()
+    }.exists()
+  }
+  .count()

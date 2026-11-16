@@ -1,0 +1,7 @@
+// Grouping on two keys, one of them two references away, with a filter
+// on the groups.
+tasks
+  .group_by { org: .project.org.id, .state }
+  .having { count() > 50 }
+  .select { org, state, n: count(), points: sum(.points), mean: avg(.points) }
+  .sort { .org.asc, .state.asc }

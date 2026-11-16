@@ -3,12 +3,10 @@
 //! `check` loads the same data into both engines and requires every query
 //! to return the same rows. `bench` times loading and each query.
 
-mod data;
-mod engines;
-
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
-use engines::{first_difference, Owl, Sqlite};
+use storefront::data;
+use storefront::engines::{first_difference, Owl, Sqlite};
 use serde_json::{json, Value as Json};
 use std::path::Path;
 use std::time::{Duration, Instant};

@@ -1,0 +1,10 @@
+// Everyone who shares a project with one person: a many-to-many
+// relationship crossed twice.
+people
+  .where {
+    .id != "p000001"
+      && .assignments.where { .project.assignments.where { .person == "p000001" }.exists() }.exists()
+  }
+  .sort { .id.asc }
+  .limit(20)
+  .select { id, name }

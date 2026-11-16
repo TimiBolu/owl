@@ -1,0 +1,7 @@
+// A running total and a row number per person, in time order.
+events
+  .where { .kind == "deploy" }
+  .sort { .person.id.asc, .at.asc, .id.asc }
+  .partition_by { .person }
+  .select { id, n: row_number(), running: running_sum(.amount) }
+  .limit(500)

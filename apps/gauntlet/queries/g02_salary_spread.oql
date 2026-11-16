@@ -1,0 +1,6 @@
+// Median and 90th percentile salary per level, and per unit through a
+// relationship.
+people
+  .group_by { .level }
+  .select { level, n: count(), median: median(.salary), p90: percentile(.salary, 0.9) }
+  .sort { .level.asc }

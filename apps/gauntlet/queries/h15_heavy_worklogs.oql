@@ -1,0 +1,3 @@
+// A filter on an aggregate over each row's own embedded list. One task in
+// fifty has a list of fifty to two hundred entries.
+tasks.where { .worklog.where { .minutes > 400 }.count() >= 3 }.count()

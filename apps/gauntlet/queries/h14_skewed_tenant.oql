@@ -1,0 +1,7 @@
+// The largest tenant holds about a third of all tasks, so the filter
+// through the project removes little before the sort.
+tasks
+  .where { .project.org == "g00" && .state == "open" && .assignee != null }
+  .sort { .points.desc, .opened.asc, .id.asc }
+  .limit(20)
+  .select { id, points, who: .assignee.name }

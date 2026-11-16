@@ -1,0 +1,10 @@
+// The limit is written last, after an expensive select. Only ten rows
+// are wanted, so only ten should be built.
+projects
+  .select {
+    id,
+    team: .assignments.count(),
+    biggest: .tasks.sort { .points.desc, .id.asc }.limit(1).select { id, points }
+  }
+  .sort { .id.asc }
+  .limit(10)

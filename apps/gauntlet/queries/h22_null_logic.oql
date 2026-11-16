@@ -1,0 +1,4 @@
+// Absent values on the row and one reference away, in both senses.
+tasks
+  .where { .assignee == null && .parent != null && .parent.assignee != null && .closed == null }
+  .count()

@@ -1,0 +1,9 @@
+// Three conditions, each at the end of a chain of references, two of them
+// through optional references that are often absent.
+tasks
+  .where {
+    .assignee.unit.parent.org.plan == "enterprise"
+      && .project.owner.manager.level >= 3
+      && .parent.state == "done"
+  }
+  .count()
