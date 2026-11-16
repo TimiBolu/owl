@@ -424,10 +424,12 @@ fn test_complex_user_defined_functions() {
             FunctionParameter {
                 name: "balance".to_string(),
                 param_type: "Float".to_string(),
+                default: None,
             },
             FunctionParameter {
                 name: "age".to_string(),
                 param_type: "Integer".to_string(),
+                default: None,
             },
         ],
         return_type: Some("Float".to_string()),
@@ -455,6 +457,7 @@ fn test_complex_user_defined_functions() {
             FunctionParameter {
                 name: "balance".to_string(),
                 param_type: "Float".to_string(),
+                default: None,
             },
         ],
         return_type: Some("String".to_string()),

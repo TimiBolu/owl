@@ -97,6 +97,7 @@ impl QueryMetrics {
             crate::parser::Operation::LimitExpr(_) => "limit".to_string(),
             crate::parser::Operation::OffsetExpr(_) => "offset".to_string(),
             crate::parser::Operation::Distinct
+            | crate::parser::Operation::Call(_)
             | crate::parser::Operation::Combine { .. }
             | crate::parser::Operation::Walk { .. }
             | crate::parser::Operation::PartitionBy(_) => "select".to_string(),

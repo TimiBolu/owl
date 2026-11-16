@@ -301,6 +301,14 @@ impl<S: DocumentStore> QueryExecutor<S> {
 
     fn execute_statement(&self, query: &OQLQuery) -> OQLResult<Vec<Document>> {
         let _statement = StatementGuard::enter();
+        for operation in &query.operations {
+            if let Operation::Sort(sort) = operation {
+                self.check_sort_functions(sort)?;
+            }
+        }
+        if let Some(Operation::Call(arguments)) = query.operations.first() {
+            return self.execute_call_query(query, arguments);
+        }
         profile_call!("execute_query", {
             if let Some(documents) = self.tie_broken_top_k(query)? {
                 self.validate_declared_paths(query)?;
@@ -454,6 +462,8 @@ impl<S: DocumentStore> QueryExecutor<S> {
         // rest is applied to its rows one operation at a time.
         let limited = Self::limit_before_select(query);
         let query = limited.as_ref().unwrap_or(query);
+        let named = self.reduction_named(query)?;
+        let query = named.as_ref().unwrap_or(query);
         let origin = Self::step_keeping_origin(query);
         let plain = query.operations.iter().position(Self::runs_plainly);
         let split = match (plain, &origin) {
@@ -660,6 +670,205 @@ impl<S: DocumentStore> QueryExecutor<S> {
             .operations
             .iter()
             .position(|operation| matches!(operation, Operation::Step(_)))?;
+        let paths = Self::anchored_paths(&query.operations[step + 1..], &query.collection);
+        (!paths.is_empty()).then_some((step, paths))
+    }
+
+    /// What reducing the values of a field means when written the other
+    /// way round: `.salary.median()` is `median(.salary)`, and
+    /// `.customer.distinct().count()` is a count of the distinct values of
+    /// `customer`. The second form is the one every shortcut knows. `None` when the
+    /// operations are not such a reduction.
+    fn reduction_naming(field: &str, operations: &[Operation]) -> Option<Vec<Operation>> {
+        let named = FieldAccess { path: vec![field.to_string()] };
+        let itself = |expression: &Expression| {
+            matches!(expression, Expression::FieldAccess(access) if access.path.is_empty())
+        };
+        Some(vec![match operations {
+            [Operation::Distinct, Operation::Count] => Operation::AggregateExpr {
+                function: DISTINCT_COUNT.to_string(),
+                input: Expression::FieldAccess(named),
+            },
+            [Operation::AggregateExpr { function, input }] if itself(input) => {
+                match function.as_str() {
+                    "sum" => Operation::Sum(named),
+                    "avg" => Operation::Avg(named),
+                    "min" => Operation::Min(named),
+                    "max" => Operation::Max(named),
+                    _ => Operation::AggregateExpr {
+                        function: function.clone(),
+                        input: Expression::FieldAccess(named),
+                    },
+                }
+            }
+            [Operation::AggregateExpr { function, input: Expression::ArrayLiteral(pair) }]
+                if function == "percentile" && pair.len() == 2 && itself(&pair[0]) =>
+            {
+                Operation::AggregateExpr {
+                    function: function.clone(),
+                    input: Expression::ArrayLiteral(vec![
+                        Expression::FieldAccess(named),
+                        pair[1].clone(),
+                    ]),
+                }
+            }
+            _ => return None,
+        }])
+    }
+
+    /// `people.where { .. }.salary.median()` as `people.where { .. }.median(.salary)`:
+    /// a step into one plain field, then a reduction of its values, is the
+    /// aggregate of that field over the rows. `None` when the query does
+    /// not end that way.
+    fn reduction_named(&self, query: &OQLQuery) -> OQLResult<Option<OQLQuery>> {
+        let Some(step) = query
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Step(_)))
+        else {
+            return Ok(None);
+        };
+        let Operation::Step(FieldAccess { path }) = &query.operations[step] else {
+            return Ok(None);
+        };
+        let [field] = path.as_slice() else {
+            return Ok(None);
+        };
+        // The rows stepped from must still be rows of the collection.
+        let whole = query.operations[..step].iter().all(|operation| {
+            matches!(
+                operation,
+                Operation::Where(_) | Operation::Sort(_) | Operation::Limit(_) | Operation::Offset(_)
+            )
+        });
+        let Some(named) = Self::reduction_naming(field, &query.operations[step + 1..]) else {
+            return Ok(None);
+        };
+        // A query's result is named after its last operation, and
+        // `.distinct().count()` is a `count`, so it is left as written.
+        if matches!(query.operations.last(), Some(Operation::Count)) {
+            return Ok(None);
+        }
+        if !whole || !self.holds_one_value(&query.collection, field)? {
+            return Ok(None);
+        }
+        let mut operations = query.operations[..step].to_vec();
+        operations.extend(named);
+        Ok(Some(OQLQuery {
+            collection: query.collection.clone(),
+            operations,
+        }))
+    }
+
+    /// Whether `field` of a row of `collection` holds one plain value, so
+    /// that reducing "the values of the field" and reducing the rows by
+    /// that field are the same thing. A list or an embedded object is not:
+    /// a path through one has a value for each element.
+    fn holds_one_value(&self, collection: &str, field: &str) -> OQLResult<bool> {
+        let Some(schema) = self.schema_of(collection)? else {
+            return Ok(false);
+        };
+        let mut declared = schema.fields.get(field);
+        while let Some(FieldType::Optional(inner)) = declared {
+            declared = Some(inner);
+        }
+        Ok(matches!(
+            declared,
+            Some(
+                FieldType::String
+                    | FieldType::Integer
+                    | FieldType::Float
+                    | FieldType::Boolean
+                    | FieldType::DateTime
+                    | FieldType::Reference(_)
+            )
+        ))
+    }
+
+    /// The rows a path reaches when the operations applied to them name a
+    /// collection the path passes through on the way. `None` when they name
+    /// none, which is nearly always.
+    fn path_keeping_origin(
+        &self,
+        scope_document: &Document,
+        path: &[String],
+        operations: &[Operation],
+    ) -> OQLResult<Option<Vec<Document>>> {
+        // Almost no operations read anything as `name.field`, and only
+        // those can name a collection on the way. Without one there is
+        // nothing to keep and the rows on the way are not looked at.
+        fn chained(node: &serde_json::Value) -> bool {
+            match node {
+                serde_json::Value::Object(fields) => {
+                    fields.contains_key("ChainedAccess") || fields.values().any(chained)
+                }
+                serde_json::Value::Array(items) => items.iter().any(chained),
+                _ => false,
+            }
+        }
+        let place = (operations.as_ptr() as usize, operations.len());
+        let known = STATEMENT.with(|scope| {
+            scope
+                .borrow()
+                .names_rows
+                .get(&place)
+                .filter(|(remembered, _)| remembered.as_slice() == operations)
+                .map(|(_, names)| *names)
+        });
+        let names = match known {
+            Some(names) => names,
+            None => {
+                let names = serde_json::to_value(operations).map_or(true, |tree| chained(&tree));
+                if StatementGuard::active() {
+                    STATEMENT.with(|scope| {
+                        scope
+                            .borrow_mut()
+                            .names_rows
+                            .insert(place, (operations.to_vec(), names))
+                    });
+                }
+                names
+            }
+        };
+        if !names {
+            return Ok(None);
+        }
+        let mut rows = vec![scope_document.clone()];
+        for (position, segment) in path[..path.len() - 1].iter().enumerate() {
+            let mut next = Vec::new();
+            for row in &rows {
+                next.extend(self.path_source_rows(row, std::slice::from_ref(segment))?.0);
+            }
+            rows = next;
+            let Some(collection) = rows.first().map(|row| row.schema.clone()) else {
+                return Ok(None);
+            };
+            // The enclosing row's own collection means the enclosing row.
+            if collection == scope_document.schema {
+                continue;
+            }
+            let wanted = Self::anchored_paths(operations, &collection);
+            if wanted.is_empty() {
+                continue;
+            }
+            let mut reached = rows;
+            let rest = &path[position + 1..];
+            for (hop, segment) in rest.iter().enumerate() {
+                reached = self.step_from_origin(
+                    reached,
+                    &FieldAccess { path: vec![segment.clone()] },
+                    &collection,
+                    (hop == 0).then_some(wanted.as_slice()),
+                )?;
+            }
+            return Ok(Some(reached));
+        }
+        Ok(None)
+    }
+
+    /// The paths that `operations` read from a row of `collection` by naming
+    /// the collection, as `tasks.state` does.
+    fn anchored_paths(operations: &[Operation], collection: &str) -> Vec<Vec<String>> {
         // `collection.a.b` is a chain of accesses that bottoms out in the
         // collection's name.
         fn collect(node: &serde_json::Value, collection: &str, paths: &mut Vec<Vec<String>>) {
@@ -689,9 +898,10 @@ impl<S: DocumentStore> QueryExecutor<S> {
             }
         }
         let mut paths = Vec::new();
-        let after = serde_json::to_value(&query.operations[step + 1..]).ok()?;
-        collect(&after, &query.collection, &mut paths);
-        (!paths.is_empty()).then_some((step, paths))
+        if let Ok(tree) = serde_json::to_value(operations) {
+            collect(&tree, collection, &mut paths);
+        }
+        paths
     }
 
     /// A path step that lets the rows it reaches still answer for the row
@@ -1132,7 +1342,250 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 });
             }
         }
+        // The names above are the first of each path in the query's own
+        // scope. Every later name, and every name inside a nested filter or
+        // projection, is checked by following the schema to where it is
+        // read. Once for the statement: a nested query is part of it.
+        if STATEMENT.with(|scope| scope.borrow().depth) <= 1 {
+            self.check_operations(Place::Rows(schema), &query.operations)?;
+        }
         Ok(())
+    }
+
+    /// Where one more name of a path leads from `place`, or the error for a
+    /// name that the declared shape there does not have.
+    fn step_place(&self, place: &Place, name: &str) -> OQLResult<Place> {
+        let unknown = |owner: &str, names: Vec<&String>, kind: &str| {
+            let closest = names
+                .into_iter()
+                .map(|field| (Self::edit_distance(field, name), field))
+                .filter(|(distance, _)| *distance <= 2)
+                .min()
+                .map(|(_, field)| format!(". Did you mean '{field}'?"))
+                .unwrap_or_default();
+            OQLError::SchemaValidation {
+                message: format!("'{owner}' has no {kind} '{name}'{closest}"),
+            }
+        };
+        // What a declared type holds: rows of a collection, an object of a
+        // declared shape, or something whose inside is not declared.
+        let held = |declared: &FieldType, schema: &Arc<Schema>, path: String| -> OQLResult<Place> {
+            let mut declared = declared;
+            let mut path = path;
+            loop {
+                match declared {
+                    FieldType::Optional(inner) => declared = inner,
+                    FieldType::List(inner) => {
+                        declared = inner;
+                        path.push_str("[]");
+                    }
+                    FieldType::Reference(reference) => {
+                        return Ok(match self.schema_of(&reference.target_schema)? {
+                            Some(target) => Place::Rows(target),
+                            None => Place::Any,
+                        })
+                    }
+                    FieldType::Object => {
+                        return Ok(match schema.shape(&path) {
+                            Some(fields) => Place::Shape {
+                                schema: schema.clone(),
+                                path,
+                                fields: fields.to_vec(),
+                            },
+                            None => Place::Any,
+                        })
+                    }
+                    _ => return Ok(Place::Any),
+                }
+            }
+        };
+        if name == "*" || name.starts_with('_') || name.starts_with('$') {
+            return Ok(Place::Any);
+        }
+        match place {
+            Place::Any => Ok(Place::Any),
+            Place::Rows(schema) => {
+                if DocumentSystemField::from_name(name).is_some() {
+                    return Ok(Place::Any);
+                }
+                if let Some(declared) = schema.fields.get(name) {
+                    return held(declared, schema, name.to_string());
+                }
+                match self.reverse_relationship(&schema.name, name)? {
+                    ReverseRelationship::Declared { source, .. } => Ok(match self.schema_of(&source)? {
+                        Some(source) => Place::Rows(source),
+                        None => Place::Any,
+                    }),
+                    ReverseRelationship::Unknown => Err(unknown(
+                        &schema.name,
+                        schema.fields.keys().collect(),
+                        "field or relationship",
+                    )),
+                    _ => Ok(Place::Any),
+                }
+            }
+            Place::Shape { schema, path, fields } => {
+                match fields.iter().find(|(field, _)| field == name) {
+                    Some((_, declared)) => held(declared, schema, format!("{path}.{name}")),
+                    None => Err(unknown(
+                        &format!("{}.{}", schema.name, path.trim_end_matches("[]")),
+                        fields.iter().map(|(field, _)| field).collect(),
+                        "field",
+                    )),
+                }
+            }
+        }
+    }
+
+    fn path_place(&self, place: &Place, path: &[String]) -> OQLResult<Place> {
+        let mut place = place.clone();
+        for name in path {
+            if matches!(place, Place::Any) {
+                break;
+            }
+            place = self.step_place(&place, name)?;
+        }
+        Ok(place)
+    }
+
+    /// Check every path of a chain of operations against the declared shape
+    /// of the rows each operation is given.
+    fn check_operations(&self, place: Place, operations: &[Operation]) -> OQLResult<()> {
+        let mut place = place;
+        for operation in operations {
+            match operation {
+                Operation::Where(block) => self.check_condition(&place, &block.condition)?,
+                Operation::Having(block) => self.check_condition(&place, &block.condition)?,
+                Operation::Sort(block) => {
+                    for field in &block.fields {
+                        self.check_expression(&place, &field.expression)?;
+                    }
+                }
+                Operation::AggregateExpr { input, .. } => self.check_expression(&place, input)?,
+                Operation::Sum(field)
+                | Operation::Avg(field)
+                | Operation::Min(field)
+                | Operation::Max(field) => {
+                    self.path_place(&place, &field.path)?;
+                }
+                // What a select or a grouping produces is named by the
+                // query, not by a schema.
+                Operation::Select(block) => {
+                    for field in &block.fields {
+                        self.check_expression(&place, &field.expression)?;
+                    }
+                    place = Place::Any;
+                }
+                Operation::GroupBy(block) | Operation::PartitionBy(block) => {
+                    for field in &block.fields {
+                        self.path_place(&place, &field.path)?;
+                    }
+                    for key in &block.computed {
+                        self.check_expression(&place, &key.expression)?;
+                    }
+                    if matches!(operation, Operation::GroupBy(_)) {
+                        place = Place::Any;
+                    }
+                }
+                Operation::Step(path) | Operation::Walk { path, .. } => {
+                    place = self.path_place(&place, &path.path)?;
+                }
+                Operation::Combine { other, .. } => self.check_expression(&Place::Any, other)?,
+                Operation::Limit(_)
+                | Operation::Offset(_)
+                | Operation::LimitExpr(_)
+                | Operation::OffsetExpr(_)
+                | Operation::Distinct
+                | Operation::First
+                | Operation::Exists
+                | Operation::Count
+                | Operation::Explain => {}
+                // A write, or anything else, is checked where it is done.
+                _ => return Ok(()),
+            }
+        }
+        Ok(())
+    }
+
+    fn check_condition(&self, place: &Place, condition: &Condition) -> OQLResult<()> {
+        match condition {
+            Condition::Comparison { left, right, .. } => {
+                self.check_expression(place, left)?;
+                self.check_expression(place, right)
+            }
+            Condition::And(left, right) | Condition::Or(left, right) => {
+                self.check_condition(place, left)?;
+                self.check_condition(place, right)
+            }
+            Condition::Not(inner) => self.check_condition(place, inner),
+        }
+    }
+
+    fn check_expression(&self, place: &Place, expression: &Expression) -> OQLResult<()> {
+        let check = |node: &Expression| self.check_expression(place, node);
+        match expression {
+            Expression::FieldAccess(access) => self.path_place(place, &access.path).map(|_| ()),
+            // The operations of a nested collection are given its rows.
+            Expression::CollectionExpression { source, operations } => {
+                let rows = match source.as_ref() {
+                    Expression::FieldAccess(access) => self.path_place(place, &access.path)?,
+                    other => {
+                        check(other)?;
+                        Place::Any
+                    }
+                };
+                self.check_operations(rows, operations)
+            }
+            Expression::QueryExpression { query } => {
+                let rows = match self.schema_of(&query.collection)? {
+                    Some(schema) => Place::Rows(schema),
+                    None => Place::Any,
+                };
+                self.check_operations(rows, &query.operations)
+            }
+            // The existence tests ask about a path that may not be there.
+            Expression::FunctionCall { name, .. }
+                if matches!(name.as_str(), "exists" | "is_null" | "is_missing" | "is_broken_ref") =>
+            {
+                Ok(())
+            }
+            Expression::FunctionCall { args, .. } => args.iter().try_for_each(check),
+            Expression::IfThenElse { condition, then_expr, else_expr } => {
+                self.check_condition(place, condition)?;
+                check(then_expr)?;
+                check(else_expr)
+            }
+            Expression::Match { expr, arms } => {
+                check(expr)?;
+                for arm in arms {
+                    if let Some(guard) = &arm.guard {
+                        self.check_condition(place, guard)?;
+                    }
+                    check(&arm.body)?;
+                }
+                Ok(())
+            }
+            Expression::LogicalAnd(left, right)
+            | Expression::LogicalOr(left, right)
+            | Expression::BinaryOp { left, right, .. } => {
+                check(left)?;
+                check(right)
+            }
+            Expression::LogicalNot(inner) => check(inner),
+            Expression::ArrayAccess { array, index } => {
+                check(array)?;
+                check(index)
+            }
+            Expression::ChainedAccess { base, .. } => check(base),
+            Expression::Block(items) | Expression::ArrayLiteral(items) => {
+                items.iter().try_for_each(check)
+            }
+            Expression::ObjectLiteral(fields) => {
+                fields.iter().try_for_each(|field| check(&field.value))
+            }
+            Expression::ConditionExpr(condition) => self.check_condition(place, condition),
+            Expression::Identifier(_) | Expression::Literal(_) => Ok(()),
+        }
     }
 
     fn edit_distance(left: &str, right: &str) -> usize {
@@ -3458,6 +3911,9 @@ impl<S: DocumentStore> QueryExecutor<S> {
             }
             Operation::Walk { path, depth } => self.apply_walk(documents, path, depth.as_ref(), None),
             Operation::PartitionBy(block) => self.apply_partition_by(documents, block),
+            Operation::Call(_) => Err(OQLError::Generic {
+                message: "a function call gives a query its rows, so it must come first".to_string(),
+            }),
             Operation::Step(path) => {
                 let mut reached = Vec::new();
                 for document in &documents {
@@ -3897,8 +4353,31 @@ impl<S: DocumentStore> QueryExecutor<S> {
                         }
                     }
                 }
+                MANY_VALUED.with(|flag| flag.set(false));
                 let left_value = self.evaluate_expression(document, left)?;
+                let left_many = MANY_VALUED.with(|flag| flag.replace(false))
+                    && matches!(left, Expression::FieldAccess(_));
                 let right_value = self.evaluate_expression(document, right)?;
+                let right_many = MANY_VALUED.with(|flag| flag.replace(false))
+                    && matches!(right, Expression::FieldAccess(_));
+                // A path through a collection has a value for each row it
+                // reaches. Whether "is it x" means any of them or all of
+                // them is not for the engine to guess, and answering
+                // "false" would hide the question.
+                if matches!(
+                    operator,
+                    ComparisonOperator::Equal
+                        | ComparisonOperator::NotEqual
+                        | ComparisonOperator::LessThan
+                        | ComparisonOperator::LessEqual
+                        | ComparisonOperator::GreaterThan
+                        | ComparisonOperator::GreaterEqual
+                ) && ((left_many && !matches!(right_value, Value::List(_)))
+                    || (right_many && !matches!(left_value, Value::List(_))))
+                {
+                    let (many, one) = if left_many { (left, right) } else { (right, left) };
+                    return Err(Self::many_compared_with_one(many, one, operator));
+                }
                 self.compare_values(&left_value, operator, &right_value)
             }
             // Both connectives short-circuit, so a guard such as
@@ -3912,6 +4391,212 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 let result = self.evaluate_condition(document, inner)?;
                 Ok(!result)
             }
+        }
+    }
+
+    /// Evaluate `left operator right`. Kept out of `evaluate_expression`,
+    /// which calls itself for every level of nesting and of recursion, so
+    /// that what this needs is not held on the stack at each of them.
+    #[inline(never)]
+    fn evaluate_arithmetic(
+        &self,
+        document: &Document,
+        left: &Expression,
+        operator: &crate::parser::BinaryOperator,
+        right: &Expression,
+    ) -> OQLResult<Value> {
+        MANY_VALUED.with(|flag| flag.set(false));
+        let left_value = self.evaluate_expression(document, left)?;
+        let left_many = MANY_VALUED.with(|flag| flag.replace(false))
+            && matches!(left, Expression::FieldAccess(_));
+        let right_value = self.evaluate_expression(document, right)?;
+        let right_many = MANY_VALUED.with(|flag| flag.replace(false))
+            && matches!(right, Expression::FieldAccess(_));
+        // Arithmetic needs one value on each side. A list joined to
+        // a list with `+` is the exception, and stays.
+        let joins_lists = matches!(operator, crate::parser::BinaryOperator::Add)
+            && matches!((&left_value, &right_value), (Value::List(_), Value::List(_)));
+        if (left_many || right_many) && !joins_lists {
+            return Err(Self::arithmetic_on_many(left, operator, right, left_many));
+        }
+        self.evaluate_binary_operation(&left_value, operator, &right_value)
+    }
+
+    /// A query written inside an expression. Inside a function, a name
+    /// that is one of its parameters is that parameter's rows or values,
+    /// not a collection of the same name.
+    #[inline(never)]
+    fn evaluate_nested_query(&self, document: &Document, query: &OQLQuery) -> OQLResult<Value> {
+        if let Some(rows) = CallFrame::collection(&query.collection) {
+            return self.run_collection_operations(
+                rows.as_ref().clone(),
+                false,
+                &query.operations,
+                document,
+                &query.collection,
+            );
+        }
+        if matches!(CallFrame::value(&query.collection), Some(Value::List(_))) {
+            return self.evaluate_collection_expression(
+                document,
+                &Expression::Identifier(query.collection.clone()),
+                &query.operations,
+            );
+        }
+        self.evaluate_query_expression(document, query)
+    }
+
+    /// A query that starts with a function call, `seniors(50).count()`.
+    ///
+    /// When the function's body is a query, that query runs as it would if
+    /// written out, with every way of reading less open to it. Otherwise the
+    /// value the function gives is the collection. What follows the call is
+    /// then applied to the rows.
+    fn execute_call_query(&self, query: &OQLQuery, args: &[Expression]) -> OQLResult<Vec<Document>> {
+        let Some(function) = self.functions.get_user_function(&query.collection) else {
+            return Err(OQLError::Generic {
+                message: format!("Unknown function: {}", query.collection),
+            });
+        };
+        let scope = Document::with_id(String::new(), String::new(), HashMap::new());
+        let mut documents = match &function.definition.body {
+            Expression::QueryExpression { query: body } => {
+                let frame = self.bind_arguments(&scope, function, args)?;
+                let _guard = CallFrameGuard::enter(frame, &function.definition.name)?;
+                self.execute_general_query(body)?
+            }
+            _ => {
+                let value = self.evaluate_user_function(&scope, function, args)?;
+                let mut rows = Vec::new();
+                self.push_source_rows(value, &query.collection, &mut rows)?;
+                rows.into_iter().map(SourceRow::into_document).collect()
+            }
+        };
+        let after = &query.operations[1..];
+        let mut grouped = false;
+        for (position, operation) in after.iter().enumerate() {
+            if grouped
+                && documents.is_empty()
+                && matches!(operation, Operation::Select(_) | Operation::Having(_))
+            {
+                continue;
+            }
+            documents = match operation {
+                Operation::Sort(sort) => self.sort_keeping(
+                    documents,
+                    sort,
+                    Self::rows_kept_after_sort(after, position),
+                )?,
+                _ => self.apply_operation(documents, operation, &query.collection)?,
+            };
+            grouped |= matches!(operation, Operation::GroupBy(_));
+        }
+        Ok(documents)
+    }
+
+    /// The error for arithmetic on a path through a collection.
+    fn arithmetic_on_many(
+        left: &Expression,
+        operator: &crate::parser::BinaryOperator,
+        right: &Expression,
+        left_many: bool,
+    ) -> OQLError {
+        use crate::parser::BinaryOperator;
+        let written = |expression: &Expression| match expression {
+            Expression::FieldAccess(access) => format!(".{}", access.path.join(".")),
+            _ => "a value".to_string(),
+        };
+        let symbol = match operator {
+            BinaryOperator::Add => "+",
+            BinaryOperator::Subtract => "-",
+            BinaryOperator::Multiply => "*",
+            BinaryOperator::Divide => "/",
+            BinaryOperator::Modulo => "%",
+        };
+        let many = written(if left_many { left } else { right });
+        // `.children*.id` is the commonest way to arrive here: `*` written
+        // to mean "any number of steps", as in a path language.
+        let advice = match (operator, left, right) {
+            (BinaryOperator::Multiply, Expression::FieldAccess(_), Expression::FieldAccess(_)) if left_many => {
+                format!(
+                    " `*` multiplies; it does not repeat a step. To follow {many} to any depth, \
+                     write .walk({many})."
+                )
+            }
+            _ => format!(
+                " To combine them into one value first, use an aggregate such as \
+                 {many_rows}.sum({last}), or shape each with {many_rows}.select {{ .. }}.",
+                many_rows = match if left_many { left } else { right } {
+                    Expression::FieldAccess(access) if access.path.len() > 1 => {
+                        format!(".{}", access.path[..access.path.len() - 1].join("."))
+                    }
+                    _ => many.clone(),
+                },
+                last = match if left_many { left } else { right } {
+                    Expression::FieldAccess(access) if access.path.len() > 1 => {
+                        format!(".{}", access.path[access.path.len() - 1])
+                    }
+                    _ => "..".to_string(),
+                },
+            ),
+        };
+        OQLError::FunctionError {
+            message: format!(
+                "{many} passes through a collection, so it has many values and {symbol} needs one.{advice}"
+            ),
+        }
+    }
+
+    /// The error for comparing a path through a collection with one value.
+    fn many_compared_with_one(
+        many: &Expression,
+        one: &Expression,
+        operator: &ComparisonOperator,
+    ) -> OQLError {
+        let path = match many {
+            Expression::FieldAccess(access) => access.path.clone(),
+            _ => Vec::new(),
+        };
+        let written = format!(".{}", path.join("."));
+        let symbol = match operator {
+            ComparisonOperator::Equal => "==",
+            ComparisonOperator::NotEqual => "!=",
+            ComparisonOperator::LessThan => "<",
+            ComparisonOperator::LessEqual => "<=",
+            ComparisonOperator::GreaterThan => ">",
+            _ => ">=",
+        };
+        let value = match one {
+            Expression::Literal(Literal::String(text)) => format!("\"{text}\""),
+            Expression::Literal(Literal::Integer(number)) => number.to_string(),
+            Expression::Literal(Literal::Float(number)) => number.to_string(),
+            Expression::Literal(Literal::Boolean(flag)) => flag.to_string(),
+            Expression::Literal(Literal::Null) => "null".to_string(),
+            _ => "value".to_string(),
+        };
+        let advice = if matches!(one, Expression::Literal(Literal::Null)) {
+            format!("To ask whether there are any, write {written}.exists() or !{written}.exists().")
+        } else {
+            match path.split_last() {
+                Some((last, before)) if !before.is_empty() => format!(
+                    "To ask whether any of them does, write .{}.where {{ .{last} {symbol} {value} }}.exists(){}.",
+                    before.join("."),
+                    if matches!(operator, ComparisonOperator::Equal) {
+                        format!(", or {written} contains {value}")
+                    } else {
+                        String::new()
+                    }
+                ),
+                _ => format!(
+                    "To ask whether any of them does, filter them and write {written}.where {{ .. }}.exists()."
+                ),
+            }
+        };
+        OQLError::FunctionError {
+            message: format!(
+                "{written} passes through a collection, so it has many values and {symbol} cannot \
+                 compare it with one. {advice}"
+            ),
         }
     }
 
@@ -3931,6 +4616,9 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 }
                 if let Some(row) = CallFrame::row(name) {
                     return Ok(Self::row_as_value(&row));
+                }
+                if let Some(rows) = CallFrame::collection(name) {
+                    return Ok(Value::List(rows.iter().map(Self::row_as_value).collect()));
                 }
                 if name.starts_with('$') {
                     return Err(OQLError::Generic {
@@ -4000,9 +4688,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 operator,
                 right,
             } => {
-                let left_value = self.evaluate_expression(document, left)?;
-                let right_value = self.evaluate_expression(document, right)?;
-                self.evaluate_binary_operation(&left_value, operator, &right_value)
+                self.evaluate_arithmetic(document, left, operator, right)
             }
             Expression::ArrayAccess { array, index } => {
                 let array_value = self.evaluate_expression(document, array)?;
@@ -4057,7 +4743,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 self.evaluate_condition(document, condition)?,
             )),
             Expression::QueryExpression { query } => {
-                self.evaluate_query_expression(document, query)
+                self.evaluate_nested_query(document, query)
             }
             Expression::CollectionExpression { source, operations } => {
                 self.evaluate_collection_expression(document, source, operations)
@@ -4426,7 +5112,35 @@ impl<S: DocumentStore> QueryExecutor<S> {
         operations: &[Operation],
         collection_scope: String,
     ) -> OQLResult<Value> {
+        // `.people.salary.median()` is `.people.median(.salary)`, which
+        // every way of reading less already understands.
         if let Expression::FieldAccess(field) = source {
+            if let Some((last, before)) = field.path.split_last().filter(|(_, before)| !before.is_empty()) {
+                if let Some(named) = Self::reduction_naming(last, operations) {
+                    let reached = match self.schema_of(&scope_document.schema)? {
+                        Some(schema) => self.path_place(&Place::Rows(schema), before).ok(),
+                        None => None,
+                    };
+                    if let Some(Place::Rows(rows)) = reached {
+                        if self.holds_one_value(&rows.name, last)? {
+                            return self.evaluate_collection_from(
+                                scope_document,
+                                &Expression::FieldAccess(FieldAccess { path: before.to_vec() }),
+                                &named,
+                                before.last().cloned().unwrap_or(collection_scope),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let from_origin = match source {
+            Expression::FieldAccess(field) if field.path.len() >= 2 => {
+                self.path_keeping_origin(scope_document, &field.path, operations)?
+            }
+            _ => None,
+        };
+        if let (Expression::FieldAccess(field), None) = (source, &from_origin) {
             if let Some(answer) = self.related_count(scope_document, &field.path, operations)? {
                 return Ok(answer);
             }
@@ -4434,7 +5148,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 return Ok(answer);
             }
         }
-        if let Expression::FieldAccess(field) = source {
+        if let (Expression::FieldAccess(field), None) = (source, &from_origin) {
             if let Some(answer) =
                 self.count_list_elements(scope_document, &field.path, operations, &collection_scope)?
             {
@@ -4495,6 +5209,63 @@ impl<S: DocumentStore> QueryExecutor<S> {
                         &collection_scope,
                     );
                 }
+            }
+            // The values of one field across a group, reduced: the same
+            // aggregate the group would compute if the field were named.
+            Expression::FieldAccess(field)
+                if scope_document.schema == "group"
+                    && field.path.len() == 1
+                    && !scope_document.fields.contains_key(&field.path[0])
+                    && scope_document.fields.contains_key("_group_rows")
+                    && Self::reduction_naming(&field.path[0], operations).is_some()
+                    && Self::group_rows(scope_document)?
+                        .first()
+                        .map(|row| self.holds_one_value(&row.schema, &field.path[0]))
+                        .transpose()?
+                        .unwrap_or(false) =>
+            {
+                let rows = Self::group_rows(scope_document)?;
+                let path = field.path.clone();
+                return match Self::reduction_naming(&field.path[0], operations).as_deref() {
+                    Some([Operation::Sum(_)]) => self.aggregate_rows(&rows, "sum", &AggregateInput::Path(path)),
+                    Some([Operation::Avg(_)]) => self.aggregate_rows(&rows, "avg", &AggregateInput::Path(path)),
+                    Some([Operation::Min(_)]) => self.aggregate_rows(&rows, "min", &AggregateInput::Path(path)),
+                    Some([Operation::Max(_)]) => self.aggregate_rows(&rows, "max", &AggregateInput::Path(path)),
+                    Some([Operation::AggregateExpr { function, input }]) => self.aggregate_rows(
+                        &rows,
+                        function,
+                        &match input {
+                            Expression::FieldAccess(_) => AggregateInput::Path(path),
+                            other => AggregateInput::Expression(other.clone()),
+                        },
+                    ),
+                    _ => unreachable!("reduction_naming gives one aggregate"),
+                };
+            }
+            // On a group row, a path that is not one of its keys starts
+            // from each of the rows the group stands for.
+            Expression::FieldAccess(field)
+                if scope_document.schema == "group"
+                    && !field.path.is_empty()
+                    && field.path != ["*"]
+                    && !scope_document.fields.contains_key(&field.path[0])
+                    && !scope_document.fields.contains_key(&field.path.join("_"))
+                    && scope_document.fields.contains_key("_group_rows") =>
+            {
+                let fields = self.fields_read_by_operations(&collection_scope, operations);
+                let mut reached = Vec::new();
+                for row in Self::group_rows(scope_document)?.iter() {
+                    reached.extend(
+                        self.path_source_rows_reading(row, &field.path, fields.as_deref())?.0,
+                    );
+                }
+                (reached, false)
+            }
+            // `.tasks.worklog.select { minutes, state: tasks.state }`: the
+            // operations name a collection the path passes through, so each
+            // row reached keeps what they read of the row it came from.
+            Expression::FieldAccess(_) if from_origin.is_some() => {
+                (from_origin.unwrap_or_default(), false)
             }
             Expression::FieldAccess(_) if from_other_side.is_some() => {
                 (from_other_side.unwrap_or_default(), false)
@@ -6188,7 +6959,19 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 // Read the document itself. A cache keyed by document id
                 // and field name cannot tell two versions of a document,
                 // or two collections, apart.
-                return Ok(document.get_field(field_name).cloned().unwrap_or(Value::Null));
+                return match document.get_field(field_name) {
+                    Some(value) => Ok(value.clone()),
+                    // A name the row does not hold may be a relationship:
+                    // then its value is the rows that refer to this one.
+                    None if document.schema == "group"
+                        || self.is_relationship(&document.schema, field_name)? =>
+                    {
+                        Ok(self
+                            .many_valued(document, &field_access.path)?
+                            .unwrap_or(Value::Null))
+                    }
+                    None => Ok(Value::Null),
+                };
             }
 
             // Grouped rows flatten grouped key paths into underscore-separated fields
@@ -6202,8 +6985,130 @@ impl<S: DocumentStore> QueryExecutor<S> {
             }
 
             // Handle multi-level field access with implicit null handling
-            self.resolve_nested_field_path(document, &field_access.path)
+            match self.resolve_nested_field_path(document, &field_access.path)? {
+                // A path that came to nothing may have met a collection on
+                // the way, which the single-valued walk does not go through.
+                Value::Null => Ok(self
+                    .many_valued(document, &field_access.path)?
+                    .unwrap_or(Value::Null)),
+                value => Ok(value),
+            }
         })
+    }
+
+    /// The value of a path that passes through a collection: a list with
+    /// what the rest of the path gives for each row reached.
+    ///
+    /// `.assignments.project.id` on a person is the id of the project of
+    /// each of that person's assignments, and `.worklog.minutes` on a task
+    /// is the minutes of each entry. Values that are absent are left out.
+    /// `None` when the path meets no collection, so it has a single value.
+    fn many_valued(&self, document: &Document, path: &[String]) -> OQLResult<Option<Value>> {
+        // On a group row, a path that is not one of the group's keys is
+        // read from the rows the group stands for.
+        if document.schema == "group" {
+            if document.fields.contains_key(&path[0])
+                || document.fields.contains_key(&path.join("_"))
+                || !document.fields.contains_key("_group_rows")
+            {
+                return Ok(None);
+            }
+            let rows = Self::group_rows(document)?;
+            let access = FieldAccess { path: path.to_vec() };
+            let mut values = Vec::with_capacity(rows.len());
+            for row in rows.iter() {
+                match self.get_field_value(row, &access)? {
+                    Value::Null => {}
+                    Value::List(more) => values.extend(more),
+                    value => values.push(value),
+                }
+            }
+            MANY_VALUED.with(|flag| flag.set(true));
+            return Ok(Some(Value::List(values)));
+        }
+        // Where the path first meets a collection: a relationship, or a
+        // list with more of the path to follow.
+        let mut held: Option<Arc<Document>> = None;
+        let mut fans_at = None;
+        for (position, segment) in path.iter().enumerate() {
+            let row: &Document = held.as_deref().unwrap_or(document);
+            if DocumentSystemField::from_name(segment).is_some() {
+                break;
+            }
+            match row.fields.get(segment) {
+                Some(Value::List(_)) if position + 1 < path.len() => {
+                    fans_at = Some(position);
+                    break;
+                }
+                Some(Value::Reference(reference)) => match self.referenced_document(reference)? {
+                    Some(target) => held = Some(target),
+                    None => break,
+                },
+                Some(_) => break,
+                None => {
+                    if self.is_relationship(&row.schema, segment)? {
+                        fans_at = Some(position);
+                    }
+                    break;
+                }
+            }
+        }
+        let Some(fans_at) = fans_at else {
+            return Ok(None);
+        };
+        let (rows, _) = self.path_source_rows(document, &path[..=fans_at])?;
+        let rest = &path[fans_at + 1..];
+        let mut values = Vec::with_capacity(rows.len());
+        for row in &rows {
+            if rest.is_empty() {
+                values.push(match row.fields.get(SCALAR_ROW_FIELD) {
+                    Some(scalar) => scalar.clone(),
+                    None => Self::row_as_value(row),
+                });
+                continue;
+            }
+            match self.get_field_value(row, &FieldAccess { path: rest.to_vec() })? {
+                Value::Null => {}
+                // A list at the end, or a further collection on the way:
+                // each step through many rows flattens.
+                Value::List(more) => values.extend(more),
+                value => values.push(value),
+            }
+        }
+        MANY_VALUED.with(|flag| flag.set(true));
+        Ok(Some(Value::List(values)))
+    }
+
+    /// Whether `name`, which a row of `schema` does not hold, is a
+    /// relationship to it. Asked for every row that lacks a field, so the
+    /// answer is kept for the statement and found without copying a name.
+    fn is_relationship(&self, schema: &str, name: &str) -> OQLResult<bool> {
+        if !StatementGuard::active() || schema.is_empty() {
+            return Ok(false);
+        }
+        if let Some(known) = STATEMENT.with(|scope| {
+            scope
+                .borrow()
+                .relationship_names
+                .get(schema)
+                .and_then(|names| names.get(name))
+                .copied()
+        }) {
+            return Ok(known);
+        }
+        let related = matches!(
+            self.reverse_relationship(schema, name)?,
+            ReverseRelationship::Declared { .. }
+        );
+        STATEMENT.with(|scope| {
+            scope
+                .borrow_mut()
+                .relationship_names
+                .entry(schema.to_string())
+                .or_default()
+                .insert(name.to_string(), related)
+        });
+        Ok(related)
     }
 
     fn resolve_path_state(&self, document: &Document, path: &[String]) -> OQLResult<PathState> {
@@ -6519,6 +7424,17 @@ impl<S: DocumentStore> QueryExecutor<S> {
             let left = self.reference_as_id(left)?;
             let right = self.reference_as_id(right)?;
             return Ok(crate::value_semantics::matches(&left, operator, &right));
+        }
+        // A list of references, as a path through a collection gives, is
+        // likewise the ids of the documents referred to.
+        if let (Value::List(items), Value::String(_)) = (left, right) {
+            if items
+                .iter()
+                .any(|item| matches!(item, Value::Reference(_) | Value::GlobalReference(_)))
+            {
+                let left = self.reference_as_id(left)?;
+                return Ok(crate::value_semantics::matches(&left, operator, right));
+            }
         }
         Ok(crate::value_semantics::matches(left, operator, right))
     }
@@ -8288,7 +9204,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
             {
                 self.evaluate_position_function(name, args)
             }
-            "count_distinct" | "median" | "percentile" => Err(OQLError::FunctionError {
+            "median" | "percentile" => Err(OQLError::FunctionError {
                 message: format!(
                     "{name}() has no collection here; use it in select or having, or call it \
                      on a collection as in .orders.{name}(..)"
@@ -8380,7 +9296,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
     fn is_aggregate_name(name: &str) -> bool {
         matches!(
             name,
-            "count" | "sum" | "avg" | "min" | "max" | "count_distinct" | "median" | "percentile"
+            "count" | "sum" | "avg" | "min" | "max" | DISTINCT_COUNT | "median" | "percentile"
         )
     }
 
@@ -8988,12 +9904,10 @@ impl<S: DocumentStore> QueryExecutor<S> {
 
                 Ok(max_value.unwrap_or(Value::Null))
             }
-            "count_distinct" => {
+            DISTINCT_COUNT => {
                 if matches!(input, AggregateInput::AllRows) {
                     return Err(OQLError::FunctionError {
-                        message: "count_distinct expects a value to tell rows apart by, as in \
-                                  count_distinct(.customer)"
-                            .to_string(),
+                        message: "a count of distinct values needs the values to tell apart".to_string(),
                     });
                 }
                 let mut seen = HashSet::new();
@@ -9004,7 +9918,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     }
                     let key = bincode::serialize(&Self::canonical_key_value(&value)).map_err(
                         |error| OQLError::Generic {
-                            message: format!("Failed to compare values for count_distinct: {error}"),
+                            message: format!("Failed to compare values for a distinct count: {error}"),
                         },
                     )?;
                     seen.insert(key);
@@ -9488,6 +10402,53 @@ impl<S: DocumentStore> QueryExecutor<S> {
         self.sort_keeping(documents, sort_block, None)
     }
 
+    /// Refuse a sort that calls a function that does not exist. A sort key
+    /// that cannot be evaluated for a row counts as null, so that absent
+    /// data never fails a sort; a misspelt function would otherwise be
+    /// null for every row and the sort would quietly do nothing.
+    fn check_sort_functions(&self, sort_block: &SortBlock) -> OQLResult<()> {
+        fn unknown<'a>(
+            expression: &'a Expression,
+            known: &dyn Fn(&str) -> bool,
+        ) -> Option<&'a str> {
+            let look = |node: &'a Expression| unknown(node, known);
+            match expression {
+                Expression::FunctionCall { name, args } => {
+                    if known(name) {
+                        args.iter().find_map(look)
+                    } else {
+                        Some(name.as_str())
+                    }
+                }
+                Expression::BinaryOp { left, right, .. }
+                | Expression::LogicalAnd(left, right)
+                | Expression::LogicalOr(left, right) => look(left).or_else(|| look(right)),
+                Expression::LogicalNot(inner) => look(inner),
+                Expression::IfThenElse { then_expr, else_expr, .. } => {
+                    look(then_expr).or_else(|| look(else_expr))
+                }
+                Expression::ArrayAccess { array, index } => look(array).or_else(|| look(index)),
+                Expression::ChainedAccess { base, .. } => look(base),
+                _ => None,
+            }
+        }
+        let known = |name: &str| {
+            matches!(name, "exists" | "is_null" | "is_missing" | "is_broken_ref")
+                || Self::is_aggregate_name(name)
+                || WindowFrame::is_position_function(name)
+                || self.functions.get_function(name).is_some()
+                || self.functions.get_user_function(name).is_some()
+        };
+        for field in &sort_block.fields {
+            if let Some(name) = unknown(&field.expression, &known) {
+                return Err(OQLError::Generic {
+                    message: format!("Unknown function: {name}"),
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// What a row is sorted by: the value of each sort expression, with one
     /// that cannot be evaluated counting as null.
     fn sort_keys(&self, document: &Document, sort_block: &SortBlock) -> Vec<Value> {
@@ -9596,6 +10557,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
         sort_block: &SortBlock,
         keep: Option<usize>,
     ) -> OQLResult<Vec<Document>> {
+        self.check_sort_functions(sort_block)?;
         let keys: Vec<Vec<Value>> = documents
             .iter()
             .map(|document| self.sort_keys(document, sort_block))
@@ -9652,24 +10614,93 @@ impl<S: DocumentStore> QueryExecutor<S> {
         args: &[Expression],
     ) -> OQLResult<Value> {
         let definition = &user_func.definition;
-        if args.len() != definition.parameters.len() {
+        let frame = self.bind_arguments(document, user_func, args)?;
+        let _guard = CallFrameGuard::enter(frame, &definition.name)?;
+        self.evaluate_expression(document, &definition.body)
+    }
+
+    /// Bind the arguments of a call to the function's parameter names.
+    #[inline(never)]
+    fn bind_arguments(
+        &self,
+        document: &Document,
+        user_func: &crate::functions::UserDefinedFunction,
+        args: &[Expression],
+    ) -> OQLResult<CallFrame> {
+        let definition = &user_func.definition;
+        // Parameters with a default may be left out, from the end.
+        let required = definition
+            .parameters
+            .iter()
+            .rposition(|parameter| parameter.default.is_none())
+            .map_or(0, |last| last + 1);
+        if args.len() < required || args.len() > definition.parameters.len() {
             return Err(OQLError::Generic {
-                message: format!(
-                    "Function '{}' expects {} arguments, got {}",
-                    definition.name,
-                    definition.parameters.len(),
-                    args.len()
-                ),
+                message: if required == definition.parameters.len() {
+                    format!(
+                        "Function '{}' expects {} arguments, got {}",
+                        definition.name,
+                        required,
+                        args.len()
+                    )
+                } else {
+                    format!(
+                        "Function '{}' expects {} to {} arguments, got {}",
+                        definition.name,
+                        required,
+                        definition.parameters.len(),
+                        args.len()
+                    )
+                },
             });
         }
 
         let mut frame = CallFrame::default();
-        for (parameter, arg) in definition.parameters.iter().zip(args) {
+        for (position, parameter) in definition.parameters.iter().enumerate() {
+            let arg = match (args.get(position), &parameter.default) {
+                (Some(arg), _) => arg,
+                (None, Some(default)) => default,
+                (None, None) => unreachable!("the argument count was checked"),
+            };
             if let Some(row) = self.row_argument(document, arg) {
                 frame.rows.insert(parameter.name.clone(), row);
                 continue;
             }
+            // `.is_boss()` is `is_boss(.)`: the current row itself, for a
+            // parameter that takes a row. A scalar parameter, or a row
+            // that stands for one value of a list, takes the value.
+            let takes_value = matches!(
+                parameter.param_type.to_ascii_lowercase().as_str(),
+                "string" | "integer" | "int" | "float" | "double" | "boolean" | "bool"
+                    | "datetime" | "timestamp" | "object"
+            );
+            if matches!(arg, Expression::FieldAccess(FieldAccess { path }) if path.is_empty())
+                && !takes_value
+                && !document.fields.contains_key(SCALAR_ROW_FIELD)
+            {
+                frame.rows.insert(parameter.name.clone(), document.clone());
+                continue;
+            }
+            MANY_VALUED.with(|flag| flag.set(false));
             let value = self.evaluate_expression(document, arg)?;
+            // A relationship, or any path through a collection, given for a
+            // parameter that takes more than one value: the rows it reaches,
+            // still rows of their collection, so the function can filter,
+            // aggregate and follow relationships from them.
+            let many = MANY_VALUED.with(|flag| flag.replace(false));
+            if let (true, false, Expression::FieldAccess(access)) = (many, takes_value, arg) {
+                let (rows, _) = self.path_source_rows(document, &access.path)?;
+                frame.collections.insert(parameter.name.clone(), Arc::new(rows));
+                continue;
+            }
+            // `.boss.is_boss()`: a reference given for a row parameter is
+            // the row it points at.
+            if let (false, Value::Reference(reference)) = (takes_value, &value) {
+                if let Some(target) = self.referenced_document(reference)? {
+                    frame.rows.insert(parameter.name.clone(), target.as_ref().clone());
+                    continue;
+                }
+            }
             let value = Self::coerce_argument(value, &parameter.param_type).map_err(|actual| {
                 OQLError::TypeError {
                     expected: format!(
@@ -9682,8 +10713,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
             frame.values.insert(parameter.name.clone(), value);
         }
 
-        let _guard = CallFrameGuard::enter(frame, &definition.name)?;
-        self.evaluate_expression(document, &definition.body)
+        Ok(frame)
     }
 
     /// A whole-row argument: `*` for the current row, or the name of a row
@@ -9737,9 +10767,31 @@ impl<S: DocumentStore> QueryExecutor<S> {
 /// collection. It is not a legal field name, so it cannot collide with data.
 const SCALAR_ROW_FIELD: &str = "$value";
 
+/// The aggregate that `.field.distinct().count()` is run as. It has no
+/// spelling of its own in the language, so the name is one that cannot be
+/// written.
+const DISTINCT_COUNT: &str = "$distinct_count";
+
 /// Where `partition_by` notes a row's partition for the next `select`. Not
 /// a legal field name, so it cannot collide with data.
 const PARTITION_FIELD: &str = "$partition";
+
+/// What a path has reached, as far as the schemas say: used to tell a name
+/// that is misspelt from one that is merely absent.
+#[derive(Clone)]
+enum Place {
+    /// A row of a collection that has a schema.
+    Rows(Arc<Schema>),
+    /// An embedded object whose fields the schema declares.
+    Shape {
+        schema: Arc<Schema>,
+        /// The shape's path within the schema, as `items[]` or `address.geo`.
+        path: String,
+        fields: Vec<(String, FieldType)>,
+    },
+    /// Anything whose fields are not declared: nothing can be ruled out.
+    Any,
+}
 
 /// Where a row reached by a path step keeps the values of the row it came
 /// from that the rest of the query asks for by the collection's name.
@@ -9824,6 +10876,12 @@ impl WindowFrame {
                 | "running_max"
         )
     }
+}
+
+thread_local! {
+    /// Set when a path was just read that passes through a collection, so
+    /// that a comparison can tell such a value from a list that is stored.
+    static MANY_VALUED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 thread_local! {
@@ -10327,6 +11385,12 @@ struct StatementScope {
     /// Answers of collection expressions that start by following a
     /// reference, by the document referred to and what was asked of it.
     through_reference: HashMap<(u64, Vec<u8>), Value>,
+    /// Whether a nested expression's operations read anything as
+    /// `name.field`, by where they are.
+    names_rows: HashMap<(usize, usize), (Vec<Operation>, bool)>,
+    /// For a collection and a name its rows may lack: whether the name is
+    /// a relationship to it.
+    relationship_names: HashMap<String, HashMap<String, bool>>,
     /// The rows of one collection that refer to one named document,
     /// arranged by the document they refer to through another field.
     also_referring: HashMap<String, Arc<HashMap<String, Vec<Arc<Document>>>>>,
@@ -10478,6 +11542,8 @@ struct CallFrame {
     /// Parameters bound to a whole row, so `p.team.name` keeps full path
     /// semantics, including reference traversal.
     rows: HashMap<String, Document>,
+    /// Parameters bound to a collection of rows.
+    collections: HashMap<String, Arc<Vec<Document>>>,
 }
 
 thread_local! {
@@ -10498,6 +11564,15 @@ impl CallFrame {
                 .borrow()
                 .last()
                 .and_then(|frame| frame.values.get(name).cloned())
+        })
+    }
+
+    fn collection(name: &str) -> Option<Arc<Vec<Document>>> {
+        CALL_FRAMES.with(|frames| {
+            frames
+                .borrow()
+                .last()
+                .and_then(|frame| frame.collections.get(name).cloned())
         })
     }
 

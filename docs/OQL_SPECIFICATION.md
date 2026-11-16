@@ -223,6 +223,7 @@ A change the rules above cannot express is done in two steps with an ordinary
 | Index from the end | `.tags[-1]`, `.tags[-2]` | Works |
 | Out-of-range index is `null` | | Works |
 | The current value itself | `.` as in `.tags.where { . == "beta" }`, `upper(.)`, `sort { . desc }` | Works. On an object row, `.` is the whole row. |
+| A path through a collection | `.orders.total`, `.items.qty`, `.team.users.id` | Works: the list of what each row reached gives, flattened when it passes through more than one collection, with absent values left out. A relationship reached by name alone (`.orders`) is the list of its rows. References in such a list match the id they point at. |
 | Bare name as a field | `select { id, name }`, `where { status == "x" }` | Works. Resolution order: function parameter, query parameter, script binding, block local, scope anchor, then field of the current row. |
 
 ### 5.2 Timestamps
@@ -264,6 +265,7 @@ literal syntax, and reads and writes are symmetric.
 | Range `x between a and b` | Out. `x >= a && x <= b` is already direct. |
 | Parentheses for conditions and for operands | Works |
 | A comparison is an ordinary boolean expression | Works |
+| A path through a collection compared with one value | An error, for `== != < <= > >=`: `.orders.total > 100` has a total for every order, and whether any or all must exceed 100 is not for the engine to guess. The message gives the spelling for "any": `.orders.where { .total > 100 }.exists()`, or `.orders.total contains 100` for equality. It used to be false for every row. `contains`, `in` and comparison with a list are unaffected, and so is a stored list compared with one value, which is a mismatch of types and false. |
 
 ### 5.4 Conditionals
 
@@ -330,7 +332,7 @@ Gaps found:
 | A single referenced or embedded object | `.team.select { name }`, `.profile.select { city }` | Works: yields one object, and shaping can traverse onward (`.team.select { name, org: .org.name }`). |
 | A collection reached through a collection | `.teams.users`, `.teams.users.orders` on an org | Works: each step maps over the rows reached so far and flattens. |
 | A path step in a chain | `orders.where { .status == "paid" }.items.group_by { .product.id }`, `orgs.teams.users.count()` | Works, at the top level and between operations in an expression. Every row is replaced by the rows its path leads to, which is how a query reaches the line items inside its orders. |
-| The row an element came from | `orders.items.group_by { status: orders.status, .product.id }` | Works at the top level. After a path step, the collection's name is the row each element was reached from, until a `select` or `group_by` reshapes the rows. This is what `$unwind` and a join back to the parent are for elsewhere. |
+| The row an element came from | `orders.items.group_by { status: orders.status, .product.id }`, `.orders.items.select { sku, status: orders.status }` | Works at the top level for the collection the query starts from, and in a nested expression for any collection the path passes through. After a path step, the collection's name is the row each element was reached from, until a `select` or `group_by` reshapes the rows. In a nested expression the enclosing row's own collection still means the enclosing row. This is what `$unwind` and a join back to the parent are for elsewhere. |
 
 ### 6.2 Operations
 
@@ -360,7 +362,7 @@ orders.group_by { .status }.select {
 | Filter | `.where { cond }` | Works |
 | Project | `.select { ... }` | Works (see section 7) |
 | Order | `.sort { .a.asc, .b.desc }`, `.sort { .a desc }` | Works |
-| Order by an expression | `.sort { (.price * .qty).desc }` | Works |
+| Order by an expression | `.sort { (.price * .qty).desc }`, `.sort { abs(.x - 5).asc }` | Works. The direction after a computed key used to be read as a field of the value, which left the rows unsorted. |
 | Limit, offset | `.limit(n)`, `.offset(n)` | Works with any expression: a literal, arithmetic, a `$parameter`, or a value computed from another collection. A negative or non-numeric count is an error. |
 | First row | `.first()` | Works. Follow-on path works (`.first().amount`). |
 | First row, then shape it | `.first().select { id, amount }` | Works: one object, or `null` when there is no row. |
@@ -392,19 +394,13 @@ is an error. All of this works and is the same in every form.
 | The same on a schemaless collection | `0`: nothing can be ruled out | Works |
 | `users.where { exists(.orders) }` | True when the relationship has rows, the same as `.orders.exists()` | Works |
 
-Still open: a misspelt *scalar* path such as `.nmae` on a schema'd collection
-reads as `null` when it is not used as a collection. It should be the same
-error.
+| `users.where { .team.nmae == "x" }`, `.orders.where { .totl > 1 }.exists()`, `.items.sum(.qyt)` on collections with schemas | Error naming the collection, the unknown name and the closest declared one | Works. Every name along a path is checked by following the schema through references, relationships and embedded objects of declared shape, wherever the path is written: a filter, a projection, a sort, a group key, a nested collection or a nested query. A name that is declared and has no value is still `null`. |
+| `.children*.id`, `.orders.total * 2` | Error: a path through a collection has many values and arithmetic needs one. For `*` between two paths the message points at `walk` | Works |
+| `sort { nonesuch(.x).desc }` | Error: unknown function | Works. A sort key that cannot be worked out for one row is still `null` for that row. |
 
-Also open, both found by the gauntlet suite (`apps/gauntlet`):
-
-- A comparison whose left side passes through a collection, such as
-  `people.where { .assignments.project.id == "j1" }`, is false for every row
-  rather than an error or "any of them". The explicit form works:
-  `.assignments.where { .project.id == "j1" }.exists()`.
-- `.children*.id` parses as a multiplication and fails with a message about
-  multiplying. It should say that `*` is not a path operator and point at
-  `walk`.
+Still open: after a `select`, names refer to what the `select` produced, and a
+misspelt one among them (`.select { id }.where { .nmae == 1 }`) still reads as
+`null`.
 
 ---
 
@@ -520,9 +516,11 @@ collide.
 | Group by a function call | `.group_by { year(.placed) }` | Works. The key is named after the function (`year`). |
 | Name a group key | `.group_by { month: format_date(.placed, "%Y-%m"), big: .amount > 100 }` | Works. Any other expression must be named. Two keys with one name are an error. |
 | Count distinct | `.select { status }.distinct().count()` | Works |
-| Count distinct as an aggregate | `count_distinct(.customer)`, `.orders.count_distinct(.status)` | Works in every form an aggregate takes. Absent values are not counted. |
-| Median and percentiles | `median(.salary)`, `percentile(.salary, 0.9)`, `.people.median(.salary)` | Works in every form an aggregate takes. The fraction is between 0 and 1; a value that falls between two rows is interpolated between them. Null for no rows. |
+| An aggregate after a path of values | `.orders.total.sum()`, `people.salary.max()`, `.salary.median()`, `.salary.percentile(0.9)` | Works. With nothing named, an aggregate takes each value it follows: `.x.sum()` is `sum(.x)`. A path picks the values and a method reduces them, at the top level, through a relationship, in a filter and in a group. |
+| Count distinct | `.customer.distinct().count()`, `.orders.status.distinct().count()` | Works, by composition, in every position. There is no word for it: `count_distinct` was added and then removed once the chain worked everywhere and ran as fast. |
+| Median and percentiles | `.salary.median()`, `.salary.percentile(0.9)`, `median(.salary)`, `percentile(.salary, 0.9)` | Works in every form an aggregate takes. The fraction is between 0 and 1; a value that falls between two rows is interpolated between them. Null for no rows. |
 | The rows of a group as a collection | `top: sort { .amount.desc }.limit(3).select { id }`, `big: where { .amount > 100 }.count()` | Works (6.2) |
+| A path in a grouped `select` that is not a key | `buyers: .customer.distinct().count()`, `amounts: .amount` | Works: it is read from the group's rows, as a path through any other collection is. |
 | Grouping an empty collection gives no rows | | Works |
 | `1` and `1.0` are one group | | Works |
 
@@ -640,11 +638,16 @@ operation on; what precedes it still uses indexes and column reads.
 | Parameters are in scope throughout the body | Works |
 | Row parameters (`m: members`, passed with `*`) keep full path semantics | Works |
 | Functions call functions; a row parameter can be passed on | Works |
+| A row parameter given by method form | Works: `.is_boss()` is `is_boss(*)`, and `.manager.is_boss()` gives the function the row the reference points at. |
 | A function body may contain a nested query over other collections | Works |
 | Arguments are type-checked; an `Integer` widens to `Float` | Works |
 | Recursion is bounded with a clear error | Works |
 | Local names inside a body | Works: `name = expression` lines before the value, each able to use the ones before it. A local may not hide a parameter. |
-| A function that returns a collection | *(not probed)* |
+| A function that returns a collection | Works: `fn seniors(least: Integer) { staff.where { .pay > least } }`, used as `seniors(70).count()` inside an expression. |
+| A function at the start of a query | Works: `seniors(70).sort { .id.asc }.select { id }`. When the body is a query it runs as if written out, and the rows are still rows of their collection, so relationships can be followed from them. |
+| A function that takes a collection | Works: `fn spread(rows) { rows.max(.pay) - rows.min(.pay) }`, called `spread(.reports)` or `.reports.spread()`. A relationship arrives as its rows, which the function can filter, aggregate and follow relationships from; a path of values arrives as those values. This is how a word that might have been built in is written in the language: `fn distinct_count(values) { values.distinct().count() }`. |
+| A parameter without a type | Works: `fn f(rows)` takes whatever it is given. |
+| A default value | Works: `fn raise(pay: Integer, by: Float = 0.1)`. Parameters with defaults may be left out from the end. |
 | Redefining a function | Works: the later definition replaces the earlier. A built-in cannot be redefined. |
 
 ---

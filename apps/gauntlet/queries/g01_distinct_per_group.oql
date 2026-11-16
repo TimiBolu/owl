@@ -2,5 +2,5 @@
 // each tenant's projects draw on.
 assignments
   .group_by { org: .project.org.id }
-  .select { org, people: count_distinct(.person), roles: count_distinct(.role), n: count() }
+  .select { org, people: .person.distinct().count(), roles: .role.distinct().count(), n: count() }
   .sort { .org.asc }

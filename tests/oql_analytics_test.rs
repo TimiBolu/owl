@@ -144,10 +144,13 @@ fn company() -> Db {
 fn distinct_counts_and_percentiles_work_in_every_form() {
     let db = company();
     // The terminal form, over a path and over an expression.
-    assert_eq!(db.scalar("staff.count_distinct(.pay)", "count_distinct"), int(5));
-    assert_eq!(db.scalar("staff.count_distinct(.pay / 50)", "count_distinct"), int(3));
+    assert_eq!(db.scalar("staff.pay.distinct().count()", "count"), int(5));
+    assert_eq!(
+        db.scalar("staff.select { band: .pay / 50 }.distinct().count()", "count"),
+        int(3)
+    );
     // An absent value is not a value: `c` has no grade.
-    assert_eq!(db.scalar("staff.count_distinct(.grade)", "count_distinct"), int(3));
+    assert_eq!(db.scalar("staff.grade.distinct().count()", "count"), int(3));
     // 40 60 80 80 90 100: the middle is between the two eighties.
     assert_eq!(db.scalar("staff.median(.pay)", "median"), Value::Float(80.0));
     // A quarter of the way along five steps is 1.25: a quarter past 60.
@@ -162,7 +165,7 @@ fn distinct_counts_and_percentiles_work_in_every_form() {
     assert_eq!(
         db.table(
             "staff.group_by { .team.id }
-               .select { team_id, people: count(), pays: count_distinct(.pay), mid: median(.pay),
+               .select { team_id, people: count(), pays: .pay.distinct().count(), mid: median(.pay),
                          top: percentile(.pay, 1) }
                .sort { .team_id.asc }",
             &["team_id", "people", "pays", "mid", "top"],
@@ -177,14 +180,14 @@ fn distinct_counts_and_percentiles_work_in_every_form() {
     );
     // Over every row, with no grouping.
     assert_eq!(
-        db.table("staff.select { mid: median(.pay), bosses: count_distinct(.boss) }", &["mid", "bosses"]),
-        vec![vec![Value::Float(80.0), int(3)]]
+        db.table("staff.select { mid: median(.pay), top: percentile(.pay, 1) }", &["mid", "top"]),
+        vec![vec![Value::Float(80.0), Value::Float(100.0)]]
     );
     // Through a relationship, in a select and in a filter.
     assert_eq!(
         db.table(
             "teams.where { .staff.median(.pay) >= 80 }.sort { .id.asc }
-               .select { id, mid: .staff.median(.pay), bosses: .staff.count_distinct(.boss) }",
+               .select { id, mid: .staff.median(.pay), bosses: .staff.boss.distinct().count() }",
             &["id", "mid", "bosses"],
         ),
         vec![
@@ -196,7 +199,7 @@ fn distinct_counts_and_percentiles_work_in_every_form() {
 
     // No rows: nothing to count, and no middle.
     assert_eq!(
-        db.scalar("staff.where { .pay > 999 }.count_distinct(.pay)", "count_distinct"),
+        db.scalar("staff.where { .pay > 999 }.pay.distinct().count()", "count"),
         int(0)
     );
     assert_eq!(db.scalar("staff.where { .pay > 999 }.median(.pay)", "median"), Value::Null);
@@ -207,6 +210,11 @@ fn distinct_counts_and_percentiles_work_in_every_form() {
     let error = db.try_rows("staff.median(.id)").unwrap_err();
     assert!(error.contains("numeric"), "{error}");
     assert!(db.try_rows("staff.where { median(.pay) > 1 }").is_err());
+
+    assert_eq!(db.scalar("staff.boss.distinct().count()", "count"), int(3));
+    // A distinct count is the chain; there is no word for it.
+    let error = db.try_rows("staff.select { n: count_distinct(.pay) }").unwrap_err();
+    assert!(error.contains("Unknown function: count_distinct"), "{error}");
 
     // The words are operations only where they are applied: data may still
     // have a field called `median`.
@@ -871,4 +879,341 @@ fn elements_and_related_rows_judged_in_place_keep_their_answers() {
     assert_eq!(ids("marks.where { .note != \"ok\" }.sort { .id.asc }"), ["m2", "m4"]);
     assert_eq!(ids("marks.where { .note == null }.sort { .id.asc }"), ["m2", "m4"]);
     assert_eq!(ids("marks.where { .box == \"b1\" && .score < 5 }"), ["m1"]);
+}
+
+/// A path through a collection has a value for every row it reaches. It
+/// used to read as null, so a comparison with it was false for every row
+/// and said nothing.
+#[test]
+fn a_path_through_a_collection_has_many_values() {
+    let db = company();
+    let sorted = |value: Value| match value {
+        Value::List(mut items) => {
+            items.sort_by(|left, right| format!("{left:?}").cmp(&format!("{right:?}")));
+            items
+        }
+        other => panic!("not a list: {other:?}"),
+    };
+    // As a value it is the list of what each row gives.
+    assert_eq!(
+        sorted(db.scalar("staff.where { .id == \"a\" }.select { ids: .reports.id }", "ids")),
+        [text("b"), text("c"), text("f")]
+    );
+    assert_eq!(
+        sorted(db.scalar("staff.where { .id == \"a\" }.select { pays: .reports.pay }", "pays")),
+        [int(80), int(80), int(90)]
+    );
+    // Through a list of objects, through a reference first, and through
+    // two collections, which flattens.
+    assert_eq!(
+        sorted(db.scalar("jobs.where { .id == \"j1\" }.select { mins: .notes.mins }", "mins")),
+        [int(5), int(7)]
+    );
+    assert_eq!(
+        sorted(db.scalar("pings.where { .id == \"p1\" }.select { under: .who.reports.id }", "under")),
+        [text("b"), text("c"), text("f")]
+    );
+    assert_eq!(
+        sorted(db.scalar("teams.where { .id == \"t1\" }.select { deep: .children.children.id }", "deep")),
+        [text("t4")]
+    );
+    // Absent values are left out, and no rows is an empty list.
+    assert_eq!(
+        sorted(db.scalar("staff.where { .id == \"a\" }.select { grades: .reports.grade }", "grades")),
+        [int(2), int(3)]
+    );
+    assert_eq!(
+        db.scalar("staff.where { .id == \"e\" }.select { ids: .reports.id }", "ids"),
+        Value::List(Vec::new())
+    );
+
+    // "Any of them" is said with `contains` or `in`, or by filtering.
+    assert_eq!(db.ids("staff.where { .reports.id contains \"d\" }"), ["b"]);
+    assert_eq!(db.ids("staff.where { \"d\" in .reports.id }"), ["b"]);
+    assert_eq!(db.ids("staff.where { .reports.where { .id == \"d\" }.exists() }"), ["b"]);
+    assert_eq!(db.ids("jobs.where { .notes.kind contains \"y\" }"), ["j1"]);
+    assert_eq!(db.ids("jobs.where { .notes.mins contains 1 }"), ["j2"]);
+    // References reached this way match the id they point at.
+    assert_eq!(db.ids("teams.where { .staff.boss contains \"d\" }"), ["t5"]);
+
+    // Compared with one value it is an error that says what to write.
+    for (query, advice) in [
+        ("staff.where { .reports.id == \"d\" }", ".reports.where { .id == \"d\" }.exists()"),
+        ("staff.where { .reports.pay > 50 }", ".reports.where { .pay > 50 }.exists()"),
+        ("staff.where { 50 < .reports.pay }", "many values"),
+        ("staff.where { .reports.id != \"d\" }", "many values"),
+        ("staff.where { .reports == null }", ".reports.exists()"),
+        ("jobs.where { .notes.mins >= 5 }", ".notes.where { .mins >= 5 }.exists()"),
+        ("pings.where { .who.reports.pay <= 80 }", "many values"),
+        // Inside a nested filter and inside a select as well.
+        ("teams.where { .staff.where { .reports.pay > 1 }.exists() }", "many values"),
+        ("staff.select { id, odd: if .reports.pay > 1 then 1 else 0 }", "many values"),
+    ] {
+        let error = db.try_rows(query).unwrap_err();
+        assert!(error.contains("many values") && error.contains(advice), "{query}\n{error}");
+    }
+    // A list is still compared with a list.
+    assert!(db.try_rows("staff.where { .reports.pay == [80, 80, 90] }").is_ok());
+
+    // What has one value is unchanged: a plain field, a field through
+    // references, an absent field, and a field that is absent on some rows.
+    assert_eq!(db.ids("staff.where { .boss.boss.id == \"a\" }"), ["d"]);
+    assert_eq!(db.ids("staff.where { .grade == null }"), ["c"]);
+    assert_eq!(db.ids("staff.where { .boss == null }"), ["a"]);
+    assert_eq!(db.ids("staff.where { .boss.grade == null && .boss != null }.sort { .id.asc }"), Vec::<String>::new());
+    assert_eq!(db.scalar("staff.where { .team.parent.id == \"t1\" }.count()", "count"), int(3));
+}
+
+/// Text that reads as a query but cannot mean what it says used to give an
+/// answer anyway: null, zero, no rows, or an unsorted result.
+#[test]
+fn what_cannot_mean_anything_says_so() {
+    let mut db = company();
+    let fails = |db: &Db, query: &str, parts: &[&str]| {
+        let error = match db.try_rows(query) {
+            Ok(rows) => panic!("answered with {} row(s): {query}", rows.len()),
+            Err(error) => error,
+        };
+        for part in parts {
+            assert!(error.contains(part), "{query}\n{error}\nlacks: {part}");
+        }
+    };
+
+    // A misspelt name anywhere along a path, wherever the path is written.
+    fails(&db, "staff.where { .team.parnet == \"t1\" }", &["'teams'", "'parnet'", "Did you mean 'parent'"]);
+    fails(&db, "staff.select { id, x: .boss.boss.pya }", &["'staff'", "'pya'", "Did you mean 'pay'"]);
+    fails(&db, "teams.where { .staff.where { .pya > 3 }.exists() }", &["'staff'", "'pya'"]);
+    fails(&db, "teams.select { id, n: .staff.sum(.pya) }", &["'staff'", "'pya'"]);
+    fails(&db, "teams.select { id, n: .staff.select { id, b: .boss.pya } }", &["'pya'"]);
+    fails(&db, "staff.where { .pay > staff.avg(.pya) }", &["'pya'"]);
+    fails(&db, "staff.sort { .team.idd.asc }", &["'teams'", "'idd'"]);
+    fails(&db, "pings.group_by { .who.pya }.select { n: count() }", &["'pya'"]);
+    // Inside an embedded object whose fields the schema declares.
+    fails(&db, "jobs.where { .notes.where { .minz > 3 }.exists() }", &["'jobs.notes'", "'minz'", "Did you mean 'mins'"]);
+    fails(&db, "jobs.select { m: .notes.minz }", &["'minz'"]);
+    fails(&db, "jobs.notes.group_by { .knid }.select { n: count() }", &["'knid'"]);
+    // A name that is declared and merely has no value is still null, and
+    // the tests for presence may ask about anything.
+    assert_eq!(db.ids("staff.where { .boss.grade == null && .boss != null }.sort { .id.asc }"), Vec::<String>::new());
+    assert_eq!(db.ids("staff.where { .boss.boss.grade == 1 }"), ["d"]);
+    assert!(db.try_rows("teams.walk(.children).select { id, d: ._depth }").is_ok());
+    assert!(db.try_rows("staff.where { exists(.boss.grade) }").is_ok());
+
+    // Arithmetic on a path through a collection. `.children*.id` is `*`
+    // written to mean "any number of steps".
+    fails(&db, "teams.select { all: .children*.id }", &["many values", ".walk(.children)"]);
+    fails(&db, "staff.select { x: .reports.pay * 2 }", &["many values", ".reports.sum(.pay)"]);
+    fails(&db, "staff.select { x: 1 + .reports.pay }", &["many values"]);
+    assert_eq!(db.scalar("staff.where { .id == \"b\" }.select { x: .pay * 2 }", "x"), int(160));
+    assert!(db.try_rows("jobs.select { kinds: .notes.kind + [\"z\"] }").is_ok());
+
+    // In a grouped select, a path that is not a key is read from the
+    // group's rows.
+    assert_eq!(
+        db.table(
+            "staff.group_by { .team.id }
+               .select { team_id, bosses: .boss.distinct().count(), reports: .reports.count(), pays: .pay }
+               .sort { .team_id.asc }",
+            &["team_id", "bosses", "reports", "pays"],
+        ),
+        vec![
+            vec![text("t1"), int(0), int(3), Value::List(vec![int(100)])],
+            vec![text("t2"), int(1), int(1), Value::List(vec![int(80), int(80)])],
+            vec![text("t3"), int(1), int(0), Value::List(vec![int(90)])],
+            vec![text("t4"), int(1), int(1), Value::List(vec![int(60)])],
+            vec![text("t5"), int(1), int(0), Value::List(vec![int(40)])],
+        ]
+    );
+    fails(&db, "staff.group_by { .team.id }.having { .pay > 50 }.select { team_id }", &["many values"]);
+
+    // A function called as a method on the current row is given the row.
+    for definition in [
+        "fn is_boss(s: staff) -> Boolean { s.reports.count() > 0 }",
+        "fn band(pay: Integer) -> String { if pay >= 80 then \"high\" else \"low\" }",
+    ] {
+        let owl_db::parser::OQLStatement::FunctionDef(definition) =
+            owl_db::parse_oql_statement(definition).unwrap()
+        else {
+            panic!("not a function");
+        };
+        db.executor.register_user_function(definition).unwrap();
+    }
+    assert_eq!(db.ids("staff.where { .is_boss() }.sort { .id.asc }"), ["a", "b", "d"]);
+    assert_eq!(db.ids("staff.where { is_boss(*) }.sort { .id.asc }"), ["a", "b", "d"]);
+    assert_eq!(db.ids("staff.where { .boss.is_boss() && !.is_boss() }.sort { .id.asc }"), ["c", "e", "f"]);
+    assert_eq!(db.ids("staff.where { .pay.band() == \"high\" }.sort { .id.asc }"), ["a", "b", "c", "f"]);
+
+    // A sort by a function that does not exist, at any depth.
+    fails(&db, "staff.sort { nonesuch(.pay).desc }", &["Unknown function: nonesuch"]);
+    fails(&db, "staff.sort { .id.asc, abs(nonesuch(.pay)).desc }.limit(2)", &["nonesuch"]);
+    fails(&db, "teams.select { id, s: .staff.sort { nonesuch(.pay).asc }.select { id } }", &["nonesuch"]);
+    // One that exists still sorts, and a key that cannot be worked out for
+    // a row is still null for that row, not a failure.
+    assert_eq!(db.ids("staff.sort { abs(.pay - 70).asc, .id.asc }.limit(1)"), ["b"]);
+    assert_eq!(db.ids("staff.sort { (.grade * 2).desc, .id.asc }.limit(2)"), ["f", "b"]);
+}
+
+/// Composition instead of new words: an aggregate follows a path of
+/// values, and a function written in OQL takes a collection, so what would
+/// otherwise be a built-in is a chain or a definition.
+#[test]
+fn values_and_functions_compose() {
+    let mut db = company();
+    // An aggregate with nothing named aggregates the values it follows.
+    assert_eq!(db.scalar("staff.pay.max()", "max"), int(100));
+    assert_eq!(db.scalar("staff.pay.min()", "min"), int(40));
+    assert_eq!(db.scalar("staff.pay.sum()", "sum"), int(450));
+    assert_eq!(db.scalar("staff.pay.avg()", "avg"), Value::Float(75.0));
+    assert_eq!(db.scalar("staff.pay.median()", "median"), Value::Float(80.0));
+    assert_eq!(db.scalar("staff.pay.percentile(0.25)", "percentile"), Value::Float(65.0));
+    assert_eq!(db.scalar("staff.pay.distinct().count()", "count"), int(5));
+    // It is the same value as naming the field.
+    assert_eq!(db.scalar("staff.pay.sum()", "sum"), db.scalar("staff.sum(.pay)", "sum"));
+    // Through a relationship, in a filter, and in a group.
+    assert_eq!(
+        db.table(
+            "staff.where { .id == \"a\" }.select { top: .reports.pay.max(), all: .reports.pay.sum(), kinds: .reports.pay.distinct().count() }",
+            &["top", "all", "kinds"],
+        ),
+        vec![vec![int(90), int(250), int(2)]]
+    );
+    assert_eq!(db.ids("staff.where { .reports.pay.max() > 85 }"), ["a"]);
+    assert_eq!(
+        db.table(
+            "staff.group_by { .team.id }.select { team_id, top: .pay.max(), kinds: .pay.distinct().count() }
+               .where { .team_id == \"t2\" }",
+            &["top", "kinds"],
+        ),
+        vec![vec![int(80), int(1)]]
+    );
+    assert_eq!(db.scalar("jobs.notes.mins.sum()", "sum"), int(15));
+
+    for definition in [
+        "fn spread(rows) { rows.max(.pay) - rows.min(.pay) }",
+        "fn bosses_among(rows) { rows.where { .reports.exists() }.count() }",
+        "fn distinct_count(values) { values.distinct().count() }",
+        "fn total(values) { values.sum() }",
+        "fn raise(pay: Integer, by: Float = 0.5) -> Float { pay * (1 + by) }",
+        "fn seniors(least: Integer = 70) { staff.where { .pay > least } }",
+        "fn headline(s: staff) { s.id + \":\" + to_string(s.pay) }",
+    ] {
+        let owl_db::parser::OQLStatement::FunctionDef(definition) =
+            owl_db::parse_oql_statement(definition).unwrap_or_else(|error| panic!("{error}\n{definition}"))
+        else {
+            panic!("not a function");
+        };
+        db.executor.register_user_function(definition).unwrap();
+    }
+
+    // A function is given a collection: a relationship keeps its rows as
+    // rows, so the function can filter and follow relationships from them.
+    assert_eq!(db.scalar("staff.where { .id == \"a\" }.select { s: spread(.reports) }", "s"), int(10));
+    assert_eq!(db.scalar("staff.where { .id == \"a\" }.select { s: .reports.spread() }", "s"), int(10));
+    assert_eq!(
+        db.table("staff.sort { .id.asc }.select { id, n: bosses_among(.reports) }", &["id", "n"]),
+        vec![
+            vec![text("a"), int(1)],
+            vec![text("b"), int(1)],
+            vec![text("c"), int(0)],
+            vec![text("d"), int(0)],
+            vec![text("e"), int(0)],
+            vec![text("f"), int(0)],
+        ]
+    );
+    // What a built-in word would do, written in the language.
+    assert_eq!(
+        db.table(
+            "staff.where { .id == \"a\" }.select { kinds: distinct_count(.reports.pay), all: total(.reports.pay) }",
+            &["kinds", "all"],
+        ),
+        vec![vec![int(2), int(250)]]
+    );
+    assert_eq!(db.ids("staff.where { total(.reports.pay) > 100 }"), ["a"]);
+
+    // A parameter left out takes its default.
+    assert_eq!(db.scalar("staff.where { .id == \"e\" }.select { r: raise(.pay) }", "r"), Value::Float(60.0));
+    assert_eq!(db.scalar("staff.where { .id == \"e\" }.select { r: raise(.pay, 1.0) }", "r"), Value::Float(80.0));
+    assert_eq!(db.scalar("staff.where { .id == \"e\" }.select { r: .pay.raise() }", "r"), Value::Float(60.0));
+    assert!(db.try_rows("staff.select { r: raise() }").unwrap_err().contains("1 to 2"));
+    assert!(db.try_rows("staff.select { r: raise(.pay, 1.0, 2.0) }").is_err());
+
+    // A function starts a query, and what follows applies to its rows,
+    // which are still rows of their collection.
+    assert_eq!(db.scalar("seniors().count()", "count"), int(4));
+    assert_eq!(db.ids("seniors(85).sort { .id.asc }"), ["a", "f"]);
+    assert_eq!(db.scalar("seniors(85).where { .reports.exists() }.count()", "count"), int(1));
+    assert_eq!(
+        db.table(
+            "seniors().sort { .pay.desc, .id.asc }.limit(2).select { id, n: .reports.count(), h: .headline() }",
+            &["id", "n", "h"],
+        ),
+        vec![
+            vec![text("a"), int(3), text("a:100")],
+            vec![text("f"), int(0), text("f:90")],
+        ]
+    );
+    assert_eq!(db.scalar("staff.where { .id == \"a\" }.select { n: seniors(85).count() }", "n"), int(2));
+    assert!(db.try_rows("nonesuch().count()").unwrap_err().contains("Unknown function: nonesuch"));
+}
+
+/// Inside a nested select too, a collection the path passed through is
+/// the row each result came from.
+#[test]
+fn a_nested_path_can_name_the_rows_it_passed_through() {
+    let db = company();
+    let nested = |query: &str, field: &str| match db.scalar(query, field) {
+        Value::List(items) => {
+            let mut rows: Vec<Vec<(String, Value)>> = items
+                .into_iter()
+                .map(|item| match item {
+                    Value::Object(fields) => {
+                        let mut fields: Vec<_> = fields
+                            .into_iter()
+                            .filter(|(name, _)| !name.starts_with('$'))
+                            .collect();
+                        fields.sort_by(|left, right| left.0.cmp(&right.0));
+                        fields
+                    }
+                    other => panic!("not a row: {other:?}"),
+                })
+                .collect();
+            rows.sort_by(|left, right| format!("{left:?}").cmp(&format!("{right:?}")));
+            rows
+        }
+        other => panic!("not a list: {other:?}\n{query}"),
+    };
+    let row = |id: &str, who: &str, pay: i64| {
+        vec![
+            ("id".to_string(), text(id)),
+            ("pay".to_string(), int(pay)),
+            ("who".to_string(), text(who)),
+        ]
+    };
+    // Team t2 holds b and c; only b has pings.
+    assert_eq!(
+        nested(
+            "teams.where { .id == \"t2\" }.select { p: .staff.pings.select { id, who: staff.id, pay: staff.pay } }",
+            "p",
+        ),
+        vec![row("p4", "b", 80), row("p5", "b", 80)]
+    );
+    // In a filter and an aggregate as well as a projection.
+    assert_eq!(
+        db.table(
+            "teams.sort { .id.asc }.limit(2).select { id, n: .staff.pings.where { staff.pay >= 90 }.count() }",
+            &["id", "n"],
+        ),
+        vec![vec![text("t1"), int(3)], vec![text("t2"), int(0)]]
+    );
+    // The enclosing row's own collection still means the enclosing row:
+    // every ping reached from `a` reports `a`, not the report it belongs to.
+    assert_eq!(
+        nested(
+            "staff.where { .id == \"a\" }.select { p: .reports.pings.select { id, who: staff.id, pay: staff.pay } }",
+            "p",
+        ),
+        vec![row("p4", "a", 100), row("p5", "a", 100)]
+    );
+    // A path that names nothing on the way is unchanged.
+    assert_eq!(db.scalar("teams.where { .id == \"t1\" }.select { n: .staff.pings.count() }", "n"), int(3));
 }
