@@ -2,5 +2,5 @@
 // relationship.
 people
   .group_by { .level }
-  .select { level, n: count(), median: median(.salary), p90: percentile(.salary, 0.9) }
+  .select { level, n: count(), median: .salary.median(), p90: .salary.percentile(0.9) }
   .sort { .level.asc }

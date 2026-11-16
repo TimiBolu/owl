@@ -106,10 +106,12 @@ fn test_simple_function(executor: &mut QueryExecutor<RocksDBStore>) -> OQLResult
             FunctionParameter {
                 name: "name".to_string(),
                 param_type: "String".to_string(),
+                default: None,
             },
             FunctionParameter {
                 name: "tier".to_string(),
                 param_type: "String".to_string(),
+                default: None,
             },
         ],
         return_type: Some("String".to_string()),
@@ -176,10 +178,12 @@ fn test_multi_parameter_function(executor: &mut QueryExecutor<RocksDBStore>) -> 
             FunctionParameter {
                 name: "age".to_string(),
                 param_type: "Integer".to_string(),
+                default: None,
             },
             FunctionParameter {
                 name: "tier".to_string(),
                 param_type: "String".to_string(),
+                default: None,
             },
         ],
         return_type: Some("Integer".to_string()),
@@ -230,6 +234,7 @@ fn test_function_with_builtin_calls(executor: &mut QueryExecutor<RocksDBStore>) 
             FunctionParameter {
                 name: "email".to_string(),
                 param_type: "String".to_string(),
+                default: None,
             },
         ],
         return_type: Some("String".to_string()),
@@ -286,6 +291,7 @@ fn test_function_type_validation(executor: &mut QueryExecutor<RocksDBStore>) -> 
             FunctionParameter {
                 name: "param".to_string(),
                 param_type: "InvalidType".to_string(),
+                default: None,
             },
         ],
         return_type: Some("String".to_string()),

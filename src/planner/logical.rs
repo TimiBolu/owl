@@ -138,6 +138,7 @@ impl LogicalPlanner {
                 "limit/offset with an unevaluated count cannot be planned",
             )),
             Operation::Distinct
+            | Operation::Call(_)
             | Operation::Combine { .. }
             | Operation::Walk { .. }
             | Operation::PartitionBy(_)

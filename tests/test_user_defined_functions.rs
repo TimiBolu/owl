@@ -83,6 +83,7 @@ fn test_function_registration_and_execution() {
             FunctionParameter {
                 name: "age".to_string(),
                 param_type: "Integer".to_string(),
+                default: None,
             },
         ],
         return_type: Some("Integer".to_string()),
@@ -131,10 +132,12 @@ fn test_function_with_multiple_parameters() {
             FunctionParameter {
                 name: "name".to_string(),
                 param_type: "String".to_string(),
+                default: None,
             },
             FunctionParameter {
                 name: "age".to_string(),
                 param_type: "Integer".to_string(),
+                default: None,
             },
         ],
         return_type: Some("String".to_string()),
@@ -186,6 +189,7 @@ fn test_function_type_validation() {
             FunctionParameter {
                 name: "param".to_string(),
                 param_type: "InvalidType".to_string(),
+                default: None,
             },
         ],
         return_type: Some("String".to_string()),
@@ -250,10 +254,12 @@ fn test_function_argument_count_validation() {
             FunctionParameter {
                 name: "param1".to_string(),
                 param_type: "String".to_string(),
+                default: None,
             },
             FunctionParameter {
                 name: "param2".to_string(),
                 param_type: "Integer".to_string(),
+                default: None,
             },
         ],
         return_type: Some("String".to_string()),
@@ -288,6 +294,7 @@ fn test_function_with_builtin_calls() {
             FunctionParameter {
                 name: "name".to_string(),
                 param_type: "String".to_string(),
+                default: None,
             },
         ],
         return_type: Some("String".to_string()),

@@ -114,8 +114,7 @@ pub const CURRENT_ROWS: &str = "$rows";
 
 /// Operations and aggregates that are words only where they are applied, so
 /// that data may still have fields called `median` or `union`.
-pub const STAGE_WORDS: [&str; 8] = [
-    "count_distinct",
+pub const STAGE_WORDS: [&str; 7] = [
     "median",
     "percentile",
     "union",
@@ -127,7 +126,7 @@ pub const STAGE_WORDS: [&str; 8] = [
 
 /// The aggregates among [`STAGE_WORDS`].
 fn is_aggregate_stage(word: &str) -> bool {
-    matches!(word, "count_distinct" | "median" | "percentile")
+    matches!(word, "median" | "percentile")
 }
 
 /// The marker the parser gives a `select` entry written `-name`: the named
@@ -802,7 +801,11 @@ pub struct FunctionDefinition {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FunctionParameter {
     pub name: String,
+    /// The declared type, or `Any` when none was written.
     pub param_type: String,
+    /// The value the parameter takes when a call leaves it out.
+    #[serde(default)]
+    pub default: Option<Expression>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -850,6 +853,10 @@ pub enum Operation {
         path: FieldAccess,
         depth: Option<Expression>,
     },
+    /// `name(args)` at the start of a query, as in `seniors(50).count()`:
+    /// the query's collection names a function, and the rows it starts
+    /// from are what the function gives for these arguments. Always first.
+    Call(Vec<Expression>),
     /// `partition_by { keys }`: the position functions of the next `select`
     /// (`row_number`, `prev`, `running_sum` and the rest) start again for
     /// each distinct key. The rows and their order are unchanged.
@@ -2028,26 +2035,36 @@ impl Parser {
             None => return Err(ParseError::UnexpectedEndOfInput),
         };
 
-        // Expect colon
-        self.expect_token(Token::Colon)?;
-
-        // Parse parameter type
-        let param_type = match self.current_token() {
-            Some(Token::Identifier(type_name)) => {
-                let type_name = type_name.clone();
-                self.advance();
-                type_name
+        // A type is optional: a parameter without one takes whatever it is
+        // given, which is how a function takes a collection.
+        let param_type = if matches!(self.current_token(), Some(Token::Colon)) {
+            self.advance();
+            match self.current_token() {
+                Some(Token::Identifier(type_name)) => {
+                    let type_name = type_name.clone();
+                    self.advance();
+                    type_name
+                }
+                Some(token) => {
+                    return Err(ParseError::UnexpectedToken(format!(
+                        "Expected parameter type, found {:?}",
+                        token
+                    )))
+                }
+                None => return Err(ParseError::UnexpectedEndOfInput),
             }
-            Some(token) => {
-                return Err(ParseError::UnexpectedToken(format!(
-                    "Expected parameter type, found {:?}",
-                    token
-                )))
-            }
-            None => return Err(ParseError::UnexpectedEndOfInput),
+        } else {
+            "Any".to_string()
+        };
+        // `by: Float = 0.1`: the value used when the call leaves it out.
+        let default = if matches!(self.current_token(), Some(Token::Assign)) {
+            self.advance();
+            Some(self.parse_expression()?)
+        } else {
+            None
         };
 
-        Ok(FunctionParameter { name, param_type })
+        Ok(FunctionParameter { name, param_type, default })
     }
 
     fn parse_oql_query(&mut self) -> Result<OQLQuery, ParseError> {
@@ -2069,7 +2086,10 @@ impl Parser {
 
         // Validate schema exists if registry is available
         if let Some(registry) = &self.schema_registry {
-            if !registry.exists(&collection) {
+            // A name followed by `(` is a function, not a collection.
+            if !registry.exists(&collection)
+                && !matches!(self.current_token(), Some(Token::LeftParen))
+            {
                 return Err(ParseError::SchemaError {
                     message: format!("Schema '{}' not found", collection),
                 });
@@ -2084,6 +2104,21 @@ impl Parser {
 
         // Parse method chain (e.g., ".where { ... }.select { ... }")
         let mut operations = Vec::new();
+
+        // `seniors(50).count()`: a function gives the rows to start from.
+        if matches!(self.current_token(), Some(Token::LeftParen)) {
+            self.advance();
+            let mut arguments = Vec::new();
+            if !matches!(self.current_token(), Some(Token::RightParen)) {
+                arguments.push(self.parse_expression()?);
+                while matches!(self.current_token(), Some(Token::Comma)) {
+                    self.advance();
+                    arguments.push(self.parse_expression()?);
+                }
+            }
+            self.expect_token(Token::RightParen)?;
+            operations.push(Operation::Call(arguments));
+        }
 
         loop {
             match self.current_token() {
@@ -2973,6 +3008,7 @@ impl Parser {
             | Operation::LimitExpr(_)
             | Operation::OffsetExpr(_)
             | Operation::Distinct
+            | Operation::Call(_)
             | Operation::Combine { .. }
             | Operation::Walk { .. }
             | Operation::PartitionBy(_)
@@ -3756,6 +3792,21 @@ impl Parser {
             }
         }
 
+        // After anything but a plain path, `(.price * .qty).desc` or
+        // `abs(.x).asc`, the direction arrives as an access of a field
+        // called `asc` or `desc` on the value. It is the direction there too.
+        if let Expression::ChainedAccess { base, field } = &expression {
+            let chained = match field.as_str() {
+                "asc" => Some(SortDirection::Asc),
+                "desc" => Some(SortDirection::Desc),
+                _ => None,
+            };
+            if let Some(chained) = chained {
+                direction = chained;
+                expression = base.as_ref().clone();
+            }
+        }
+
         // Check for optional direction (.asc or .desc)
         if matches!(self.current_token(), Some(Token::Dot)) {
             self.advance(); // consume dot
@@ -4516,13 +4567,23 @@ impl Parser {
                 let function = name.clone();
                 self.advance();
                 self.expect_token(Token::LeftParen)?;
-                let mut arguments = vec![self.parse_expression()?];
-                while matches!(self.current_token(), Some(Token::Comma)) {
-                    self.advance();
+                let mut arguments = Vec::new();
+                if !matches!(self.current_token(), Some(Token::RightParen)) {
                     arguments.push(self.parse_expression()?);
+                    while matches!(self.current_token(), Some(Token::Comma)) {
+                        self.advance();
+                        arguments.push(self.parse_expression()?);
+                    }
                 }
                 self.expect_token(Token::RightParen)?;
+                // After a path of values there is nothing to name: the
+                // value aggregated is each value itself. `.salary.median()`
+                // is `.salary.median(.)`, and `.salary.percentile(0.9)` is
+                // `.salary.percentile(., 0.9)`.
                 let expected = if function == "percentile" { 2 } else { 1 };
+                if arguments.len() + 1 == expected {
+                    arguments.insert(0, Expression::FieldAccess(FieldAccess { path: Vec::new() }));
+                }
                 if arguments.len() != expected {
                     return Err(ParseError::InvalidSyntax(format!(
                         "{function} takes {expected} argument(s), not {}",
@@ -4545,6 +4606,18 @@ impl Parser {
             Some(Token::Max) => "max",
             _ => return Ok(None),
         };
+        // `.salary.max()`: with nothing named, each value itself.
+        if matches!(self.peek_token(), Some(Token::LeftParen))
+            && matches!(self.tokens.get(self.position + 2), Some(Token::RightParen))
+        {
+            self.advance();
+            self.advance();
+            self.advance();
+            return Ok(Some(Operation::AggregateExpr {
+                function: function.to_string(),
+                input: Expression::FieldAccess(FieldAccess { path: Vec::new() }),
+            }));
+        }
         // A plain path keeps its dedicated operation, which the planner and
         // schema validation understand.
         let simple_path = matches!(
@@ -5065,6 +5138,7 @@ fn operation_uses_legacy_outer(operation: &Operation) -> bool {
         | Operation::LimitExpr(_)
         | Operation::OffsetExpr(_)
         | Operation::Distinct
+        | Operation::Call(_)
         | Operation::Combine { .. }
         | Operation::Walk { .. }
         | Operation::PartitionBy(_)
