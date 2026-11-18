@@ -44,8 +44,8 @@ mod tests {
         }
 
         fn scan_documents(&self, _schema: &str) -> OQLResult<Vec<Document>> {
-            // Not needed for these tests
-            unimplemented!("scan_documents not implemented for test store")
+            // These tests read single documents; a scan finds none.
+            Ok(Vec::new())
         }
 
         fn get_schema(&self, name: &str) -> OQLResult<Option<Schema>> {

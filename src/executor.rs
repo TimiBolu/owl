@@ -141,12 +141,49 @@ impl<S: DocumentStore> QueryExecutor<S> {
     /// Create a new query executor with dependency injection
     pub fn new(store: Arc<S>, clock: Arc<dyn Clock>) -> Self {
         let streaming_executor = StreamingExecutor::new_with_clock(store.clone(), clock.clone());
-        Self {
+        let mut executor = Self {
             store: store.clone(),
             clock,
             functions: FunctionRegistry::new(),
             // optimizer: QueryOptimizer::new(), // TODO: Re-enable after optimizer module
             streaming_executor,
+        };
+        executor.load_stored_functions();
+        executor
+    }
+
+    /// Take up the functions the database holds, so that a function
+    /// defined before a restart is still there after it.
+    fn load_stored_functions(&mut self) {
+        let Ok(stored) = self
+            .store
+            .scan_documents(crate::functions::STORED_FUNCTIONS)
+        else {
+            return;
+        };
+        for document in stored {
+            let read = crate::functions::function_of_stored(&document).and_then(|definition| {
+                self.functions
+                    .register_user_function(definition)
+                    .map_err(|error| error.to_string())
+            });
+            if let Err(reason) = read {
+                self.functions.note_unreadable(&document.id, reason);
+            }
+        }
+    }
+
+    /// The error for a call to a function that is not there.
+    fn unknown_function(&self, name: &str) -> OQLError {
+        match self.functions.why_unreadable(name) {
+            Some(reason) => OQLError::Generic {
+                message: format!(
+                    "Function '{name}' is stored in this database but cannot be used: {reason}. Define it again."
+                ),
+            },
+            None => OQLError::Generic {
+                message: format!("Unknown function: {name}"),
+            },
         }
     }
 
@@ -184,12 +221,21 @@ impl<S: DocumentStore> QueryExecutor<S> {
             .collect())
     }
 
-    /// Register a user-defined function
+    /// Define a function, here and in the database: it is written as any
+    /// document is, so it is there after a restart, and a transaction that
+    /// is rolled back does not keep it.
     pub fn register_user_function(
         &mut self,
         func_def: crate::parser::FunctionDefinition,
     ) -> OQLResult<()> {
-        self.functions.register_user_function(func_def)
+        let stored = crate::functions::stored_function(&func_def)?;
+        let name = func_def.name.clone();
+        self.functions.register_user_function(func_def)?;
+        if let Err(error) = self.store.put_document(&stored) {
+            self.unregister_user_function(&name);
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// See and define the same OQL functions as `other` from now on. A
@@ -199,10 +245,17 @@ impl<S: DocumentStore> QueryExecutor<S> {
         self.functions.share_user_functions(&other.functions);
     }
 
-    /// Remove a user-defined function, for example when the transaction
-    /// that defined it is rolled back.
+    /// Undo a definition that did not last, for example when the
+    /// transaction that made it is rolled back: the function is again what
+    /// the database holds, or what the standard library ships, or nothing.
     pub fn unregister_user_function(&mut self, name: &str) {
-        self.functions.unregister_user_function(name);
+        let stored = self
+            .store
+            .get_document(crate::functions::STORED_FUNCTIONS, &name.to_string())
+            .ok()
+            .flatten()
+            .and_then(|document| crate::functions::function_of_stored(&document).ok());
+        self.functions.restore_user_function(name, stored);
     }
 
     /// Get access to the underlying store (for testing)
@@ -5650,9 +5703,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
         args: &[Expression],
     ) -> OQLResult<Vec<Document>> {
         let Some(function) = self.functions.get_user_function(&query.collection) else {
-            return Err(OQLError::Generic {
-                message: format!("Unknown function: {}", query.collection),
-            });
+            return Err(self.unknown_function(&query.collection));
         };
         Ok(match &function.definition.body {
             Expression::QueryExpression { query: body } => {
@@ -10902,9 +10953,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     // Handle user-defined function
                     self.evaluate_user_function(document, &user_func, args)
                 } else {
-                    Err(OQLError::Generic {
-                        message: format!("Unknown function: {}", name),
-                    })
+                    Err(self.unknown_function(&name))
                 }
             }
         }
@@ -12237,9 +12286,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
         };
         for field in &sort_block.fields {
             if let Some(name) = unknown(&field.expression, &known) {
-                return Err(OQLError::Generic {
-                    message: format!("Unknown function: {name}"),
-                });
+                return Err(self.unknown_function(name));
             }
         }
         Ok(())
@@ -12810,9 +12857,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
         args: &[Expression],
     ) -> OQLResult<Value> {
         let Some(function) = self.functions.get_user_function(name) else {
-            return Err(OQLError::Generic {
-                message: format!("Unknown function: {}", name),
-            });
+            return Err(self.unknown_function(&name));
         };
         if function.library {
             if let Some(answer) = self.library_directly(document, &function, args)? {
@@ -12939,9 +12984,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
         following: &[Operation],
     ) -> OQLResult<Vec<Document>> {
         let Some(function) = self.functions.get_user_function(name) else {
-            return Err(OQLError::Generic {
-                message: format!("Unknown function: {name}"),
-            });
+            return Err(self.unknown_function(name));
         };
         let definition = &function.definition;
         let Some((first, others)) = definition.parameters.split_first() else {

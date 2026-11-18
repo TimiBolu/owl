@@ -31,6 +31,44 @@ pub struct FunctionRegistry {
     /// been defined since. Shared, so that everything running against one
     /// database connection sees a function as soon as it is defined.
     user_functions: Arc<RwLock<HashMap<String, Arc<UserDefinedFunction>>>>,
+    /// Functions the database holds but this version cannot read, each with
+    /// the reason. A call to one says so instead of calling it unknown.
+    unreadable: Arc<RwLock<HashMap<String, String>>>,
+}
+
+/// The collection a database keeps its OQL functions in, one document a
+/// function, so that a definition is as durable as any other write and a
+/// transaction that is rolled back takes its definitions with it.
+pub const STORED_FUNCTIONS: &str = "$functions";
+const STORED_DEFINITION: &str = "definition";
+
+/// A function as the document the database keeps.
+pub fn stored_function(definition: &FunctionDefinition) -> OQLResult<crate::document::Document> {
+    let written = serde_json::to_string(definition).map_err(|error| {
+        OQLError::generic(&format!(
+            "function '{}' cannot be written down: {error}",
+            definition.name
+        ))
+    })?;
+    let mut fields = crate::document::Fields::default();
+    fields.insert("name".to_string(), Value::String(definition.name.clone()));
+    fields.insert(STORED_DEFINITION.to_string(), Value::String(written));
+    Ok(crate::document::Document::with_id(
+        definition.name.clone(),
+        STORED_FUNCTIONS.to_string(),
+        fields,
+    ))
+}
+
+/// The function a stored document holds, or why it cannot be read.
+pub fn function_of_stored(
+    document: &crate::document::Document,
+) -> Result<FunctionDefinition, String> {
+    let Some(Value::String(written)) = document.fields.get(STORED_DEFINITION) else {
+        return Err("its stored form has no definition".to_string());
+    };
+    serde_json::from_str(written)
+        .map_err(|error| format!("it was written by a version of Owl this one cannot read ({error})"))
 }
 
 /// The standard library, parsed once.
@@ -55,6 +93,7 @@ impl FunctionRegistry {
         let mut registry = Self {
             builtin_functions: HashMap::new(),
             user_functions: Arc::new(RwLock::new(HashMap::new())),
+            unreadable: Arc::new(RwLock::new(HashMap::new())),
         };
 
         // Register all built-in functions
@@ -89,6 +128,43 @@ impl FunctionRegistry {
     /// See and define the same OQL functions as `other` from now on.
     pub fn share_user_functions(&mut self, other: &FunctionRegistry) {
         self.user_functions = other.user_functions.clone();
+        self.unreadable = other.unreadable.clone();
+    }
+
+    /// Note that the database holds a function this version cannot read.
+    pub fn note_unreadable(&mut self, name: &str, reason: String) {
+        if let Ok(mut unreadable) = self.unreadable.write() {
+            unreadable.insert(name.to_string(), reason);
+        }
+    }
+
+    /// Why a stored function of this name could not be read, if one could
+    /// not.
+    pub fn why_unreadable(&self, name: &str) -> Option<String> {
+        self.unreadable
+            .read()
+            .ok()
+            .and_then(|unreadable| unreadable.get(name).cloned())
+    }
+
+    /// Put a function back to what it was before a definition that did not
+    /// last: the one the database holds, or else the standard library's,
+    /// or else nothing.
+    pub fn restore_user_function(&mut self, name: &str, stored: Option<FunctionDefinition>) {
+        let earlier = stored.or_else(|| {
+            standard_library()
+                .iter()
+                .find(|shipped| shipped.name == name)
+                .cloned()
+        });
+        match earlier {
+            Some(definition) => {
+                if self.register_user_function(definition).is_err() {
+                    self.unregister_user_function(name);
+                }
+            }
+            None => self.unregister_user_function(name),
+        }
     }
 
     /// Check if a function exists (built-in or user-defined)
@@ -133,6 +209,9 @@ impl FunctionRegistry {
             .write()
             .map_err(|_| OQLError::generic("function registry lock poisoned"))?
             .insert(func_def.name.clone(), Arc::new(user_func));
+        if let Ok(mut unreadable) = self.unreadable.write() {
+            unreadable.remove(&func_def.name);
+        }
         Ok(())
     }
 
