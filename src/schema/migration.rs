@@ -539,7 +539,6 @@ impl<S: DocumentStore> MigrationExecutor<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     #[test]
     fn test_migration_script_creation() {
@@ -561,7 +560,7 @@ mod tests {
             default_value: Value::String("unknown@example.com".to_string()),
         });
 
-        let mut doc = Document::with_id("user1".to_string(), "users".to_string(), HashMap::new());
+        let mut doc = Document::with_id("user1".to_string(), "users".to_string(), crate::document::Fields::default());
         doc.fields
             .insert("name".to_string(), Value::String("Alice".to_string()));
 
@@ -583,7 +582,7 @@ mod tests {
             field_name: "old_field".to_string(),
         });
 
-        let mut doc = Document::with_id("user1".to_string(), "users".to_string(), HashMap::new());
+        let mut doc = Document::with_id("user1".to_string(), "users".to_string(), crate::document::Fields::default());
         doc.fields
             .insert("name".to_string(), Value::String("Alice".to_string()));
         doc.fields.insert(
@@ -607,7 +606,7 @@ mod tests {
             new_name: "email_address".to_string(),
         });
 
-        let mut doc = Document::with_id("user1".to_string(), "users".to_string(), HashMap::new());
+        let mut doc = Document::with_id("user1".to_string(), "users".to_string(), crate::document::Fields::default());
         doc.fields
             .insert("name".to_string(), Value::String("Alice".to_string()));
         doc.fields.insert(
@@ -634,7 +633,7 @@ mod tests {
             transform: FieldTransform::ToString,
         });
 
-        let mut doc = Document::with_id("user1".to_string(), "users".to_string(), HashMap::new());
+        let mut doc = Document::with_id("user1".to_string(), "users".to_string(), crate::document::Fields::default());
         doc.fields.insert("age".to_string(), Value::Integer(30));
 
         script.apply_to_document(&mut doc).unwrap();
@@ -655,7 +654,7 @@ mod tests {
             transform: FieldTransform::ToInteger,
         });
 
-        let mut doc = Document::with_id("user1".to_string(), "users".to_string(), HashMap::new());
+        let mut doc = Document::with_id("user1".to_string(), "users".to_string(), crate::document::Fields::default());
         doc.fields
             .insert("age".to_string(), Value::String("30".to_string()));
 
@@ -683,7 +682,7 @@ mod tests {
         plan.add_script(script1);
         plan.add_script(script2);
 
-        let mut doc = Document::with_id("user1".to_string(), "users".to_string(), HashMap::new());
+        let mut doc = Document::with_id("user1".to_string(), "users".to_string(), crate::document::Fields::default());
         doc.fields
             .insert("name".to_string(), Value::String("Alice".to_string()));
 

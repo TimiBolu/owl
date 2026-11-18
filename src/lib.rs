@@ -6,6 +6,7 @@ pub mod concurrency;
 pub mod config;
 pub mod distributed;
 pub mod document;
+pub mod fields;
 pub mod error;
 pub mod execution;
 pub mod executor;
@@ -55,7 +56,7 @@ pub use config::{
     MigrationManager, MigrationResult, NetworkConfig, PerformanceConfig, SecurityConfig,
     StorageConfig,
 };
-pub use document::{Document, DocumentId, Value};
+pub use document::{Document, DocumentId, Fields, Value};
 pub use error::{OQLError, OQLResult};
 pub use execution::OperatorExecutionStats;
 pub use executor::{BatchQueryExecution, QueryExecution, QueryExecutor};

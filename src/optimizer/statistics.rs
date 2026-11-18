@@ -647,12 +647,11 @@ fn current_timestamp() -> u64 {
 mod tests {
     use super::*;
     use crate::storage::create_storage;
-    use std::collections::HashMap;
 
     fn create_test_documents(count: usize) -> Vec<Document> {
         (0..count)
             .map(|i| {
-                let mut fields = HashMap::new();
+                let mut fields = crate::document::Fields::default();
                 fields.insert("id".to_string(), Value::Integer(i as i64));
                 fields.insert("name".to_string(), Value::String(format!("User {}", i)));
                 fields.insert("age".to_string(), Value::Integer(20 + (i % 50) as i64));

@@ -10,7 +10,6 @@ use owl_db::{
     error::{OQLResult},
 };
 use std::sync::Arc;
-use std::collections::HashMap;
 use chrono::{Utc, TimeZone};
 use tempfile::TempDir;
 
@@ -75,7 +74,7 @@ impl FunctionSystemTestFixture {
     }
     
     fn create_customer(&self, id: &str, name: &str, age: i64, balance: f64, premium: bool, joined_date: &str) -> Document {
-        let mut fields = HashMap::new();
+        let mut fields = owl_db::Fields::default();
         fields.insert("name".to_string(), Value::String(name.to_string()));
         fields.insert("age".to_string(), Value::Integer(age));
         fields.insert("balance".to_string(), Value::Float(balance));
@@ -87,7 +86,7 @@ impl FunctionSystemTestFixture {
     }
     
     fn create_order(&self, id: &str, customer_id: &str, total: f64, status: &str, order_date: &str) -> Document {
-        let mut fields = HashMap::new();
+        let mut fields = owl_db::Fields::default();
         fields.insert("customer_id".to_string(), Value::String(customer_id.to_string()));
         fields.insert("total".to_string(), Value::Float(total));
         fields.insert("status".to_string(), Value::String(status.to_string()));
@@ -97,7 +96,7 @@ impl FunctionSystemTestFixture {
     }
     
     fn create_product(&self, id: &str, name: &str, price: f64, inventory: i64) -> Document {
-        let mut fields = HashMap::new();
+        let mut fields = owl_db::Fields::default();
         fields.insert("name".to_string(), Value::String(name.to_string()));
         fields.insert("price".to_string(), Value::Float(price));
         fields.insert("inventory".to_string(), Value::Integer(inventory));
@@ -153,7 +152,7 @@ fn test_string_functions_with_null_and_empty() {
     let fixture = FunctionSystemTestFixture::new();
     
     // Create document with null and empty string values
-    let mut fields = HashMap::new();
+    let mut fields = owl_db::Fields::default();
     fields.insert("null_field".to_string(), Value::Null);
     fields.insert("empty_field".to_string(), Value::String("".to_string()));
     fields.insert("whitespace_field".to_string(), Value::String("   ".to_string()));
@@ -187,7 +186,7 @@ fn test_string_functions_unicode_support() {
     let fixture = FunctionSystemTestFixture::new();
     
     // Create document with Unicode strings
-    let mut fields = HashMap::new();
+    let mut fields = owl_db::Fields::default();
     fields.insert("unicode_text".to_string(), Value::String("Hello 世界 🌍".to_string()));
     fields.insert("emoji_text".to_string(), Value::String("🚀🎉🔥".to_string()));
     
@@ -296,7 +295,7 @@ fn test_math_functions_precision() {
     let fixture = FunctionSystemTestFixture::new();
     
     // Create document with precise decimal values
-    let mut fields = HashMap::new();
+    let mut fields = owl_db::Fields::default();
     fields.insert("precise_value".to_string(), Value::Float(3.141592653589793));
     fields.insert("small_value".to_string(), Value::Float(0.000001));
     fields.insert("large_value".to_string(), Value::Float(1e15));
@@ -355,7 +354,7 @@ fn test_datetime_extraction_functions() {
     
     // Create document with specific datetime
     let test_date = Utc.with_ymd_and_hms(2023, 10, 15, 14, 30, 45).unwrap();
-    let mut fields = HashMap::new();
+    let mut fields = owl_db::Fields::default();
     fields.insert("test_datetime".to_string(), Value::DateTime(test_date));
     
     let datetime_doc = Document::with_id("datetime_test".to_string(), "test_docs".to_string(), fields);
@@ -388,7 +387,7 @@ fn test_datetime_arithmetic_functions() {
     
     // Create document with base datetime
     let base_date = Utc.with_ymd_and_hms(2023, 6, 15, 12, 0, 0).unwrap();
-    let mut fields = HashMap::new();
+    let mut fields = owl_db::Fields::default();
     fields.insert("base_date".to_string(), Value::DateTime(base_date));
     
     let datetime_doc = Document::with_id("datetime_test".to_string(), "test_docs".to_string(), fields);
@@ -730,7 +729,7 @@ fn test_function_performance_with_large_dataset() {
     
     // Create a larger dataset for performance testing
     for i in 0..100 {
-        let mut fields = HashMap::new();
+        let mut fields = owl_db::Fields::default();
         fields.insert("name".to_string(), Value::String(format!("Customer {}", i)));
         fields.insert("value".to_string(), Value::Float(i as f64 * 1.5));
         fields.insert("category".to_string(), Value::String(if i % 2 == 0 { "even".to_string() } else { "odd".to_string() }));

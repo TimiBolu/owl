@@ -850,7 +850,7 @@ mod tests {
     }
 
     fn create_test_document(id: &str, name: &str) -> Document {
-        let mut fields = HashMap::new();
+        let mut fields = crate::document::Fields::default();
         fields.insert("name".to_string(), Value::String(name.to_string()));
 
         Document::with_id(id.to_string(), "users".to_string(), fields)
@@ -1075,14 +1075,14 @@ mod tests {
         let local_ref_doc = Document::with_id(
             "note_local".to_string(),
             "notes".to_string(),
-            HashMap::from([("name".to_string(), Value::String("local".to_string()))]),
+            crate::document::Fields::from_iter([("name".to_string(), Value::String("local".to_string()))]),
         );
         local_storage.put_document(&local_ref_doc).unwrap();
 
         let remote_ref_doc = Document::with_id(
             "note_remote".to_string(),
             "notes".to_string(),
-            HashMap::from([("name".to_string(), Value::String("remote".to_string()))]),
+            crate::document::Fields::from_iter([("name".to_string(), Value::String("remote".to_string()))]),
         );
         network.add_document(remote_shard, remote_ref_doc.clone());
 
@@ -1201,7 +1201,7 @@ mod tests {
         let local_org = Document::with_id(
             org_id.clone(),
             "organizations".to_string(),
-            HashMap::from([("id".to_string(), Value::String(org_id.clone()))]),
+            crate::document::Fields::from_iter([("id".to_string(), Value::String(org_id.clone()))]),
         );
         local_storage.put_document(&local_org).unwrap();
         let local_org_ref = local_storage
@@ -1214,7 +1214,7 @@ mod tests {
         let remote_company = Document::with_id(
             remote_company_id.clone(),
             "companies".to_string(),
-            HashMap::from([
+            crate::document::Fields::from_iter([
                 // A document's `id` field is its identity.
                 ("id".to_string(), Value::String(remote_company_id.clone())),
                 ("name".to_string(), Value::String("Remote Co".to_string())),
@@ -1301,7 +1301,7 @@ mod tests {
         let local_org = Document::with_id(
             "org_doc_1".to_string(),
             "organizations".to_string(),
-            HashMap::from([
+            crate::document::Fields::from_iter([
                 ("id".to_string(), Value::String("org_1".to_string())),
                 ("name".to_string(), Value::String("North Org".to_string())),
             ]),
@@ -1317,7 +1317,7 @@ mod tests {
         let remote_company = Document::with_id(
             remote_company_id,
             "companies".to_string(),
-            HashMap::from([
+            crate::document::Fields::from_iter([
                 ("id".to_string(), Value::String("c_global".to_string())),
                 ("name".to_string(), Value::String("Remote Co".to_string())),
                 (
@@ -1386,7 +1386,7 @@ mod tests {
         let org = Document::with_id(
             "org_doc_1".to_string(),
             "organizations".to_string(),
-            HashMap::from([("id".to_string(), Value::String("org_1".to_string()))]),
+            crate::document::Fields::from_iter([("id".to_string(), Value::String("org_1".to_string()))]),
         );
         local_storage.put_document(&org).unwrap();
 
@@ -1400,7 +1400,7 @@ mod tests {
         let company = Document::with_id(
             "company_local_1".to_string(),
             "companies".to_string(),
-            HashMap::from([
+            crate::document::Fields::from_iter([
                 ("id".to_string(), Value::String("c1".to_string())),
                 ("org".to_string(), Value::String("org_1".to_string())),
             ]),

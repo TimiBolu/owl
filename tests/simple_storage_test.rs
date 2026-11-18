@@ -11,7 +11,7 @@ fn create_test_document(schema: &str, id: &str, value: i64) -> Document {
     Document::with_id(
         id.to_string(),
         schema.to_string(),
-        fields,
+        fields.into_iter().collect(),
     )
 }
 

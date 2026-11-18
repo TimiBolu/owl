@@ -9,11 +9,10 @@ use owl_db::execution::{
 use owl_db::parser::FieldAccess;
 use owl_db::planner::types::{AggregateFunction, AggregateSpec};
 use owl_db::storage::create_storage;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 fn create_test_document(schema: &str, id: &str, value: i64, category: &str) -> Document {
-    let mut fields = HashMap::new();
+    let mut fields = owl_db::Fields::default();
     fields.insert("value".to_string(), Value::Integer(value));
     fields.insert("category".to_string(), Value::String(category.to_string()));
     

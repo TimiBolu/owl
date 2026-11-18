@@ -8,7 +8,6 @@ use owl_db::{
     storage::{DocumentStore, RustStore},
 };
 use chrono::Utc;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -50,7 +49,7 @@ impl FunctionTestFixture {
 }
 
 fn create_test_doc(id: &str, text: &str, number: i64, decimal: f64, flag: bool) -> Document {
-    let mut fields = HashMap::new();
+    let mut fields = owl_db::Fields::default();
     fields.insert("text".to_string(), Value::String(text.to_string()));
     fields.insert("number".to_string(), Value::Integer(number));
     fields.insert("decimal".to_string(), Value::Float(decimal));
@@ -405,7 +404,7 @@ fn test_function_with_null_values() {
     let fixture = FunctionTestFixture::new();
     
     // Create a document with null values
-    let mut fields = HashMap::new();
+    let mut fields = owl_db::Fields::default();
     fields.insert("text".to_string(), Value::Null);
     fields.insert("number".to_string(), Value::Null);
     

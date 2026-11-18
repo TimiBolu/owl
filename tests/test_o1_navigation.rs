@@ -5,7 +5,6 @@
 
 use owl_db::document::{Document, Value, ObjRef};
 use owl_db::storage::{create_storage, DocumentStore};
-use std::collections::HashMap;
 
 #[test]
 fn test_single_hop_navigation() {
@@ -14,7 +13,7 @@ fn test_single_hop_navigation() {
     let rust_store = RustStore::new("/tmp/test_single_hop.owl", 10 * 1024 * 1024).unwrap();
     
     // Create two documents: doc1 -> doc2
-    let mut doc2_fields = HashMap::new();
+    let mut doc2_fields = owl_db::Fields::default();
     doc2_fields.insert("name".to_string(), Value::String("Document 2".to_string()));
     doc2_fields.insert("value".to_string(), Value::Integer(42));
     let doc2 = Document::with_id("doc2".to_string(), "test".to_string(), doc2_fields);
@@ -24,7 +23,7 @@ fn test_single_hop_navigation() {
     let doc2_ref = rust_store.get_objref("test", &doc2.id).unwrap().unwrap();
     
     // Create doc1 with reference to doc2
-    let mut doc1_fields = HashMap::new();
+    let mut doc1_fields = owl_db::Fields::default();
     doc1_fields.insert("name".to_string(), Value::String("Document 1".to_string()));
     doc1_fields.insert("next".to_string(), Value::Reference(doc2_ref));
     let doc1 = Document::with_id("doc1".to_string(), "test".to_string(), doc1_fields);
@@ -58,21 +57,21 @@ fn test_multi_hop_navigation() {
     let rust_store = RustStore::new("/tmp/test_multi_hop.owl", 10 * 1024 * 1024).unwrap();
     
     // Create a chain: doc1 -> doc2 -> doc3
-    let mut doc3_fields = HashMap::new();
+    let mut doc3_fields = owl_db::Fields::default();
     doc3_fields.insert("name".to_string(), Value::String("Document 3".to_string()));
     doc3_fields.insert("value".to_string(), Value::Integer(100));
     let doc3 = Document::with_id("doc3".to_string(), "test".to_string(), doc3_fields);
     rust_store.put_document(&doc3).unwrap();
     
     let doc3_ref = rust_store.get_objref("test", &doc3.id).unwrap().unwrap();
-    let mut doc2_fields = HashMap::new();
+    let mut doc2_fields = owl_db::Fields::default();
     doc2_fields.insert("name".to_string(), Value::String("Document 2".to_string()));
     doc2_fields.insert("next".to_string(), Value::Reference(doc3_ref));
     let doc2 = Document::with_id("doc2".to_string(), "test".to_string(), doc2_fields);
     rust_store.put_document(&doc2).unwrap();
     
     let doc2_ref = rust_store.get_objref("test", &doc2.id).unwrap().unwrap();
-    let mut doc1_fields = HashMap::new();
+    let mut doc1_fields = owl_db::Fields::default();
     doc1_fields.insert("name".to_string(), Value::String("Document 1".to_string()));
     doc1_fields.insert("next".to_string(), Value::Reference(doc2_ref));
     let doc1 = Document::with_id("doc1".to_string(), "test".to_string(), doc1_fields);
@@ -135,11 +134,11 @@ fn test_navigation_with_nested_fields() {
     let rust_store = RustStore::new("/tmp/test_nested_nav.owl", 10 * 1024 * 1024).unwrap();
     
     // Create doc2 with nested object
-    let mut profile = HashMap::new();
+    let mut profile = owl_db::Fields::default();
     profile.insert("age".to_string(), Value::Integer(30));
     profile.insert("city".to_string(), Value::String("San Francisco".to_string()));
     
-    let mut doc2_fields = HashMap::new();
+    let mut doc2_fields = owl_db::Fields::default();
     doc2_fields.insert("name".to_string(), Value::String("Alice".to_string()));
     doc2_fields.insert("profile".to_string(), Value::Object(profile));
     let doc2 = Document::with_id("doc2".to_string(), "users".to_string(), doc2_fields);
@@ -147,7 +146,7 @@ fn test_navigation_with_nested_fields() {
     
     // Create doc1 with reference to doc2
     let doc2_ref = rust_store.get_objref("users", &doc2.id).unwrap().unwrap();
-    let mut doc1_fields = HashMap::new();
+    let mut doc1_fields = owl_db::Fields::default();
     doc1_fields.insert("friend".to_string(), Value::Reference(doc2_ref));
     let doc1 = Document::with_id("doc1".to_string(), "users".to_string(), doc1_fields);
     rust_store.put_document(&doc1).unwrap();

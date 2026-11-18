@@ -124,7 +124,7 @@ fn fixture(document_count: usize) -> Fixture {
         writes.push(WriteOperation::PutDocument(Document::with_id(
             format!("event-{sequence}"),
             "events".to_string(),
-            HashMap::from([
+            owl_db::Fields::from_iter([
                 ("level".to_string(), Value::String(level.to_string())),
                 (
                     "message".to_string(),

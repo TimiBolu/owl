@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex};
 struct PartialAggregate {
     count: i64,
     sums: HashMap<String, f64>,
-    mins: HashMap<String, Value>,
-    maxs: HashMap<String, Value>,
+    mins: crate::document::Fields,
+    maxs: crate::document::Fields,
 }
 
 impl PartialAggregate {
@@ -24,8 +24,8 @@ impl PartialAggregate {
         Self {
             count: 0,
             sums: HashMap::new(),
-            mins: HashMap::new(),
-            maxs: HashMap::new(),
+            mins: crate::document::Fields::default(),
+            maxs: crate::document::Fields::default(),
         }
     }
 
@@ -242,7 +242,7 @@ impl ParallelAggregateExec {
     }
 
     fn create_result_document(&self, aggregate: PartialAggregate) -> Document {
-        let mut fields = HashMap::new();
+        let mut fields = crate::document::Fields::default();
 
         for spec in &self.aggregates {
             let result_name = spec
@@ -360,7 +360,7 @@ mod tests {
     use crate::storage::create_storage;
 
     fn create_test_document(schema: &str, id: &str, value: i64) -> Document {
-        let mut fields = HashMap::new();
+        let mut fields = crate::document::Fields::default();
         fields.insert("value".to_string(), Value::Integer(value));
 
         Document::with_id(id.to_string(), schema.to_string(), fields)

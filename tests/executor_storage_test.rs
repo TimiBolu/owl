@@ -29,7 +29,7 @@ fn test_basic_query_with_zig_storage() {
     let (executor, _temp_dir) = create_test_executor();
 
     // Create test documents
-    let mut fields = HashMap::new();
+    let mut fields = owl_db::Fields::default();
     fields.insert("name".to_string(), Value::String("Alice".to_string()));
     fields.insert("age".to_string(), Value::Integer(30));
     let doc = Document::new("users".to_string(), fields);
@@ -67,7 +67,7 @@ fn test_update_with_zig_storage() {
     let (executor, _temp_dir) = create_test_executor();
 
     // Create initial document
-    let mut fields = HashMap::new();
+    let mut fields = owl_db::Fields::default();
     fields.insert("name".to_string(), Value::String("Charlie".to_string()));
     fields.insert("age".to_string(), Value::Integer(35));
     let doc = Document::new("users".to_string(), fields);
@@ -90,7 +90,7 @@ fn test_delete_with_zig_storage() {
     let (executor, _temp_dir) = create_test_executor();
 
     // Create initial document
-    let mut fields = HashMap::new();
+    let mut fields = owl_db::Fields::default();
     fields.insert("name".to_string(), Value::String("David".to_string()));
     let doc = Document::new("users".to_string(), fields);
     let doc_id = doc.id.clone();
@@ -113,7 +113,7 @@ fn test_select_projection_with_zig_storage() {
 
     // Create test documents
     for i in 0..3 {
-        let mut fields = HashMap::new();
+        let mut fields = owl_db::Fields::default();
         fields.insert("name".to_string(), Value::String(format!("User{}", i)));
         fields.insert("age".to_string(), Value::Integer(20 + i));
         fields.insert("email".to_string(), Value::String(format!("user{}@example.com", i)));
@@ -139,7 +139,7 @@ fn test_aggregation_with_zig_storage() {
 
     // Create test documents
     for i in 0..5 {
-        let mut fields = HashMap::new();
+        let mut fields = owl_db::Fields::default();
         fields.insert("name".to_string(), Value::String(format!("User{}", i)));
         fields.insert("score".to_string(), Value::Integer(10 * (i + 1)));
         let doc = Document::new("users".to_string(), fields);
@@ -174,7 +174,7 @@ fn test_sorting_with_zig_storage() {
     // Create test documents in random order
     let ages = vec![35, 25, 30, 40, 20];
     for (i, age) in ages.iter().enumerate() {
-        let mut fields = HashMap::new();
+        let mut fields = owl_db::Fields::default();
         fields.insert("name".to_string(), Value::String(format!("User{}", i)));
         fields.insert("age".to_string(), Value::Integer(*age));
         let doc = Document::new("users".to_string(), fields);
@@ -200,7 +200,7 @@ fn test_limit_with_zig_storage() {
 
     // Create test documents
     for i in 0..10 {
-        let mut fields = HashMap::new();
+        let mut fields = owl_db::Fields::default();
         fields.insert("name".to_string(), Value::String(format!("User{}", i)));
         let doc = Document::new("users".to_string(), fields);
         executor.store().put_document(&doc).unwrap();
@@ -219,7 +219,7 @@ fn test_complex_query_with_zig_storage() {
 
     // Create test documents
     for i in 0..10 {
-        let mut fields = HashMap::new();
+        let mut fields = owl_db::Fields::default();
         fields.insert("name".to_string(), Value::String(format!("User{}", i)));
         fields.insert("age".to_string(), Value::Integer(20 + i));
         fields.insert("active".to_string(), Value::Boolean(i % 2 == 0));
@@ -271,7 +271,7 @@ fn test_concurrent_queries_with_zig_storage() {
 
     // Pre-populate with documents
     for i in 0..100 {
-        let mut fields = HashMap::new();
+        let mut fields = owl_db::Fields::default();
         fields.insert("name".to_string(), Value::String(format!("User{}", i)));
         fields.insert("value".to_string(), Value::Integer(i));
         let doc = Document::new("users".to_string(), fields);
@@ -304,7 +304,7 @@ fn test_memory_efficiency_with_zig_storage() {
 
     // Create many documents to test memory efficiency
     for i in 0..1000 {
-        let mut fields = HashMap::new();
+        let mut fields = owl_db::Fields::default();
         fields.insert("id".to_string(), Value::Integer(i));
         fields.insert("data".to_string(), Value::String(format!("Data{}", i)));
         let doc = Document::new("items".to_string(), fields);
@@ -325,7 +325,7 @@ fn test_null_handling_with_zig_storage() {
     let (executor, _temp_dir) = create_test_executor();
 
     // Create document with null field
-    let mut fields = HashMap::new();
+    let mut fields = owl_db::Fields::default();
     fields.insert("name".to_string(), Value::String("Alice".to_string()));
     fields.insert("email".to_string(), Value::Null);
     let doc = Document::new("users".to_string(), fields);
@@ -352,7 +352,7 @@ fn test_error_handling_with_zig_storage() {
     assert_eq!(results.len(), 0); // Should return empty, not error
 
     // Test invalid field access
-    let mut fields = HashMap::new();
+    let mut fields = owl_db::Fields::default();
     fields.insert("name".to_string(), Value::String("Alice".to_string()));
     let doc = Document::new("users".to_string(), fields);
     executor.store().put_document(&doc).unwrap();
@@ -370,7 +370,7 @@ fn test_performance_baseline_with_zig_storage() {
 
     // Create test dataset
     for i in 0..1000 {
-        let mut fields = HashMap::new();
+        let mut fields = owl_db::Fields::default();
         fields.insert("id".to_string(), Value::Integer(i));
         fields.insert("value".to_string(), Value::Integer(i * 2));
         let doc = Document::new("items".to_string(), fields);

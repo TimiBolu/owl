@@ -1312,9 +1312,9 @@ mod tests {
         );
 
         // Insert docs
-        let mut d1 = HashMap::new();
+        let mut d1 = crate::document::Fields::default();
         d1.insert("age".to_string(), Value::Integer(30));
-        let mut d2 = HashMap::new();
+        let mut d2 = crate::document::Fields::default();
         d2.insert("age".to_string(), Value::Integer(40));
         store
             .put_document(&Document::with_id(
@@ -1407,14 +1407,14 @@ mod tests {
             RustStore::new(db_path.to_str().expect("path"), 10 * 1024 * 1024).expect("store"),
         );
 
-        let mut profile1 = HashMap::new();
+        let mut profile1 = crate::document::Fields::default();
         profile1.insert("country".to_string(), Value::String("NG".to_string()));
-        let mut d1 = HashMap::new();
+        let mut d1 = crate::document::Fields::default();
         d1.insert("profile".to_string(), Value::Object(profile1));
 
-        let mut profile2 = HashMap::new();
+        let mut profile2 = crate::document::Fields::default();
         profile2.insert("country".to_string(), Value::String("US".to_string()));
-        let mut d2 = HashMap::new();
+        let mut d2 = crate::document::Fields::default();
         d2.insert("profile".to_string(), Value::Object(profile2));
 
         store
@@ -1498,14 +1498,14 @@ mod tests {
             })
             .expect("persist scalar index metadata");
 
-        let mut profile1 = HashMap::new();
+        let mut profile1 = crate::document::Fields::default();
         profile1.insert("country".to_string(), Value::String("NG".to_string()));
-        let mut d1 = HashMap::new();
+        let mut d1 = crate::document::Fields::default();
         d1.insert("profile".to_string(), Value::Object(profile1));
 
-        let mut profile2 = HashMap::new();
+        let mut profile2 = crate::document::Fields::default();
         profile2.insert("country".to_string(), Value::String("US".to_string()));
-        let mut d2 = HashMap::new();
+        let mut d2 = crate::document::Fields::default();
         d2.insert("profile".to_string(), Value::Object(profile2));
 
         store
@@ -1561,7 +1561,7 @@ mod tests {
                 .put_document(&Document::with_id(
                     id.into(),
                     "scores".into(),
-                    HashMap::from([("score".into(), Value::Integer(score))]),
+                    crate::document::Fields::from_iter([("score".into(), Value::Integer(score))]),
                 ))
                 .unwrap();
         }
@@ -1606,7 +1606,7 @@ mod tests {
                 .put_document(&Document::with_id(
                     id.into(),
                     "events".into(),
-                    HashMap::from([("level".into(), Value::String(level.into()))]),
+                    crate::document::Fields::from_iter([("level".into(), Value::String(level.into()))]),
                 ))
                 .unwrap();
         }
@@ -1651,7 +1651,7 @@ mod tests {
                 .put_document(&Document::with_id(
                     format!("event-{sequence}"),
                     "events".into(),
-                    HashMap::from([
+                    crate::document::Fields::from_iter([
                         ("level".into(), Value::String("error".into())),
                         ("sequence".into(), Value::Integer(sequence)),
                     ]),
@@ -1707,7 +1707,7 @@ mod tests {
                 .put_document(&Document::with_id(
                     format!("event-{sequence}"),
                     "events".into(),
-                    HashMap::from([
+                    crate::document::Fields::from_iter([
                         ("sequence".into(), Value::Integer(sequence)),
                         ("keep".into(), Value::Boolean(sequence % 70 == 0)),
                     ]),
@@ -1781,7 +1781,7 @@ mod tests {
                 .put_document(&Document::with_id(
                     id.into(),
                     "events".into(),
-                    HashMap::from([
+                    crate::document::Fields::from_iter([
                         ("app".into(), Value::String(app.into())),
                         ("level".into(), Value::String(level.into())),
                     ]),
@@ -1832,7 +1832,7 @@ mod tests {
                 .put_document(&Document::with_id(
                     id.into(),
                     "events".into(),
-                    HashMap::from([
+                    crate::document::Fields::from_iter([
                         ("app".into(), Value::String(app.into())),
                         ("seq".into(), Value::Integer(sequence)),
                     ]),
@@ -1903,7 +1903,7 @@ mod tests {
                 .put_document(&Document::with_id(
                     number.to_string(),
                     "events".into(),
-                    HashMap::from([
+                    crate::document::Fields::from_iter([
                         ("level".into(), Value::String("error".into())),
                         ("large_payload".into(), Value::String("x".repeat(1024))),
                     ]),
@@ -1953,7 +1953,7 @@ mod tests {
                 .put_document(&Document::with_id(
                     number.to_string(),
                     "events".into(),
-                    HashMap::from([("level".into(), Value::String("error".into()))]),
+                    crate::document::Fields::from_iter([("level".into(), Value::String("error".into()))]),
                 ))
                 .unwrap();
         }
@@ -2024,7 +2024,7 @@ mod tests {
                 .put_document(&Document::with_id(
                     id.into(),
                     "events".into(),
-                    HashMap::from([("timestamp".into(), Value::Integer(timestamp))]),
+                    crate::document::Fields::from_iter([("timestamp".into(), Value::Integer(timestamp))]),
                 ))
                 .unwrap();
         }

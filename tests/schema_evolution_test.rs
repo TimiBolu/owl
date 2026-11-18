@@ -19,7 +19,7 @@ fn create_basic_schema(name: &str) -> Schema {
 
 // Helper function to create a document with initial fields
 fn create_test_document(schema: &str, initial_fields: HashMap<String, Value>) -> Document {
-    Document::new(schema.to_string(), initial_fields)
+    Document::new(schema.to_string(), initial_fields.into_iter().collect())
 }
 
 #[test]

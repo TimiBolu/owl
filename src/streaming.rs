@@ -486,7 +486,6 @@ mod tests {
     use crate::document::Document;
     use crate::parser::OQLQuery;
     use crate::storage::RustStore;
-    use std::collections::HashMap;
     use std::sync::Arc;
     use tempfile::TempDir;
 
@@ -500,7 +499,7 @@ mod tests {
     fn create_test_documents(count: usize) -> Vec<Document> {
         (0..count)
             .map(|i| {
-                let mut fields = HashMap::new();
+                let mut fields = crate::document::Fields::default();
                 fields.insert(
                     "name".to_string(),
                     crate::document::Value::String(format!("User {}", i)),

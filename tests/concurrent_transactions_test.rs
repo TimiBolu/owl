@@ -664,7 +664,6 @@ fn statements_inside_a_transaction_wait_for_its_commit() {
 fn every_acknowledged_commit_survives_a_crash_however_many_shared_a_sync() {
     use owl_db::simulation::SimulatedFileSystem;
     use owl_db::storage::DocumentStore;
-    use std::collections::HashMap;
 
     let filesystem = Arc::new(SimulatedFileSystem::new(7));
     let path = "crash/db.owl";
@@ -682,7 +681,7 @@ fn every_acknowledged_commit_survives_a_crash_however_many_shared_a_sync() {
                         let document = Document::with_id(
                             format!("w{worker}-{round:03}"),
                             "events".to_string(),
-                            HashMap::from([("n".to_string(), Value::Integer(round as i64))]),
+                            owl_db::Fields::from_iter([("n".to_string(), Value::Integer(round as i64))]),
                         );
                         // Returning is the acknowledgement.
                         store.put_document(&document).unwrap();

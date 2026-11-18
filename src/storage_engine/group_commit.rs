@@ -175,7 +175,7 @@ mod tests {
     use super::*;
     use crate::document::Value;
     use crate::storage::DocumentStore;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
     use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
 
@@ -198,7 +198,7 @@ mod tests {
                     .commit_documents(vec![Document::with_id(
                         number.to_string(),
                         "events".to_string(),
-                        HashMap::from([("sequence".to_string(), Value::Integer(number))]),
+                        crate::document::Fields::from_iter([("sequence".to_string(), Value::Integer(number))]),
                     )])
                     .unwrap()
             }));
@@ -242,7 +242,7 @@ mod tests {
                     documents: vec![Document::with_id(
                         id.to_string(),
                         "events".to_string(),
-                        HashMap::from([(
+                        crate::document::Fields::from_iter([(
                             "fingerprint".to_string(),
                             Value::String(fingerprint.to_string()),
                         )]),

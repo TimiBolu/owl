@@ -1109,7 +1109,6 @@ mod tests {
     use super::*;
     use crate::simulation::RealClock;
 
-    use std::collections::HashMap;
     use std::sync::Arc;
     use std::thread;
 
@@ -1228,7 +1227,7 @@ mod tests {
         let version_store = LockFreeVersionStore::new(clock);
 
         // Create test document
-        let mut fields = HashMap::new();
+        let mut fields = crate::document::Fields::default();
         fields.insert(
             "name".to_string(),
             crate::document::Value::String("Alice".to_string()),
@@ -1277,7 +1276,7 @@ mod tests {
         let document_key = "users#user1";
 
         // Create multiple versions
-        let mut fields1 = HashMap::new();
+        let mut fields1 = crate::document::Fields::default();
         fields1.insert(
             "name".to_string(),
             crate::document::Value::String("Alice".to_string()),
@@ -1285,7 +1284,7 @@ mod tests {
         let doc1 =
             crate::document::Document::with_id("user1".to_string(), "users".to_string(), fields1);
 
-        let mut fields2 = HashMap::new();
+        let mut fields2 = crate::document::Fields::default();
         fields2.insert(
             "name".to_string(),
             crate::document::Value::String("Alice Updated".to_string()),
@@ -1348,7 +1347,7 @@ mod tests {
                     let document_key = format!("doc_{}", i);
                     let transaction_id = format!("txn_{}_{}", i, j);
 
-                    let mut fields = HashMap::new();
+                    let mut fields = crate::document::Fields::default();
                     fields.insert(
                         "value".to_string(),
                         crate::document::Value::Integer(j as i64),
@@ -1395,7 +1394,7 @@ mod tests {
         manager.register_transaction("txn1").unwrap();
 
         // Create test document
-        let mut fields = HashMap::new();
+        let mut fields = crate::document::Fields::default();
         fields.insert(
             "name".to_string(),
             crate::document::Value::String("Test".to_string()),

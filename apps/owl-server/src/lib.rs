@@ -316,7 +316,7 @@ async fn insert(State(server): State<Server>, axum::Json(request): axum::Json<In
                 document
                     .iter()
                     .map(|(name, value)| Ok((name.clone(), from_json(value)?)))
-                    .collect::<Result<HashMap<_, _>, Failure>>()
+                    .collect::<Result<owl_db::Fields, Failure>>()
             })
             .collect::<Result<Vec<_>, Failure>>()?;
         server.within(request.transaction, || {

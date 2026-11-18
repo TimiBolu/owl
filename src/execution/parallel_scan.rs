@@ -258,10 +258,9 @@ mod tests {
     use super::*;
     use crate::document::Value;
     use crate::storage::create_storage;
-    use std::collections::HashMap;
 
     fn create_test_document(schema: &str, id: &str, value: i64) -> Document {
-        let mut fields = HashMap::new();
+        let mut fields = crate::document::Fields::default();
         fields.insert("value".to_string(), Value::Integer(value));
 
         Document::with_id(id.to_string(), schema.to_string(), fields)

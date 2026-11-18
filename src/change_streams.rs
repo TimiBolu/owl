@@ -97,7 +97,7 @@ impl DocumentChange {
 pub struct ChangeFilter {
     pub schemas: Option<Vec<String>>,
     pub change_types: Option<Vec<ChangeType>>,
-    pub field_filters: Option<HashMap<String, Value>>,
+    pub field_filters: Option<crate::document::Fields>,
     pub condition: Option<Condition>,
 }
 
@@ -127,7 +127,7 @@ impl ChangeFilter {
     /// Filter by field values
     pub fn field_filter(mut self, field: String, value: Value) -> Self {
         if self.field_filters.is_none() {
-            self.field_filters = Some(HashMap::new());
+            self.field_filters = Some(crate::document::Fields::default());
         }
         self.field_filters.as_mut().unwrap().insert(field, value);
         self
@@ -608,7 +608,6 @@ impl<S: DocumentStore + Send + Sync + 'static> DocumentStore for ChangeTrackingS
 mod tests {
     use super::*;
     use crate::storage::RustStore;
-    use std::collections::HashMap;
     use tempfile::TempDir;
 
     fn create_test_store() -> (ChangeTrackingStore<RustStore>, TempDir) {
@@ -620,7 +619,7 @@ mod tests {
     }
 
     fn create_test_document(id: &str, name: &str) -> Document {
-        let mut fields = HashMap::new();
+        let mut fields = crate::document::Fields::default();
         fields.insert("name".to_string(), Value::String(name.to_string()));
         Document::with_id(id.to_string(), "users".to_string(), fields)
     }

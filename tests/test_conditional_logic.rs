@@ -6,7 +6,6 @@ use owl_db::{
     parser::parse_oql,
     storage::{RustStore, DocumentStore},
 };
-use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
 
@@ -20,7 +19,7 @@ fn create_test_executor() -> (QueryExecutor<RustStore>, TempDir) {
 fn setup_test_data(executor: &QueryExecutor<RustStore>) {
     let customers = vec![
         Document::with_id("cust_1".to_string(), "customers".to_string(), {
-            let mut fields = HashMap::new();
+            let mut fields = owl_db::Fields::default();
             fields.insert("name".to_string(), Value::String("Alice".to_string()));
             fields.insert("age".to_string(), Value::Integer(25));
             fields.insert("premium".to_string(), Value::Boolean(true));
@@ -28,7 +27,7 @@ fn setup_test_data(executor: &QueryExecutor<RustStore>) {
             fields
         }),
         Document::with_id("cust_2".to_string(), "customers".to_string(), {
-            let mut fields = HashMap::new();
+            let mut fields = owl_db::Fields::default();
             fields.insert("name".to_string(), Value::String("Bob".to_string()));
             fields.insert("age".to_string(), Value::Integer(17));
             fields.insert("premium".to_string(), Value::Boolean(false));

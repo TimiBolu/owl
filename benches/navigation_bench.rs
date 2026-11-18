@@ -34,7 +34,7 @@ fn chain_fixture(hops: usize) -> ChainFixture {
     let mut next = None;
     for index in (0..hops).rev() {
         let mut fields =
-            HashMap::from([("name".to_string(), Value::String(format!("node-{index}")))]);
+            owl_db::Fields::from_iter([("name".to_string(), Value::String(format!("node-{index}")))]);
         if let Some(object_ref) = next {
             fields.insert("next".to_string(), Value::Reference(object_ref));
         }
@@ -128,7 +128,7 @@ fn fanout_fixture(fanout: usize) -> FanoutFixture {
     let target = Document::with_id(
         target_id.clone(),
         "nodes".to_string(),
-        HashMap::from([("name".to_string(), Value::String("target".to_string()))]),
+        owl_db::Fields::from_iter([("name".to_string(), Value::String("target".to_string()))]),
     );
     store.put_document(&target).expect("target");
     let target_ref = store
@@ -141,7 +141,7 @@ fn fanout_fixture(fanout: usize) -> FanoutFixture {
             Document::with_id(
                 format!("source-{index}"),
                 "nodes".to_string(),
-                HashMap::from([
+                owl_db::Fields::from_iter([
                     ("name".to_string(), Value::String(format!("source-{index}"))),
                     ("next".to_string(), Value::Reference(target_ref)),
                 ]),

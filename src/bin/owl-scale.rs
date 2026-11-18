@@ -221,7 +221,7 @@ fn run_case(
         batch.push(Document::with_id(
             id,
             "events".into(),
-            HashMap::from([
+            owl_db::Fields::from_iter([
                 ("sequence".into(), Value::Integer(sequence as i64)),
                 ("message".into(), Value::String(message)),
                 ("padding".into(), Value::String(padding)),

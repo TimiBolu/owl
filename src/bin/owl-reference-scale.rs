@@ -175,7 +175,7 @@ fn run_case(
         batch.push(Document::with_id(
             target_id(target),
             "nodes".into(),
-            HashMap::from([
+            owl_db::Fields::from_iter([
                 ("sequence".into(), Value::Integer(target as i64)),
                 (
                     "message".into(),
@@ -198,7 +198,7 @@ fn run_case(
         );
     }
     for source in 0..sources {
-        let mut fields = HashMap::from([
+        let mut fields = owl_db::Fields::from_iter([
             ("sequence".into(), Value::Integer(source as i64)),
             (
                 "message".into(),

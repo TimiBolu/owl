@@ -9,10 +9,9 @@ use owl_db::execution::aggregate::AggregateExec;
 use owl_db::parser::{ComparisonOperator, Expression, FieldAccess, Literal};
 use owl_db::planner::types::{AggregateFunction, AggregateSpec, FilterCondition, ProjectionField, SortSpec};
 use owl_db::storage::create_storage;
-use std::collections::HashMap;
 
 fn create_test_document(schema: &str, id: &str, name: &str, age: i64) -> Document {
-    let mut fields = HashMap::new();
+    let mut fields = owl_db::Fields::default();
     fields.insert("name".to_string(), Value::String(name.to_string()));
     fields.insert("age".to_string(), Value::Integer(age));
     

@@ -987,11 +987,11 @@ mod tests {
         let manager =
             IndexManager::new_with_backend(Arc::new(RealClock::new()), IndexBackendKind::InMemory);
 
-        let mut profile = HashMap::new();
+        let mut profile = crate::document::Fields::default();
         profile.insert("country".to_string(), Value::String("NG".to_string()));
         profile.insert("age".to_string(), Value::Integer(29));
 
-        let mut fields = HashMap::new();
+        let mut fields = crate::document::Fields::default();
         fields.insert("profile".to_string(), Value::Object(profile));
 
         let doc = Document::with_id("u1".to_string(), "users".to_string(), fields);
