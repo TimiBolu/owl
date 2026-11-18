@@ -458,7 +458,7 @@ struct State {
     /// Stable collection scan order, derived from live document identities.
     /// This is rebuilt during recovery and maintained atomically with writes.
     collection_rows: HashMap<String, BTreeMap<DocumentId, ObjRef>>,
-    object_directory: crate::storage_engine::object_ref::ByObjRef<Arc<Document>>,
+    object_directory: DecodedRows,
     /// Authoritative checkpoint rows that have not needed a general
     /// `Document` representation. Locations remain valid for the immutable
     /// `typed_segments` base and disappear atomically on update/delete.
@@ -485,6 +485,19 @@ struct State {
     /// holds is decoded from there again, and any other row from its
     /// record, which is then kept in memory in its place.
     decoded_budget: Option<usize>,
+    /// The most memory, roughly, that the rows held decoded may take, or
+    /// `None` for no limit. Past it the oldest are let go, as with
+    /// `decoded_budget`. A database gets one by default, sized from the
+    /// machine, so that it cannot grow without limit; while everything
+    /// fits within it nothing is let go and nothing is slower.
+    decoded_bytes_budget: Option<usize>,
+    /// Whether rows have been let go to keep within the bytes budget. From
+    /// then on the store takes it that memory is short.
+    let_go_for_bytes: bool,
+    /// How many pages each file-backed index keeps decoded: a bound while
+    /// there is a budget on decoded rows, and none (zero) otherwise. Shared
+    /// with the indexes, so that a budget set later reaches them.
+    index_page_limit: Arc<std::sync::atomic::AtomicUsize>,
     /// Decoded documents in the order they were taken in, kept only while
     /// there is a budget. It may name documents since removed.
     decoded_order: VecDeque<ObjRef>,
@@ -494,9 +507,81 @@ struct State {
     checkpoint_records: Option<Arc<Mutex<CheckpointReadHandles>>>,
 }
 
+/// The column segments held decoded while a database has a budget come to
+/// about this much, as encoded, at most.
+const SEGMENT_BYTES_UNDER_A_BUDGET: usize = 64 << 20;
+
+/// The memory the rows held decoded may take when a database is opened and
+/// told nothing: what `OWL_DECODED_BYTES` says (0 for no limit), or a
+/// quarter of the machine's memory. `None` where neither is known.
+///
+/// A database that fits within it behaves as one with no limit. One that
+/// does not lets its oldest rows go, and reads them again when wanted,
+/// where it would otherwise grow until the machine had no memory left.
+fn default_decoded_bytes() -> Option<usize> {
+    static DEFAULT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *DEFAULT.get_or_init(|| {
+        if let Ok(asked) = std::env::var("OWL_DECODED_BYTES") {
+            return asked.trim().parse::<usize>().ok().filter(|bytes| *bytes > 0);
+        }
+        machine_memory().map(|bytes| bytes / 4)
+    })
+}
+
+/// How much memory the machine has, in bytes, where that can be learned.
+fn machine_memory() -> Option<usize> {
+    // Linux says so in a file.
+    if let Ok(text) = std::fs::read_to_string("/proc/meminfo") {
+        return text
+            .lines()
+            .find_map(|line| line.strip_prefix("MemTotal:"))
+            .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse::<usize>().ok())
+            .map(|kilobytes| kilobytes.saturating_mul(1024));
+    }
+    // macOS and the BSDs answer a question.
+    std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|text| text.trim().parse::<usize>().ok())
+}
+
+/// An index keeps this many of its pages decoded while there is a budget.
+const INDEX_PAGES_UNDER_A_BUDGET: usize = 64;
+
 impl State {
+    /// The bound the file-backed indexes go by, brought in line with the
+    /// budget, and handed to an index being made.
+    /// Whether there is any limit on the rows held decoded, so that a row
+    /// held now may be let go later.
+    fn bounded(&self) -> bool {
+        self.decoded_budget.is_some() || self.decoded_bytes_budget.is_some()
+    }
+
+    /// Whether memory is short: a count of rows was set, which says so, or
+    /// the bytes budget has had rows let go. Until then a database with
+    /// only the default budget keeps everything it would with none.
+    fn tight(&self) -> bool {
+        self.decoded_budget.is_some() || (self.decoded_bytes_budget.is_some() && self.let_go_for_bytes)
+    }
+
+    fn index_pages(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        self.index_page_limit.store(
+            if self.tight() { INDEX_PAGES_UNDER_A_BUDGET } else { 0 },
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        // A database short of memory also bounds the column segments this
+        // process holds decoded. One that is not leaves that as it finds it.
+        if self.tight() {
+            crate::storage_engine::checkpoint::segments_loaded().set_limit(SEGMENT_BYTES_UNDER_A_BUDGET);
+        }
+        self.index_page_limit.clone()
+    }
+
     fn note_decoded(&mut self, object_ref: ObjRef) {
-        if self.decoded_budget.is_some() {
+        if self.bounded() {
             self.decoded_order.push_back(object_ref);
         }
     }
@@ -514,10 +599,11 @@ fn evict_clean_records(state: &mut State) {
         object_directory,
         typed_row_locations,
         decoded_budget,
+        decoded_bytes_budget,
         checkpoint_records: state_checkpoint_records,
         ..
     } = state;
-    if decoded_budget.is_none() {
+    if decoded_budget.is_none() && decoded_bytes_budget.is_none() {
         object_records.evict_clean();
         return;
     }
@@ -540,11 +626,18 @@ fn evict_clean_records(state: &mut State) {
 /// from a column segment: a row with no segment behind it keeps its
 /// record, encoded afresh if a checkpoint had already taken the bytes.
 fn enforce_decoded_budget(state: &mut State) -> OQLResult<()> {
-    let Some(budget) = state.decoded_budget else {
+    if !state.bounded() {
         return Ok(());
-    };
+    }
+    let budget = state.decoded_budget.unwrap_or(usize::MAX);
+    let bytes = state.decoded_bytes_budget.unwrap_or(usize::MAX);
+    if state.object_directory.bytes() > bytes && !state.let_go_for_bytes {
+        // Memory is short from here on: what is cached is bounded too.
+        state.let_go_for_bytes = true;
+        state.index_pages();
+    }
     let mut refilled = false;
-    while state.object_directory.len() > budget {
+    while state.object_directory.len() > budget || state.object_directory.bytes() > bytes {
         let Some(candidate) = state.decoded_order.pop_front() else {
             // The order lost track, as it does when the budget was set
             // after documents were already held. Start it over, once.
@@ -1851,6 +1944,86 @@ enum MaintenanceMessage {
 }
 
 #[doc(hidden)]
+/// The rows held decoded, by reference, with a running count of roughly
+/// how much memory they take.
+#[derive(Default)]
+struct DecodedRows {
+    rows: crate::storage_engine::object_ref::ByObjRef<Arc<Document>>,
+    bytes: usize,
+}
+
+impl DecodedRows {
+    /// Roughly what a decoded row takes: itself, its id and collection
+    /// name, and each value with what it holds.
+    fn weight(document: &Document) -> usize {
+        fn of_value(value: &Value) -> usize {
+            std::mem::size_of::<Value>()
+                + match value {
+                    Value::String(text) => text.len(),
+                    Value::List(items) => items.iter().map(of_value).sum(),
+                    Value::Object(fields) => 40 + fields.values().map(of_value).sum::<usize>(),
+                    _ => 0,
+                }
+        }
+        std::mem::size_of::<Document>()
+            + 48
+            + document.id.len()
+            + document.schema.len()
+            + document.fields.values().map(of_value).sum::<usize>()
+    }
+
+    fn get(&self, object_ref: &ObjRef) -> Option<&Arc<Document>> {
+        self.rows.get(object_ref)
+    }
+
+    fn contains_key(&self, object_ref: &ObjRef) -> bool {
+        self.rows.contains_key(object_ref)
+    }
+
+    fn insert(&mut self, object_ref: ObjRef, document: Arc<Document>) -> Option<Arc<Document>> {
+        self.bytes += Self::weight(&document);
+        let replaced = self.rows.insert(object_ref, document);
+        if let Some(replaced) = &replaced {
+            self.bytes = self.bytes.saturating_sub(Self::weight(replaced));
+        }
+        replaced
+    }
+
+    fn remove(&mut self, object_ref: &ObjRef) -> Option<Arc<Document>> {
+        let removed = self.rows.remove(object_ref);
+        if let Some(removed) = &removed {
+            self.bytes = self.bytes.saturating_sub(Self::weight(removed));
+        }
+        removed
+    }
+
+    fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    fn capacity(&self) -> usize {
+        self.rows.capacity()
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &ObjRef> + '_ {
+        self.rows.keys()
+    }
+
+    /// Roughly how many bytes the rows held take.
+    fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl<'a> IntoIterator for &'a DecodedRows {
+    type Item = (&'a ObjRef, &'a Arc<Document>);
+    type IntoIter = std::collections::hash_map::Iter<'a, ObjRef, Arc<Document>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.rows.iter()
+    }
+}
+
 /// See [`StoreCore::built_columns`].
 #[derive(Default)]
 struct BuiltColumns {
@@ -1872,6 +2045,10 @@ struct BuiltCollection {
     /// The collection's rows, in the order its columns are in. Listing them
     /// is itself a pass over the collection.
     rows: Option<Arc<Vec<Arc<Document>>>>,
+    /// The same list, held so that it keeps no row in memory: used while
+    /// there is any limit on decoded rows, when a row listed may be let go.
+    /// It is good for as long as every row in it is still held somewhere.
+    weak_rows: Option<Arc<Vec<std::sync::Weak<Document>>>>,
     /// Which row each position in the columns is, when the rows themselves
     /// are not kept: under a budget on decoded rows, a row is decoded when
     /// it is wanted and only then.
@@ -2309,11 +2486,47 @@ impl RustStore {
             built.collections.clear();
         }
         state.decoded_budget = decoded_documents;
+        state.index_pages();
         state.decoded_order = match decoded_documents {
             Some(_) => state.object_directory.keys().copied().collect(),
             None => VecDeque::new(),
         };
         enforce_decoded_budget(&mut state)
+    }
+
+    /// How many bytes of column segments, as encoded, this process holds
+    /// decoded at most. Those decoded longest ago are let go past it and
+    /// read from their files again when wanted. `None` for no limit. The
+    /// limit is the process's, across every database it has open; setting
+    /// a budget on decoded rows sets it to 64 MB.
+    pub fn set_column_segment_budget(bytes: Option<usize>) {
+        crate::storage_engine::checkpoint::segments_loaded().set_limit(bytes.unwrap_or(0));
+    }
+
+    /// Change the budget, in bytes, on the memory the rows held decoded
+    /// may take. `None` removes it. A database opened without one takes a
+    /// quarter of the machine's memory, or what `OWL_DECODED_BYTES` says
+    /// (0 for none).
+    pub fn set_decoded_bytes_budget(&self, bytes: Option<usize>) -> OQLResult<()> {
+        let mut state = self
+            .state
+            .write()
+            .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+        if let Ok(mut built) = self.built_columns.lock() {
+            built.collections.clear();
+        }
+        state.decoded_bytes_budget = bytes;
+        state.let_go_for_bytes = false;
+        state.index_pages();
+        if state.decoded_order.is_empty() && state.bounded() {
+            state.decoded_order = state.object_directory.keys().copied().collect();
+        }
+        enforce_decoded_budget(&mut state)
+    }
+
+    /// Roughly how many bytes the rows held decoded take at this moment.
+    pub fn decoded_bytes(&self) -> usize {
+        self.state.read().map_or(0, |state| state.object_directory.bytes())
     }
 
     /// How many documents are held decoded in memory at this moment.
@@ -2586,12 +2799,78 @@ impl RustStore {
         Ok(report)
     }
 
+    /// What the store holds in memory, part by part: a name, how many
+    /// entries, and roughly how many bytes. The bytes are estimates from
+    /// the sizes of what is held, not a count of allocations.
+    pub fn memory_breakdown(&self) -> OQLResult<Vec<(String, usize, usize)>> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+        let mut parts = Vec::new();
+        parts.push(("rows held decoded".to_string(), state.object_directory.len(), 0));
+        let (records, record_bytes) = state.object_records.held_in_memory();
+        parts.push(("records held as bytes".to_string(), records, record_bytes));
+        let ids: usize = state.collection_rows.values().map(BTreeMap::len).sum();
+        let id_bytes: usize = state
+            .collection_rows
+            .values()
+            .flat_map(BTreeMap::keys)
+            .map(|id| id.len() + 16 + 24 + 8 + 16)
+            .sum();
+        parts.push(("ids of every row, by collection".to_string(), ids, id_bytes));
+        parts.push((
+            "schema version of every row".to_string(),
+            state.object_schema_versions.len(),
+            state.object_schema_versions.capacity() * 17,
+        ));
+        parts.push((
+            "the map from a reference to its decoded row".to_string(),
+            state.object_directory.len(),
+            state.object_directory.capacity() * 17,
+        ));
+        let located: usize = state.typed_row_locations.collections.values().map(Vec::len).sum();
+        parts.push((
+            "where each row is in the column segments".to_string(),
+            state.typed_row_locations.len,
+            located * 8 + state.typed_row_locations.overrides.capacity() * 17,
+        ));
+        let (reverse, reverse_bytes) = state.reverse_reference_index.held_in_memory();
+        parts.push(("relationship index, held over its file".to_string(), reverse, reverse_bytes));
+        let mut indexed = 0;
+        let mut indexed_bytes = 0;
+        for index in state.scalar_index_data.values() {
+            let (entries, bytes) = index.held_in_memory();
+            indexed += entries;
+            indexed_bytes += bytes;
+        }
+        parts.push(("declared indexes, held over their files".to_string(), indexed, indexed_bytes));
+        let fenced: usize = state.typed_id_fences.values().map(Vec::len).sum();
+        parts.push(("id fences of the column segments".to_string(), fenced, fenced * 64));
+        let delta: usize = state.typed_delta_rows.values().map(BTreeMap::len).sum();
+        parts.push(("rows changed since the column segments".to_string(), delta, delta * 72));
+        parts.push(("order rows were decoded in".to_string(), state.decoded_order.len(), state.decoded_order.capacity() * 8));
+        parts.push(("recent commits kept for open transactions".to_string(), state.conflicts.recent.len(), 0));
+        drop(state);
+        if let Ok(built) = self.built_columns.lock() {
+            let bytes: usize = built.collections.values().map(|kept| kept.bytes).sum();
+            parts.push(("columns and row lists kept between queries".to_string(), built.collections.len(), bytes));
+        }
+        Ok(parts)
+    }
+
     /// Remove files unreachable from the newest durable manifest.
     pub fn reclaim_obsolete_files(&self) -> OQLResult<ReclamationReport> {
         let _checkpoint = self
             .checkpoint_lock
             .lock()
             .map_err(|_| OQLError::generic("checkpoint lock poisoned"))?;
+        self.reclaim_after_audit()
+    }
+
+    /// [`Self::reclaim_obsolete_files`], for a caller that holds the
+    /// checkpoint lock.
+    fn reclaim_after_audit(&self) -> OQLResult<ReclamationReport> {
         let _commit = self
             .commit_lock
             .lock()
@@ -2669,8 +2948,7 @@ impl RustStore {
             .state
             .read()
             .map_err(|_| OQLError::generic("storage state lock poisoned"))?
-            .decoded_budget
-            .is_some();
+            .tight();
         if !bounded {
             return Ok(false);
         }
@@ -3034,6 +3312,32 @@ impl RustStore {
             .lock()
             .map_err(|_| OQLError::generic("checkpoint lock poisoned"))?;
         self.core.compact_concurrent()
+    }
+
+    /// [`Self::compact`], then remove the copy it replaced.
+    ///
+    /// A compaction rewrites the whole database into the other of two
+    /// slots. The slot it came from then holds a full, older copy that
+    /// nothing reads, kept as something to fall back to should the new one
+    /// be damaged; the database takes about twice its size on disk for it.
+    /// This removes that copy, after everything the new checkpoint refers
+    /// to has been read back and checked, so what is discarded is never the
+    /// only good copy at that moment. What is given up is the fallback
+    /// afterwards: use it where backups or replicas are the protection.
+    pub fn compact_and_reclaim(&self) -> OQLResult<(CheckpointInfo, ReclamationReport)> {
+        if self.poisoned.load(Ordering::Acquire) {
+            return Err(OQLError::storage_error(
+                "storage writer is poisoned; reopen before compacting",
+                None,
+            ));
+        }
+        let _checkpoint = self
+            .checkpoint_lock
+            .lock()
+            .map_err(|_| OQLError::generic("checkpoint lock poisoned"))?;
+        let info = self.core.compact_concurrent()?;
+        let reclaimed = self.reclaim_after_audit()?;
+        Ok((info, reclaimed))
     }
 }
 
@@ -3793,6 +4097,7 @@ impl StoreCore {
             .state
             .read()
             .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+        let limit = state.index_pages();
         for index in published {
             let identity = (index.schema.clone(), index.name.clone());
             if identity.0 == REVERSE_INDEX_SCHEMA && identity.1 == REVERSE_INDEX_NAME {
@@ -3804,6 +4109,7 @@ impl StoreCore {
                         index.name,
                         false,
                         index.pages,
+                        state.index_pages(),
                     )))
                     .map_err(|error| OQLError::storage_error(&error, None))?;
                 continue;
@@ -3832,6 +4138,7 @@ impl StoreCore {
                     index.name,
                     index.unique,
                     index.pages,
+                    limit.clone(),
                 )))
                 .map_err(|error| OQLError::storage_error(&error, None))?;
         }
@@ -4951,6 +5258,7 @@ impl RustStore {
                 State {
                     next_collection_id: 1,
                     decoded_budget,
+                    decoded_bytes_budget: default_decoded_bytes(),
                     ..State::default()
                 },
                 0,
@@ -7212,13 +7520,20 @@ fn restore_checkpoint(
         }
     }
     state.decoded_budget = decoded_budget;
+    state.decoded_bytes_budget = default_decoded_bytes();
     records.for_each_chunk(filesystem.as_ref(), 4_096, |records| {
         // With a budget, only as many rows as it has room for are decoded.
         // The rest are known by the schema and id their records state, and
         // decoded if they are ever asked for.
-        let room = state
-            .decoded_budget
-            .map_or(usize::MAX, |budget| budget.saturating_sub(state.object_directory.len()));
+        let room = match state
+            .decoded_bytes_budget
+            .is_some_and(|bytes| state.object_directory.bytes() >= bytes)
+        {
+            true => 0,
+            false => state
+                .decoded_budget
+                .map_or(usize::MAX, |budget| budget.saturating_sub(state.object_directory.len())),
+        };
         let records: Vec<(usize, (ObjRef, Arc<[u8]>))> = records.into_iter().enumerate().collect();
         let hydrated = {
             let compiled_schemas = &state.compiled_schemas;
@@ -7290,7 +7605,10 @@ fn restore_checkpoint(
                     // is held below, and decoded when it is asked for.
                     let room = state
                         .decoded_budget
-                        .map_or(true, |budget| state.object_directory.len() < budget);
+                        .map_or(true, |budget| state.object_directory.len() < budget)
+                        && state
+                            .decoded_bytes_budget
+                            .map_or(true, |bytes| state.object_directory.bytes() < bytes);
                     match document {
                         Some(document) if room => {
                             state.note_decoded(object_ref);
@@ -7822,6 +8140,7 @@ fn restore_scalar_indexes(
                 identity.1.clone(),
                 definition.unique,
                 pages,
+                state.index_pages(),
             )))),
         );
     }
@@ -7845,6 +8164,7 @@ fn restore_scalar_indexes(
             reverse_identity.1,
             false,
             pages,
+            state.index_pages(),
         ))))
     } else {
         build_reverse_reference_index(state)?
@@ -9241,11 +9561,53 @@ impl RustStore {
                 return Ok(None);
             }
         }
-        // Under a budget on decoded rows the rows are not listed and kept.
-        // The columns are made in one pass that decodes a row, takes its
+        let bounded = state.bounded();
+        // The collection's rows, listed, when every one of them is held.
+        // With no limit on decoded rows the list is kept as it is. With
+        // one it is kept without holding the rows, and is good while they
+        // are all still held.
+        let listing = |built: &mut BuiltColumns| -> OQLResult<Option<Arc<Vec<Arc<Document>>>>> {
+            let kept = built.of(&state, schema);
+            if let Some(rows) = &kept.rows {
+                return Ok(Some(rows.clone()));
+            }
+            if let Some(weak) = kept.weak_rows.clone() {
+                let rows: Option<Vec<Arc<Document>>> = weak.iter().map(std::sync::Weak::upgrade).collect();
+                match rows {
+                    Some(rows) => return Ok(Some(Arc::new(rows))),
+                    None => kept.weak_rows = None,
+                }
+            }
+            let Some(held) = held_rows(&state)? else {
+                return Ok(None);
+            };
+            let held = Arc::new(held);
+            let bytes = held.len() * pointer;
+            if !built.makes_room(schema, bytes) {
+                return Ok(Some(held));
+            }
+            let kept = built.of(&state, schema);
+            match bounded {
+                true => kept.weak_rows = Some(Arc::new(held.iter().map(Arc::downgrade).collect())),
+                false => kept.rows = Some(held.clone()),
+            }
+            kept.bytes += bytes;
+            Ok(Some(held))
+        };
+        let missing_any = {
+            let kept = built.of(&state, schema);
+            fields.iter().any(|name| !kept.columns.contains_key(name))
+        };
+        let mut rows: Option<Arc<Vec<Arc<Document>>>> = None;
+        if with_rows || missing_any {
+            rows = listing(&mut built)?;
+        }
+        // Not every row is held. Without a limit on decoded rows that is a
+        // collection in column segments, which another way reads. With one,
+        // the columns are made in a pass that decodes a row, takes its
         // fields and lets it go, and what is kept is which row is where.
-        if state.decoded_budget.is_some() {
-            if with_rows {
+        if (with_rows || missing_any) && rows.is_none() {
+            if !bounded || with_rows {
                 return Ok(None);
             }
             let kept = built.of(&state, schema);
@@ -9310,32 +9672,6 @@ impl RustStore {
             };
             return Ok(Some((None, ColumnBatch::new(kept.stamp, count, columns))));
         }
-        let mut rows: Option<Arc<Vec<Arc<Document>>>> = built.of(&state, schema).rows.clone();
-        let list_rows = |built: &mut BuiltColumns| -> OQLResult<Option<Arc<Vec<Arc<Document>>>>> {
-            let Some(held) = held_rows(&state)? else {
-                return Ok(None);
-            };
-            let held = Arc::new(held);
-            // Under a budget on decoded rows the list is used and let go:
-            // kept, it would hold on to rows the budget has dropped.
-            if state.decoded_budget.is_some() {
-                return Ok(Some(held));
-            }
-            let bytes = held.len() * pointer;
-            if !built.makes_room(schema, bytes) {
-                return Ok(None);
-            }
-            let kept = built.of(&state, schema);
-            kept.rows = Some(held.clone());
-            kept.bytes += bytes;
-            Ok(Some(held))
-        };
-        if with_rows && rows.is_none() {
-            match list_rows(&mut built)? {
-                Some(held) => rows = Some(held),
-                None => return Ok(None),
-            }
-        }
         let mut columns = Vec::with_capacity(fields.len());
         for name in fields {
             if let Some(known) = built.of(&state, schema).columns.get(name) {
@@ -9345,14 +9681,10 @@ impl RustStore {
             let Some(field_type) = declared.fields.get(name) else {
                 return Ok(None);
             };
-            if rows.is_none() {
-                match list_rows(&mut built)? {
-                    Some(held) => rows = Some(held),
-                    None => return Ok(None),
-                }
-            }
-            let Some(column) =
-                TypedColumn::of_rows(name, field_type, rows.as_deref().map_or(&[][..], |rows| rows.as_slice()))?
+            let Some(listed) = rows.as_deref() else {
+                return Ok(None);
+            };
+            let Some(column) = TypedColumn::of_rows(name, field_type, listed.as_slice())?
             else {
                 return Ok(None);
             };
@@ -9366,7 +9698,7 @@ impl RustStore {
             // of; then the column is used for this query and not kept.
             // Under a budget no list is kept, and the rows are listed in
             // the same order each time until the collection is written.
-            if state.decoded_budget.is_some()
+            if bounded
                 || kept.rows.as_ref().is_some_and(|listed| rows.as_ref().is_some_and(|rows| Arc::ptr_eq(listed, rows)))
             {
                 kept.columns.insert(name.clone(), column.clone());
@@ -9830,8 +10162,18 @@ impl DocumentStore for RustStore {
             .built_columns
             .lock()
             .map_err(|_| OQLError::generic("column cache lock poisoned"))?;
-        if let Some(known) = &built.of(&state, schema).rows {
-            return Ok(Some(known.as_ref().clone()));
+        {
+            let kept = built.of(&state, schema);
+            if let Some(known) = &kept.rows {
+                return Ok(Some(known.as_ref().clone()));
+            }
+            if let Some(weak) = kept.weak_rows.clone() {
+                let rows: Option<Vec<Arc<Document>>> = weak.iter().map(std::sync::Weak::upgrade).collect();
+                match rows {
+                    Some(rows) => return Ok(Some(rows)),
+                    None => kept.weak_rows = None,
+                }
+            }
         }
         let object_refs = logical_collection_object_refs(&state, schema)?;
         // Under a budget, a collection that is small beside it is worth
@@ -9860,9 +10202,15 @@ impl DocumentStore for RustStore {
         // The list is made either way, so keeping it costs a copy of its
         // pointers and saves the next statement making it again.
         built.of(&state, schema).asks();
-        if state.decoded_budget.is_none() && built.makes_room(schema, bytes) {
+        // With any limit on decoded rows the list is kept so that it
+        // holds no row in memory, and only when nothing here was decoded
+        // for the purpose: such rows may not stay.
+        if decoded.is_empty() && built.makes_room(schema, bytes) {
             let kept = built.of(&state, schema);
-            kept.rows = Some(Arc::new(documents.clone()));
+            match state.bounded() {
+                true => kept.weak_rows = Some(Arc::new(documents.iter().map(Arc::downgrade).collect())),
+                false => kept.rows = Some(Arc::new(documents.clone())),
+            }
             kept.bytes += bytes;
         }
         drop(built);
@@ -10065,7 +10413,18 @@ impl DocumentStore for RustStore {
                         None => return Ok(None),
                     }
                 }
-            } else if let Some(refs) = &kept.refs {
+            } else {
+                // Which row is where: kept with the columns when they were
+                // made a row at a time, and otherwise listed now, which is
+                // the same order for as long as the stamp holds.
+                let listed;
+                let refs: &[ObjRef] = match &kept.refs {
+                    Some(refs) => refs.as_slice(),
+                    None => {
+                        listed = logical_collection_object_refs(&state, schema)?;
+                        &listed
+                    }
+                };
                 for position in positions {
                     let Some(object_ref) = refs.get(*position as usize) else {
                         return Ok(None);
@@ -10075,8 +10434,6 @@ impl DocumentStore for RustStore {
                         None => return Ok(None),
                     }
                 }
-            } else {
-                return Ok(None);
             }
             rows
         };

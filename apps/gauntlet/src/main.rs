@@ -55,6 +55,13 @@ enum Command {
         rows: usize,
         queries: Vec<String>,
     },
+    /// How much memory Owl takes: after loading, after a checkpoint, and
+    /// after every query has run. SQLite is not opened, so the figures are
+    /// Owl's and the data generator's alone.
+    Memory {
+        #[arg(long, default_value_t = 2000)]
+        people: usize,
+    },
     /// An experiment: time two slow questions over rows, over the store's
     /// column segments and over plain arrays.
     Columns {
@@ -184,6 +191,169 @@ fn load_sqlite(sqlite: &mut Sqlite, table: &Table) -> Result<()> {
 /// compaction: columns on disk, and rows decoded only when read.
 fn compacted() -> bool {
     std::env::var("OWL_COMPACT").is_ok_and(|value| value == "1")
+}
+
+/// Counts the bytes this process has allocated and not yet freed. What
+/// the system reports for a process depends on what else the machine is
+/// doing; this does not.
+struct Counting;
+
+static LIVE_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The most that was held at once since it was last asked for.
+static PEAK_BYTES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+// SAFETY: every call is passed straight to the system allocator; the count
+// beside it does not touch the memory.
+unsafe impl std::alloc::GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let now = LIVE_BYTES.fetch_add(layout.size(), std::sync::atomic::Ordering::Relaxed) + layout.size();
+        PEAK_BYTES.fetch_max(now, std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
+        LIVE_BYTES.fetch_sub(layout.size(), std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::alloc::System.dealloc(pointer, layout) }
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        let now = LIVE_BYTES.fetch_add(size, std::sync::atomic::Ordering::Relaxed) + size;
+        PEAK_BYTES.fetch_max(now, std::sync::atomic::Ordering::Relaxed);
+        LIVE_BYTES.fetch_sub(layout.size(), std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::alloc::System.realloc(pointer, layout, size) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Counting = Counting;
+
+/// What this process has allocated and still holds, in megabytes.
+fn resident_megabytes() -> f64 {
+    LIVE_BYTES.load(std::sync::atomic::Ordering::Relaxed) as f64 / (1024.0 * 1024.0)
+}
+
+fn memory(people: usize) -> Result<()> {
+    let queries = queries(None)?;
+    let start = resident_megabytes();
+    let directory = tempfile::TempDir::new()?;
+    let path = directory.path().join("gauntlet.owl");
+    let owl = Owl::open_with(&path, include_str!("../schema.oql"))?;
+    let mut rows = 0usize;
+    let mut source_bytes = 0usize;
+    {
+        let tables = data::generate(people);
+        for table in &tables {
+            rows += table.rows.len();
+            for batch in table.rows.chunks(BATCH) {
+                owl.insert_rows(table.name, batch.iter().map(owl_row).collect())?;
+            }
+            source_bytes += table
+                .rows
+                .iter()
+                .map(|row| serde_json::to_string(&row.iter().map(|(name, cell)| (name, format!("{cell:?}"))).collect::<Vec<_>>()).map_or(0, |text| text.len()))
+                .sum::<usize>();
+        }
+    }
+    let report = |when: &str, base: f64| {
+        let now = resident_megabytes();
+        // The most held at once since the last line, which is what the
+        // work in between needed on top of what it left behind.
+        let peak = PEAK_BYTES.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / (1024.0 * 1024.0);
+        println!(
+            "{when:<36} {:>7.0} MB held {:>7.0} bytes a row {:>8.0} MB at most meanwhile",
+            now - base,
+            (now - base) * 1024.0 * 1024.0 / rows as f64,
+            peak - base
+        );
+        now
+    };
+    println!("{rows} rows ({people} people); written out as text they are about {:.0} MB\n", source_bytes as f64 / 1e6);
+    println!(
+        "a value is {} bytes, a row before its fields {} bytes\n",
+        std::mem::size_of::<Value>(),
+        std::mem::size_of::<owl_db::Document>()
+    );
+    report("after loading", start);
+    owl.checkpoint()?;
+    report("after a checkpoint", start);
+    let files_of = |directory: &std::path::Path| -> Vec<(String, u64)> {
+        let mut files: Vec<(String, u64)> = std::fs::read_dir(directory)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                Some((entry.file_name().to_string_lossy().into_owned(), entry.metadata().ok()?.len()))
+            })
+            .collect();
+        files.sort();
+        files
+    };
+    let files = files_of(directory.path());
+    let on_disk: u64 = files.iter().map(|(_, size)| size).sum();
+    println!("{:<44} {:>8.1} MB", "the database's files on disk", on_disk as f64 / 1e6);
+    for (name, size) in &files {
+        println!("    {name:<44} {:>8.1} MB", *size as f64 / 1e6);
+    }
+    owl.compact()?;
+    let files = files_of(directory.path());
+    let compacted: u64 = files.iter().map(|(_, size)| size).sum();
+    println!("{:<44} {:>8.1} MB", "the same after compaction", compacted as f64 / 1e6);
+    for (name, size) in &files {
+        println!("    {name:<44} {:>8.1} MB", *size as f64 / 1e6);
+    }
+    owl.compact_and_reclaim()?;
+    let reclaimed: u64 = files_of(directory.path()).iter().map(|(_, size)| size).sum();
+    println!(
+        "{:<44} {:>8.1} MB",
+        "with the copy it replaced removed",
+        reclaimed as f64 / 1e6
+    );
+    // The same data in SQLite, with the indexes its schema declares.
+    {
+        let other = tempfile::TempDir::new()?;
+        let mut sqlite = Sqlite::open_with(&other.path().join("gauntlet.sqlite"), include_str!("../schema.sql"))?;
+        for table in &data::generate(people) {
+            load_sqlite(&mut sqlite, table)?;
+        }
+        sqlite.checkpoint()?;
+        drop(sqlite);
+        let size: u64 = files_of(other.path()).iter().map(|(_, size)| size).sum();
+        println!("{:<44} {:>8.1} MB", "SQLite's files for the same data", size as f64 / 1e6);
+    }
+    report("after compaction", start);
+    for round in 1..=2 {
+        for query in &queries {
+            if let Some(oql) = &query.oql {
+                owl.query(oql)?;
+            }
+        }
+        report(&format!("after every query, round {round}"), start);
+    }
+    // Which queries need the most on top of what is held.
+    let mut needs: Vec<(f64, &str)> = Vec::new();
+    for query in &queries {
+        if let Some(oql) = &query.oql {
+            let before = resident_megabytes();
+            PEAK_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
+            owl.query(oql)?;
+            let peak = PEAK_BYTES.load(std::sync::atomic::Ordering::Relaxed) as f64 / (1024.0 * 1024.0);
+            needs.push((peak - before, query.name.as_str()));
+        }
+    }
+    needs.sort_by(|left, right| right.0.total_cmp(&left.0));
+    println!("\nthe queries that need the most while they run:");
+    for (megabytes, name) in needs.iter().take(8) {
+        println!("  {name:<34} {megabytes:>7.0} MB");
+    }
+    println!("\nwhat the store holds, part by part (estimated):");
+    for (name, entries, bytes) in owl.store().memory_breakdown().map_err(|error| anyhow!("{error}"))? {
+        println!("  {name:<46} {entries:>8} entries {:>7.1} MB", bytes as f64 / 1e6);
+    }
+    for collection in ["people", "tasks", "events"] {
+        let (live, resident, lazy) = owl.residency(collection)?;
+        println!("{collection}: {live} rows; store-wide {resident} held decoded, {lazy} only in column segments");
+    }
+    Ok(())
 }
 
 fn load(people: usize) -> Result<Loaded> {
@@ -344,5 +514,6 @@ fn main() -> Result<()> {
         Command::Bench { people, only, samples } => run(people, only.as_deref(), Some(samples)),
         Command::Show { people, rows, queries } => show(people, rows, &queries),
         Command::Columns { people, samples } => columns::run(&load(people)?.owl, samples),
+        Command::Memory { people } => memory(people),
     }
 }

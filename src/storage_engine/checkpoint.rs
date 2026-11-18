@@ -288,7 +288,7 @@ pub(crate) struct TypedSegmentFileDescriptor {
 pub(crate) struct TypedSegmentHandle {
     descriptor: TypedSegmentDescriptor,
     identity: Mutex<Option<TypedSegmentIdentity>>,
-    decoded: Mutex<Option<Arc<TypedSegment>>>,
+    decoded: Arc<Mutex<Option<Arc<TypedSegment>>>>,
     file: Option<Arc<dyn FileHandle>>,
     offset: usize,
 }
@@ -310,7 +310,7 @@ impl TypedSegmentHandle {
                 encoded_len: 0,
             },
             identity: Mutex::new(None),
-            decoded: Mutex::new(Some(Arc::new(segment))),
+            decoded: Arc::new(Mutex::new(Some(Arc::new(segment)))),
             file: None,
             offset: 0,
         }
@@ -338,7 +338,7 @@ impl TypedSegmentHandle {
         Ok(Self {
             descriptor: location.descriptor,
             identity: Mutex::new(identity),
-            decoded: Mutex::new(None),
+            decoded: Arc::new(Mutex::new(None)),
             file: Some(file),
             offset: location.offset,
         })
@@ -509,7 +509,65 @@ impl TypedSegmentHandle {
         let bytes = read_exact_at(file.as_ref(), self.offset, self.descriptor.encoded_len)?;
         let segment = Arc::new(TypedSegment::decode(&bytes)?);
         *decoded = Some(segment.clone());
+        // Let go of this one's lock before another segment's is taken.
+        drop(decoded);
+        segments_loaded().note(Arc::downgrade(&self.decoded), self.descriptor.encoded_len);
         Ok(segment)
+    }
+}
+
+/// The column segments decoded from their files and held in memory, across
+/// every database this process has open, oldest first.
+///
+/// A segment decoded once used to stay for good, so a database read for
+/// long enough held all its column data in memory. With a limit set, the
+/// segments decoded longest ago are let go when the total passes it; they
+/// are in their files and are decoded again when next read. A segment
+/// that has no file behind it is never among these.
+pub(crate) struct SegmentsLoaded {
+    /// The most bytes of segments, as encoded, to hold. Zero for no limit.
+    limit: std::sync::atomic::AtomicUsize,
+    held: Mutex<(usize, std::collections::VecDeque<(std::sync::Weak<Mutex<Option<Arc<TypedSegment>>>>, usize)>)>,
+}
+
+pub(crate) fn segments_loaded() -> &'static SegmentsLoaded {
+    static LOADED: std::sync::OnceLock<SegmentsLoaded> = std::sync::OnceLock::new();
+    LOADED.get_or_init(|| SegmentsLoaded {
+        limit: std::sync::atomic::AtomicUsize::new(0),
+        held: Mutex::new((0, std::collections::VecDeque::new())),
+    })
+}
+
+impl SegmentsLoaded {
+    /// Hold at most this many bytes of decoded segments; zero for no limit.
+    pub(crate) fn set_limit(&self, bytes: usize) {
+        self.limit.store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn note(&self, segment: std::sync::Weak<Mutex<Option<Arc<TypedSegment>>>>, bytes: usize) {
+        let limit = self.limit.load(std::sync::atomic::Ordering::Relaxed);
+        if limit == 0 {
+            return;
+        }
+        let mut released = Vec::new();
+        if let Ok(mut held) = self.held.lock() {
+            held.0 += bytes;
+            held.1.push_back((segment, bytes));
+            // The one just decoded is the last and is never let go here.
+            while held.0 > limit && held.1.len() > 1 {
+                if let Some((oldest, size)) = held.1.pop_front() {
+                    held.0 = held.0.saturating_sub(size);
+                    released.push(oldest);
+                }
+            }
+        }
+        for oldest in released {
+            if let Some(decoded) = oldest.upgrade() {
+                if let Ok(mut decoded) = decoded.lock() {
+                    *decoded = None;
+                }
+            }
+        }
     }
 }
 
@@ -819,6 +877,13 @@ pub(crate) struct FileIndexBase {
     /// page says otherwise; every read then looks at each entry.
     ordered: std::sync::atomic::AtomicBool,
     page_cache: Mutex<HashMap<usize, Arc<Vec<(Vec<u8>, Vec<ObjRef>)>>>>,
+    /// The pages read from the file, oldest first. Pages handed over
+    /// already decoded when the index was made are not among them.
+    read_order: Mutex<std::collections::VecDeque<usize>>,
+    /// The most pages read from the file that are kept decoded, shared
+    /// with the store; zero for no limit. Without one every page ever read
+    /// stays, and in time the whole index is in memory.
+    page_limit: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl FileIndexBase {
@@ -828,6 +893,7 @@ impl FileIndexBase {
         name: String,
         unique: bool,
         mut pages: Vec<IndexPageDescriptor>,
+        page_limit: Arc<std::sync::atomic::AtomicUsize>,
     ) -> Self {
         let page_cache = pages
             .iter_mut()
@@ -851,6 +917,8 @@ impl FileIndexBase {
             unique,
             pages,
             page_cache: Mutex::new(page_cache),
+            read_order: Mutex::new(std::collections::VecDeque::new()),
+            page_limit,
         }
     }
 
@@ -891,10 +959,27 @@ impl FileIndexBase {
                 .store(false, std::sync::atomic::Ordering::Relaxed);
         }
         let entries = Arc::new(page.entries);
-        self.page_cache
+        let mut cache = self
+            .page_cache
             .lock()
-            .map_err(|_| "checkpoint index page cache lock poisoned".to_string())?
-            .insert(page_index, entries.clone());
+            .map_err(|_| "checkpoint index page cache lock poisoned".to_string())?;
+        let limit = self.page_limit.load(std::sync::atomic::Ordering::Relaxed);
+        if limit > 0 {
+            let mut order = self
+                .read_order
+                .lock()
+                .map_err(|_| "checkpoint index page order lock poisoned".to_string())?;
+            while order.len() >= limit {
+                match order.pop_front() {
+                    Some(oldest) => {
+                        cache.remove(&oldest);
+                    }
+                    None => break,
+                }
+            }
+            order.push_back(page_index);
+        }
+        cache.insert(page_index, entries.clone());
         Ok(entries)
     }
 }
@@ -4291,6 +4376,7 @@ mod tests {
             published.name,
             published.unique,
             published.pages,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         );
         assert_eq!(base.search_key(&target_key).unwrap().len(), 1);
         assert!(!base

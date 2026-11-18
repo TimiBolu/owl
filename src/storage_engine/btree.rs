@@ -273,6 +273,28 @@ impl BTreeIndex {
         Ok(())
     }
 
+    /// How many keys are held in memory over the base, and roughly what
+    /// they take.
+    pub(crate) fn held_in_memory(&self) -> (usize, usize) {
+        let Ok(inner) = self.inner.read() else {
+            return (0, 0);
+        };
+        let entry = |key: &Vec<u8>| key.len() + 3 * std::mem::size_of::<usize>() + 16;
+        let postings = |postings: &Postings| match postings {
+            Postings::Empty | Postings::One(_) => 0,
+            Postings::Few(list) => list.len() * 8 + 16,
+            Postings::Many(tree) => tree.len() * 16,
+        };
+        let bytes: usize = inner
+            .entries
+            .iter()
+            .map(|(key, held)| entry(key) + std::mem::size_of::<Postings>() + postings(held))
+            .sum::<usize>()
+            + inner.tombstones.iter().map(entry).sum::<usize>()
+            + inner.dirty.iter().map(entry).sum::<usize>();
+        (inner.entries.len() + inner.tombstones.len() + inner.dirty.len(), bytes)
+    }
+
     pub(crate) fn clear_overlay(&self) -> Result<(), String> {
         let mut inner = self
             .inner

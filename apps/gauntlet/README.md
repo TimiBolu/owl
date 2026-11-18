@@ -153,6 +153,36 @@ it is under twice as slow as that; with under one percent, about two and a
 half times. What remains is mostly queries that need whole rows or the lists
 inside them.
 
+### Memory and disk
+
+`gauntlet memory` counts the bytes Owl has allocated and still holds, and
+lists its files. For the same 74,612 rows, about 25 MB as text:
+
+| | Size |
+|---|---:|
+| Held in memory after loading | 73 MB |
+| Held after a checkpoint | 61 MB |
+| Held after compaction | 33 MB |
+| Held after every query has run | about 50 MB |
+| Most held at once while a query runs | up to 115 MB |
+| On disk after a checkpoint | 36.0 MB |
+| On disk after compaction | 40.2 MB |
+| On disk after compaction, with the copy it replaced removed | 22.4 MB |
+| SQLite's files for the same data | 19.3 MB |
+
+A database opened and told nothing takes a budget of a quarter of the
+machine's memory for the rows it holds decoded (`OWL_DECODED_BYTES` sets it;
+0 for none). While the data fits within it nothing is let go and nothing is
+slower: the suite runs within a few percent of having no budget. Past it the
+oldest rows are let go and read again when wanted, and the caches of index
+pages and column segments are bounded too. With the budget at 4 MB the same
+database holds 7 MB after compaction and 25 MB after every query has run,
+and the suite takes about twice as long as with the default.
+
+A compaction keeps the copy it replaced, as something to fall back to;
+`compact_and_reclaim` removes it once the new one has been read back and
+checked.
+
 ## What the results say
 
 Owl gets every answer right, including the ones SQL needs four nested

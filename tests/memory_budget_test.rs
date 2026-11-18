@@ -473,3 +473,116 @@ fn a_row_read_from_a_checkpoint_file_is_held_within_the_budget() {
     assert_eq!(rows(&store, r#"orders.where { .note == "changed since" }.count()"#).unwrap(), [r#"{"count":1}"#]);
     assert!(store.decoded_documents() <= 10);
 }
+
+/// A compaction leaves the copy it replaced on disk, as something to fall
+/// back to. Asked to, it removes that copy once the new one has been read
+/// back and checked. The database is then about half the size on disk, and
+/// answers and reopens exactly as before.
+#[test]
+fn a_compaction_can_remove_the_copy_it_replaced() {
+    let home = TempDir::new().unwrap();
+    let (_, expected) = reference(home.path());
+    let path = home.path().join("light.owl");
+    let size_on_disk = || -> u64 {
+        std::fs::read_dir(home.path())
+            .unwrap()
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("light.owl")
+                    .then(|| entry.metadata().ok().map(|metadata| metadata.len()))
+                    .flatten()
+            })
+            .sum()
+    };
+    let store = Arc::new(RustStore::new(&path, SIZE).unwrap());
+    load(&store);
+    store.checkpoint().unwrap();
+    store.compact().unwrap();
+    let kept = size_on_disk();
+    same(&answers(&store), &expected, "after a compaction");
+
+    let (_, reclaimed) = store.compact_and_reclaim().unwrap();
+    assert!(reclaimed.files_removed >= 1, "{reclaimed:?}");
+    let light = size_on_disk();
+    assert!(light * 10 < kept * 7, "{light} bytes after reclaiming, {kept} before");
+    same(&answers(&store), &expected, "after reclaiming");
+    assert!(store.verify_integrity().is_ok());
+
+    // A write afterwards, and the database reopened.
+    rows(&store, r#"orders.where { .id == "o001" }.update { note: "after reclaiming" }"#).unwrap();
+    let after = answers(&store);
+    drop(store);
+    let reopened = Arc::new(RustStore::new(&path, SIZE).unwrap());
+    same(&answers(&reopened), &after, "reopened after reclaiming");
+}
+
+/// Column segments are decoded from their files when read. With a limit on
+/// how much of them is held, the ones decoded longest ago are let go and
+/// decoded again when wanted, and no answer changes: here the limit is so
+/// small that only the segment in use is ever held.
+#[test]
+fn column_segments_are_let_go_and_read_again() {
+    let home = TempDir::new().unwrap();
+    let (_, expected) = reference(home.path());
+    let path = home.path().join("segments.owl");
+    let store = Arc::new(RustStore::with_decoded_budget(&path, SIZE, 10).unwrap());
+    load(&store);
+    store.checkpoint().unwrap();
+    store.compact().unwrap();
+    RustStore::set_column_segment_budget(Some(1));
+    for round in 0..3 {
+        same(&answers(&store), &expected, &format!("round {round} with one segment held"));
+    }
+    rows(&store, r#"orders.where { .id == "o003" }.update { note: "between rounds" }"#).unwrap();
+    let after = answers(&store);
+    RustStore::set_column_segment_budget(None);
+    same(&answers(&store), &after, "with no limit again");
+    drop(store);
+    let reopened = Arc::new(RustStore::new(&path, SIZE).unwrap());
+    same(&answers(&reopened), &after, "reopened");
+}
+
+/// A budget in bytes bounds roughly how much memory the decoded rows take,
+/// whatever the size of each. Answers are the same within it, across
+/// writes, when it is removed, and after reopening.
+#[test]
+fn a_budget_in_bytes_bounds_memory_and_changes_no_answer() {
+    let home = TempDir::new().unwrap();
+    let (_, expected) = reference(home.path());
+    let path = home.path().join("bytes.owl");
+    let store = Arc::new(RustStore::new(&path, SIZE).unwrap());
+    load(&store);
+    store.checkpoint().unwrap();
+    // Everything fits at first, and a database told nothing has a budget
+    // far above this one's size, so every row is held.
+    let unbounded = store.decoded_bytes();
+    assert!(unbounded > 100_000, "{unbounded} bytes held");
+    same(&answers(&store), &expected, "with the default budget");
+
+    for budget in [unbounded / 2, 20_000, 0] {
+        store.set_decoded_bytes_budget(Some(budget)).unwrap();
+        assert!(store.decoded_bytes() <= budget, "{} held under {budget}", store.decoded_bytes());
+        for round in 0..2 {
+            same(&answers(&store), &expected, &format!("round {round} under {budget} bytes"));
+            assert!(store.decoded_bytes() <= budget, "{} held under {budget}", store.decoded_bytes());
+        }
+    }
+
+    // Writes are seen, and held within the budget.
+    store.set_decoded_bytes_budget(Some(20_000)).unwrap();
+    rows(&store, r#"orders.where { .id == "o002" }.update { note: "under a bytes budget" }"#).unwrap();
+    let after = answers(&store);
+    assert_ne!(after, expected);
+    assert!(store.decoded_bytes() <= 20_000);
+    same(&answers(&store), &after, "asked again");
+
+    // With the budget removed everything may be held again.
+    store.set_decoded_bytes_budget(None).unwrap();
+    same(&answers(&store), &after, "with no budget");
+    drop(store);
+    let reopened = Arc::new(RustStore::new(&path, SIZE).unwrap());
+    same(&answers(&reopened), &after, "reopened");
+}
