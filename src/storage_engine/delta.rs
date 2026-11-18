@@ -49,9 +49,62 @@ pub(crate) struct RecordRootHandle {
     target_lsn: u64,
     authority_checksum: u32,
     legacy: Option<RecordPageDelta>,
+    /// Pages read from the file and checked, by where they start. Records
+    /// read one after another are mostly on the same page, and reading a
+    /// page is opening the file, reading it and checking its sum.
+    pages: std::sync::Mutex<PagesRead>,
 }
 
+/// The pages a [`RecordRootHandle`] has read lately.
+#[derive(Default)]
+struct PagesRead {
+    held: std::collections::HashMap<usize, Arc<[u8]>>,
+    /// The order they were read in, oldest first.
+    order: std::collections::VecDeque<usize>,
+}
+
+/// A handle holds on to this many pages: about four megabytes.
+const PAGES_HELD: usize = 256;
+
 impl RecordRootHandle {
+    /// The page from `page_offset` to `page_end`, whose checksum the
+    /// directory holds at `page_cursor`, read and checked once and then
+    /// kept for a while.
+    fn page(&self, page_cursor: usize, page_offset: usize, page_end: usize) -> OQLResult<Arc<[u8]>> {
+        if let Some(known) = self
+            .pages
+            .lock()
+            .ok()
+            .and_then(|pages| pages.held.get(&page_offset).cloned())
+        {
+            return Ok(known);
+        }
+        let page = read_file_range(
+            self.filesystem.as_ref(),
+            &self.path,
+            page_offset,
+            page_end - page_offset,
+        )?;
+        if crc32fast::hash(&page) != get_u32(&self.prefix, page_cursor + 28)? {
+            return Err(OQLError::storage_error(
+                "record root page checksum is invalid",
+                None,
+            ));
+        }
+        let page: Arc<[u8]> = Arc::from(page);
+        if let Ok(mut pages) = self.pages.lock() {
+            if pages.order.len() >= PAGES_HELD {
+                if let Some(oldest) = pages.order.pop_front() {
+                    pages.held.remove(&oldest);
+                }
+            }
+            if pages.held.insert(page_offset, page.clone()).is_none() {
+                pages.order.push_back(page_offset);
+            }
+        }
+        Ok(page)
+    }
+
     pub(crate) fn open(filesystem: Arc<dyn FileSystem>, path: &Path) -> OQLResult<Self> {
         let file_len = usize::try_from(filesystem.file_size(path).map_err(|error| {
             OQLError::storage_error(&format!("inspect record root: {error}"), None)
@@ -84,6 +137,7 @@ impl RecordRootHandle {
                 target_lsn,
                 authority_checksum: crc32fast::hash(&bytes),
                 legacy: Some(legacy),
+                pages: std::sync::Mutex::new(PagesRead::default()),
             });
         }
         let directory_len = usize::try_from(get_u64(&header, 32)?)
@@ -124,6 +178,7 @@ impl RecordRootHandle {
             target_lsn,
             authority_checksum,
             legacy: None,
+            pages: std::sync::Mutex::new(PagesRead::default()),
         })
     }
 
@@ -194,18 +249,7 @@ impl RecordRootHandle {
                 None,
             ));
         }
-        let page = read_file_range(
-            self.filesystem.as_ref(),
-            &self.path,
-            page_offset,
-            page_end - page_offset,
-        )?;
-        if crc32fast::hash(&page) != get_u32(&self.prefix, page_cursor + 28)? {
-            return Err(OQLError::storage_error(
-                "record root page checksum is invalid",
-                None,
-            ));
-        }
+        let page = self.page(page_cursor, page_offset, page_end)?;
         let relative_start = offset - page_offset;
         let relative_end = end - page_offset;
         let record = &page[relative_start..relative_end];
@@ -234,18 +278,7 @@ impl RecordRootHandle {
                 None,
             ));
         }
-        let page = read_file_range(
-            self.filesystem.as_ref(),
-            &self.path,
-            page_offset,
-            page_end - page_offset,
-        )?;
-        if crc32fast::hash(&page) != get_u32(&self.prefix, page_cursor + 28)? {
-            return Err(OQLError::storage_error(
-                "record root page checksum is invalid",
-                None,
-            ));
-        }
+        let page = self.page(page_cursor, page_offset, page_end)?;
         lookup_v3_page(&page, object_ref)
     }
 }

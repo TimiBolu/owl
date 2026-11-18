@@ -629,6 +629,19 @@ fn a_collection_name_always_means_something() {
         db.scalar("staff.where { .id == \"a\" }.select { all: staff.sum(.pay) }", "all"),
         int(450)
     );
+
+    // A collection may be called by a word the language also uses.
+    db.script(
+        "schema first { id: String, n: Integer }
+         first.insert [ { id: \"x\", n: 1 }, { id: \"y\", n: 2 } ]",
+    );
+    assert_eq!(db.ids("first.where { .n > 1 }"), ["y"]);
+    assert_eq!(db.scalar("first.count()", "count"), int(2));
+    assert_eq!(db.scalar("first.sort { .n.desc }.first().select { id }", "id"), text("y"));
+    assert_eq!(
+        db.scalar("staff.where { .id == \"a\" }.select { n: first.where { .n > 0 }.count() }", "n"),
+        int(2)
+    );
 }
 
 /// Shorter ways to the same answer: a table of rows keyed by what a

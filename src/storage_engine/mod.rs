@@ -23,7 +23,7 @@ pub(crate) use arena::Arena;
 pub use btree::BTreeIndex;
 pub use checkpoint::CheckpointInfo;
 pub(crate) use column_segment::{
-    ColumnValues, TypedCell, TypedColumn, TypedSegment, TypedSegmentDescriptor,
+    ColumnBuilder, ColumnValues, TypedCell, TypedColumn, TypedSegment, TypedSegmentDescriptor,
     TypedSegmentIdentity,
 };
 pub use group_commit::GroupCommitter;

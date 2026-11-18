@@ -705,34 +705,82 @@ impl TypedColumn {
         field_type: &FieldType,
         rows: &[Arc<Document>],
     ) -> OQLResult<Option<Self>> {
-        let Some(kind) = column_kind(field_type) else {
+        let Some(mut builder) = ColumnBuilder::new(field_name, field_type, rows.len()) else {
             return Ok(None);
         };
-        let bitmap_len = rows.len().div_ceil(8);
-        let mut presence = vec![0; bitmap_len];
-        let mut nulls = vec![0; bitmap_len];
-        let mut values = empty_values(kind, rows.len());
-        for (index, document) in rows.iter().enumerate() {
-            let Some(value) = document.fields.get(field_name) else {
-                push_default(&mut values)?;
-                continue;
-            };
-            set_bit(&mut presence, index);
-            if value.is_null() {
-                set_bit(&mut nulls, index);
-                push_default(&mut values)?;
-                continue;
-            }
-            if push_value(&mut values, value).is_err() {
-                return Ok(None);
-            }
+        for document in rows {
+            builder.push(document)?;
         }
-        finish_strings(&mut values)?;
+        builder.finish()
+    }
+}
+
+/// Makes a column of one field, a row at a time, so that the rows need not
+/// all be in hand at once.
+pub(crate) struct ColumnBuilder {
+    name: String,
+    presence: Vec<u8>,
+    nulls: Vec<u8>,
+    values: ColumnValues,
+    rows: usize,
+    /// A row held a value of another type than the field declares.
+    mistyped: bool,
+}
+
+impl ColumnBuilder {
+    /// `None` when the field's type has no column form.
+    pub(crate) fn new(field_name: &str, field_type: &FieldType, expected_rows: usize) -> Option<Self> {
+        let kind = column_kind(field_type)?;
+        Some(Self {
+            name: field_name.to_string(),
+            presence: Vec::with_capacity(expected_rows.div_ceil(8)),
+            nulls: Vec::with_capacity(expected_rows.div_ceil(8)),
+            values: empty_values(kind, expected_rows),
+            rows: 0,
+            mistyped: false,
+        })
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn push(&mut self, document: &Document) -> OQLResult<()> {
+        let index = self.rows;
+        self.rows += 1;
+        if index / 8 >= self.presence.len() {
+            self.presence.push(0);
+            self.nulls.push(0);
+        }
+        if self.mistyped {
+            return Ok(());
+        }
+        let Some(value) = document.fields.get(&self.name) else {
+            return push_default(&mut self.values);
+        };
+        set_bit(&mut self.presence, index);
+        if value.is_null() {
+            set_bit(&mut self.nulls, index);
+            return push_default(&mut self.values);
+        }
+        if push_value(&mut self.values, value).is_err() {
+            self.mistyped = true;
+        }
+        Ok(())
+    }
+
+    /// `None` when a row held a value of another type than the field
+    /// declares.
+    pub(crate) fn finish(mut self) -> OQLResult<Option<TypedColumn>> {
+        if self.mistyped {
+            return Ok(None);
+        }
+        finish_strings(&mut self.values)?;
         Ok(Some(TypedColumn {
             field_id: 0,
-            presence,
-            nulls,
-            values,
+            presence: self.presence,
+            nulls: self.nulls,
+            values: self.values,
             integer_min: None,
             integer_max: None,
         }))

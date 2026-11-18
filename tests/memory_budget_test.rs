@@ -388,3 +388,88 @@ fn declaring_an_unchanged_schema_again_rebuilds_nothing() {
     same(&answers(&reopened), &expected, "reopened without a budget");
     reopened.verify_integrity().unwrap();
 }
+
+/// What is kept between queries to answer them faster (a collection's rows
+/// listed, its fields as columns) must not hold on to rows the budget has
+/// let go. A row the store dropped is then still in memory, uncounted.
+#[test]
+fn nothing_kept_between_queries_outlives_the_budget() {
+    let home = TempDir::new().unwrap();
+    let store = Arc::new(RustStore::with_decoded_budget(home.path().join("kept.owl"), SIZE, 30).unwrap());
+    script(
+        &store,
+        "schema alpha { id: String, n: Integer, tags: List(String) }
+         schema beta { id: String, n: Integer, tags: List(String) }",
+    );
+    let insert = |collection: &str| {
+        let rows: Vec<String> = (0..20)
+            .map(|row| format!("{{ id: \"{collection}{row:02}\", n: {row}, tags: [\"t\"] }}"))
+            .collect();
+        script(&store, &format!("{collection}.insert [ {} ]", rows.join(", ")));
+    };
+    insert("alpha");
+    let every = |collection: &str| rows(&store, &format!("{collection}.where {{ .n >= 0 }}.sort {{ .id.asc }}")).unwrap();
+    let count = |collection: &str| rows(&store, &format!("{collection}.where {{ .n > 5 }}.count()")).unwrap();
+
+    // All of the first collection is held. Ask the same question of it
+    // several times, which is what gets things kept.
+    for _ in 0..4 {
+        assert_eq!(count("alpha"), [r#"{"count":14}"#]);
+    }
+    let Some(held) = store.scan_documents_shared("alpha").unwrap() else {
+        panic!("the first collection should all be held after writing it");
+    };
+    let one = held[0].clone();
+    drop(held);
+
+    // Writing the second collection pushes rows of the first out of the
+    // budget. Nothing was written to the first, so what was kept of it
+    // would otherwise stay.
+    insert("beta");
+    for _ in 0..4 {
+        assert_eq!(count("beta"), [r#"{"count":14}"#]);
+    }
+    assert!(store.decoded_documents() <= 30, "{} held", store.decoded_documents());
+    assert_eq!(
+        Arc::strong_count(&one),
+        1,
+        "a row the budget let go is still held somewhere"
+    );
+    // And the answers are still right, asked more than once.
+    for _ in 0..3 {
+        assert_eq!(count("alpha"), [r#"{"count":14}"#]);
+        assert_eq!(every("alpha").len(), 20);
+        assert_eq!(count("beta"), [r#"{"count":14}"#]);
+    }
+    assert!(store.decoded_documents() <= 30, "{} held", store.decoded_documents());
+}
+
+/// A row whose record is in a checkpoint file is decoded when read. It must
+/// then be held, within the budget, so that reading it again does not
+/// decode it again; and a write to it must still be seen.
+#[test]
+fn a_row_read_from_a_checkpoint_file_is_held_within_the_budget() {
+    let home = TempDir::new().unwrap();
+    let store = Arc::new(RustStore::with_decoded_budget(home.path().join("held.owl"), SIZE, 10).unwrap());
+    load(&store);
+    store.checkpoint().unwrap();
+    // The budget is far below the rows written, so most are on file only.
+    store.set_decoded_budget(Some(0)).unwrap();
+    assert_eq!(store.decoded_documents(), 0);
+    store.set_decoded_budget(Some(10)).unwrap();
+
+    let one = r#"orders.where { .id == "o007" }"#;
+    let before = rows(&store, one).unwrap();
+    assert_eq!(before.len(), 1);
+    assert!(store.decoded_documents() >= 1, "the row read was not held");
+    assert!(store.decoded_documents() <= 10);
+    assert_eq!(rows(&store, one).unwrap(), before);
+
+    // A write is seen, by this row and by a query over all of them.
+    rows(&store, r#"orders.where { .id == "o007" }.update { note: "changed since" }"#).unwrap();
+    let after = rows(&store, one).unwrap();
+    assert_ne!(after, before);
+    assert!(after[0].contains("changed since"), "{after:?}");
+    assert_eq!(rows(&store, r#"orders.where { .note == "changed since" }.count()"#).unwrap(), [r#"{"count":1}"#]);
+    assert!(store.decoded_documents() <= 10);
+}

@@ -65,61 +65,110 @@ pick queries by name.
 
 ## Results
 
-2,000 people, 74,612 rows, on a laptop with other work running. Times are the
-median of three runs in milliseconds; the ratio is Owl over SQLite, so below 1
-is faster. All 38 queries return the same rows.
+2,000 people, 74,612 rows, on a quiet laptop. Times are the median of 21 runs
+in milliseconds; the ratio is Owl over SQLite, so below 1 is faster. A second
+run agreed with this one to within a few percent. All 44 queries return the
+same rows: 12 are faster on Owl, 30 are within five times, and 2 are beyond.
 
 | Query | Owl | SQLite | Ratio |
 |---|---:|---:|---:|
-| `g01_distinct_per_group` | 17.9 | 4.3 | 4.2x |
-| `g02_salary_spread` | 2.8 | 3.5 | 0.8x |
-| `g03_unit_medians` | 3.6 | 4.4 | 0.8x |
-| `g04_owners_or_managers` | 4.3 | 0.5 | 8.3x |
-| `g05_owner_and_manager` | 6.2 | 0.4 | 13.7x |
-| `g06_subtree_headcount` | 1.8 | 0.4 | 5.0x |
-| `g07_management_chain` | 0.1 | 0.3 | 0.2x |
-| `g08_transitive_blockers` | 0.1 | 2.5 | 0.1x |
-| `g09_two_levels_of_reports` | 0.5 | 0.1 | 4.5x |
-| `g10_running_total` | 28.9 | 8.9 | 3.3x |
-| `g11_salary_rank` | 12.4 | 5.0 | 2.5x |
-| `g12_sessions` | 320.3 | 185.7 | 1.7x |
-| `g13_longest_gap` | 280.9 | 128.6 | 2.2x |
-| `g14_unwind_with_parent` | 490.9 | 133.6 | 3.7x |
-| `h01_org_rollup` | 23.6 | 12.4 | 1.9x |
-| `h02_unit_tree` | 0.5 | 0.4 | 1.1x |
-| `h03_deep_forward_filter` | 16.6 | 5.8 | 2.9x |
-| `h04_colleagues` | 2.4 | 0.5 | 4.7x |
-| `h05_cross_tenant` | 4.4 | 5.6 | 0.8x |
-| `h06_overallocated` | 6.4 | 2.3 | 2.8x |
-| `h07_no_local_assignee` | 3.4 | 1.3 | 2.5x |
-| `h08_above_unit_average` | 2.9 | 12.8 | 0.2x |
-| `h09_outearned_managers` | 1.0 | 0.1 | 6.8x |
-| `h10_states_by_org` | 21.5 | 17.9 | 1.2x |
-| `h11_monthly_flow` | 121.9 | 30.8 | 4.0x |
-| `h12_top_earners_per_unit` | 3.5 | 1.7 | 2.1x |
-| `h13_late_limit` | 2.6 | 0.8 | 3.5x |
-| `h14_skewed_tenant` | 16.0 | 3.1 | 5.1x |
-| `h15_heavy_worklogs` | 41.8 | 9.2 | 4.5x |
-| `h16_worklog_by_author` | 246.2 | 85.3 | 2.9x |
-| `h17_label_histogram` | 58.1 | 17.8 | 3.3x |
-| `h18_distinct_assignees` | 26.3 | 6.3 | 4.2x |
-| `h19_deep_offset` | 30.5 | 10.8 | 2.8x |
-| `h20_blocked_two_hops` | 56.0 | 13.6 | 4.1x |
-| `h21_rollup_fixed_depth` | 0.6 | 0.2 | 3.7x |
-| `h22_null_logic` | 13.5 | 1.8 | 7.4x |
-| `h23_or_across_relationships` | 3.0 | 1.6 | 1.9x |
-| `h24_everything_at_once` | 38.0 | 13.5 | 2.8x |
+| `g01_distinct_per_group` | 8.0 | 2.7 | 3.0x |
+| `g02_salary_spread` | 2.0 | 2.2 | 0.9x |
+| `g03_unit_medians` | 2.4 | 2.8 | 0.9x |
+| `g04_owners_or_managers` | 0.28 | 0.32 | 0.9x |
+| `g05_owner_and_manager` | 1.2 | 0.28 | 4.3x |
+| `g06_subtree_headcount` | 1.1 | 0.23 | 5.0x |
+| `g07_management_chain` | 0.05 | 0.22 | 0.2x |
+| `g08_transitive_blockers` | 0.07 | 1.5 | 0.0x |
+| `g09_two_levels_of_reports` | 0.28 | 0.06 | 4.6x |
+| `g10_running_total` | 1.5 | 5.7 | 0.3x |
+| `g11_salary_rank` | 6.9 | 3.2 | 2.2x |
+| `g12_sessions` | 188.3 | 105.8 | 1.8x |
+| `g13_longest_gap` | 157.7 | 82.1 | 1.9x |
+| `g14_unwind_with_parent` | 229.6 | 78.4 | 2.9x |
+| `g15_share_of_unit` | 10.6 | 2.8 | 3.7x |
+| `g16_pay_spread` | 1.2 | 0.34 | 3.5x |
+| `g17_pairs_at_one_level` | 1.0 | 0.26 | 4.0x |
+| `g18_moving_window` | 1.9 | 0.94 | 2.0x |
+| `g19_budget_down_the_tree` | 0.42 | 0.08 | 5.4x |
+| `g20_routes_to_blockers` | 1.7 | 0.24 | 7.1x |
+| `h01_org_rollup` | 8.0 | 7.9 | 1.0x |
+| `h02_unit_tree` | 0.26 | 0.27 | 1.0x |
+| `h03_deep_forward_filter` | 11.2 | 3.7 | 3.0x |
+| `h04_colleagues` | 1.0 | 0.31 | 3.3x |
+| `h05_cross_tenant` | 1.9 | 3.5 | 0.5x |
+| `h06_overallocated` | 3.2 | 1.4 | 2.2x |
+| `h07_no_local_assignee` | 1.7 | 0.83 | 2.1x |
+| `h08_above_unit_average` | 1.4 | 8.0 | 0.2x |
+| `h09_outearned_managers` | 0.26 | 0.09 | 3.0x |
+| `h10_states_by_org` | 9.8 | 11.4 | 0.9x |
+| `h11_monthly_flow` | 44.6 | 19.7 | 2.3x |
+| `h12_top_earners_per_unit` | 1.8 | 1.1 | 1.7x |
+| `h13_late_limit` | 1.2 | 0.47 | 2.6x |
+| `h14_skewed_tenant` | 2.4 | 2.0 | 1.2x |
+| `h15_heavy_worklogs` | 15.6 | 5.8 | 2.7x |
+| `h16_worklog_by_author` | 116.0 | 55.4 | 2.1x |
+| `h17_label_histogram` | 23.9 | 9.6 | 2.5x |
+| `h18_distinct_assignees` | 9.9 | 3.5 | 2.8x |
+| `h19_deep_offset` | 3.0 | 6.8 | 0.4x |
+| `h20_blocked_two_hops` | 33.0 | 8.6 | 3.8x |
+| `h21_rollup_fixed_depth` | 0.31 | 0.09 | 3.5x |
+| `h22_null_logic` | 0.43 | 1.1 | 0.4x |
+| `h23_or_across_relationships` | 1.7 | 0.99 | 1.8x |
+| `h24_everything_at_once` | 16.5 | 8.5 | 1.9x |
+
+### With a memory budget
+
+Everything above is with every row held decoded in memory. With a budget on
+decoded rows (`OWL_DECODED_DOCUMENTS`), all 44 queries still return the same
+rows. Measured in one sitting, on a laptop in low power mode, so the ratios
+are comparable and the times are not those of the table above:
+
+| Budget, of 74,612 rows | Faster | Within 5x | Beyond | Owl time over SQLite's, whole suite |
+|---|---:|---:|---:|---:|
+| None | 13 | 29 | 2 | 2.0 |
+| 20,000 | 7 | 26 | 11 | 3.4 |
+| 20,000, compacted first | 6 | 27 | 11 | 3.1 |
+| 500 | 3 | 12 | 29 | 5.2 |
+
+The first time this was measured, the budget of 20,000 left 10 queries within
+five times and the suite took six times as long as with no budget. What
+closed most of that:
+
+- A row decoded from a checkpoint file is held, within the budget. It used
+  not to be held at all, so every statement that wanted it decoded it again.
+- Following a relationship decodes each row it reaches once, not twice,
+  passes over rows of other collections without reading them, and for a
+  count or a sum decodes only the fields read.
+- A page of a checkpoint file is read and checked once and kept for a while,
+  and records that lie one after another are read in one stretch.
+- A field's column is built in one pass that decodes a row, takes its fields
+  and lets it go, so filters, cut sorts and aggregates run on columns whether
+  or not the rows are held, and only the rows a filter leaves are decoded.
+- A scan that names its fields decodes only those from a record on file, and
+  skips over a row's long lists.
+
+Owl is fastest when the data fits in memory. With a quarter of it in memory
+it is under twice as slow as that; with under one percent, about two and a
+half times. What remains is mostly queries that need whole rows or the lists
+inside them.
 
 ## What the results say
 
 Owl gets every answer right, including the ones SQL needs four nested
-subqueries or a recursive CTE for. Six queries are faster than SQLite,
-twenty-six are within five times, and six are further behind. Ratios move by
-up to a point between runs on a busy machine.
+subqueries or a recursive CTE for. Twelve queries are faster than SQLite,
+thirty are within five times, and two are further behind. On a busy machine
+the ratios move by a point or more between runs, and should not be trusted.
 
 The first run of this suite had sixteen queries more than five times slower,
 the worst by 900 times. What closed most of that:
 
+- A filter on plain fields is decided from the fields' columns, built in
+  memory from the held rows and kept until the collection is written, so only
+  the rows that pass are read at all. Cut sorts, aggregates and groups read
+  from the same columns.
+- A row holds its values in order and shares its field names with other rows
+  of the same shape, so reading a field is an index and not a hash.
 - Rows are filtered, counted and stepped through where the store holds them,
   and only the rows a query keeps are copied. Following a path used to copy
   the whole starting row, work log and all, before reading one field of it.
