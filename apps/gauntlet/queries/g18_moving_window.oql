@@ -1,0 +1,12 @@
+// Moving windows per person, in time order: the average of the last 7
+// events, and how many of the last 30 were large. The second is a filter
+// inside a window.
+events
+  .sort { .person.id.asc, .at.asc, .id.asc }
+  .partition_by { .person }
+  .select {
+    id,
+    recent: so_far().last(7).amount.avg(),
+    large: so_far().last(30).where { .amount > 150 }.count()
+  }
+  .limit(500)

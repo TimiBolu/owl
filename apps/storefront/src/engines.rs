@@ -40,6 +40,11 @@ impl Owl {
         Ok(owl)
     }
 
+    /// The store itself, for measurements that read it directly.
+    pub fn store(&self) -> &Arc<RustStore> {
+        &self.store
+    }
+
     /// Run one statement and return its rows.
     pub fn query(&self, source: &str) -> Result<Vec<Json>> {
         let query = parse_oql(source).map_err(|error| anyhow!("{error}"))?;

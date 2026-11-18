@@ -1,0 +1,11 @@
+// Every route from a task to what blocks it, up to five steps, for the
+// first 400 tasks: how many ways each blocker is reached, and the nearest.
+// A route never passes through the same task twice.
+tasks
+  .sort { .id.asc }
+  .limit(400)
+  .routes(.blocked_by.blocker, 5)
+  .group_by { .id }
+  .select { id, routes: count(), nearest: min(._depth) }
+  .sort { .routes.desc, .id.asc }
+  .limit(20)

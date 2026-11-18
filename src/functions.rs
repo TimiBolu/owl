@@ -6,6 +6,7 @@ use crate::error::{OQLError, OQLResult};
 use crate::parser::FunctionDefinition;
 use chrono::{DateTime, Datelike, Duration, NaiveDateTime, TimeZone, Timelike, Utc};
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 
 /// Function signature for built-in functions
 pub type BuiltinFunction = fn(&[Value]) -> OQLResult<Value>;
@@ -16,12 +17,36 @@ pub struct UserDefinedFunction {
     pub definition: FunctionDefinition,
     pub parameter_types: Vec<String>,
     pub return_type: Option<String>,
+    /// Whether this is a standard library function exactly as shipped.
+    /// The engine may then compute what its definition says without
+    /// evaluating the definition. A function a user defines under the same
+    /// name with a different body is not one.
+    pub library: bool,
 }
 
 /// Registry of all functions (built-in and user-defined)
 pub struct FunctionRegistry {
     builtin_functions: HashMap<String, BuiltinFunction>,
-    user_functions: HashMap<String, UserDefinedFunction>,
+    /// Functions written in OQL: the standard library and whatever has
+    /// been defined since. Shared, so that everything running against one
+    /// database connection sees a function as soon as it is defined.
+    user_functions: Arc<RwLock<HashMap<String, Arc<UserDefinedFunction>>>>,
+}
+
+/// The standard library, parsed once.
+fn standard_library() -> &'static [FunctionDefinition] {
+    static LIBRARY: std::sync::OnceLock<Vec<FunctionDefinition>> = std::sync::OnceLock::new();
+    LIBRARY.get_or_init(|| {
+        let file = crate::parser::parse_oql_file(include_str!("std.oql"))
+            .expect("the standard library is valid OQL");
+        file.statements
+            .into_iter()
+            .map(|statement| match statement {
+                crate::parser::OQLFileStatement::FunctionDef(definition) => definition,
+                _ => panic!("the standard library holds only function definitions"),
+            })
+            .collect()
+    })
 }
 
 impl FunctionRegistry {
@@ -29,7 +54,7 @@ impl FunctionRegistry {
     pub fn new() -> Self {
         let mut registry = Self {
             builtin_functions: HashMap::new(),
-            user_functions: HashMap::new(),
+            user_functions: Arc::new(RwLock::new(HashMap::new())),
         };
 
         // Register all built-in functions
@@ -37,6 +62,13 @@ impl FunctionRegistry {
         registry.register_math_functions();
         registry.register_datetime_functions();
         registry.register_utility_functions();
+        // The standard library is OQL, registered as any function a user
+        // defines is, so a user may replace any of it.
+        for definition in standard_library() {
+            registry
+                .register_user_function(definition.clone())
+                .expect("the standard library defines valid functions");
+        }
 
         registry
     }
@@ -47,20 +79,30 @@ impl FunctionRegistry {
     }
 
     /// Get a user-defined function by name
-    pub fn get_user_function(&self, name: &str) -> Option<&UserDefinedFunction> {
-        self.user_functions.get(name)
+    pub fn get_user_function(&self, name: &str) -> Option<Arc<UserDefinedFunction>> {
+        self.user_functions
+            .read()
+            .ok()
+            .and_then(|functions| functions.get(name).cloned())
+    }
+
+    /// See and define the same OQL functions as `other` from now on.
+    pub fn share_user_functions(&mut self, other: &FunctionRegistry) {
+        self.user_functions = other.user_functions.clone();
     }
 
     /// Check if a function exists (built-in or user-defined)
     pub fn has_function(&self, name: &str) -> bool {
-        self.builtin_functions.contains_key(name) || self.user_functions.contains_key(name)
+        self.builtin_functions.contains_key(name) || self.get_user_function(name).is_some()
     }
 
     /// Get all function names
     pub fn function_names(&self) -> Vec<String> {
         let mut names = Vec::new();
         names.extend(self.builtin_functions.keys().cloned());
-        names.extend(self.user_functions.keys().cloned());
+        if let Ok(functions) = self.user_functions.read() {
+            names.extend(functions.keys().cloned());
+        }
         names
     }
 
@@ -81,18 +123,24 @@ impl FunctionRegistry {
             .collect();
 
         let user_func = UserDefinedFunction {
+            library: standard_library().iter().any(|shipped| *shipped == func_def),
             return_type: func_def.return_type.clone(),
             parameter_types,
             definition: func_def.clone(),
         };
 
-        self.user_functions.insert(func_def.name.clone(), user_func);
+        self.user_functions
+            .write()
+            .map_err(|_| OQLError::generic("function registry lock poisoned"))?
+            .insert(func_def.name.clone(), Arc::new(user_func));
         Ok(())
     }
 
     /// Remove a user-defined function. Built-in functions are unaffected.
     pub fn unregister_user_function(&mut self, name: &str) {
-        self.user_functions.remove(name);
+        if let Ok(mut functions) = self.user_functions.write() {
+            functions.remove(name);
+        }
     }
 
     /// Validate a function definition

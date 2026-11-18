@@ -1,0 +1,39 @@
+// The OQL standard library: functions written in OQL and loaded with every
+// database. Each takes a collection of values, so each can be called on a
+// path (`.orders.total.stddev()`), given one (`stddev(.orders.total)`), or
+// put at the end of a query (`orders.total.stddev()`).
+//
+// These are ordinary functions. Defining one of the same name replaces it.
+
+// How far the values spread from their mean, estimated from a sample: the
+// squared distances from the mean, summed, over one less than their number.
+// Null for fewer than two values.
+fn variance(values) {
+  n = values.count()
+  m = values.avg()
+  if n < 2 then null else to_float(values.select { d: (. - m) * (. - m) }.d.sum()) / (n - 1)
+}
+
+// The square root of the variance, in the units of the values themselves.
+fn stddev(values) {
+  v = variance(values)
+  if v == null then null else sqrt(v)
+}
+
+// The same two for values that are the whole population, not a sample of
+// it: over their number, not one less. Null for no values.
+fn variance_pop(values) {
+  n = values.count()
+  m = values.avg()
+  if n < 1 then null else to_float(values.select { d: (. - m) * (. - m) }.d.sum()) / n
+}
+
+fn stddev_pop(values) {
+  v = variance_pop(values)
+  if v == null then null else sqrt(v)
+}
+
+// The value that occurs most often; of several that tie, the least.
+fn mode(values) {
+  values.group_by { v: . }.select { v, n: count() }.sort { .n.desc, .v.asc }.first().v
+}

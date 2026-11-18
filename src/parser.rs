@@ -112,9 +112,22 @@ pub enum Token {
 /// identifier, so it cannot collide with a binding or a field.
 pub const CURRENT_ROWS: &str = "$rows";
 
+/// The name under which a function's local value is kept in its body: a
+/// call of this, with the local's expression and its place among the
+/// function's locals. It cannot be written, so nothing can collide with it.
+pub const LOCAL_VALUE: &str = "$local";
+
+/// The collection name of a query that starts with an expression in
+/// parentheses. It cannot be written, so it cannot collide with a name.
+pub const ROWS_OF: &str = "$of";
+
+/// The source of `so_far()` in a select: the rows of the partition from its
+/// first row to the row being shaped, in order.
+pub const ROWS_SO_FAR: &str = "$so_far";
+
 /// Operations and aggregates that are words only where they are applied, so
 /// that data may still have fields called `median` or `union`.
-pub const STAGE_WORDS: [&str; 7] = [
+pub const STAGE_WORDS: [&str; 11] = [
     "median",
     "percentile",
     "union",
@@ -122,11 +135,15 @@ pub const STAGE_WORDS: [&str; 7] = [
     "except",
     "walk",
     "partition_by",
+    "so_far",
+    "last",
+    "routes",
+    "product",
 ];
 
 /// The aggregates among [`STAGE_WORDS`].
 fn is_aggregate_stage(word: &str) -> bool {
-    matches!(word, "median" | "percentile")
+    matches!(word, "median" | "percentile" | "product")
 }
 
 /// The marker the parser gives a `select` entry written `-name`: the named
@@ -849,18 +866,35 @@ pub enum Operation {
     /// `walk(.path)`: every row reached by following the path one or more
     /// times, each once, nearest first. A second argument limits how many
     /// times. Each row carries `_depth`, the steps taken to reach it.
+    ///
+    /// With `every`, this is `routes(.path)`: one row for every route to a
+    /// row, not one row for each row reached. A route never passes through
+    /// the same row twice.
+    ///
+    /// With `paths`, each row also carries `_path`: the rows on the way to
+    /// it, from the row the walk started at to the row itself, in order.
+    /// The parser sets it when the statement reads `_path`.
     Walk {
         path: FieldAccess,
         depth: Option<Expression>,
+        every: bool,
+        paths: bool,
     },
     /// `name(args)` at the start of a query, as in `seniors(50).count()`:
     /// the query's collection names a function, and the rows it starts
     /// from are what the function gives for these arguments. Always first.
+    ///
+    /// When the collection is [`ROWS_OF`], the query started with an
+    /// expression in parentheses, `(a + b).count()`, and the one argument
+    /// is that expression: its rows are the rows the query starts from.
     Call(Vec<Expression>),
     /// `partition_by { keys }`: the position functions of the next `select`
-    /// (`row_number`, `prev`, `running_sum` and the rest) start again for
+    /// (`row_number`, `prev`, `so_far()` and the rest) start again for
     /// each distinct key. The rows and their order are unchanged.
     PartitionBy(GroupByBlock),
+    /// `last(n)`: the final `n` rows, in the order they were in. The
+    /// counterpart of `limit(n)`.
+    Last(Expression),
     First,
     Exists,
     Nearest(NearestBlock),
@@ -1990,6 +2024,31 @@ impl Parser {
             // query block: later lines may use the names before them.
             let value = self.parse_expression()?;
             let value = Self::substitute_scoped_locals_expression(&value, &locals);
+            // A local that is one value, not a collection to go on
+            // querying, is worked out once for each call. It is wrapped so
+            // that every place it is used finds the same answer.
+            let one_value = match &value {
+                Expression::QueryExpression { query } => {
+                    query.operations.last().is_some_and(Self::gives_one_value)
+                }
+                Expression::CollectionExpression { operations, .. } => {
+                    operations.last().is_some_and(Self::gives_one_value)
+                }
+                Expression::Identifier(_) | Expression::FieldAccess(_) | Expression::Literal(_) => false,
+                Expression::ChainedAccess { .. } => false,
+                _ => true,
+            };
+            let value = if one_value {
+                Expression::FunctionCall {
+                    name: LOCAL_VALUE.to_string(),
+                    args: vec![
+                        value,
+                        Expression::Literal(Literal::Integer(locals.len() as i64)),
+                    ],
+                }
+            } else {
+                value
+            };
             locals.insert(local, value);
         }
         let body = if return_type
@@ -2012,6 +2071,21 @@ impl Parser {
             return_type,
             body,
         })
+    }
+
+    /// Whether an operation ends a chain in one value: a count, an
+    /// aggregate, a test for existence.
+    fn gives_one_value(operation: &Operation) -> bool {
+        matches!(
+            operation,
+            Operation::Count
+                | Operation::Exists
+                | Operation::Sum(_)
+                | Operation::Avg(_)
+                | Operation::Min(_)
+                | Operation::Max(_)
+                | Operation::AggregateExpr { .. }
+        )
     }
 
     fn is_boolean_type_name(type_name: &str) -> bool {
@@ -2068,6 +2142,28 @@ impl Parser {
     }
 
     fn parse_oql_query(&mut self) -> Result<OQLQuery, ParseError> {
+        // `(a + b).sort { .. }`: the rows of an expression in parentheses,
+        // most often two collections joined with `+`.
+        if matches!(self.current_token(), Some(Token::LeftParen)) {
+            self.advance();
+            let rows = self.parse_expression()?;
+            self.expect_token(Token::RightParen)?;
+            let mut operations = vec![Operation::Call(vec![rows])];
+            while matches!(self.current_token(), Some(Token::Dot)) {
+                self.advance();
+                operations.push(self.parse_operation()?);
+            }
+            if !matches!(self.current_token(), Some(Token::EOF) | None) {
+                return Err(ParseError::UnexpectedToken(format!(
+                    "Expected end of query, found {:?}",
+                    self.current_token()
+                )));
+            }
+            return Ok(OQLQuery {
+                collection: ROWS_OF.to_string(),
+                operations,
+            });
+        }
         // Parse collection name (e.g., "customers" in "customers.where { ... }")
         let collection = match self.current_token() {
             Some(Token::Identifier(name)) => {
@@ -2122,10 +2218,36 @@ impl Parser {
 
         loop {
             match self.current_token() {
+                // `orders.where { .. }.headcount()`: after an operation, a
+                // name that is not one is a function given the rows.
+                Some(Token::Dot)
+                    if matches!(self.tokens.get(self.position + 1), Some(Token::Identifier(_)))
+                        && matches!(self.tokens.get(self.position + 2), Some(Token::LeftParen)) =>
+                {
+                    self.advance();
+                    let Some(Token::Identifier(function)) = self.current_token().cloned() else {
+                        unreachable!("the token was just seen to be a name");
+                    };
+                    self.advance();
+                    operations.push(self.parse_function_over_rows(function)?);
+                }
                 Some(Token::Dot) => {
                     self.advance(); // consume dot
                     let operation = self.parse_operation_with_validation(&collection)?;
                     operations.push(operation);
+                }
+                // `orders.total.stddev()`: a path, then a function given the
+                // values it reaches. A function is the last name before `(`.
+                Some(Token::FieldAccess(path))
+                    if matches!(self.peek_token(), Some(Token::LeftParen)) =>
+                {
+                    let mut path = path.clone();
+                    let function = path.pop().unwrap_or_default();
+                    self.advance();
+                    if !path.is_empty() {
+                        operations.push(Operation::Step(FieldAccess { path }));
+                    }
+                    operations.push(self.parse_function_over_rows(function)?);
                 }
                 // A path in the chain steps from each row to what the path
                 // leads to: `orders.items`, `teams.users.orders`.
@@ -2149,6 +2271,29 @@ impl Parser {
             collection,
             operations,
         })
+    }
+
+    /// `(args)` after a function's name in a chain. The function is given
+    /// the rows in hand as its first argument, written here as `.` in the
+    /// same place a built-in aggregate keeps the value it reduces; what is
+    /// in the parentheses are its further arguments.
+    fn parse_function_over_rows(&mut self, function: String) -> Result<Operation, ParseError> {
+        self.expect_token(Token::LeftParen)?;
+        let mut arguments = vec![Expression::FieldAccess(FieldAccess { path: Vec::new() })];
+        if !matches!(self.current_token(), Some(Token::RightParen)) {
+            arguments.push(self.parse_expression()?);
+            while matches!(self.current_token(), Some(Token::Comma)) {
+                self.advance();
+                arguments.push(self.parse_expression()?);
+            }
+        }
+        self.expect_token(Token::RightParen)?;
+        let input = if arguments.len() == 1 {
+            arguments.remove(0)
+        } else {
+            Expression::ArrayLiteral(arguments)
+        };
+        Ok(Operation::AggregateExpr { function, input })
     }
 
     fn parse_scoped_query(&mut self, collection: String) -> Result<OQLQuery, ParseError> {
@@ -2382,11 +2527,13 @@ impl Parser {
                 how: how.clone(),
                 other: Self::substitute_scoped_locals_expression(other, locals),
             },
-            Operation::Walk { path, depth } => Operation::Walk {
+            Operation::Walk { path, depth, every, paths } => Operation::Walk {
                 path: path.clone(),
                 depth: depth
                     .as_ref()
                     .map(|depth| Self::substitute_scoped_locals_expression(depth, locals)),
+                every: *every,
+                paths: *paths,
             },
             Operation::PartitionBy(block) => Operation::PartitionBy(GroupByBlock {
                 fields: block.fields.clone(),
@@ -3011,6 +3158,7 @@ impl Parser {
             | Operation::Call(_)
             | Operation::Combine { .. }
             | Operation::Walk { .. }
+            | Operation::Last(_)
             | Operation::PartitionBy(_)
             | Operation::AggregateExpr { .. }
             | Operation::Explain
@@ -4168,6 +4316,17 @@ impl Parser {
                         self.advance();
                         let method = matches!(self.current_token(), Some(Token::LeftParen))
                             .then(|| path.pop().unwrap_or_default());
+                        // `so_far().amount.stddev()`: the function is given
+                        // the values the path steps to.
+                        if let (Some(_), Expression::CollectionExpression { operations, .. }) =
+                            (&method, &mut expr)
+                        {
+                            if !path.is_empty() {
+                                operations.push(Operation::Step(FieldAccess {
+                                    path: std::mem::take(&mut path),
+                                }));
+                            }
+                        }
                         for field_name in path {
                             expr = Expression::ChainedAccess {
                                 base: Box::new(expr),
@@ -4342,7 +4501,7 @@ impl Parser {
             }
             // `.walk(.children)` starts from the current row.
             Some(Token::Dot)
-                if matches!(self.peek_token(), Some(Token::Stage(word)) if word == "walk") =>
+                if matches!(self.peek_token(), Some(Token::Stage(word)) if word == "walk" || word == "routes") =>
             {
                 self.advance();
                 let operation = self.parse_operation()?;
@@ -4367,6 +4526,24 @@ impl Parser {
                 let name = name.clone();
                 self.advance();
                 self.parse_function_call(name)
+            }
+            // `so_far()`: the rows up to the one being shaped. What follows
+            // it is a chain over those rows.
+            Some(Token::Stage(name)) if name == "so_far" => {
+                self.advance();
+                self.expect_token(Token::LeftParen)?;
+                if !matches!(self.current_token(), Some(Token::RightParen)) {
+                    return Err(ParseError::InvalidSyntax(
+                        "so_far() takes nothing; narrow it with what follows, as in \
+                         so_far().last(7)"
+                            .to_string(),
+                    ));
+                }
+                self.advance();
+                Ok(Expression::CollectionExpression {
+                    source: Box::new(Expression::Identifier(ROWS_SO_FAR.to_string())),
+                    operations: Vec::new(),
+                })
             }
             // An operation with no receiver applies to the collection the
             // expression is evaluated over: the rows of the group in a
@@ -4541,7 +4718,7 @@ impl Parser {
                     self.expect_token(Token::RightParen)?;
                     return Ok(Some(Operation::Combine { how: name, other }));
                 }
-                "walk" => {
+                "walk" | "routes" => {
                     self.advance();
                     self.expect_token(Token::LeftParen)?;
                     let path = self.parse_field_access_expression()?;
@@ -4552,11 +4729,40 @@ impl Parser {
                         None
                     };
                     self.expect_token(Token::RightParen)?;
-                    return Ok(Some(Operation::Walk { path, depth }));
+                    // The way to each row is kept when the statement reads
+                    // it. A function's rows may be read by its caller.
+                    let paths = self.tokens.iter().any(|token| match token {
+                        Token::FieldAccess(path) => path.iter().any(|name| name == "_path"),
+                        Token::Identifier(name) => name == "_path",
+                        Token::Fn => true,
+                        _ => false,
+                    });
+                    return Ok(Some(Operation::Walk {
+                        path,
+                        depth,
+                        every: name == "routes",
+                        paths,
+                    }));
                 }
                 "partition_by" => {
                     self.advance();
                     return Ok(Some(Operation::PartitionBy(self.parse_group_by_block()?)));
+                }
+                "last" => {
+                    self.advance();
+                    if matches!(self.peek_token(), Some(Token::RightParen)) {
+                        return Err(ParseError::InvalidSyntax(
+                            "last takes how many rows to keep, as in last(7)".to_string(),
+                        ));
+                    }
+                    return Ok(Some(Operation::Last(self.parse_row_count("last")?)));
+                }
+                "so_far" => {
+                    return Err(ParseError::InvalidSyntax(
+                        "so_far() is the rows up to the one a select is shaping, so it starts \
+                         a chain: so_far().amount.sum()"
+                            .to_string(),
+                    ));
                 }
                 _ => {}
             }
@@ -5141,6 +5347,7 @@ fn operation_uses_legacy_outer(operation: &Operation) -> bool {
         | Operation::Call(_)
         | Operation::Combine { .. }
         | Operation::Walk { .. }
+        | Operation::Last(_)
         | Operation::PartitionBy(_)
         | Operation::AggregateExpr { .. }
         | Operation::Explain
@@ -6203,7 +6410,10 @@ fn split_statements_with_lines(content: &str) -> Vec<(usize, String)> {
         }
 
         if line_ended && depth == 0 && start.is_some() {
-            let continues = !(character.is_ascii_alphabetic() || character == '_')
+            // A statement starts with a name, or with `(` for a query that
+            // starts with a sum of collections. Either continues the line
+            // before when that line ended expecting more.
+            let continues = !(character.is_ascii_alphabetic() || character == '_' || character == '(')
                 || "=,+-*/%&|<>([{.:!".contains(last_significant);
             if !continues {
                 let from = start.unwrap();
@@ -6995,6 +7205,9 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
 ) -> Result<OQLFileExecutionResult, Box<dyn std::error::Error>> {
     let mut script_executor =
         crate::executor::QueryExecutor::new_with_real_clock(executor.store().clone());
+    // A function the script defines is the connection's from then on, and
+    // the script sees the ones defined before it.
+    script_executor.share_functions_with(executor);
     let mut results = Vec::new();
     let mut schema_count = 0;
     let mut query_count = 0;

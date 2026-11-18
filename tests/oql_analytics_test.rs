@@ -365,13 +365,13 @@ fn position_functions_see_the_rows_around_a_row() {
             "pings.sort { .who.id.asc, .at.asc }.partition_by { .who }.select {
                id,
                k: row_number(),
-               run: running_sum(.n),
+               run: so_far().n.sum(),
                before: prev(.id),
                after: next(.id),
                gap: seconds_until(prev(.at), .at),
-               low: running_min(.n),
-               high: running_max(.n),
-               seen: running_count()
+               low: so_far().n.min(),
+               high: so_far().max(.n),
+               seen: so_far().count()
              }",
             &["id", "k", "run", "before", "after", "gap", "low", "high", "seen"],
         ),
@@ -386,7 +386,7 @@ fn position_functions_see_the_rows_around_a_row() {
     // With no partition the whole result is one sequence.
     assert_eq!(
         db.table(
-            "pings.sort { .id.asc }.select { id, k: row_number(), run: running_sum(.n), mean: running_avg(.n) }",
+            "pings.sort { .id.asc }.select { id, k: row_number(), run: so_far().n.sum(), mean: so_far().n.avg() }",
             &["k", "run", "mean"],
         ),
         vec![
@@ -442,13 +442,15 @@ fn position_functions_see_the_rows_around_a_row() {
         ]
     );
     // One inside another: a session starts when an hour passes in silence,
-    // and the running count of starts numbers the sessions.
+    // and the count of starts so far numbers the sessions. In a filter on
+    // the rows so far, `prev` is each row's own neighbour.
     assert_eq!(
         db.table(
             "pings.sort { .who.id.asc, .at.asc }.partition_by { .who }.select {
                id,
-               session: running_sum(
-                 if prev(.at) == null || seconds_until(prev(.at), .at) >= 3600 then 1 else 0)
+               session: so_far()
+                 .where { prev(.at) == null || seconds_until(prev(.at), .at) >= 3600 }
+                 .count()
              }",
             &["id", "session"],
         ),
@@ -471,7 +473,7 @@ fn position_functions_see_the_rows_around_a_row() {
     // The rows of a relationship are a sequence of their own.
     let nested = db.rows(
         "staff.where { .id == \"a\" }.select {
-           id, pings: .pings.sort { .at.asc }.select { id, run: running_sum(.n) }
+           id, pings: .pings.sort { .at.asc }.select { id, run: so_far().n.sum() }
          }",
     );
     let Some(Value::List(pings)) = nested[0].get_field("pings") else {
@@ -490,7 +492,306 @@ fn position_functions_see_the_rows_around_a_row() {
     let error = db.try_rows("staff.where { row_number() > 1 }").unwrap_err();
     assert!(error.contains("select"), "{error}");
     assert!(db.try_rows("staff.select { k: row_number(1) }").is_err());
-    assert!(db.try_rows("staff.select { k: running_sum() }").is_err());
+}
+
+#[test]
+fn a_walk_keeps_the_way_to_each_row() {
+    let db = company();
+    // The way to a row is a collection: the row the walk started at, then
+    // each row in turn, ending with the row itself.
+    assert_eq!(
+        db.table(
+            "staff.where { .id == \"e\" }.walk(.boss).select {
+               id, steps: ._path.count(), paid: ._path.pay.sum(), from: ._path.first().id
+             }",
+            &["id", "steps", "paid", "from"],
+        ),
+        vec![
+            vec![text("d"), int(2), int(100), text("e")],
+            vec![text("b"), int(3), int(180), text("e")],
+            vec![text("a"), int(4), int(280), text("e")],
+        ]
+    );
+    // From each row of a select.
+    assert_eq!(
+        db.table(
+            "teams.where { .id == \"t1\" }.select {
+               id, longest: .walk(.children).max(._path.count())
+             }",
+            &["longest"],
+        ),
+        vec![vec![int(4)]]
+    );
+
+    // A bill of materials: a bolt is used in the frame and in the hub.
+    let db = Db::new();
+    db.script(
+        r#"
+        schema parts { id: String }
+        schema uses { id: String, whole: Ref(parts) as uses, part: Ref(parts) as used_in, qty: Integer }
+        parts.insert [
+          { id: "bike" }, { id: "wheel" }, { id: "frame" }, { id: "spoke" }, { id: "hub" }, { id: "bolt" }
+        ]
+        uses.insert [
+          { id: "u1", whole: "bike", part: "wheel", qty: 2 },
+          { id: "u2", whole: "bike", part: "frame", qty: 1 },
+          { id: "u3", whole: "wheel", part: "spoke", qty: 32 },
+          { id: "u4", whole: "wheel", part: "hub", qty: 1 },
+          { id: "u5", whole: "frame", part: "bolt", qty: 4 },
+          { id: "u6", whole: "hub", part: "bolt", qty: 2 }
+        ]
+        "#,
+    );
+    // `walk` reaches each part once, by the shortest way.
+    assert_eq!(
+        db.ids("parts.where { .id == \"bike\" }.walk(.uses.part).sort { .id.asc }"),
+        ["bolt", "frame", "hub", "spoke", "wheel"]
+    );
+    // `routes` gives a row for every way to it. The rows passed through
+    // are on the way, so the quantities along it multiply.
+    assert_eq!(
+        db.table(
+            "parts.where { .id == \"bike\" }.routes(.uses.part)
+               .select { id, depth: ._depth, needed: ._path.qty.product() }
+               .sort { .id.asc, .needed.asc }",
+            &["id", "depth", "needed"],
+        ),
+        vec![
+            vec![text("bolt"), int(2), int(4)],
+            vec![text("bolt"), int(3), int(4)],
+            vec![text("frame"), int(1), int(1)],
+            vec![text("hub"), int(2), int(2)],
+            vec![text("spoke"), int(2), int(64)],
+            vec![text("wheel"), int(1), int(2)],
+        ]
+    );
+    // Added up for each part: what the whole bike needs.
+    assert_eq!(
+        db.table(
+            "parts.where { .id == \"bike\" }.routes(.uses.part)
+               .select { id, needed: ._path.qty.product() }
+               .group_by { .id }.select { id, needed: sum(.needed) }.sort { .id.asc }",
+            &["id", "needed"],
+        ),
+        vec![
+            vec![text("bolt"), int(8)],
+            vec![text("frame"), int(1)],
+            vec![text("hub"), int(2)],
+            vec![text("spoke"), int(64)],
+            vec![text("wheel"), int(2)],
+        ]
+    );
+    // No further than asked, and a route does not pass through a row twice.
+    assert_eq!(db.rows("parts.where { .id == \"bike\" }.routes(.uses.part, 1)").len(), 2);
+    let ring = company();
+    assert_eq!(
+        ring.ids("nodes.where { .id == \"n1\" }.routes(.outgoing.dst).sort { .id.asc }"),
+        ["n2", "n3"]
+    );
+
+    // `product` is an aggregate like `sum`; of nothing it is 1.
+    assert_eq!(db.scalar("uses.select { all: product(.qty) }", "all"), int(2 * 32 * 4 * 2));
+    assert_eq!(db.scalar("uses.where { .qty > 99 }.select { all: product(.qty) }", "all"), int(1));
+    assert_eq!(db.scalar("parts.where { .id == \"wheel\" }.select { n: .uses.qty.product() }", "n"), int(32));
+}
+
+/// Shorter ways to the same answer: a table of rows keyed by what a
+/// function matches on, calls that end once enough ordered rows are in
+/// hand, a sort through a reference that reads only the first rows, set
+/// operations run as one filter, and library statistics computed directly.
+/// Each is checked against the long way.
+#[test]
+fn shorter_ways_give_the_same_answers() {
+    let db = Db::new();
+    db.script(
+        r#"
+        schema clubs { id: String, tier: Integer }
+        schema folk { id: String, rank: Integer, club: Ref(clubs), level: Integer }
+        fn same(p: folk) { folk.where { .club == p.club && .level == p.level && .id > p.id } }
+        fn same_long(p: folk) {
+          folk.where { .club == p.club && .level == p.level && .id > p.id }.sort { .id.asc }
+        }
+        fn my_variance(values) {
+          n = values.count()
+          m = values.avg()
+          if n < 2 then null else to_float(values.select { d: (. - m) * (. - m) }.d.sum()) / (n - 1)
+        }
+        "#,
+    );
+    let clubs: Vec<String> = (0..10)
+        .map(|club| format!("{{ id: \"c{club}\", tier: {} }}", club % 3))
+        .collect();
+    let folk: Vec<String> = (0..100)
+        .map(|person| {
+            format!(
+                "{{ id: \"f{person:03}\", rank: {}, club: \"c{}\", level: {} }}",
+                (person * 37) % 101,
+                (person * 7) % 10,
+                person % 4
+            )
+        })
+        .collect();
+    db.script(&format!("clubs.insert [ {} ]\nfolk.insert [ {} ]", clubs.join(", "), folk.join(", ")));
+
+    // Pairs through a function: the keyed table against the long way.
+    let pairs = |function: &str, tail: &str| {
+        db.table(
+            &format!("folk.{function}().select {{ a: folk.id, b: .id }}.sort {{ {tail} }}"),
+            &["a", "b"],
+        )
+    };
+    let all = pairs("same", ".a.asc, .b.asc");
+    assert!(all.len() > 50, "{}", all.len());
+    assert_eq!(all, pairs("same_long", ".a.asc, .b.asc"));
+    // Cut short, the calls end early; the rows are the first of them all.
+    for keep in [1, 5, 40] {
+        assert_eq!(pairs("same", &format!(".a.asc, .b.asc }}.limit({keep}).select {{ a, b")), all[..keep]);
+    }
+    let backwards = pairs("same", ".a.desc, .b.asc");
+    assert_eq!(pairs("same", ".a.desc, .b.asc }.limit(7).select { a, b"), backwards[..7]);
+
+    // A sort through a reference, cut short.
+    for (filter, sort) in [
+        ("", ".club.id.asc, .rank.desc"),
+        ("", ".club.id.desc, .id.asc"),
+        ("", ".club.tier.desc, .rank.asc, .id.asc"),
+        (".where { .level == 1 }", ".club.tier.asc, .id.desc"),
+    ] {
+        let whole = db.ids(&format!("folk{filter}.sort {{ {sort} }}"));
+        for (skip, keep) in [(0, 1), (0, 6), (3, 4), (0, 12)] {
+            assert_eq!(
+                db.ids(&format!("folk{filter}.sort {{ {sort} }}.offset({skip}).limit({keep})")),
+                whole[skip..skip + keep],
+                "{filter} {sort} {skip} {keep}"
+            );
+        }
+    }
+
+    // Set operations on one collection against the filter they amount to.
+    let count = |query: &str| db.scalar(query, "count");
+    assert_eq!(
+        count("folk.where { .level == 1 }.intersect(folk.where { .rank < 50 }).count()"),
+        count("folk.where { .level == 1 && .rank < 50 }.count()")
+    );
+    assert_eq!(
+        count("folk.where { .level == 1 }.except(folk.where { .rank < 50 }).count()"),
+        count("folk.where { .level == 1 && .rank >= 50 }.count()")
+    );
+    assert_eq!(
+        count("folk.where { .level == 1 }.union(folk.where { .rank < 50 }).count()"),
+        count("folk.where { .level == 1 || .rank < 50 }.count()")
+    );
+    assert_eq!(
+        db.ids(
+            "folk.where { .level == 1 }.union(folk.where { .rank < 50 })
+               .except(folk.where { .club.tier == 0 }).sort { .id.desc }.limit(9)"
+        ),
+        db.ids("folk.where { (.level == 1 || .rank < 50) && .club.tier != 0 }.sort { .id.desc }.limit(9)")
+    );
+    // Without a sort, a union still puts the other query's rows after.
+    let joined = db.ids("folk.where { .rank < 3 }.union(folk.where { .rank > 80 })");
+    assert!(joined.len() > 3);
+    assert_eq!(joined[..3], db.ids("folk.where { .rank < 3 }")[..]);
+
+    // The library's statistics against the same definition written here.
+    let spread = db.table(
+        "folk.group_by { .level }.select {
+           level, a: variance(.rank), b: my_variance(.rank), c: .rank.stddev(), d: stddev(.rank)
+         }.sort { .level.asc }",
+        &["a", "b", "c", "d"],
+    );
+    assert_eq!(spread.len(), 4);
+    for row in spread {
+        let [Value::Float(a), Value::Float(b), Value::Float(c), Value::Float(d)] = row.as_slice() else {
+            panic!("not numbers: {row:?}");
+        };
+        assert!((a - b).abs() < 1e-9 * b.abs(), "{a} {b}");
+        assert!((c - b.sqrt()).abs() < 1e-9 * c.abs(), "{c} {b}");
+        assert_eq!(c, d);
+    }
+    // One value has no spread to speak of.
+    assert_eq!(
+        db.scalar(
+            "folk.where { .id == \"f000\" }.group_by { .level }.select { v: variance(.rank) }",
+            "v"
+        ),
+        Value::Null
+    );
+}
+
+#[test]
+fn the_rows_so_far_are_a_collection() {
+    let db = company();
+    let n = |value: i64| int(value);
+    let column = |expression: &str| -> Vec<Value> {
+        db.table(
+            &format!("pings.sort {{ .id.asc }}.select {{ id, v: {expression} }}"),
+            &["v"],
+        )
+        .into_iter()
+        .map(|mut row| row.remove(0))
+        .collect()
+    };
+    let whole = |values: [i64; 5]| values.map(int).to_vec();
+    // In id order the values are 5, -2, 4, 1, 1.
+    assert_eq!(column("so_far().n.sum()"), whole([5, 3, 7, 8, 9]));
+    assert_eq!(column("so_far().sum(.n * 2)"), whole([10, 6, 14, 16, 18]));
+    assert_eq!(column("so_far().count()"), whole([1, 2, 3, 4, 5]));
+    // A moving window is the last few of them.
+    assert_eq!(column("so_far().last(2).n.sum()"), whole([5, 3, 2, 5, 2]));
+    assert_eq!(column("so_far().last(3).n.max()"), whole([5, 5, 5, 4, 4]));
+    assert_eq!(
+        column("so_far().last(2).n.avg()"),
+        [5.0, 1.5, 1.0, 2.5, 1.0].map(Value::Float)
+    );
+    // Being a collection, it takes a filter, on either side of the window.
+    assert_eq!(column("so_far().where { .n > 0 }.n.sum()"), whole([5, 5, 9, 10, 11]));
+    assert_eq!(column("so_far().last(2).where { .n > 0 }.count()"), whole([1, 1, 1, 2, 2]));
+    assert_eq!(column("so_far().where { .n > 0 }.last(2).n.sum()"), whole([5, 5, 9, 5, 2]));
+    // Anything else a collection takes works too, the long way.
+    assert_eq!(column("so_far().limit(100).n.sum()"), whole([5, 3, 7, 8, 9]));
+    assert_eq!(column("so_far().last(2).limit(100).n.avg()"), column("so_far().last(2).n.avg()"));
+    assert_eq!(column("so_far().distinct().count()"), whole([1, 2, 3, 4, 5]));
+    assert_eq!(
+        column("so_far().sort { .n.asc }.first().id"),
+        ["p1", "p2", "p2", "p2", "p2"].map(text)
+    );
+    assert_eq!(column("so_far().n.median()"), column("so_far().limit(100).n.median()"));
+    // So does a function written in OQL.
+    let spread = column("so_far().n.stddev()");
+    assert_eq!(spread[0], Value::Null);
+    assert!(
+        matches!(spread[1], Value::Float(value) if (value - 24.5_f64.sqrt()).abs() < 1e-9),
+        "{spread:?}"
+    );
+    // It reaches back to the start of the row's partition and no further.
+    assert_eq!(
+        db.table(
+            "pings.sort { .who.id.asc, .at.asc }.partition_by { .who }.select {
+               id, run: so_far().n.sum(), two: so_far().last(2).count()
+             }",
+            &["id", "run", "two"],
+        ),
+        vec![
+            vec![text("p1"), n(5), n(1)],
+            vec![text("p2"), n(3), n(2)],
+            vec![text("p3"), n(7), n(2)],
+            vec![text("p4"), n(1), n(1)],
+            vec![text("p5"), n(2), n(2)],
+        ]
+    );
+    // `last(n)` is the counterpart of `limit(n)` on any rows.
+    assert_eq!(db.ids("pings.sort { .id.asc }.last(2)"), ["p4", "p5"]);
+    assert_eq!(db.ids("pings.sort { .id.asc }.last(9)").len(), 5);
+    assert_eq!(db.ids("pings.sort { .id.asc }.last(0)").len(), 0);
+
+    // Outside a select there is no row for the rows to lead up to.
+    let error = db.try_rows("pings.where { so_far().count() > 1 }").unwrap_err();
+    assert!(error.contains("select"), "{error}");
+    assert!(db.try_rows("pings.select { v: so_far(3).count() }").is_err());
+    assert!(db.try_rows("pings.sort { .id.asc }.last()").is_err());
+    // The words this replaced are gone.
+    assert!(db.try_rows("pings.select { v: running_sum(.n) }").is_err());
 }
 
 #[test]
@@ -767,7 +1068,7 @@ fn questions_asked_by_many_rows_keep_their_answers() {
     // A limit after position functions that only look back runs first...
     assert_eq!(
         db.table(
-            "folk.sort { .id.asc }.select { id, n: row_number(), run: running_sum(.rank) }.limit(3)",
+            "folk.sort { .id.asc }.select { id, n: row_number(), run: so_far().rank.sum() }.limit(3)",
             &["id", "n", "run"],
         ),
         vec![
@@ -1130,6 +1431,16 @@ fn values_and_functions_compose() {
     );
     assert_eq!(db.ids("staff.where { total(.reports.pay) > 100 }"), ["a"]);
 
+    // In a grouped select the function is given the group's values.
+    assert_eq!(
+        db.table(
+            "staff.group_by { .team.id }.select { team_id, all: total(.pay), kinds: distinct_count(.pay) }
+               .where { .team_id == \"t2\" }",
+            &["all", "kinds"],
+        ),
+        vec![vec![int(160), int(1)]]
+    );
+
     // A parameter left out takes its default.
     assert_eq!(db.scalar("staff.where { .id == \"e\" }.select { r: raise(.pay) }", "r"), Value::Float(60.0));
     assert_eq!(db.scalar("staff.where { .id == \"e\" }.select { r: raise(.pay, 1.0) }", "r"), Value::Float(80.0));
@@ -1216,4 +1527,383 @@ fn a_nested_path_can_name_the_rows_it_passed_through() {
     );
     // A path that names nothing on the way is unchanged.
     assert_eq!(db.scalar("teams.where { .id == \"t1\" }.select { n: .staff.pings.count() }", "n"), int(3));
+}
+
+/// The rest of composition: names after a select are checked, a function
+/// follows paths from the rows it is given, any collection a query steps
+/// through can be named, and after `partition_by` the rows in hand are the
+/// row's partition.
+#[test]
+fn rows_in_hand_are_named_and_reduced_wherever_they_are() {
+    let mut db = company();
+
+    // After a select, a name is one the select produced, a relationship of
+    // the row, or a mistake.
+    let error = db.try_rows("staff.select { id }.where { .nmae == 1 }").unwrap_err();
+    assert!(error.contains("'nmae'") && error.contains("select"), "{error}");
+    let error = db.try_rows("staff.select { id, wage: .pay }.sort { .wagee.asc }").unwrap_err();
+    assert!(error.contains("Did you mean 'wage'"), "{error}");
+    assert_eq!(db.ids("staff.select { id, wage: .pay }.where { .wage > 85 }.sort { .id.asc }"), ["a", "f"]);
+    assert_eq!(db.ids("staff.select { id }.where { .reports.count() > 0 }.sort { .id.asc }"), ["a", "b", "d"]);
+    assert_eq!(db.ids("staff.select { * }.where { .pay > 90 }"), ["a"]);
+    assert_eq!(db.scalar("staff.select { n: count() }.where { .n > 1 }", "n"), int(6));
+    assert!(db.try_rows("staff.group_by { .team.id }.select { team_id, n: count() }.where { .n > 1 }").is_ok());
+
+    for definition in [
+        "fn grand(rows) { rows.reports.count() }",
+        "fn top_pay(rows) { rows.pay.max() }",
+        "fn pays(rows) { rows.pay }",
+        "fn under(s: staff) { s.reports.reports.count() }",
+    ] {
+        let owl_db::parser::OQLStatement::FunctionDef(definition) =
+            owl_db::parse_oql_statement(definition).unwrap()
+        else {
+            panic!("not a function");
+        };
+        db.executor.register_user_function(definition).unwrap();
+    }
+    // A function follows a path from the rows it was given.
+    assert_eq!(
+        db.table(
+            "staff.where { .id == \"a\" }.select { g: grand(.reports), t: top_pay(.reports), u: under(*), v: .under() }",
+            &["g", "t", "u", "v"],
+        ),
+        vec![vec![int(1), int(90), int(1), int(1)]]
+    );
+    let Value::List(mut pays) = db.scalar("staff.where { .id == \"a\" }.select { p: pays(.reports) }", "p") else {
+        panic!("not a list");
+    };
+    pays.sort_by(|left, right| format!("{left:?}").cmp(&format!("{right:?}")));
+    assert_eq!(pays, [int(80), int(80), int(90)]);
+
+    // At the top level, a collection reached on the way can be named.
+    assert_eq!(
+        db.table("teams.staff.pings.select { id, who: staff.id }.sort { .id.asc }", &["id", "who"]),
+        vec![
+            vec![text("p1"), text("a")],
+            vec![text("p2"), text("a")],
+            vec![text("p3"), text("a")],
+            vec![text("p4"), text("b")],
+            vec![text("p5"), text("b")],
+        ]
+    );
+    assert_eq!(
+        db.table(
+            "teams.where { .id == \"t2\" }.staff.pings.group_by { pay: staff.pay }.select { pay, n: count() }",
+            &["pay", "n"],
+        ),
+        vec![vec![int(80), int(2)]]
+    );
+    assert_eq!(
+        db.table(
+            "teams.staff.where { .pay < 100 }.pings.select { id, who: staff.id }.sort { .id.asc }",
+            &["id", "who"],
+        ),
+        vec![vec![text("p4"), text("b")], vec![text("p5"), text("b")]]
+    );
+    assert_eq!(
+        db.table("jobs.notes.where { .mins > 5 }.select { kind, job: jobs.id }", &["kind", "job"]),
+        vec![vec![text("y"), text("j1")]]
+    );
+
+    // After `partition_by`, an aggregate or an operation with no receiver
+    // is over the row's partition, and every row is kept.
+    assert_eq!(
+        db.table(
+            "staff.sort { .id.asc }.partition_by { .team.id }.select {
+               id,
+               total: sum(.pay),
+               n: count(),
+               rich: where { .pay >= 80 }.count(),
+               top: sort { .pay.desc, .id.asc }.first().id,
+               k: row_number()
+             }",
+            &["id", "total", "n", "rich", "top", "k"],
+        ),
+        vec![
+            vec![text("a"), int(100), int(1), int(1), text("a"), int(1)],
+            vec![text("b"), int(160), int(2), int(2), text("b"), int(1)],
+            vec![text("c"), int(160), int(2), int(2), text("b"), int(2)],
+            vec![text("d"), int(60), int(1), int(0), text("d"), int(1)],
+            vec![text("e"), int(40), int(1), int(0), text("e"), int(1)],
+            vec![text("f"), int(90), int(1), int(1), text("f"), int(1)],
+        ]
+    );
+    // One partition for everything gives a share of the whole.
+    assert_eq!(
+        db.table(
+            "staff.sort { .id.asc }.partition_by { all: 1 }.select { id, total: sum(.pay), most: max(.pay) }.limit(2)",
+            &["id", "total", "most"],
+        ),
+        vec![vec![text("a"), int(450), int(100)], vec![text("b"), int(450), int(100)]]
+    );
+    // A limit after such a select does not shrink the partitions.
+    assert_eq!(
+        db.table(
+            "staff.sort { .id.asc }.partition_by { .team.id }.select { id, total: sum(.pay), k: row_number() }.limit(2)",
+            &["id", "total"],
+        ),
+        vec![vec![text("a"), int(100)], vec![text("b"), int(160)]]
+    );
+    // Without `partition_by` an aggregate select is still one row.
+    assert_eq!(db.rows("staff.select { total: sum(.pay) }").len(), 1);
+    // Through a relationship as well.
+    let Value::List(rows) = db.scalar(
+        "staff.where { .id == \"a\" }.select { r: .reports.sort { .id.asc }.partition_by { .pay }.select { id, same: count() } }",
+        "r",
+    ) else {
+        panic!("not a list");
+    };
+    let same: Vec<Value> = rows
+        .iter()
+        .map(|row| match row {
+            Value::Object(fields) => fields.get("same").cloned().unwrap_or(Value::Null),
+            other => panic!("not a row: {other:?}"),
+        })
+        .collect();
+    assert_eq!(same, [int(2), int(2), int(1)]);
+}
+
+/// Two collections joined with `+` keep every row of both, and such a sum
+/// can start a query.
+#[test]
+fn collections_join_with_plus() {
+    let db = company();
+    let count = |query: &str| db.scalar(query, "count");
+    assert_eq!(count("(staff.where { .pay >= 90 } + staff.where { .pay >= 80 }).count()"), int(6));
+    // Every row is kept, where `union` keeps one of each.
+    assert_eq!(
+        db.ids("(staff.where { .pay >= 90 } + staff.where { .pay >= 80 }).sort { .id.asc }"),
+        ["a", "a", "b", "c", "f", "f"]
+    );
+    assert_eq!(count("staff.where { .pay >= 90 }.union(staff.where { .pay >= 80 }).count()"), int(4));
+    assert_eq!(count("(staff.where { .pay >= 90 } + staff.where { .pay >= 80 }).distinct().count()"), int(4));
+    // The order is the first collection's rows, then the second's.
+    assert_eq!(
+        db.ids("(staff.where { .id == \"f\" } + staff.where { .id == \"a\" } + staff.where { .id == \"c\" })"),
+        ["f", "a", "c"]
+    );
+    // Whole collections by name, and collections of different kinds.
+    assert_eq!(count("(staff + staff).count()"), int(12));
+    assert_eq!(count("(teams + staff).count()"), int(11));
+    // The rows are still rows of their collections.
+    assert_eq!(
+        db.table(
+            "(staff.where { .id == \"b\" } + staff.where { .id == \"a\" }).select { id, n: .reports.count() }",
+            &["id", "n"],
+        ),
+        vec![vec![text("b"), int(1)], vec![text("a"), int(3)]]
+    );
+    assert_eq!(
+        db.table(
+            "(staff.where { .team == \"t2\" } + staff.where { .pay == 100 })
+               .group_by { .pay }.select { pay, n: count() }.sort { .pay.asc }",
+            &["pay", "n"],
+        ),
+        vec![vec![int(80), int(2)], vec![int(100), int(1)]]
+    );
+    // Inside an expression it is the same thing.
+    assert_eq!(
+        db.scalar("teams.where { .id == \"t1\" }.select { n: (.staff + .children).count() }", "n"),
+        int(3)
+    );
+    // Parentheses round one collection are just that collection.
+    assert_eq!(db.ids("(staff.where { .pay == 40 }).select { id }"), ["e"]);
+    // In a script, among other statements.
+    db.script("both = 1\n(staff + teams).count()\nstaff.count()");
+}
+
+/// A field the schema declares as a list, compared with one value, is a
+/// mistake that used to be false for every row.
+#[test]
+fn a_declared_list_is_not_compared_with_one_value() {
+    let db = Db::new();
+    db.script(
+        r#"
+        schema kits {
+          id: String,
+          tags: List(String),
+          scores: Optional(List(Integer)),
+          parts: List({ kind: String, sizes: List(Integer) })
+        }
+        kits.insert [
+          { id: "k1", tags: ["red", "big"], scores: [1, 9], parts: [ { kind: "a", sizes: [1, 2] } ] },
+          { id: "k2", tags: ["red"], parts: [] },
+          { id: "k3", tags: [], scores: [4], parts: [ { kind: "b", sizes: [] } ] }
+        ]
+        loose.insert [ { id: "l1", tags: ["red"] }, { id: "l2", tags: "red" } ]
+        "#,
+    );
+    for (query, advice) in [
+        ("kits.where { .tags == \"red\" }", ".tags contains \"red\""),
+        ("kits.where { \"red\" == .tags }", ".tags contains \"red\""),
+        ("kits.where { .tags != \"red\" }", "!(.tags contains \"red\")"),
+        ("kits.where { .scores > 3 }", ".scores.where { . > 3 }.exists()"),
+        ("kits.select { id, red: if .tags == \"red\" then 1 else 0 }", "is a list"),
+        ("kits.where { .parts.where { .sizes == 2 }.exists() }", ".sizes contains 2"),
+        ("kits.sort { .id.asc }.limit(1).where { .tags == \"red\" }", "is a list"),
+    ] {
+        let error = match db.try_rows(query) {
+            Ok(rows) => panic!("answered with {} row(s): {query}", rows.len()),
+            Err(error) => error,
+        };
+        assert!(error.contains("is a list") && error.contains(advice), "{query}\n{error}");
+    }
+    // What the messages point at, and what was always fine.
+    assert_eq!(db.ids("kits.where { .tags contains \"red\" }.sort { .id.asc }"), ["k1", "k2"]);
+    assert_eq!(db.ids("kits.where { !(.tags contains \"red\") }"), ["k3"]);
+    assert_eq!(db.ids("kits.where { .tags == [\"red\"] }"), ["k2"]);
+    assert_eq!(db.ids("kits.where { .scores.where { . > 3 }.exists() }.sort { .id.asc }"), ["k1", "k3"]);
+    assert_eq!(db.ids("kits.where { .scores == null }"), ["k2"]);
+    assert_eq!(db.ids("kits.where { .tags != null }.sort { .id.asc }"), ["k1", "k2", "k3"]);
+    assert_eq!(db.ids("kits.where { .parts.where { .sizes contains 2 }.exists() }"), ["k1"]);
+    // With no schema nothing says the field is a list, and here it is not
+    // always one: the comparison stays a quiet mismatch where it is.
+    assert_eq!(db.ids("loose.where { .tags == \"red\" }"), ["l2"]);
+    assert_eq!(db.ids("loose.where { .tags contains \"red\" }.sort { .id.asc }"), ["l1", "l2"]);
+}
+
+/// The standard library is written in OQL and is there from the start.
+#[test]
+fn the_standard_library_is_ordinary_functions() {
+    let mut db = company();
+    let near = |value: Value, expected: f64| match value {
+        Value::Float(found) => assert!((found - expected).abs() < 1e-9, "{found} is not {expected}"),
+        other => panic!("not a number: {other:?}, wanted {expected}"),
+    };
+    // Pay is 100 80 80 60 40 90: mean 75, squared distances sum to 2350.
+    near(db.scalar("staff.pay.variance()", "variance"), 470.0);
+    near(db.scalar("staff.pay.stddev()", "stddev"), 470.0_f64.sqrt());
+    near(db.scalar("staff.pay.variance_pop()", "variance_pop"), 2350.0 / 6.0);
+    near(db.scalar("staff.pay.stddev_pop()", "stddev_pop"), (2350.0_f64 / 6.0).sqrt());
+    assert_eq!(db.scalar("staff.pay.mode()", "mode"), int(80));
+    // After a filter, through a relationship, as a call, and in a group.
+    near(db.scalar("staff.where { .team == \"t2\" }.pay.variance()", "variance"), 0.0);
+    near(
+        db.scalar("staff.where { .id == \"a\" }.select { s: .reports.pay.variance() }", "s"),
+        100.0 / 3.0,
+    );
+    near(
+        db.scalar("staff.where { .id == \"a\" }.select { s: stddev(.reports.pay) }", "s"),
+        (100.0_f64 / 3.0).sqrt(),
+    );
+    assert_eq!(
+        db.table(
+            "staff.group_by { .team.id }.select { team_id, v: variance(.pay), m: .pay.mode() }
+               .sort { .team_id.asc }.limit(2)",
+            &["team_id", "v", "m"],
+        ),
+        vec![
+            // One value has no spread to estimate.
+            vec![text("t1"), Value::Null, int(100)],
+            vec![text("t2"), Value::Float(0.0), int(80)],
+        ]
+    );
+    // Too few values, and none.
+    assert_eq!(db.scalar("staff.where { .id == \"a\" }.pay.stddev()", "stddev"), Value::Null);
+    assert_eq!(db.scalar("staff.where { .pay > 999 }.pay.variance_pop()", "variance_pop"), Value::Null);
+    assert_eq!(db.scalar("staff.where { .pay > 999 }.pay.mode()", "mode"), Value::Null);
+    // Of values that tie, the least.
+    assert_eq!(db.scalar("staff.where { .pay < 80 }.pay.mode()", "mode"), int(40));
+
+    // Any function written in OQL ends a chain the same way: it is given
+    // the rows in hand, and may take more arguments.
+    db.script(
+        "fn headcount(rows) { rows.count() }\nfn paid_over(rows, least: Integer = 0) { rows.where { .pay > least } }\nfn twice(x: Integer) { x * 2 }",
+    );
+    assert_eq!(db.scalar("staff.where { .pay > 70 }.headcount()", "headcount"), int(4));
+    assert_eq!(db.scalar("staff.where { .reports.exists() }.headcount()", "headcount"), int(3));
+    assert_eq!(db.ids("staff.paid_over(85).sort { .id.asc }"), ["a", "f"]);
+    assert_eq!(db.scalar("staff.paid_over().headcount()", "headcount"), int(6));
+    assert!(db.try_rows("staff.pay.nonesuch()").unwrap_err().contains("Unknown function: nonesuch"));
+    assert!(db.try_rows("staff.paid_over(1, 2)").is_err());
+    // A function a script defined is there for the queries after it.
+    assert_eq!(db.scalar("staff.where { .id == \"e\" }.select { t: twice(.pay) }", "t"), int(80));
+
+    // A library function is replaced like any other.
+    let owl_db::parser::OQLStatement::FunctionDef(definition) =
+        owl_db::parse_oql_statement("fn mode(values) { values.max() }").unwrap()
+    else {
+        panic!("not a function");
+    };
+    db.executor.register_user_function(definition).unwrap();
+    assert_eq!(db.scalar("staff.pay.mode()", "mode"), int(100));
+}
+
+/// A function that takes a row is a step in a chain: it is called for each
+/// row, and the rows it gives for all of them carry on. That is how rows
+/// are paired with other rows without a join.
+#[test]
+fn a_function_of_a_row_is_a_step() {
+    let db = company();
+    db.script(
+        r#"
+        fn peers(s: staff) { staff.where { .boss == s.boss && .id > s.id } }
+        fn paid_within(s: staff, gap: Integer = 10) { staff.where { .id != s.id && abs(.pay - s.pay) <= gap } }
+        fn under(s: staff) { s.reports }
+        fn team_pings(t: teams) { pings.where { .who.team == t.id } }
+        fn headcount(rows) { rows.count() }
+        "#,
+    );
+    // Each pair of people with the same boss, once. The collection's name
+    // is the row the function was called for; `.` is the row it gave.
+    assert_eq!(
+        db.table(
+            "staff.peers().select { a: staff.id, b: .id }.sort { .a.asc, .b.asc }",
+            &["a", "b"],
+        ),
+        vec![
+            vec![text("b"), text("c")],
+            vec![text("b"), text("f")],
+            vec![text("c"), text("f")],
+        ]
+    );
+    assert_eq!(db.scalar("staff.peers().count()", "count"), int(3));
+    // Further arguments, and a default.
+    assert_eq!(db.ids("staff.where { .id == \"b\" }.paid_within().sort { .id.asc }"), ["c", "f"]);
+    assert_eq!(db.scalar("staff.where { .id == \"b\" }.paid_within(20).count()", "count"), int(4));
+    // The rows given are still rows of their collection, and whatever
+    // follows applies to them: a relationship, a filter, a grouping.
+    assert_eq!(
+        db.table(
+            "staff.peers().select { b: .id, pay: .pay, has: .reports.count() }.sort { .b.asc }.limit(1)",
+            &["b", "pay", "has"],
+        ),
+        vec![vec![text("c"), int(80), int(0)]]
+    );
+    assert_eq!(
+        db.table(
+            "staff.peers().where { .pay > staff.pay }.select { a: staff.id, b: .id }.sort { .a.asc }",
+            &["a", "b"],
+        ),
+        vec![vec![text("b"), text("f")], vec![text("c"), text("f")]]
+    );
+    assert_eq!(
+        db.table(
+            "staff.peers().group_by { left: staff.id }.select { left, n: count() }.sort { .left.asc }",
+            &["left", "n"],
+        ),
+        vec![vec![text("b"), int(2)], vec![text("c"), int(1)]]
+    );
+    // From one collection to another.
+    assert_eq!(
+        db.table(
+            "teams.team_pings().select { team: teams.id, id }.sort { .id.asc }",
+            &["team", "id"],
+        ),
+        vec![
+            vec![text("t1"), text("p1")],
+            vec![text("t1"), text("p2")],
+            vec![text("t1"), text("p3")],
+            vec![text("t2"), text("p4")],
+            vec![text("t2"), text("p5")],
+        ]
+    );
+    // A function whose body is not a query, and steps one after another.
+    assert_eq!(db.scalar("staff.where { .id == \"a\" }.under().count()", "count"), int(3));
+    assert_eq!(db.scalar("staff.where { .id == \"a\" }.under().under().count()", "count"), int(1));
+    // A function of the rows together is unchanged, and follows a step.
+    assert_eq!(db.scalar("staff.peers().headcount()", "headcount"), int(3));
+    // The tree form is still there for when pairs are not wanted flat.
+    assert_eq!(db.scalar("staff.where { .id == \"b\" }.select { n: peers(*).count() }", "n"), int(2));
 }

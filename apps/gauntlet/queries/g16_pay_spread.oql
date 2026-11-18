@@ -1,0 +1,6 @@
+// How widely pay varies at each level, by statistics that are not built
+// in: they come from the standard library, which is written in OQL.
+people
+  .group_by { .level }
+  .select { level, sample: variance(.salary), whole: .salary.variance_pop() }
+  .sort { .level.asc }

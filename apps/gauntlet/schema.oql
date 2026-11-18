@@ -81,3 +81,7 @@ schema events {
   amount: Integer,
   index(.at)
 }
+
+// A relationship no reference declares: the people in the same unit at the
+// same level. Written once here, it is a step any query can take.
+fn same_level(p: people) { people.where { .unit == p.unit && .level == p.level && .id > p.id } }
