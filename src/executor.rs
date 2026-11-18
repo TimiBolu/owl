@@ -1515,10 +1515,22 @@ impl<S: DocumentStore> QueryExecutor<S> {
         };
         // The collection's rows as the columns list them; which of them
         // are still in the running; and what the columns were stamped.
-        let mut listed: Option<(Arc<Vec<Arc<Document>>>, u64)> = None;
+        let mut listed: Option<(Option<Arc<Vec<Arc<Document>>>>, u64)> = None;
         let mut origin: Option<Vec<u32>> = None;
         if !asked.is_empty() && COLUMN_AGGREGATION.with(|enabled| enabled.get()) {
-            if let Some((rows, batch)) = self.store.scan_rows_and_columns(&query.collection, &asked)? {
+            // With the rows when the store holds them all; the columns
+            // alone when it does not, and then only the rows the columns
+            // leave are fetched.
+            let columns = match self.store.scan_rows_and_columns(&query.collection, &asked)? {
+                Some((rows, batch)) => Some((Some(rows), batch)),
+                None => self
+                    .store
+                    .scan_columns(&query.collection, &asked)?
+                    .filter(|batches| batches.len() == 1)
+                    .and_then(|mut batches| batches.pop())
+                    .map(|batch| (None, batch)),
+            };
+            if let Some((rows, batch)) = columns {
                 let mut chosen: Vec<u32> = Vec::new();
                 let mut whole = true;
                 for (part, (_, plain)) in prepared.iter().enumerate() {
@@ -1544,18 +1556,35 @@ impl<S: DocumentStore> QueryExecutor<S> {
         // The rows to go on with: those the columns left, or every row.
         let narrowed: Vec<Arc<Document>>;
         let stored: &[Arc<Document>] = match (&listed, &origin) {
-            (Some((rows, _)), Some(origin)) => {
+            (Some((Some(rows), _)), Some(origin)) => {
                 narrowed = origin.iter().map(|row| rows[*row as usize].clone()).collect();
                 &narrowed
             }
-            (Some((rows, _)), None) => rows.as_slice(),
-            (None, _) => match self.store.scan_documents_shared(&query.collection)? {
-                Some(rows) => {
-                    narrowed = rows;
-                    &narrowed
+            (Some((Some(rows), _)), None) => rows.as_slice(),
+            // The store does not hold every row. The rows the columns left
+            // are fetched; if the columns are no longer the collection's,
+            // another way answers, with the whole filter.
+            (Some((None, stamp)), Some(origin)) => {
+                match self.store.rows_of_columns(&query.collection, *stamp, origin)? {
+                    Some(rows) => {
+                        narrowed = rows;
+                        &narrowed
+                    }
+                    None => return Ok(None),
                 }
-                None => return Ok(None),
-            },
+            }
+            (Some((None, _)), None) | (None, _) => {
+                // Every row is wanted, and listed afresh: where each is in
+                // the columns is then not known.
+                listed = None;
+                match self.store.scan_documents_shared(&query.collection)? {
+                    Some(rows) => {
+                        narrowed = rows;
+                        &narrowed
+                    }
+                    None => return Ok(None),
+                }
+            }
         };
         match (next, operations.get(filters + 1)) {
             (Some(Operation::Count), None) => {
@@ -6607,13 +6636,39 @@ impl<S: DocumentStore> QueryExecutor<S> {
         // relationship: a stored field of that name is read differently.
         let mut reached: Option<Vec<Arc<Document>>> = None;
         let mut source_schema = String::new();
-        for segment in path {
+        // What is read of the rows each step reaches: of the last, the
+        // field measured and what the filters read; of the others,
+        // nothing but which rows they are. A store that would have to
+        // decode a row decodes only that much of it.
+        let read_of_last: Option<Vec<String>> = match filters.is_empty() {
+            true => Some(measured.into_iter().cloned().collect()),
+            // Asked of the filters and the measure together: filters alone
+            // would leave the rows whole, and every field of them wanted.
+            false => self
+                .fields_read_by_operations(path.last().map_or("", String::as_str), operations)
+                .map(|mut read| {
+                    read.extend(measured.into_iter().cloned());
+                    read
+                }),
+        };
+        for (step, segment) in path.iter().enumerate() {
             if DocumentSystemField::from_name(segment).is_some() {
                 return Ok(None);
             }
+            let read: Option<&[String]> = match step + 1 == path.len() {
+                true => read_of_last.as_deref(),
+                false => Some(&[]),
+            };
             let mut next = Vec::new();
             let mut follow = |document: &Document| -> OQLResult<bool> {
-                if document.fields.contains_key(segment) {
+                // A stored field of that name is read differently. A row
+                // decoded only in part may not hold it, so the schema is
+                // asked as well.
+                if document.fields.contains_key(segment)
+                    || self
+                        .schema_of(&document.schema)?
+                        .is_some_and(|schema| schema.fields.contains_key(segment))
+                {
                     return Ok(false);
                 }
                 let ReverseRelationship::Declared { source, field } =
@@ -6621,12 +6676,21 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 else {
                     return Ok(false);
                 };
-                next.extend(self.store.scan_referencing_documents_shared(
-                    &document.schema,
-                    &document.id,
-                    Some(&source),
-                    field.as_deref(),
-                )?);
+                next.extend(match read {
+                    Some(read) => self.store.scan_referencing_documents_reading(
+                        &document.schema,
+                        &document.id,
+                        Some(&source),
+                        field.as_deref(),
+                        read,
+                    )?,
+                    None => self.store.scan_referencing_documents_shared(
+                        &document.schema,
+                        &document.id,
+                        Some(&source),
+                        field.as_deref(),
+                    )?,
+                });
                 if source_schema != source {
                     source_schema = source;
                 }

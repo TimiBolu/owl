@@ -2171,6 +2171,15 @@ impl Parser {
                 self.advance();
                 collection
             }
+            // A keyword followed by `.` is not being applied to anything,
+            // so it is a name: a collection may be called `first`.
+            Some(token)
+                if token.keyword_text().is_some() && matches!(self.peek_token(), Some(Token::Dot)) =>
+            {
+                let collection = token.keyword_text().unwrap_or_default().to_string();
+                self.advance();
+                collection
+            }
             Some(token) => {
                 return Err(ParseError::UnexpectedToken(format!(
                     "Expected collection name, found {:?}",

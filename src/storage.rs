@@ -763,6 +763,32 @@ pub trait DocumentStore: Send + Sync + 'static {
     /// Keep `value` under `key` until the next commit, if the columns
     /// stamped `stamp` are still good.
     fn keep_with_columns(&self, _key: &str, _stamp: u64, _value: Arc<dyn std::any::Any + Send + Sync>) {}
+    /// The same rows as `scan_referencing_documents_shared`, of which only
+    /// `read` will be read. A row the store holds decoded is given whole. A
+    /// row it would have to decode is decoded only so far: it may hold
+    /// nothing but those fields, and is not kept.
+    fn scan_referencing_documents_reading(
+        &self,
+        target_schema: &str,
+        target_id: &DocumentId,
+        source_schema: Option<&str>,
+        field_path: Option<&str>,
+        _read: &[String],
+    ) -> OQLResult<Vec<Arc<Document>>> {
+        self.scan_referencing_documents_shared(target_schema, target_id, source_schema, field_path)
+    }
+    /// The rows at `positions` in the columns stamped `stamp`, in that
+    /// order. This is how rows chosen by their columns are read: only they
+    /// are, and a store that does not hold them decoded decodes just them.
+    /// `None` when those columns are no longer the collection's.
+    fn rows_of_columns(
+        &self,
+        _schema: &str,
+        _stamp: u64,
+        _positions: &[u32],
+    ) -> OQLResult<Option<Vec<Arc<Document>>>> {
+        Ok(None)
+    }
     /// The collection's rows as `scan_documents_shared` gives them, and the
     /// columns of `fields` over exactly those rows: row `n` of each column
     /// is row `n` of the rows. For choosing rows by their columns and then

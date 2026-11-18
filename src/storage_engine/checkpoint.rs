@@ -2775,7 +2775,18 @@ pub(crate) struct BaseSegmentHandle {
     directory_start: usize,
     records_start: usize,
     records_len: usize,
+    /// The stretch of the record region read last, and where it starts.
+    /// Records lie in the order of their references, so the rows of one
+    /// collection are read one after another, and a stretch read once
+    /// serves the records that follow.
+    window: Mutex<(usize, Vec<u8>)>,
+    /// Where the record read last ended. A record that starts there, or
+    /// just past it, is the next of a run, and worth reading ahead for.
+    last_end: std::sync::atomic::AtomicUsize,
 }
+
+/// How much of the record region one read takes in.
+const RECORD_WINDOW: usize = 32 * 1024;
 
 impl BaseSegmentHandle {
     pub(crate) fn open(
@@ -2876,6 +2887,8 @@ impl BaseSegmentHandle {
             directory_start,
             records_start,
             records_len,
+            window: Mutex::new((0, Vec::new())),
+            last_end: std::sync::atomic::AtomicUsize::new(usize::MAX),
         })
     }
 
@@ -2918,18 +2931,31 @@ impl BaseSegmentHandle {
                         .ok_or_else(|| {
                             OQLError::storage_error("base record lies outside its region", None)
                         })?;
-                    let mut file = self.file.lock().map_err(|_| {
-                        OQLError::storage_error("base segment read handle lock poisoned", None)
+                    let mut window = self.window.lock().map_err(|_| {
+                        OQLError::storage_error("base segment read window lock poisoned", None)
                     })?;
-                    file.seek(SeekFrom::Start((self.records_start + offset) as u64))
-                        .map_err(|error| {
-                            OQLError::storage_error(
-                                &format!("seek base object record: {error}"),
-                                None,
-                            )
+                    // One record read on its own is read alone. The next
+                    // after it, or one close behind, is part of a run, and
+                    // a stretch is read for the records that will follow.
+                    let last_end = self.last_end.swap(end, std::sync::atomic::Ordering::Relaxed);
+                    let in_a_run = offset >= last_end && offset - last_end <= RECORD_WINDOW / 8;
+                    if offset < window.0 || end > window.0 + window.1.len() {
+                        let ahead = if in_a_run { RECORD_WINDOW } else { 0 };
+                        let length = (end - offset).max(ahead).min(self.records_len - offset);
+                        let mut file = self.file.lock().map_err(|_| {
+                            OQLError::storage_error("base segment read handle lock poisoned", None)
                         })?;
-                    let record = read_exact_handle(file.as_mut(), end - offset)?;
-                    if crc32fast::hash(&record) != checksum {
+                        file.seek(SeekFrom::Start((self.records_start + offset) as u64))
+                            .map_err(|error| {
+                                OQLError::storage_error(
+                                    &format!("seek base object record: {error}"),
+                                    None,
+                                )
+                            })?;
+                        *window = (offset, read_exact_handle(file.as_mut(), length)?);
+                    }
+                    let record = &window.1[offset - window.0..end - window.0];
+                    if crc32fast::hash(record) != checksum {
                         return Err(OQLError::storage_error(
                             "base object record checksum mismatch",
                             None,

@@ -23,7 +23,7 @@ use crate::storage::{
 };
 use crate::storage_engine::{
     BTreeIndex, BorrowedRecordValue, CompiledSchema, RecordCodec, RecordView, TypedKey,
-    TypedColumn, TypedSegment,
+    ColumnBuilder, TypedColumn, TypedSegment,
 };
 use crc32fast::Hasher;
 use rayon::prelude::*;
@@ -1872,6 +1872,10 @@ struct BuiltCollection {
     /// The collection's rows, in the order its columns are in. Listing them
     /// is itself a pass over the collection.
     rows: Option<Arc<Vec<Arc<Document>>>>,
+    /// Which row each position in the columns is, when the rows themselves
+    /// are not kept: under a budget on decoded rows, a row is decoded when
+    /// it is wanted and only then.
+    refs: Option<Arc<Vec<ObjRef>>>,
     columns: HashMap<String, Arc<TypedColumn>>,
     /// What the executor made from these columns and asked to have kept
     /// with them.
@@ -2119,6 +2123,7 @@ impl RustStore {
             object_ref,
             document,
             record,
+            read_at,
         } in decoded
         {
             if state.object_directory.contains_key(&object_ref) {
@@ -2128,10 +2133,18 @@ impl RustStore {
             // until it is rewritten, and a record is replaced, not changed.
             let unchanged = match &record {
                 None => state.typed_row_locations.get(&object_ref)?.is_some(),
-                Some(read) => state
-                    .object_records
-                    .get(&object_ref)
-                    .is_some_and(|current| Arc::ptr_eq(current, read)),
+                Some(read) => match state.object_records.get(&object_ref) {
+                    Some(current) => Arc::ptr_eq(current, read),
+                    // The record was read from a checkpoint file and is not
+                    // held in memory. It is still the row's as long as the
+                    // row is live and nothing has been committed since it
+                    // was read. Without this a row whose record is on file
+                    // is decoded again by every statement that wants it.
+                    None => {
+                        state.committed_lsn == read_at
+                            && state.object_schema_versions.contains_key(&object_ref)
+                    }
+                },
             };
             if unchanged {
                 state.object_directory.insert(object_ref, document);
@@ -2290,6 +2303,11 @@ impl RustStore {
             .state
             .write()
             .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+        // What was kept while there was no budget may hold rows a budget
+        // would let go.
+        if let Ok(mut built) = self.built_columns.lock() {
+            built.collections.clear();
+        }
         state.decoded_budget = decoded_documents;
         state.decoded_order = match decoded_documents {
             Some(_) => state.object_directory.keys().copied().collect(),
@@ -6818,6 +6836,21 @@ enum DocumentSource {
 
 /// A row that lives outside the column segments and is not held decoded,
 /// decoded from its record. `None` when `object_ref` is not such a row.
+/// The record of a row from the checkpoint files, when they hold it.
+fn record_on_file(state: &State, object_ref: ObjRef) -> OQLResult<Option<Arc<[u8]>>> {
+    state
+        .checkpoint_records
+        .as_ref()
+        .map(|files| {
+            files
+                .lock()
+                .map_err(|_| OQLError::generic("checkpoint read handle lock poisoned"))?
+                .record(object_ref)
+        })
+        .transpose()
+        .map(Option::flatten)
+}
+
 fn record_document(
     state: &State,
     object_ref: ObjRef,
@@ -6959,6 +6992,7 @@ fn shared_document(
         Some((document, DocumentSource::Held)) => Some(document),
         Some((document, source)) => {
             decoded.push(Decoded {
+                read_at: state.committed_lsn,
                 object_ref,
                 document: document.clone(),
                 record: match source {
@@ -6977,6 +7011,8 @@ struct Decoded {
     object_ref: ObjRef,
     document: Arc<Document>,
     record: Option<Arc<[u8]>>,
+    /// What had been committed when the row was read.
+    read_at: u64,
 }
 
 fn logical_documents(state: &State) -> OQLResult<Vec<(ObjRef, Arc<Document>)>> {
@@ -9205,16 +9241,90 @@ impl RustStore {
                 return Ok(None);
             }
         }
+        // Under a budget on decoded rows the rows are not listed and kept.
+        // The columns are made in one pass that decodes a row, takes its
+        // fields and lets it go, and what is kept is which row is where.
+        if state.decoded_budget.is_some() {
+            if with_rows {
+                return Ok(None);
+            }
+            let kept = built.of(&state, schema);
+            let missing: Vec<&String> =
+                fields.iter().filter(|name| !kept.columns.contains_key(*name)).collect();
+            if !missing.is_empty() {
+                let refs = match &kept.refs {
+                    Some(refs) => refs.clone(),
+                    None => Arc::new(logical_collection_object_refs(&state, schema)?),
+                };
+                let mut builders = Vec::with_capacity(missing.len());
+                for name in missing {
+                    let Some(builder) = declared
+                        .fields
+                        .get(name)
+                        .and_then(|field_type| ColumnBuilder::new(name, field_type, refs.len()))
+                    else {
+                        return Ok(None);
+                    };
+                    builders.push(builder);
+                }
+                for object_ref in refs.iter() {
+                    // Every listed row must be there, or positions in these
+                    // columns would not be positions in the list.
+                    let Some((document, _)) = sourced_document(&state, *object_ref)? else {
+                        return Ok(None);
+                    };
+                    for builder in &mut builders {
+                        builder.push(&document)?;
+                    }
+                }
+                let mut made = Vec::with_capacity(builders.len());
+                let mut bytes = refs.len() * std::mem::size_of::<ObjRef>();
+                for builder in builders {
+                    let name = builder.name().to_string();
+                    let Some(column) = builder.finish()? else {
+                        return Ok(None);
+                    };
+                    bytes += column.bytes();
+                    made.push((name, Arc::new(column)));
+                }
+                if !built.makes_room(schema, bytes) {
+                    return Ok(None);
+                }
+                let kept = built.of(&state, schema);
+                if kept.refs.is_none() {
+                    kept.refs = Some(refs);
+                }
+                kept.columns.extend(made);
+                kept.bytes += bytes;
+            }
+            let kept = built.of(&state, schema);
+            let mut columns = Vec::with_capacity(fields.len());
+            for name in fields {
+                match kept.columns.get(name) {
+                    Some(column) => columns.push(column.clone()),
+                    None => return Ok(None),
+                }
+            }
+            let Some(count) = columns.first().map(|column| column.rows()) else {
+                return Ok(None);
+            };
+            return Ok(Some((None, ColumnBatch::new(kept.stamp, count, columns))));
+        }
         let mut rows: Option<Arc<Vec<Arc<Document>>>> = built.of(&state, schema).rows.clone();
         let list_rows = |built: &mut BuiltColumns| -> OQLResult<Option<Arc<Vec<Arc<Document>>>>> {
             let Some(held) = held_rows(&state)? else {
                 return Ok(None);
             };
+            let held = Arc::new(held);
+            // Under a budget on decoded rows the list is used and let go:
+            // kept, it would hold on to rows the budget has dropped.
+            if state.decoded_budget.is_some() {
+                return Ok(Some(held));
+            }
             let bytes = held.len() * pointer;
             if !built.makes_room(schema, bytes) {
                 return Ok(None);
             }
-            let held = Arc::new(held);
             let kept = built.of(&state, schema);
             kept.rows = Some(held.clone());
             kept.bytes += bytes;
@@ -9254,7 +9364,11 @@ impl RustStore {
             let kept = built.of(&state, schema);
             // Making room may have dropped the rows list this column is
             // of; then the column is used for this query and not kept.
-            if kept.rows.as_ref().is_some_and(|listed| rows.as_ref().is_some_and(|rows| Arc::ptr_eq(listed, rows))) {
+            // Under a budget no list is kept, and the rows are listed in
+            // the same order each time until the collection is written.
+            if state.decoded_budget.is_some()
+                || kept.rows.as_ref().is_some_and(|listed| rows.as_ref().is_some_and(|rows| Arc::ptr_eq(listed, rows)))
+            {
                 kept.columns.insert(name.clone(), column.clone());
                 kept.bytes += bytes;
             }
@@ -9265,6 +9379,138 @@ impl RustStore {
         };
         let stamp = built.of(&state, schema).stamp;
         Ok(Some((rows.filter(|_| with_rows), ColumnBatch::new(stamp, count, columns))))
+    }
+}
+
+impl RustStore {
+    /// The documents that refer to one document, through one field when it
+    /// is named. With `read`, a row that would have to be decoded is
+    /// decoded only as far as those fields.
+    fn referencing_documents(
+        &self,
+        target_schema: &str,
+        target_id: &DocumentId,
+        source_schema: Option<&str>,
+        field_path: Option<&str>,
+        read: Option<&HashSet<String>>,
+    ) -> OQLResult<Vec<Arc<Document>>> {
+        if !self.pending_operations()?.is_empty() {
+            return Ok(self
+                .scan_referencing_documents(target_schema, target_id, source_schema, field_path)?
+                .into_iter()
+                .map(Arc::new)
+                .collect());
+        }
+        // One pass under one lock: the postings, each source's identity, and
+        // the document the store already holds for it.
+        let state = self
+            .state
+            .read()
+            .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+        let Some(target) = lookup_object_ref(&state, target_schema, target_id)? else {
+            return Ok(Vec::new());
+        };
+        let mut decoded = Vec::new();
+        let prefix = target.packed().to_be_bytes().to_vec();
+        let end = target
+            .packed()
+            .checked_add(1)
+            .map(|next| Bound::Excluded(next.to_be_bytes().to_vec()))
+            .unwrap_or(Bound::Unbounded);
+        // The postings under this target, through the wanted field when one
+        // is named. The keys are only looked at, never kept.
+        let mut rows = Vec::new();
+        state
+            .reverse_reference_index
+            .visit_range(Bound::Included(prefix), end, &mut |key, source| {
+                if field_path.is_none_or(|expected| {
+                    key.get(8..).unwrap_or_default() == expected.as_bytes()
+                }) {
+                    rows.push(source);
+                }
+            })
+            .map_err(|error| OQLError::storage_error(&error, None))?;
+        let mut found = Vec::with_capacity(rows.len());
+        let mut documents = Vec::with_capacity(rows.len());
+        // A reference says which collection its document is in, so a
+        // posting from another collection is passed over unread.
+        let wanted_collection = match source_schema {
+            Some(expected) => match state.collection_ids.get(expected) {
+                Some(collection) => Some(*collection),
+                None => return Ok(Vec::new()),
+            },
+            None => None,
+        };
+        for source in rows {
+            if wanted_collection.is_some_and(|collection| collection != source.collection_id()) {
+                continue;
+            }
+            // A source already held decoded is the current version of its
+            // document: it is entered under its id and removed with it, in
+            // one step.
+            if let Some(document) = state.object_directory.get(&source) {
+                found.push(source);
+                documents.push(document.clone());
+                continue;
+            }
+            // One that is not held is decoded once: to learn which
+            // document it is, and to be the answer when it is that
+            // document's current version, as it nearly always is.
+            // When only some fields will be read and the row is a record,
+            // only those are decoded, and the row is not kept: a row with
+            // long lists in it is otherwise built whole to be counted.
+            let partly = match (read, state.typed_row_locations.contains_key(&source)?) {
+                (Some(read), false) => {
+                    let record = match state.object_records.get(&source) {
+                        Some(record) => Some(record.clone()),
+                        None => record_on_file(&state, source)?,
+                    };
+                    match (record, state.object_schema_versions.get(&source)) {
+                        (Some(record), Some(version)) => {
+                            let compiled = state
+                                .compiled_schemas
+                                .get(&(source.collection_id(), *version))
+                                .ok_or_else(|| OQLError::storage_error("compiled schema is missing", None))?;
+                            Some(Arc::new(RecordCodec::decode_projection(&record, compiled, Some(read))?))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            let document = match partly {
+                Some(document) => document,
+                None => match shared_document(&state, source, &mut decoded)? {
+                    Some(document) => document,
+                    None => continue,
+                },
+            };
+            let current = match lookup_object_ref(&state, &document.schema, &document.id)? {
+                Some(current) => current,
+                None => continue,
+            };
+            let document = match current == source {
+                true => Some(document),
+                false => shared_document(&state, current, &mut decoded)?,
+            };
+            if let Some(document) = document {
+                found.push(current);
+                documents.push(document);
+            }
+        }
+        // Each document once, where it first appears. Two postings naming
+        // one document are rare, so that is looked for before paying to
+        // remove them.
+        let mut ordered = found.clone();
+        ordered.sort_unstable();
+        if ordered.windows(2).any(|pair| pair[0] == pair[1]) {
+            let mut seen = HashSet::with_capacity(found.len());
+            let mut current = found.iter();
+            documents.retain(|_| current.next().is_some_and(|current| seen.insert(*current)));
+        }
+        drop(state);
+        self.keep_decoded(decoded)?;
+        Ok(documents)
     }
 }
 
@@ -9588,10 +9834,22 @@ impl DocumentStore for RustStore {
             return Ok(Some(known.as_ref().clone()));
         }
         let object_refs = logical_collection_object_refs(&state, schema)?;
+        // Under a budget, a collection that is small beside it is worth
+        // holding: its rows are decoded here and kept, within the budget,
+        // so the next statement finds them held. Without that, every scan
+        // of it decodes every row and lets it go again.
+        let worth_holding = state
+            .decoded_budget
+            .is_some_and(|budget| object_refs.len() <= budget / 4);
+        let mut decoded = Vec::new();
         let mut documents = Vec::with_capacity(object_refs.len());
         for object_ref in object_refs {
             match sourced_document(&state, object_ref)? {
                 Some((document, DocumentSource::Held)) => documents.push(document),
+                Some(_) if worth_holding => match shared_document(&state, object_ref, &mut decoded)? {
+                    Some(document) => documents.push(document),
+                    None => {}
+                },
                 // A row that would have to be decoded to be lent is better
                 // read by a scan that decodes only the fields it needs.
                 Some(_) => return Ok(None),
@@ -9602,11 +9860,14 @@ impl DocumentStore for RustStore {
         // The list is made either way, so keeping it costs a copy of its
         // pointers and saves the next statement making it again.
         built.of(&state, schema).asks();
-        if built.makes_room(schema, bytes) {
+        if state.decoded_budget.is_none() && built.makes_room(schema, bytes) {
             let kept = built.of(&state, schema);
             kept.rows = Some(Arc::new(documents.clone()));
             kept.bytes += bytes;
         }
+        drop(built);
+        drop(state);
+        self.keep_decoded(decoded)?;
         Ok(Some(documents))
     }
 
@@ -9775,6 +10036,52 @@ impl DocumentStore for RustStore {
             });
         }
         Ok(Some(documents))
+    }
+
+    fn rows_of_columns(
+        &self,
+        schema: &str,
+        stamp: u64,
+        positions: &[u32],
+    ) -> OQLResult<Option<Vec<Arc<Document>>>> {
+        let mut decoded = Vec::new();
+        let rows = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+            let built = self
+                .built_columns
+                .lock()
+                .map_err(|_| OQLError::generic("column cache lock poisoned"))?;
+            let Some(kept) = built.collections.get(schema).filter(|kept| kept.stamp == stamp) else {
+                return Ok(None);
+            };
+            let mut rows = Vec::with_capacity(positions.len());
+            if let Some(listed) = &kept.rows {
+                for position in positions {
+                    match listed.get(*position as usize) {
+                        Some(row) => rows.push(row.clone()),
+                        None => return Ok(None),
+                    }
+                }
+            } else if let Some(refs) = &kept.refs {
+                for position in positions {
+                    let Some(object_ref) = refs.get(*position as usize) else {
+                        return Ok(None);
+                    };
+                    match shared_document(&state, *object_ref, &mut decoded)? {
+                        Some(row) => rows.push(row),
+                        None => return Ok(None),
+                    }
+                }
+            } else {
+                return Ok(None);
+            }
+            rows
+        };
+        self.keep_decoded(decoded)?;
+        Ok(Some(rows))
     }
 
     fn kept_with_columns(&self, key: &str, stamp: u64) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
@@ -10012,6 +10319,24 @@ impl DocumentStore for RustStore {
                         })?;
                     Arc::new(RecordCodec::decode_projection(record, compiled, Some(&wanted))?)
                 }
+                // The record is in a checkpoint file. It is read from
+                // there, and still only the fields asked for are decoded:
+                // a row's long lists are skipped over, not built.
+                (true, None, Some(version)) => match record_on_file(&state, object_ref)? {
+                    Some(record) => {
+                        let compiled = state
+                            .compiled_schemas
+                            .get(&(object_ref.collection_id(), *version))
+                            .ok_or_else(|| {
+                                OQLError::storage_error("compiled schema is missing", None)
+                            })?;
+                        Arc::new(RecordCodec::decode_projection(&record, compiled, Some(&wanted))?)
+                    }
+                    None => match logical_document(&state, object_ref)? {
+                        Some(document) => document,
+                        None => continue,
+                    },
+                },
                 _ => match logical_document(&state, object_ref)? {
                     Some(document) => document,
                     None => continue,
@@ -10367,98 +10692,21 @@ impl DocumentStore for RustStore {
         source_schema: Option<&str>,
         field_path: Option<&str>,
     ) -> OQLResult<Vec<Arc<Document>>> {
-        // Uncommitted writes are overlaid one document at a time by the
-        // general route.
-        if !self.pending_operations()?.is_empty() {
-            return Ok(self
-                .scan_referencing_documents(target_schema, target_id, source_schema, field_path)?
-                .into_iter()
-                .map(Arc::new)
-                .collect());
-        }
-        // One pass under one lock: the postings, each source's identity, and
-        // the document the store already holds for it.
-        let state = self
-            .state
-            .read()
-            .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
-        let Some(target) = lookup_object_ref(&state, target_schema, target_id)? else {
-            return Ok(Vec::new());
-        };
-        let mut decoded = Vec::new();
-        let prefix = target.packed().to_be_bytes().to_vec();
-        let end = target
-            .packed()
-            .checked_add(1)
-            .map(|next| Bound::Excluded(next.to_be_bytes().to_vec()))
-            .unwrap_or(Bound::Unbounded);
-        // The postings under this target, through the wanted field when one
-        // is named. The keys are only looked at, never kept.
-        let mut rows = Vec::new();
-        state
-            .reverse_reference_index
-            .visit_range(Bound::Included(prefix), end, &mut |key, source| {
-                if field_path.is_none_or(|expected| {
-                    key.get(8..).unwrap_or_default() == expected.as_bytes()
-                }) {
-                    rows.push(source);
-                }
-            })
-            .map_err(|error| OQLError::storage_error(&error, None))?;
-        let mut found = Vec::with_capacity(rows.len());
-        let mut documents = Vec::with_capacity(rows.len());
-        for source in rows {
-            // A source already held decoded names itself, with nothing
-            // copied; one that is not is asked for its identity.
-            let held = state.object_directory.get(&source);
-            let identity = match held {
-                Some(_) => None,
-                None => match logical_object_identity(&state, source)? {
-                    Some(identity) => Some(identity),
-                    None => continue,
-                },
-            };
-            let (schema, id) = match (&held, &identity) {
-                (Some(document), _) => (document.schema.as_str(), &document.id),
-                (None, Some((schema, id))) => (schema.as_str(), id),
-                (None, None) => continue,
-            };
-            if source_schema.is_some_and(|expected| expected != schema) {
-                continue;
-            }
-            // The current version of that document, as a lookup by id finds.
-            // A document held decoded is the current one: it is entered
-            // under its id and removed with it, in one step.
-            let current = match held {
-                Some(_) => source,
-                None => match lookup_object_ref(&state, schema, id)? {
-                    Some(current) => current,
-                    None => continue,
-                },
-            };
-            let document = match held {
-                Some(document) if current == source => Some(document.clone()),
-                _ => shared_document(&state, current, &mut decoded)?,
-            };
-            if let Some(document) = document {
-                found.push(current);
-                documents.push(document);
-            }
-        }
-        // Each document once, where it first appears. Two postings naming
-        // one document are rare, so that is looked for before paying to
-        // remove them.
-        let mut ordered = found.clone();
-        ordered.sort_unstable();
-        if ordered.windows(2).any(|pair| pair[0] == pair[1]) {
-            let mut seen = HashSet::with_capacity(found.len());
-            let mut current = found.iter();
-            documents.retain(|_| current.next().is_some_and(|current| seen.insert(*current)));
-        }
-        drop(state);
-        self.keep_decoded(decoded)?;
-        Ok(documents)
+        self.referencing_documents(target_schema, target_id, source_schema, field_path, None)
     }
+
+    fn scan_referencing_documents_reading(
+        &self,
+        target_schema: &str,
+        target_id: &DocumentId,
+        source_schema: Option<&str>,
+        field_path: Option<&str>,
+        read: &[String],
+    ) -> OQLResult<Vec<Arc<Document>>> {
+        let read: HashSet<String> = read.iter().cloned().collect();
+        self.referencing_documents(target_schema, target_id, source_schema, field_path, Some(&read))
+    }
+
 
     fn navigate_reference(&self, object_ref: &ObjRef) -> OQLResult<Option<Document>> {
         if object_ref.is_null() {
