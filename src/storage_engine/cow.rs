@@ -21,6 +21,21 @@ pub(crate) struct RecordSnapshot {
     shards: Vec<Arc<BTreeMap<ObjRef, Arc<[u8]>>>>,
 }
 
+impl CowRecordDirectory {
+    /// How many records are held in memory and the bytes of them.
+    pub(crate) fn held_in_memory(&self) -> (usize, usize) {
+        let mut bytes = 0;
+        let mut count = 0;
+        for shard in &self.shards {
+            for record in shard.values() {
+                count += 1;
+                bytes += record.len() + 48;
+            }
+        }
+        (count, bytes + self.dirty.len() * 24)
+    }
+}
+
 impl Default for CowRecordDirectory {
     fn default() -> Self {
         Self {

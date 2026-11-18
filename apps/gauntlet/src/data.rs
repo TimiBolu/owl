@@ -4,6 +4,7 @@
 //! one loader serves both engines: a list of objects or of text is part of
 //! the row in Owl and a child table in SQLite.
 
+#[derive(Debug)]
 pub enum Cell {
     Text(String),
     Int(i64),

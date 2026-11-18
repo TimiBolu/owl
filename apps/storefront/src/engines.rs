@@ -85,6 +85,14 @@ impl Owl {
             .map_err(|error| anyhow!("compact: {error}"))
     }
 
+    /// Compact, then remove the copy the compaction replaced.
+    pub fn compact_and_reclaim(&self) -> Result<()> {
+        self.store
+            .compact_and_reclaim()
+            .map(|_| ())
+            .map_err(|error| anyhow!("compact and reclaim: {error}"))
+    }
+
     /// How many of a collection's rows are held as decoded documents, and
     /// how many live only in column segments.
     pub fn residency(&self, collection: &str) -> Result<(usize, usize, usize)> {
