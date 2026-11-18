@@ -18,7 +18,7 @@ fn make_doc(schema: &str, id: &str, i: i64) -> Document {
     let mut fields = HashMap::new();
     fields.insert("value".to_string(), Value::Integer(i));
     fields.insert("tag".to_string(), Value::String(format!("t{}", i % 10)));
-    Document::with_id(id.to_string(), schema.to_string(), fields)
+    Document::with_id(id.to_string(), schema.to_string(), fields.into_iter().collect())
 }
 
 #[test]

@@ -9,10 +9,9 @@ use crate::document::{Document, DocumentId, ObjRef, Value};
 use crate::error::{OQLError, OQLResult};
 use crate::parser::ComparisonOperator;
 use crate::schema::{DocumentSystemField, Schema};
-use crate::storage_engine::{TypedCell, TypedSegment};
+use crate::storage_engine::{ColumnValues, TypedCell, TypedColumn, TypedSegment};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -220,6 +219,112 @@ impl<'a> ProjectedValueRef<'a> {
             Self::Reference(value) => Value::Reference(value),
         }
     }
+}
+
+/// Whole columns of one stored group of rows: for each field asked for, its
+/// values as one typed run of memory, with which rows have a value.
+///
+/// This is for reading one field of many rows. A loop over a column touches
+/// nothing but that column, where a loop over rows reaches into each row for
+/// it.
+#[derive(Debug)]
+pub struct ColumnBatch {
+    stamp: u64,
+    rows: usize,
+    /// One for each field asked for, in the order asked.
+    columns: Vec<Arc<TypedColumn>>,
+}
+
+impl ColumnBatch {
+    pub(crate) fn new(stamp: u64, rows: usize, columns: Vec<Arc<TypedColumn>>) -> Self {
+        Self { stamp, rows, columns }
+    }
+
+    /// The same for two batches exactly when nothing was committed between
+    /// them, so that row `n` of one is row `n` of the other.
+    pub fn stamp(&self) -> u64 {
+        self.stamp
+    }
+
+    /// How many rows the batch holds. Row `n` of every column is the same
+    /// row: the `n`th the store gives when asked for the collection's rows.
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    /// The column of the field asked for at position `field`.
+    pub fn column(&self, field: usize) -> Column<'_> {
+        Column {
+            column: &self.columns[field],
+        }
+    }
+}
+
+/// One field of every row of a [`ColumnBatch`].
+#[derive(Debug, Clone, Copy)]
+pub struct Column<'a> {
+    column: &'a TypedColumn,
+}
+
+/// A column's values. A row without a value holds a placeholder here; ask
+/// [`Column::has_value`].
+#[derive(Debug, Clone, Copy)]
+pub enum ColumnData<'a> {
+    /// The text of row `n` is `bytes[offsets[n]..offsets[n + 1]]`, valid UTF-8.
+    Strings { offsets: &'a [u32], bytes: &'a [u8] },
+    Integers(&'a [i64]),
+    Floats(&'a [f64]),
+    /// 0 or 1.
+    Booleans(&'a [u8]),
+    DateTimes(&'a [DateTime<Utc>]),
+    References(&'a [crate::document::ObjRef]),
+}
+
+impl<'a> Column<'a> {
+    pub fn data(&self) -> ColumnData<'a> {
+        match &self.column.values {
+            ColumnValues::Strings { offsets, bytes } => ColumnData::Strings { offsets, bytes },
+            ColumnValues::Integers(values) => ColumnData::Integers(values),
+            ColumnValues::Floats(values) => ColumnData::Floats(values),
+            ColumnValues::Booleans(values) => ColumnData::Booleans(values),
+            ColumnValues::DateTimes(values) => ColumnData::DateTimes(values),
+            ColumnValues::References(values) => ColumnData::References(values),
+        }
+    }
+
+    /// Whether the row holds a value: the field is there and is not null.
+    #[inline]
+    pub fn has_value(&self, row: usize) -> bool {
+        let (byte, bit) = (row / 8, 1u8 << (row % 8));
+        self.column.presence[byte] & bit != 0 && self.column.nulls[byte] & bit == 0
+    }
+
+    /// Whether the row holds the field at all, null or not.
+    #[inline]
+    pub fn is_present(&self, row: usize) -> bool {
+        self.column.presence[row / 8] & (1u8 << (row % 8)) != 0
+    }
+
+    /// The text of a row of a column of strings.
+    #[inline]
+    pub fn text(offsets: &[u32], bytes: &'a [u8], row: usize) -> &'a str {
+        // The segment was checked to hold valid UTF-8 when it was loaded.
+        std::str::from_utf8(&bytes[offsets[row] as usize..offsets[row + 1] as usize]).unwrap_or("")
+    }
+}
+
+static STATEMENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Told by the executor that a statement is starting. A store that builds
+/// something on a collection's second read counts reads by this, so that
+/// one statement asking twice is one read.
+pub fn statement_begins() {
+    STATEMENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Which statement is running: a number that moves when one starts.
+pub fn statement_now() -> u64 {
+    STATEMENTS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub struct ProjectedRows<'a> {
@@ -465,7 +570,7 @@ impl ProjectedRowBatch {
             .map(|(((id, created_at), updated_at), version)| Document {
                 id,
                 schema: self.schema.clone(),
-                fields: HashMap::with_capacity(self.columns.len()),
+                fields: crate::document::Fields::with_capacity_and_hasher(self.columns.len(), Default::default()),
                 created_at,
                 updated_at,
                 version,
@@ -489,7 +594,7 @@ mod projected_batch_tests {
     use crate::document::Value;
 
     fn row(id: &str, include_optional: bool) -> Arc<Document> {
-        let mut fields = HashMap::from([(
+        let mut fields = crate::document::Fields::from_iter([(
             "message".to_string(),
             Value::String(format!("message-{id}")),
         )]);
@@ -636,6 +741,37 @@ pub trait DocumentStore: Send + Sync + 'static {
         _fields: Option<&[String]>,
         _limit: usize,
     ) -> OQLResult<Option<Vec<Document>>> {
+        Ok(None)
+    }
+    /// The whole columns of `fields`, for every row of a collection, in
+    /// the order `scan_documents_shared` gives the rows. `None` when the
+    /// store cannot give them: a field's type has no column form, the rows
+    /// are not all held, or there are writes not yet committed.
+    fn scan_columns(&self, _schema: &str, _fields: &[String]) -> OQLResult<Option<Vec<ColumnBatch>>> {
+        Ok(None)
+    }
+    /// Something the caller made from columns stamped `stamp`, kept under
+    /// `key` for as long as those columns are good. `None` when nothing was
+    /// kept, or something has been committed since.
+    fn kept_with_columns(
+        &self,
+        _key: &str,
+        _stamp: u64,
+    ) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        None
+    }
+    /// Keep `value` under `key` until the next commit, if the columns
+    /// stamped `stamp` are still good.
+    fn keep_with_columns(&self, _key: &str, _stamp: u64, _value: Arc<dyn std::any::Any + Send + Sync>) {}
+    /// The collection's rows as `scan_documents_shared` gives them, and the
+    /// columns of `fields` over exactly those rows: row `n` of each column
+    /// is row `n` of the rows. For choosing rows by their columns and then
+    /// reading only the rows chosen.
+    fn scan_rows_and_columns(
+        &self,
+        _schema: &str,
+        _fields: &[String],
+    ) -> OQLResult<Option<(Arc<Vec<Arc<Document>>>, ColumnBatch)>> {
         Ok(None)
     }
     /// Attempt the same pushed scan while retaining projected fields in

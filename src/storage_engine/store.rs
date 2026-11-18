@@ -17,13 +17,13 @@ use crate::parser::ComparisonOperator;
 use crate::schema::{DocumentSystemField, Schema};
 use crate::simulation::filesystem::{FileHandle, FileOptions, FileSystem};
 use crate::storage::{
-    DocumentStore, ProjectedRowBatch, ReverseReferenceEntry, ScalarIndexCursor,
+    ColumnBatch, DocumentStore, ProjectedRowBatch, ReverseReferenceEntry, ScalarIndexCursor,
     ScalarIndexDefinition, ScalarIndexDirection, ScalarIndexRange, ScalarIndexScanPage,
     ScanPredicate, VectorIndexDefinition,
 };
 use crate::storage_engine::{
     BTreeIndex, BorrowedRecordValue, CompiledSchema, RecordCodec, RecordView, TypedKey,
-    TypedSegment,
+    TypedColumn, TypedSegment,
 };
 use crc32fast::Hasher;
 use rayon::prelude::*;
@@ -435,6 +435,12 @@ impl DenseTypedRowDirectory {
 
 #[derive(Default)]
 struct State {
+    /// For each collection, the commit that last wrote one of its rows.
+    /// What is built from a collection's rows is good until this moves.
+    collection_stamps: HashMap<String, u64>,
+    /// The commit that last changed a schema, or replayed the log. What is
+    /// built from any collection's rows is good until this moves.
+    catalog_stamp: u64,
     committed_lsn: u64,
     /// Immutable scan base from the last fully materialized checkpoint. Newer
     /// WAL mutations remain in `typed_delta_rows` and merge in ID order.
@@ -452,7 +458,7 @@ struct State {
     /// Stable collection scan order, derived from live document identities.
     /// This is rebuilt during recovery and maintained atomically with writes.
     collection_rows: HashMap<String, BTreeMap<DocumentId, ObjRef>>,
-    object_directory: HashMap<ObjRef, Arc<Document>>,
+    object_directory: crate::storage_engine::object_ref::ByObjRef<Arc<Document>>,
     /// Authoritative checkpoint rows that have not needed a general
     /// `Document` representation. Locations remain valid for the immutable
     /// `typed_segments` base and disappear atomically on update/delete.
@@ -460,7 +466,7 @@ struct State {
     /// Compiled schema identities for resident/overflow rows. Lazy typed rows
     /// derive the version from their immutable segment location instead of
     /// paying for a duplicate hash-directory entry.
-    object_schema_versions: HashMap<ObjRef, u32>,
+    object_schema_versions: crate::storage_engine::object_ref::ByObjRef<u32>,
     object_records: CowRecordDirectory,
     schemas: HashMap<String, Schema>,
     compiled_schemas: HashMap<(u16, u32), CompiledSchema>,
@@ -1845,6 +1851,94 @@ enum MaintenanceMessage {
 }
 
 #[doc(hidden)]
+/// See [`StoreCore::built_columns`].
+#[derive(Default)]
+struct BuiltColumns {
+    /// What the whole cache was built against: the last schema change, and
+    /// the last time rows were moved into column segments. Either moving
+    /// empties it.
+    epoch: (u64, u64),
+    collections: HashMap<String, BuiltCollection>,
+}
+
+/// What is kept of one collection's rows between queries.
+#[derive(Default)]
+struct BuiltCollection {
+    /// The commit that last wrote the collection when this was built.
+    written: u64,
+    /// Unlike any other build's: two batches with the same stamp are of
+    /// the same rows.
+    stamp: u64,
+    /// The collection's rows, in the order its columns are in. Listing them
+    /// is itself a pass over the collection.
+    rows: Option<Arc<Vec<Arc<Document>>>>,
+    columns: HashMap<String, Arc<TypedColumn>>,
+    /// What the executor made from these columns and asked to have kept
+    /// with them.
+    kept: HashMap<String, Arc<dyn std::any::Any + Send + Sync>>,
+    /// Roughly what the rows list and columns take.
+    bytes: usize,
+    /// How many statements have asked for the collection's rows or
+    /// columns since it was last written. Nothing is built for the first:
+    /// a collection written between every read would build its columns
+    /// only to drop them.
+    asked: u32,
+    /// The statement that asked last.
+    asked_by: u64,
+}
+
+impl BuiltCollection {
+    /// Note that the running statement asks; `true` once enough have.
+    fn asks(&mut self) -> bool {
+        let statement = crate::storage::statement_now();
+        if self.asked_by != statement {
+            self.asked_by = statement;
+            self.asked = self.asked.saturating_add(1);
+        }
+        self.asked >= 2
+    }
+}
+
+/// The cache of built columns holds about this much at most. Past it,
+/// other collections' columns are dropped, and if that is not enough the
+/// query reads rows instead.
+const BUILT_COLUMNS_LIMIT: usize = 256 << 20;
+
+impl BuiltColumns {
+    /// What is kept of `schema`, emptied first if anything it was built
+    /// from has since been written.
+    fn of<'a>(&'a mut self, state: &State, schema: &str) -> &'a mut BuiltCollection {
+        static STAMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let epoch = (state.catalog_stamp, state.typed_base_lsn);
+        if self.epoch != epoch {
+            self.epoch = epoch;
+            self.collections.clear();
+        }
+        let written = state.collection_stamps.get(schema).copied().unwrap_or(0);
+        let kept = self.collections.entry(schema.to_string()).or_default();
+        if kept.stamp == 0 || kept.written != written {
+            *kept = BuiltCollection {
+                written,
+                stamp: STAMPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                ..BuiltCollection::default()
+            };
+        }
+        kept
+    }
+
+    /// Whether `more` bytes for `schema` fit, after dropping what is kept
+    /// of other collections if need be.
+    fn makes_room(&mut self, schema: &str, more: usize) -> bool {
+        let held = |collections: &HashMap<String, BuiltCollection>| -> usize {
+            collections.values().map(|kept| kept.bytes).sum()
+        };
+        if held(&self.collections) + more > BUILT_COLUMNS_LIMIT {
+            self.collections.retain(|name, _| name == schema);
+        }
+        held(&self.collections) + more <= BUILT_COLUMNS_LIMIT
+    }
+}
+
 pub struct StoreCore {
     filesystem: Arc<dyn FileSystem>,
     wal_path: PathBuf,
@@ -1866,6 +1960,9 @@ pub struct StoreCore {
     checkpoint_lock: Mutex<()>,
     pending_checkpoint: Mutex<Option<PendingCheckpoint>>,
     pending_incremental_checkpoint: Mutex<Option<PendingIncrementalCheckpoint>>,
+    /// Fields of whole collections as columns, built from the held rows
+    /// when first asked for and kept until the next commit.
+    built_columns: Mutex<BuiltColumns>,
     transactions: Mutex<HashMap<u64, PendingTransaction>>,
     /// How far the WAL is known to be on disk. A commit writes its frame
     /// and applies it, then waits here until a sync covers it; one sync
@@ -2345,6 +2442,7 @@ impl RustStore {
             checkpoint_lock: Mutex::new(()),
             pending_checkpoint: Mutex::new(None),
             pending_incremental_checkpoint: Mutex::new(None),
+            built_columns: Mutex::new(BuiltColumns::default()),
             transactions: Mutex::new(HashMap::new()),
             // Everything recovered was read back from disk.
             durability: Mutex::new(Durability {
@@ -5180,6 +5278,7 @@ impl RustStore {
         batch: WalBatch,
         index_mode: IndexReplayMode,
     ) -> OQLResult<()> {
+        let batch_lsn = batch.lsn;
         for mutation in batch.mutations {
             match mutation {
                 Mutation::PutCompiledSchema(compiled) => {
@@ -5257,6 +5356,7 @@ impl RustStore {
                     }
                     let delta_schema = document.schema.clone();
                     let delta_id = document.id.clone();
+                    state.collection_stamps.insert(delta_schema.clone(), batch_lsn);
                     state
                         .collection_rows
                         .entry(document.schema.clone())
@@ -5297,6 +5397,7 @@ impl RustStore {
                         )?;
                         remove_reverse_reference_target(state, object_ref)?;
                     }
+                    state.collection_stamps.insert(schema.clone(), batch_lsn);
                     if let Some(rows) = state.collection_rows.get_mut(&schema) {
                         rows.remove(&id);
                         if rows.is_empty() {
@@ -5316,9 +5417,11 @@ impl RustStore {
                     }
                 }
                 Mutation::PutSchema(schema) => {
+                    state.catalog_stamp = batch_lsn;
                     state.schemas.insert(schema.name.clone(), schema);
                 }
                 Mutation::DeleteSchema(name) => {
+                    state.catalog_stamp = batch_lsn;
                     state.schemas.remove(&name);
                 }
                 Mutation::PutScalarIndex(index) => {
@@ -5559,6 +5662,7 @@ fn apply_compaction_batch(
         }
     }
     state.committed_lsn = lsn;
+    state.catalog_stamp = lsn;
     Ok(())
 }
 
@@ -9057,6 +9161,113 @@ fn scan_typed_base_with_row_delta(
     Ok(Some(batches))
 }
 
+impl RustStore {
+    /// The columns of `fields`, and with `with_rows` the rows they are of.
+    /// Columns are built from the held rows when first asked for and kept
+    /// until the next commit.
+    fn rows_and_columns(
+        &self,
+        schema: &str,
+        fields: &[String],
+        with_rows: bool,
+    ) -> OQLResult<Option<(Option<Arc<Vec<Arc<Document>>>>, ColumnBatch)>> {
+        if !self.pending_operations()?.is_empty() {
+            return Ok(None);
+        }
+        // Held for the whole of this, so that every column is of the same
+        // rows: nothing is committed while they are read.
+        let state = self
+            .state
+            .read()
+            .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+        let Some(declared) = state.schemas.get(schema) else {
+            return Ok(None);
+        };
+        let mut built = self
+            .built_columns
+            .lock()
+            .map_err(|_| OQLError::generic("column cache lock poisoned"))?;
+        let held_rows = |state: &State| -> OQLResult<Option<Vec<Arc<Document>>>> {
+            let object_refs = logical_collection_object_refs(state, schema)?;
+            let mut held = Vec::with_capacity(object_refs.len());
+            for object_ref in object_refs {
+                match sourced_document(state, object_ref)? {
+                    Some((document, DocumentSource::Held)) => held.push(document),
+                    Some(_) => return Ok(None),
+                    None => {}
+                }
+            }
+            Ok(Some(held))
+        };
+        let pointer = std::mem::size_of::<Arc<Document>>();
+        {
+            if !built.of(&state, schema).asks() {
+                return Ok(None);
+            }
+        }
+        let mut rows: Option<Arc<Vec<Arc<Document>>>> = built.of(&state, schema).rows.clone();
+        let list_rows = |built: &mut BuiltColumns| -> OQLResult<Option<Arc<Vec<Arc<Document>>>>> {
+            let Some(held) = held_rows(&state)? else {
+                return Ok(None);
+            };
+            let bytes = held.len() * pointer;
+            if !built.makes_room(schema, bytes) {
+                return Ok(None);
+            }
+            let held = Arc::new(held);
+            let kept = built.of(&state, schema);
+            kept.rows = Some(held.clone());
+            kept.bytes += bytes;
+            Ok(Some(held))
+        };
+        if with_rows && rows.is_none() {
+            match list_rows(&mut built)? {
+                Some(held) => rows = Some(held),
+                None => return Ok(None),
+            }
+        }
+        let mut columns = Vec::with_capacity(fields.len());
+        for name in fields {
+            if let Some(known) = built.of(&state, schema).columns.get(name) {
+                columns.push(known.clone());
+                continue;
+            }
+            let Some(field_type) = declared.fields.get(name) else {
+                return Ok(None);
+            };
+            if rows.is_none() {
+                match list_rows(&mut built)? {
+                    Some(held) => rows = Some(held),
+                    None => return Ok(None),
+                }
+            }
+            let Some(column) =
+                TypedColumn::of_rows(name, field_type, rows.as_deref().map_or(&[][..], |rows| rows.as_slice()))?
+            else {
+                return Ok(None);
+            };
+            let bytes = column.bytes();
+            if !built.makes_room(schema, bytes) {
+                return Ok(None);
+            }
+            let column = Arc::new(column);
+            let kept = built.of(&state, schema);
+            // Making room may have dropped the rows list this column is
+            // of; then the column is used for this query and not kept.
+            if kept.rows.as_ref().is_some_and(|listed| rows.as_ref().is_some_and(|rows| Arc::ptr_eq(listed, rows))) {
+                kept.columns.insert(name.clone(), column.clone());
+                kept.bytes += bytes;
+            }
+            columns.push(column);
+        }
+        let Some(count) = columns.first().map(|column| column.rows()) else {
+            return Ok(None);
+        };
+        let stamp = built.of(&state, schema).stamp;
+        Ok(Some((rows.filter(|_| with_rows), ColumnBatch::new(stamp, count, columns))))
+    }
+}
+
 impl DocumentStore for RustStore {
     fn supports_storage_owned_scan(&self) -> bool {
         true
@@ -9367,6 +9578,15 @@ impl DocumentStore for RustStore {
             .state
             .read()
             .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+        // The list is kept from one query to the next until something is
+        // committed; making it is a pass over the collection.
+        let mut built = self
+            .built_columns
+            .lock()
+            .map_err(|_| OQLError::generic("column cache lock poisoned"))?;
+        if let Some(known) = &built.of(&state, schema).rows {
+            return Ok(Some(known.as_ref().clone()));
+        }
         let object_refs = logical_collection_object_refs(&state, schema)?;
         let mut documents = Vec::with_capacity(object_refs.len());
         for object_ref in object_refs {
@@ -9377,6 +9597,15 @@ impl DocumentStore for RustStore {
                 Some(_) => return Ok(None),
                 None => {}
             }
+        }
+        let bytes = documents.len() * std::mem::size_of::<Arc<Document>>();
+        // The list is made either way, so keeping it costs a copy of its
+        // pointers and saves the next statement making it again.
+        built.of(&state, schema).asks();
+        if built.makes_room(schema, bytes) {
+            let kept = built.of(&state, schema);
+            kept.rows = Some(Arc::new(documents.clone()));
+            kept.bytes += bytes;
         }
         Ok(Some(documents))
     }
@@ -9548,6 +9777,38 @@ impl DocumentStore for RustStore {
         Ok(Some(documents))
     }
 
+    fn kept_with_columns(&self, key: &str, stamp: u64) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+        let built = self.built_columns.lock().ok()?;
+        built
+            .collections
+            .values()
+            .find(|kept| kept.stamp == stamp)
+            .and_then(|kept| kept.kept.get(key).cloned())
+    }
+
+    fn keep_with_columns(&self, key: &str, stamp: u64, value: Arc<dyn std::any::Any + Send + Sync>) {
+        if let Ok(mut built) = self.built_columns.lock() {
+            if let Some(kept) = built.collections.values_mut().find(|kept| kept.stamp == stamp) {
+                kept.kept.insert(key.to_string(), value);
+            }
+        }
+    }
+
+    fn scan_columns(&self, schema: &str, fields: &[String]) -> OQLResult<Option<Vec<ColumnBatch>>> {
+        Ok(self
+            .rows_and_columns(schema, fields, false)?
+            .map(|(_, batch)| vec![batch]))
+    }
+
+    fn scan_rows_and_columns(
+        &self,
+        schema: &str,
+        fields: &[String],
+    ) -> OQLResult<Option<(Arc<Vec<Arc<Document>>>, ColumnBatch)>> {
+        Ok(self
+            .rows_and_columns(schema, fields, true)?
+            .and_then(|(rows, batch)| Some((rows?, batch))))
+    }
     fn scan_projected_batches(
         &self,
         schema: &str,
@@ -11107,7 +11368,7 @@ mod tests {
     }
 
     fn document(id: &str) -> Document {
-        Document::with_id(id.to_string(), "events".to_string(), HashMap::new())
+        Document::with_id(id.to_string(), "events".to_string(), crate::document::Fields::default())
     }
 
     #[test]
@@ -11642,7 +11903,7 @@ mod tests {
                 let document = Document::with_id(
                     id.to_string(),
                     "events".to_string(),
-                    HashMap::from([
+                    crate::document::Fields::from_iter([
                         ("severity_code".to_string(), Value::String("E".to_string())),
                         ("sequence_number".to_string(), Value::Integer(7)),
                     ]),
@@ -11684,7 +11945,7 @@ mod tests {
         let scalar = Document::with_id(
             "scalar".into(),
             "logs".into(),
-            HashMap::from([
+            crate::document::Fields::from_iter([
                 ("message".into(), Value::String("failed".into())),
                 ("level".into(), Value::Integer(50)),
             ]),
@@ -11699,9 +11960,9 @@ mod tests {
         let nested = Document::with_id(
             "nested".into(),
             "payloads".into(),
-            HashMap::from([(
+            crate::document::Fields::from_iter([(
                 "context".into(),
-                Value::Object(HashMap::from([(
+                Value::Object(crate::document::Fields::from_iter([(
                     "request".into(),
                     Value::String("req-1".into()),
                 )])),
@@ -11778,12 +12039,12 @@ mod tests {
             let first = Document::with_id(
                 "first".to_string(),
                 "events".to_string(),
-                HashMap::from([("message".to_string(), Value::String("old".to_string()))]),
+                crate::document::Fields::from_iter([("message".to_string(), Value::String("old".to_string()))]),
             );
             let second = Document::with_id(
                 "second".to_string(),
                 "events".to_string(),
-                HashMap::from([
+                crate::document::Fields::from_iter([
                     ("message".to_string(), Value::String("new".to_string())),
                     ("code".to_string(), Value::Integer(500)),
                 ]),
@@ -11883,7 +12144,7 @@ mod tests {
                     .put_document(&Document::with_id(
                         id.into(),
                         "events".into(),
-                        HashMap::from([
+                        crate::document::Fields::from_iter([
                             ("message".into(), Value::String(format!("message-{id}"))),
                             ("level_rank".into(), Value::Integer(rank)),
                         ]),
@@ -11998,7 +12259,7 @@ mod tests {
                     .put_document(&Document::with_id(
                         format!("event-{sequence:03}"),
                         "events".into(),
-                        HashMap::from([("sequence".into(), Value::Integer(sequence))]),
+                        crate::document::Fields::from_iter([("sequence".into(), Value::Integer(sequence))]),
                     ))
                     .unwrap();
             }
@@ -12009,7 +12270,7 @@ mod tests {
                     .put_document(&Document::with_id(
                         format!("event-{sequence:03}"),
                         "events".into(),
-                        HashMap::from([("sequence".into(), Value::Integer(sequence))]),
+                        crate::document::Fields::from_iter([("sequence".into(), Value::Integer(sequence))]),
                     ))
                     .unwrap();
             }
@@ -12069,7 +12330,7 @@ mod tests {
                     .put_document(&Document::with_id(
                         id.into(),
                         "events".into(),
-                        HashMap::from([
+                        crate::document::Fields::from_iter([
                             ("message".into(), Value::String(format!("message-{id}"))),
                             ("level_rank".into(), Value::Integer(rank)),
                         ]),
@@ -12092,7 +12353,7 @@ mod tests {
                 .put_document(&Document::with_id(
                     "aa".into(),
                     "events".into(),
-                    HashMap::from([
+                    crate::document::Fields::from_iter([
                         ("message".into(), Value::String("message-aa".into())),
                         ("level_rank".into(), Value::Integer(35)),
                     ]),
@@ -12147,7 +12408,7 @@ mod tests {
                 .put_document(&Document::with_id(
                     "a".into(),
                     "events".into(),
-                    HashMap::from([("sequence".into(), Value::Integer(1))]),
+                    crate::document::Fields::from_iter([("sequence".into(), Value::Integer(1))]),
                 ))
                 .unwrap();
             store.checkpoint().unwrap();
@@ -12317,7 +12578,7 @@ mod tests {
         {
             let store = RustStore::new_with_fs(path, 8 * 1024 * 1024, fs.clone()).unwrap();
             store.put_schema(&schema).unwrap();
-            let target = Document::with_id("target".into(), "nodes".into(), HashMap::new());
+            let target = Document::with_id("target".into(), "nodes".into(), crate::document::Fields::default());
             store.put_document(&target).unwrap();
             let target_ref = store
                 .get_objref("nodes", &"target".to_string())
@@ -12326,7 +12587,7 @@ mod tests {
             let source = Document::with_id(
                 "source".into(),
                 "nodes".into(),
-                HashMap::from([("parent".into(), Value::Reference(target_ref))]),
+                crate::document::Fields::from_iter([("parent".into(), Value::Reference(target_ref))]),
             );
             store.put_document(&source).unwrap();
             store.checkpoint().unwrap();
@@ -13322,7 +13583,7 @@ mod tests {
         let large = Document::with_id(
             "large".to_string(),
             "events".to_string(),
-            HashMap::from([("message".to_string(), Value::String("x".repeat(70 * 1024)))]),
+            crate::document::Fields::from_iter([("message".to_string(), Value::String("x".repeat(70 * 1024)))]),
         );
         store.put_document(&large).unwrap();
         store.wait_for_maintenance().unwrap();
@@ -13863,7 +14124,7 @@ mod tests {
             Document::with_id(
                 id.to_string(),
                 "users".into(),
-                HashMap::from([("email".into(), Value::String("same@example.com".into()))]),
+                crate::document::Fields::from_iter([("email".into(), Value::String("same@example.com".into()))]),
             )
         };
         let error = store
@@ -13894,7 +14155,7 @@ mod tests {
                 .put_document(&Document::with_id(
                     id.into(),
                     "scores".into(),
-                    HashMap::from([("score".into(), Value::Integer(score))]),
+                    crate::document::Fields::from_iter([("score".into(), Value::Integer(score))]),
                 ))
                 .unwrap();
         }
@@ -13935,7 +14196,7 @@ mod tests {
                 .put_document(&Document::with_id(
                     number.to_string(),
                     "numbers".into(),
-                    HashMap::from([("value".into(), Value::Integer(value))]),
+                    crate::document::Fields::from_iter([("value".into(), Value::Integer(value))]),
                 ))
                 .unwrap();
         }

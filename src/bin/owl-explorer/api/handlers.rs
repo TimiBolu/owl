@@ -79,7 +79,7 @@ fn json_to_value(raw: &serde_json::Value) -> Result<Value, String> {
             Ok(Value::List(out))
         }
         serde_json::Value::Object(obj) => {
-            let mut out = std::collections::HashMap::new();
+            let mut out = owl_db::Fields::default();
             for (k, v) in obj {
                 out.insert(k.clone(), json_to_value(v)?);
             }
@@ -371,7 +371,7 @@ fn constraint_to_json(constraint: &SchemaConstraint) -> serde_json::Value {
 }
 
 fn extract_field_path_value(
-    fields: &std::collections::HashMap<String, Value>,
+    fields: &owl_db::Fields,
     path: &str,
 ) -> Option<Value> {
     let mut parts = path.split('.');
@@ -1754,7 +1754,7 @@ pub fn update_document(
         .ok_or_else(|| format!("document '{}' not found", req.id))?;
 
     let replace = req.replace.unwrap_or(false);
-    let mut converted_fields = std::collections::HashMap::new();
+    let mut converted_fields = owl_db::Fields::default();
     for (field_name, raw) in req.fields {
         let field_type = schema.fields.get(&field_name).ok_or_else(|| {
             format!(
@@ -1972,7 +1972,7 @@ pub fn import_data(
     let mut errors = Vec::new();
     for (idx, doc_raw) in req.documents.iter().enumerate() {
         let mut row_errors = Vec::new();
-        let mut fields = std::collections::HashMap::new();
+        let mut fields = owl_db::Fields::default();
         for (field_name, field_type) in &schema.fields {
             let Some(value_raw) = doc_raw.get(field_name) else {
                 if !field_type.is_optional() {

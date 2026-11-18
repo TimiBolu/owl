@@ -126,3 +126,33 @@ mod tests {
         assert_eq!(ObjRef::null().to_string_id(), "");
     }
 }
+
+
+/// A quick hash for maps keyed by an [`ObjRef`]. A reference is a number the
+/// store hands out itself, so a map of them does not pay for resistance to
+/// chosen keys.
+#[derive(Default, Clone, Copy)]
+pub struct ObjRefHasher(u64);
+
+impl std::hash::Hasher for ObjRefHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.write_u64(u64::from(*byte));
+        }
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        // Multiply to spread the bits, then fold the strong high half onto
+        // the low half a table picks its slot by.
+        let mixed = (self.0.rotate_left(5) ^ value).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        self.0 = mixed ^ (mixed >> 32);
+    }
+}
+
+/// A map keyed by [`ObjRef`].
+pub type ByObjRef<Value> =
+    std::collections::HashMap<ObjRef, Value, std::hash::BuildHasherDefault<ObjRefHasher>>;

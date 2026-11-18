@@ -954,7 +954,7 @@ fn a_single_related_row_projects_as_an_object() {
     // A reference is one row, so shaping it yields one object.
     assert_eq!(
         db.scalar(r#"users.where { .id == "u1" }.select { team: .team.select { name } }"#, "team"),
-        Value::Object(HashMap::from([("name".to_string(), text("Core"))]))
+        Value::Object(owl_db::Fields::from_iter([("name".to_string(), text("Core"))]))
     );
     // Shaping can traverse onward from the referenced row.
     assert_eq!(
@@ -962,7 +962,7 @@ fn a_single_related_row_projects_as_an_object() {
             r#"users.where { .id == "u1" }.select { team: .team.select { name, org: .org.name } }"#,
             "team"
         ),
-        Value::Object(HashMap::from([
+        Value::Object(owl_db::Fields::from_iter([
             ("name".to_string(), text("Core")),
             ("org".to_string(), text("Acme")),
         ]))
@@ -973,7 +973,7 @@ fn a_single_related_row_projects_as_an_object() {
             r#"users.where { .id == "u1" }.select { top: .orders.sort { .amount.desc }.first().select { id } }"#,
             "top"
         ),
-        Value::Object(HashMap::from([("id".to_string(), text("r1"))]))
+        Value::Object(owl_db::Fields::from_iter([("id".to_string(), text("r1"))]))
     );
     // No related row is null, not an empty object or a list.
     assert_eq!(
@@ -989,12 +989,12 @@ fn a_single_related_row_projects_as_an_object() {
             "users {\n  team = .team\n  where { .id == \"u2\" }\n  select { t: team.select { name } }\n}",
             "t"
         ),
-        Value::Object(HashMap::from([("name".to_string(), text("Ops"))]))
+        Value::Object(owl_db::Fields::from_iter([("name".to_string(), text("Ops"))]))
     );
     // An embedded object behaves the same way.
     assert_eq!(
         db.scalar(r#"users.where { .id == "u1" }.select { p: .profile.select { city } }"#, "p"),
-        Value::Object(HashMap::from([("city".to_string(), text("Lagos"))]))
+        Value::Object(owl_db::Fields::from_iter([("city".to_string(), text("Lagos"))]))
     );
 }
 
@@ -1297,7 +1297,7 @@ fn dot_is_the_current_value() {
     };
     assert_eq!(
         shouted[0],
-        Value::Object(HashMap::from([("v".to_string(), text("RUST"))]))
+        Value::Object(owl_db::Fields::from_iter([("v".to_string(), text("RUST"))]))
     );
 
     assert_eq!(db.ids(r#"posts.where { .tags.where { . == "rust" }.exists() }"#), ["a"]);
@@ -1500,7 +1500,7 @@ fn every_operation_means_the_same_on_every_kind_of_collection() {
         ("embedded array", ".order_list"),
     ];
     let int = Value::Integer;
-    let id = |value: &str| Value::Object(HashMap::from([("id".to_string(), text(value))]));
+    let id = |value: &str| Value::Object(owl_db::Fields::from_iter([("id".to_string(), text(value))]));
     let ids = |values: &[&str]| Value::List(values.iter().map(|value| id(value)).collect());
     let operations: Vec<(&str, Value)> = vec![
         ("count()", int(4)),
@@ -1528,20 +1528,20 @@ fn every_operation_means_the_same_on_every_kind_of_collection() {
         (
             "sort { .id.asc }.select { status }.distinct()",
             Value::List(vec![
-                Value::Object(HashMap::from([("status".to_string(), text("paid"))])),
-                Value::Object(HashMap::from([("status".to_string(), text("open"))])),
+                Value::Object(owl_db::Fields::from_iter([("status".to_string(), text("paid"))])),
+                Value::Object(owl_db::Fields::from_iter([("status".to_string(), text("open"))])),
             ]),
         ),
         ("select { status }.distinct().count()", int(2)),
         (
             "group_by { .status }.select { status, n: count(), total: sum(.amount) }.sort { .status.asc }",
             Value::List(vec![
-                Value::Object(HashMap::from([
+                Value::Object(owl_db::Fields::from_iter([
                     ("status".to_string(), text("open")),
                     ("n".to_string(), int(2)),
                     ("total".to_string(), int(55)),
                 ])),
-                Value::Object(HashMap::from([
+                Value::Object(owl_db::Fields::from_iter([
                     ("status".to_string(), text("paid")),
                     ("n".to_string(), int(2)),
                     ("total".to_string(), int(420)),
@@ -1550,7 +1550,7 @@ fn every_operation_means_the_same_on_every_kind_of_collection() {
         ),
         (
             "group_by { big: .amount > 100 }.select { big, n: count() }.sort { .n.desc }.first().select { n }",
-            Value::Object(HashMap::from([("n".to_string(), int(2))])),
+            Value::Object(owl_db::Fields::from_iter([("n".to_string(), int(2))])),
         ),
     ];
 
@@ -1747,7 +1747,7 @@ fn an_operation_with_no_receiver_applies_to_the_rows_in_hand() {
     assert_eq!(paid.get_field("big"), Some(&Value::Integer(2)));
     assert_eq!(
         paid.get_field("top"),
-        Some(&Value::Object(HashMap::from([("id".to_string(), text("r3"))])))
+        Some(&Value::Object(owl_db::Fields::from_iter([("id".to_string(), text("r3"))])))
     );
     assert_eq!(open.get_field("top_two_total"), Some(&Value::Integer(55)));
     let Some(Value::List(ids)) = open.get_field("ids") else {
@@ -1769,7 +1769,7 @@ fn an_operation_with_no_receiver_applies_to_the_rows_in_hand() {
     assert_eq!(row.get_field("share"), Some(&Value::Integer(0)));
     assert_eq!(
         row.get_field("largest"),
-        Some(&Value::Object(HashMap::from([("id".to_string(), text("r3"))])))
+        Some(&Value::Object(owl_db::Fields::from_iter([("id".to_string(), text("r3"))])))
     );
 }
 
@@ -3326,7 +3326,7 @@ fn inserting_values_is_inserting_text_without_the_parse() {
     given.script(schema);
 
     let text = |value: &str| Value::String(value.to_string());
-    let row = |fields: Vec<(&str, Value)>| -> HashMap<String, Value> {
+    let row = |fields: Vec<(&str, Value)>| -> owl_db::Fields {
         fields
             .into_iter()
             .map(|(name, value)| (name.to_string(), value))
@@ -3408,7 +3408,7 @@ fn inserting_values_is_inserting_text_without_the_parse() {
         fields.insert(name.to_string(), value);
         fields
     };
-    let cases: Vec<(&str, HashMap<String, Value>)> = vec![
+    let cases: Vec<(&str, owl_db::Fields)> = vec![
         (r#"{ id: "t1", owner: "w1", made: "2026-03-01", weight: 1.0, tags: [], box: { wide: 1, deep: 1 } }"#, good("t1")),
         (r#"{ id: "t8", owner: "nobody", made: "2026-03-01", weight: 1.0, tags: [], box: { wide: 1, deep: 1 } }"#, with("t8", "owner", text("nobody"))),
         (r#"{ id: "t8", owner: "w1", made: "soon", weight: 1.0, tags: [], box: { wide: 1, deep: 1 } }"#, with("t8", "made", text("soon"))),

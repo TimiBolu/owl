@@ -246,7 +246,7 @@ impl<'a> RecordView<'a> {
     }
 
     pub(crate) fn decode_slots(&self, projection: &[(usize, String)]) -> OQLResult<Document> {
-        let mut fields = HashMap::with_capacity(projection.len());
+        let mut fields = crate::document::Fields::with_capacity_and_hasher(projection.len(), Default::default());
         for (index, name) in projection {
             if *index >= self.schema.fields.len()
                 || (self.regions.header.format_version >= RECORD_VERSION
@@ -443,7 +443,7 @@ impl RecordCodec {
         let nulls = &record[null_start..fixed_start];
         let fixed = &record[fixed_start..variable_start];
         let variable = &record[variable_start..variable_end];
-        let mut fields = HashMap::new();
+        let mut fields = crate::document::Fields::default();
 
         for (index, field) in schema.fields.iter().enumerate() {
             if projection.is_some_and(|projection| !projection.contains(&field.name)) {
@@ -698,7 +698,7 @@ fn decode_dynamic(input: &[u8], cursor: &mut usize, depth: usize) -> OQLResult<V
         }
         TAG_OBJECT => {
             let count = take_count(input, cursor)?;
-            let mut fields = HashMap::with_capacity(count.min(1024));
+            let mut fields = crate::document::Fields::with_capacity_and_hasher(count.min(1024), Default::default());
             for _ in 0..count {
                 let name = std::str::from_utf8(take_sized(input, cursor)?)
                     .map_err(|_| OQLError::storage_error("field name is not UTF-8", None))?
@@ -908,7 +908,7 @@ mod tests {
         Document {
             id: "event-1".to_string(),
             schema: "events".to_string(),
-            fields: HashMap::from([
+            fields: crate::document::Fields::from_iter([
                 ("message".to_string(), Value::String("boom".to_string())),
                 ("count".to_string(), Value::Integer(-42)),
                 ("ratio".to_string(), Value::Float(1.25)),
@@ -928,7 +928,7 @@ mod tests {
                 ),
                 (
                     "attrs".to_string(),
-                    Value::Object(HashMap::from([(
+                    Value::Object(crate::document::Fields::from_iter([(
                         "region".to_string(),
                         Value::String("ng".to_string()),
                     )])),
@@ -1005,7 +1005,7 @@ mod tests {
         let projected = view.decode_slots(&[(count, "count".to_string())]).unwrap();
         assert_eq!(
             projected.fields,
-            HashMap::from([("count".into(), Value::Integer(-42))])
+            crate::document::Fields::from_iter([("count".into(), Value::Integer(-42))])
         );
     }
 

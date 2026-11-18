@@ -478,7 +478,7 @@ impl TypedSegment {
                 "typed segment cannot authoritatively reconstruct this row",
             ));
         }
-        let mut fields = std::collections::HashMap::with_capacity(compiled.fields.len());
+        let mut fields = crate::document::Fields::with_capacity_and_hasher(compiled.fields.len(), Default::default());
         for field in &compiled.fields {
             let column = self
                 .column(field.id)
@@ -674,6 +674,68 @@ impl TypedColumn {
             ColumnValues::DateTimes(values) => Ok(TypedCell::DateTime(values[row])),
             ColumnValues::References(values) => Ok(TypedCell::Reference(values[row])),
         }
+    }
+}
+
+impl TypedColumn {
+    /// How many rows the column covers.
+    pub(crate) fn rows(&self) -> usize {
+        self.values.len()
+    }
+
+    /// Roughly what the column takes in memory.
+    pub(crate) fn bytes(&self) -> usize {
+        let rows = self.values.len();
+        self.presence.len()
+            + self.nulls.len()
+            + match &self.values {
+                ColumnValues::Strings { offsets, bytes } => offsets.len() * 4 + bytes.len(),
+                ColumnValues::Booleans(_) => rows,
+                ColumnValues::DateTimes(_) => rows * std::mem::size_of::<DateTime<Utc>>(),
+                ColumnValues::References(_) => rows * std::mem::size_of::<ObjRef>(),
+                ColumnValues::Integers(_) | ColumnValues::Floats(_) => rows * 8,
+            }
+    }
+
+    /// One field of `rows` as a column, in their order. `None` when the
+    /// field's type has no column form, or a row holds a value of another
+    /// type than the field declares.
+    pub(crate) fn of_rows(
+        field_name: &str,
+        field_type: &FieldType,
+        rows: &[Arc<Document>],
+    ) -> OQLResult<Option<Self>> {
+        let Some(kind) = column_kind(field_type) else {
+            return Ok(None);
+        };
+        let bitmap_len = rows.len().div_ceil(8);
+        let mut presence = vec![0; bitmap_len];
+        let mut nulls = vec![0; bitmap_len];
+        let mut values = empty_values(kind, rows.len());
+        for (index, document) in rows.iter().enumerate() {
+            let Some(value) = document.fields.get(field_name) else {
+                push_default(&mut values)?;
+                continue;
+            };
+            set_bit(&mut presence, index);
+            if value.is_null() {
+                set_bit(&mut nulls, index);
+                push_default(&mut values)?;
+                continue;
+            }
+            if push_value(&mut values, value).is_err() {
+                return Ok(None);
+            }
+        }
+        finish_strings(&mut values)?;
+        Ok(Some(TypedColumn {
+            field_id: 0,
+            presence,
+            nulls,
+            values,
+            integer_min: None,
+            integer_max: None,
+        }))
     }
 }
 
@@ -1271,7 +1333,7 @@ mod tests {
         let mut first = Document::with_id(
             "a".into(),
             "events".into(),
-            HashMap::from([
+            crate::document::Fields::from_iter([
                 ("active".into(), Value::Boolean(true)),
                 ("message".into(), Value::String("alpha".into())),
                 ("sequence".into(), Value::Integer(-3)),
@@ -1285,7 +1347,7 @@ mod tests {
         let mut second = Document::with_id(
             "b".into(),
             "events".into(),
-            HashMap::from([
+            crate::document::Fields::from_iter([
                 ("active".into(), Value::Boolean(false)),
                 ("message".into(), Value::String("βeta".into())),
                 ("sequence".into(), Value::Integer(9)),
@@ -1434,7 +1496,7 @@ mod tests {
                     Arc::new(Document::with_id(
                         format!("log-{index:04}"),
                         "logs".into(),
-                        HashMap::from([
+                        crate::document::Fields::from_iter([
                             (
                                 "message".into(),
                                 Value::String("repeated stack frame".repeat(8)),

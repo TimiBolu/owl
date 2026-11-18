@@ -33,7 +33,7 @@ fn fixture(document_count: usize) -> Fixture {
             Document::with_id(
                 format!("event-{sequence}"),
                 "events".to_string(),
-                HashMap::from([
+                owl_db::Fields::from_iter([
                     ("app".to_string(), Value::String("api".to_string())),
                     (
                         "message".to_string(),

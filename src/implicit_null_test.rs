@@ -68,14 +68,14 @@ mod tests {
 
     /// Create a test document with nested structure
     fn create_test_document_with_nested_fields() -> Document {
-        let mut fields = HashMap::new();
+        let mut fields = crate::document::Fields::default();
 
         // Basic fields
         fields.insert("name".to_string(), Value::String("Alice".to_string()));
         fields.insert("age".to_string(), Value::Integer(30));
 
         // Nested profile object
-        let mut profile = HashMap::new();
+        let mut profile = crate::document::Fields::default();
         profile.insert(
             "avatar".to_string(),
             Value::String("avatar.jpg".to_string()),
@@ -86,12 +86,12 @@ mod tests {
         );
 
         // Deeply nested preferences
-        let mut preferences = HashMap::new();
+        let mut preferences = crate::document::Fields::default();
         preferences.insert("theme".to_string(), Value::String("dark".to_string()));
         preferences.insert("notifications".to_string(), Value::Boolean(true));
 
         // Even deeper nested settings
-        let mut advanced_settings = HashMap::new();
+        let mut advanced_settings = crate::document::Fields::default();
         advanced_settings.insert("beta_features".to_string(), Value::Boolean(false));
         advanced_settings.insert("debug_mode".to_string(), Value::Boolean(true));
         preferences.insert("advanced".to_string(), Value::Object(advanced_settings));
@@ -104,7 +104,7 @@ mod tests {
 
     /// Create a test document with minimal fields (simulating old schema)
     fn create_legacy_document() -> Document {
-        let mut fields = HashMap::new();
+        let mut fields = crate::document::Fields::default();
         fields.insert("name".to_string(), Value::String("Bob".to_string()));
         fields.insert("age".to_string(), Value::Integer(25));
         // No profile field - simulating old schema

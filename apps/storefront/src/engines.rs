@@ -223,7 +223,7 @@ impl Owl {
     pub fn insert_rows(
         &self,
         collection: &str,
-        rows: Vec<std::collections::HashMap<String, Value>>,
+        rows: Vec<owl_db::Fields>,
     ) -> Result<()> {
         self.executor
             .insert_documents(collection, rows)

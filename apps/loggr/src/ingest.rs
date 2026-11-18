@@ -244,11 +244,11 @@ fn event_document(event: &PreparedEvent) -> Result<Document> {
         .attributes
         .iter()
         .map(|(key, value)| Ok((key.clone(), json_value(value)?)))
-        .collect::<Result<HashMap<_, _>>>()?;
+        .collect::<Result<owl_db::Fields>>()?;
     Ok(Document::with_id(
         event.id.clone(),
         "events".into(),
-        HashMap::from([
+        owl_db::Fields::from_iter([
             (
                 "application".into(),
                 Value::String(event.application.clone()),
@@ -281,7 +281,7 @@ fn new_issue(event: &PreparedEvent, fingerprint: &str) -> Document {
     Document::with_id(
         fingerprint.into(),
         "issues".into(),
-        HashMap::from([
+        owl_db::Fields::from_iter([
             (
                 "application".into(),
                 Value::String(event.application.clone()),
@@ -326,7 +326,7 @@ fn advance_issue(issue: Document, event: &PreparedEvent) -> Document {
     };
     let is_latest = event.occurred_at >= previous_last_seen;
     let resolved = matches!(issue.fields.get("resolved_at"), Some(Value::DateTime(at)) if event.occurred_at > *at);
-    let mut updates = HashMap::from([
+    let mut updates = owl_db::Fields::from_iter([
         ("first_seen".into(), Value::DateTime(first_seen)),
         (
             "last_seen".into(),
@@ -357,7 +357,7 @@ fn advance_issue(issue: Document, event: &PreparedEvent) -> Document {
 }
 
 fn frame_value(frame: &StackFrame) -> Value {
-    Value::Object(HashMap::from([
+    Value::Object(owl_db::Fields::from_iter([
         (
             "module".into(),
             frame

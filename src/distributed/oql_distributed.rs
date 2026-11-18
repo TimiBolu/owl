@@ -764,7 +764,7 @@ impl DistributedOQLEngine {
         schema: &str,
         insert_block: &InsertBlock,
     ) -> OQLResult<Document> {
-        let mut fields = HashMap::new();
+        let mut fields = crate::document::Fields::default();
         let mut document_id: Option<DocumentId> = None;
 
         for field in &insert_block.fields {
@@ -827,7 +827,7 @@ impl DistributedOQLEngine {
                 Ok(Value::List(array_values))
             }
             Expression::ObjectLiteral(fields) => {
-                let mut object_fields = HashMap::new();
+                let mut object_fields = crate::document::Fields::default();
                 for field in fields {
                     let value = self.expression_to_value(&field.value)?;
                     object_fields.insert(field.name.clone(), value);
@@ -1255,14 +1255,14 @@ mod tests {
             .put_document(&Document::with_id(
                 "u1".to_string(),
                 "User".to_string(),
-                HashMap::from([("name".to_string(), Value::String("Alice".to_string()))]),
+                crate::document::Fields::from_iter([("name".to_string(), Value::String("Alice".to_string()))]),
             ))
             .unwrap();
         storage
             .put_document(&Document::with_id(
                 "u2".to_string(),
                 "User".to_string(),
-                HashMap::from([("name".to_string(), Value::String("Bob".to_string()))]),
+                crate::document::Fields::from_iter([("name".to_string(), Value::String("Bob".to_string()))]),
             ))
             .unwrap();
 
@@ -1286,14 +1286,14 @@ mod tests {
             .put_document(&Document::with_id(
                 "u1".to_string(),
                 "User".to_string(),
-                HashMap::from([("name".to_string(), Value::String("Alice".to_string()))]),
+                crate::document::Fields::from_iter([("name".to_string(), Value::String("Alice".to_string()))]),
             ))
             .unwrap();
         storage
             .put_document(&Document::with_id(
                 "u2".to_string(),
                 "User".to_string(),
-                HashMap::from([("name".to_string(), Value::String("Bob".to_string()))]),
+                crate::document::Fields::from_iter([("name".to_string(), Value::String("Bob".to_string()))]),
             ))
             .unwrap();
 
@@ -1326,7 +1326,7 @@ mod tests {
             .put_document(&Document::with_id(
                 "u1".to_string(),
                 "User".to_string(),
-                HashMap::from([("name".to_string(), Value::String("Bob".to_string()))]),
+                crate::document::Fields::from_iter([("name".to_string(), Value::String("Bob".to_string()))]),
             ))
             .unwrap();
 
@@ -1354,14 +1354,14 @@ mod tests {
             .put_document(&Document::with_id(
                 "u1".to_string(),
                 "User".to_string(),
-                HashMap::from([("name".to_string(), Value::String("Alice".to_string()))]),
+                crate::document::Fields::from_iter([("name".to_string(), Value::String("Alice".to_string()))]),
             ))
             .unwrap();
         storage
             .put_document(&Document::with_id(
                 "u2".to_string(),
                 "User".to_string(),
-                HashMap::from([("name".to_string(), Value::String("Bob".to_string()))]),
+                crate::document::Fields::from_iter([("name".to_string(), Value::String("Bob".to_string()))]),
             ))
             .unwrap();
 
@@ -1503,7 +1503,7 @@ mod tests {
     fn test_document_to_oql_conversion() {
         let (engine, _temp_dir) = create_test_engine();
 
-        let mut fields = HashMap::new();
+        let mut fields = crate::document::Fields::default();
         fields.insert("id".to_string(), Value::String("user1".to_string()));
         fields.insert("name".to_string(), Value::String("Alice".to_string()));
         fields.insert("age".to_string(), Value::Integer(30));

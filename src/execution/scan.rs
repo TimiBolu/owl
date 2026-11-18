@@ -364,7 +364,7 @@ impl ProjectExec {
     }
 
     fn project_document(&self, doc: &Document) -> OQLResult<Document> {
-        let mut projected_fields = std::collections::HashMap::new();
+        let mut projected_fields = crate::document::Fields::default();
 
         for proj in &self.projections {
             let value = self.evaluate_expression(doc, &proj.expression)?;
@@ -724,7 +724,7 @@ mod batch_tests {
         Document::with_id(
             id.to_string(),
             "events".to_string(),
-            HashMap::from([
+            crate::document::Fields::from_iter([
                 ("level".to_string(), Value::Integer(level)),
                 ("message".to_string(), Value::String(message.to_string())),
             ]),
@@ -794,7 +794,7 @@ mod batch_tests {
                 .put_document(&Document::with_id(
                     id.to_string(),
                     "events".to_string(),
-                    HashMap::from([("message".to_string(), Value::String(id.to_string()))]),
+                    crate::document::Fields::from_iter([("message".to_string(), Value::String(id.to_string()))]),
                 ))
                 .unwrap();
         }

@@ -611,11 +611,10 @@ mod tests {
     use super::*;
     use crate::document::Value;
     use crate::simulation::RealFileSystem;
-    use std::collections::HashMap;
     use tempfile::TempDir;
 
     fn create_test_document(id: &str, name: &str) -> Document {
-        let mut fields = HashMap::new();
+        let mut fields = crate::document::Fields::default();
         fields.insert("name".to_string(), Value::String(name.to_string()));
         Document::with_id(id.to_string(), "users".to_string(), fields)
     }

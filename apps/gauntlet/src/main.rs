@@ -14,7 +14,6 @@ use clap::{Parser, Subcommand};
 use data::{Cell, Row, Table};
 use owl_db::Value;
 use serde_json::Value as Json;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
 use storefront::engines::{first_difference, Owl, Sqlite, BATCH};
@@ -118,7 +117,7 @@ fn owl_value(cell: &Cell) -> Option<Value> {
     })
 }
 
-fn owl_row(row: &Row) -> HashMap<String, Value> {
+fn owl_row(row: &Row) -> owl_db::Fields {
     row.iter()
         .filter_map(|(name, cell)| Some(((*name).to_string(), owl_value(cell)?)))
         .collect()
@@ -180,6 +179,13 @@ fn load_sqlite(sqlite: &mut Sqlite, table: &Table) -> Result<()> {
     Ok(())
 }
 
+/// Whether to move the rows into column segments after loading, as
+/// `OWL_COMPACT=1` asks. Queries then run against the store as it is after
+/// compaction: columns on disk, and rows decoded only when read.
+fn compacted() -> bool {
+    std::env::var("OWL_COMPACT").is_ok_and(|value| value == "1")
+}
+
 fn load(people: usize) -> Result<Loaded> {
     let tables = data::generate(people);
     let directory = tempfile::TempDir::new()?;
@@ -197,6 +203,10 @@ fn load(people: usize) -> Result<Loaded> {
         load_sqlite(&mut sqlite, table).with_context(|| format!("loading {} into SQLite", table.name))?;
     }
     owl.checkpoint()?;
+    if compacted() {
+        owl.compact()?;
+        println!("compacted: rows are in column segments");
+    }
     sqlite.checkpoint()?;
     println!("{rows} rows loaded into each engine ({people} people)\n");
     Ok(Loaded { _directory: directory, owl, sqlite })

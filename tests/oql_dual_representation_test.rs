@@ -164,18 +164,18 @@ fn null_missing_and_broken_reference_predicates_remain_distinct() {
     let present = Document::with_id(
         "present".into(),
         "users".into(),
-        HashMap::from([("nickname".into(), Value::String("Ada".into()))]),
+        owl_db::Fields::from_iter([("nickname".into(), Value::String("Ada".into()))]),
     );
     let explicit_null = Document::with_id(
         "null".into(),
         "users".into(),
-        HashMap::from([("nickname".into(), Value::Null)]),
+        owl_db::Fields::from_iter([("nickname".into(), Value::Null)]),
     );
-    let missing = Document::with_id("missing".into(), "users".into(), HashMap::new());
+    let missing = Document::with_id("missing".into(), "users".into(), owl_db::Fields::default());
     let broken = Document::with_id(
         "broken".into(),
         "users".into(),
-        HashMap::from([
+        owl_db::Fields::from_iter([
             (
                 "team".into(),
                 Value::Reference(owl_db::document::ObjRef::from_parts(99, 42, 1)),
@@ -212,17 +212,17 @@ fn array_fields_use_the_same_collection_operations_as_top_level_queries() {
     let executor = QueryExecutor::new_with_real_clock(store.clone());
 
     let items = vec![
-        Value::Object(HashMap::from([
+        Value::Object(owl_db::Fields::from_iter([
             ("sku".into(), Value::String("book-1".into())),
             ("category".into(), Value::String("books".into())),
             ("price".into(), Value::Integer(35)),
         ])),
-        Value::Object(HashMap::from([
+        Value::Object(owl_db::Fields::from_iter([
             ("sku".into(), Value::String("game-1".into())),
             ("category".into(), Value::String("games".into())),
             ("price".into(), Value::Integer(70)),
         ])),
-        Value::Object(HashMap::from([
+        Value::Object(owl_db::Fields::from_iter([
             ("sku".into(), Value::String("book-2".into())),
             ("category".into(), Value::String("books".into())),
             ("price".into(), Value::Integer(55)),
@@ -232,12 +232,12 @@ fn array_fields_use_the_same_collection_operations_as_top_level_queries() {
         .put_document(&Document::with_id(
             "order-1".into(),
             "orders".into(),
-            HashMap::from([
+            owl_db::Fields::from_iter([
                 ("items".into(), Value::List(items)),
                 ("featured_sku".into(), Value::String("book-2".into())),
                 (
                     "profile".into(),
-                    Value::Object(HashMap::from([
+                    Value::Object(owl_db::Fields::from_iter([
                         ("city".into(), Value::String("Lagos".into())),
                         ("country".into(), Value::String("NG".into())),
                     ])),
@@ -282,21 +282,21 @@ fn array_fields_use_the_same_collection_operations_as_top_level_queries() {
     );
     assert_eq!(
         rows[0].get_field("first_book"),
-        Some(&Value::Object(HashMap::from([(
+        Some(&Value::Object(owl_db::Fields::from_iter([(
             "sku".into(),
             Value::String("book-2".into())
         )])))
     );
     assert_eq!(
         rows[0].get_field("profile"),
-        Some(&Value::Object(HashMap::from([(
+        Some(&Value::Object(owl_db::Fields::from_iter([(
             "city".into(),
             Value::String("Lagos".into())
         )])))
     );
     assert_eq!(
         rows[0].get_field("second_item"),
-        Some(&Value::List(vec![Value::Object(HashMap::from([(
+        Some(&Value::List(vec![Value::Object(owl_db::Fields::from_iter([(
             "sku".into(),
             Value::String("book-2".into())
         )]))]))
@@ -507,7 +507,7 @@ fn nested_and_arithmetic_updates_preserve_shaped_mutation_semantics() {
     assert_eq!(updated[0].get_field("balance"), Some(&Value::Integer(125)));
     assert_eq!(
         updated[0].get_field("profile"),
-        Some(&Value::Object(HashMap::from([
+        Some(&Value::Object(owl_db::Fields::from_iter([
             ("city".into(), Value::String("Lagos".into())),
             ("country".into(), Value::String("NG".into())),
         ])))
@@ -535,7 +535,7 @@ fn nested_and_arithmetic_updates_preserve_shaped_mutation_semantics() {
         .unwrap();
     assert_eq!(
         created[0].get_field("profile"),
-        Some(&Value::Object(HashMap::from([(
+        Some(&Value::Object(owl_db::Fields::from_iter([(
             "city".into(),
             Value::String("Lagos".into())
         )])))
@@ -592,7 +592,7 @@ fn having_evaluates_aggregate_expressions_over_each_group() {
             .put_document(&Document::with_id(
                 id.into(),
                 "orders".into(),
-                HashMap::from([
+                owl_db::Fields::from_iter([
                     ("status".into(), Value::String(status.into())),
                     ("amount".into(), amount),
                 ]),
@@ -654,7 +654,7 @@ fn ungrouped_aggregate_calls_remain_composable_expressions() {
             .put_document(&Document::with_id(
                 id.into(),
                 "orders".into(),
-                HashMap::from([("amount".into(), amount)]),
+                owl_db::Fields::from_iter([("amount".into(), amount)]),
             ))
             .unwrap();
     }
@@ -686,7 +686,7 @@ fn ungrouped_aggregate_calls_remain_composable_expressions() {
     assert_eq!(rows[0].get_field("healthy"), Some(&Value::Boolean(true)));
     assert_eq!(
         rows[0].get_field("summary"),
-        Some(&Value::Object(HashMap::from([
+        Some(&Value::Object(owl_db::Fields::from_iter([
             ("minimum".into(), Value::Integer(40)),
             ("maximum".into(), Value::Integer(60)),
         ])))

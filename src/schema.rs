@@ -41,7 +41,7 @@ impl Schema {
     }
 
     /// Validate a document's fields against this schema
-    pub fn validate_document(&self, fields: &HashMap<String, Value>) -> OQLResult<()> {
+    pub fn validate_document(&self, fields: &crate::document::Fields) -> OQLResult<()> {
         // Check that all required fields are present and have correct types
         for (field_name, field_type) in &self.fields {
             if let Some(value) = fields.get(field_name) {
@@ -180,7 +180,7 @@ impl Schema {
     }
 
     /// Check embedded objects against their declared shapes.
-    pub fn validate_shapes(&self, fields: &HashMap<String, Value>) -> OQLResult<()> {
+    pub fn validate_shapes(&self, fields: &crate::document::Fields) -> OQLResult<()> {
         for constraint in &self.constraints {
             let SchemaConstraint::Shape { path, .. } = constraint else {
                 continue;
@@ -740,7 +740,7 @@ mod tests {
 
         let schema = Schema::new("users".to_string(), fields);
 
-        let mut doc_fields = HashMap::new();
+        let mut doc_fields = crate::document::Fields::default();
         doc_fields.insert("name".to_string(), Value::String("Alice".to_string()));
         doc_fields.insert("age".to_string(), Value::Integer(30));
 
@@ -755,7 +755,7 @@ mod tests {
 
         let schema = Schema::new("users".to_string(), fields);
 
-        let mut doc_fields = HashMap::new();
+        let mut doc_fields = crate::document::Fields::default();
         doc_fields.insert("name".to_string(), Value::String("Alice".to_string()));
         // Missing required 'age' field
 
@@ -775,7 +775,7 @@ mod tests {
 
         let schema = Schema::new("users".to_string(), fields);
 
-        let mut doc_fields = HashMap::new();
+        let mut doc_fields = crate::document::Fields::default();
         doc_fields.insert("name".to_string(), Value::String("Alice".to_string()));
         doc_fields.insert("age".to_string(), Value::String("thirty".to_string())); // Wrong type
 
@@ -796,7 +796,7 @@ mod tests {
         let schema = Schema::new("users".to_string(), fields);
 
         // Test with optional field present
-        let mut doc_fields = HashMap::new();
+        let mut doc_fields = crate::document::Fields::default();
         doc_fields.insert("name".to_string(), Value::String("Alice".to_string()));
         doc_fields.insert(
             "email".to_string(),
@@ -805,12 +805,12 @@ mod tests {
         assert!(schema.validate_document(&doc_fields).is_ok());
 
         // Test with optional field missing
-        let mut doc_fields = HashMap::new();
+        let mut doc_fields = crate::document::Fields::default();
         doc_fields.insert("name".to_string(), Value::String("Alice".to_string()));
         assert!(schema.validate_document(&doc_fields).is_ok());
 
         // Test with optional field as null
-        let mut doc_fields = HashMap::new();
+        let mut doc_fields = crate::document::Fields::default();
         doc_fields.insert("name".to_string(), Value::String("Alice".to_string()));
         doc_fields.insert("email".to_string(), Value::Null);
         assert!(schema.validate_document(&doc_fields).is_ok());
@@ -853,26 +853,26 @@ mod tests {
         let customer = Value::Reference(crate::document::ObjRef::from_parts(1, 123, 1));
 
         // Test valid reference
-        let mut doc_fields = HashMap::new();
+        let mut doc_fields = crate::document::Fields::default();
         doc_fields.insert("name".to_string(), Value::String("Order 1".to_string()));
         doc_fields.insert("customer".to_string(), customer.clone());
         assert!(schema.validate_document(&doc_fields).is_ok());
 
         // Test null required reference (should fail)
-        let mut doc_fields = HashMap::new();
+        let mut doc_fields = crate::document::Fields::default();
         doc_fields.insert("name".to_string(), Value::String("Order 1".to_string()));
         doc_fields.insert("customer".to_string(), Value::Null);
         assert!(schema.validate_document(&doc_fields).is_err());
 
         // Test null optional reference (should pass)
-        let mut doc_fields = HashMap::new();
+        let mut doc_fields = crate::document::Fields::default();
         doc_fields.insert("name".to_string(), Value::String("Order 1".to_string()));
         doc_fields.insert("customer".to_string(), customer);
         doc_fields.insert("optional_ref".to_string(), Value::Null);
         assert!(schema.validate_document(&doc_fields).is_ok());
 
         // Test empty reference ID (should fail)
-        let mut doc_fields = HashMap::new();
+        let mut doc_fields = crate::document::Fields::default();
         doc_fields.insert("name".to_string(), Value::String("Order 1".to_string()));
         doc_fields.insert(
             "customer".to_string(),

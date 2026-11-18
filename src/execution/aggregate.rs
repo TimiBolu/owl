@@ -60,7 +60,7 @@ impl GroupByExec {
     }
 
     fn create_group_document(&self, group_key: &str, documents: &[Document]) -> Document {
-        let mut fields = HashMap::new();
+        let mut fields = crate::document::Fields::default();
 
         // Add group key fields
         for (_i, field_name) in self.group_by_fields.iter().enumerate() {
@@ -250,8 +250,8 @@ impl AggregateExec {
     fn compute_aggregates(&mut self) -> OQLResult<()> {
         let mut count: i64 = 0;
         let mut sums: HashMap<String, f64> = HashMap::new();
-        let mut mins: HashMap<String, Value> = HashMap::new();
-        let mut maxs: HashMap<String, Value> = HashMap::new();
+        let mut mins: crate::document::Fields = crate::document::Fields::default();
+        let mut maxs: crate::document::Fields = crate::document::Fields::default();
 
         // Collect all documents and compute aggregates
         while let Some(doc) = self.input.next()? {
@@ -296,7 +296,7 @@ impl AggregateExec {
         }
 
         // Build result document
-        let mut fields = HashMap::new();
+        let mut fields = crate::document::Fields::default();
 
         for spec in &self.aggregates {
             let result_name = spec
@@ -413,7 +413,7 @@ mod tests {
     use crate::storage::create_storage;
 
     fn create_test_document(schema: &str, id: &str, age: i64, score: f64) -> Document {
-        let mut fields = HashMap::new();
+        let mut fields = crate::document::Fields::default();
         fields.insert("age".to_string(), Value::Integer(age));
         fields.insert("score".to_string(), Value::Float(score));
 

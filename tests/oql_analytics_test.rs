@@ -595,6 +595,42 @@ fn a_walk_keeps_the_way_to_each_row() {
     assert_eq!(db.scalar("parts.where { .id == \"wheel\" }.select { n: .uses.qty.product() }", "n"), int(32));
 }
 
+#[test]
+fn a_collection_name_always_means_something() {
+    let db = company();
+    // In a query on staff with no row above it, `staff` is the row in hand.
+    assert_eq!(
+        db.table("staff.sort { .id.asc }.limit(2).select { id, pay: staff.pay, me: staff.id }", &["pay", "me"]),
+        vec![vec![int(100), text("a")], vec![int(80), text("b")]]
+    );
+    // Under a step it is still the row the step was taken from.
+    assert_eq!(
+        db.scalar(
+            "staff.where { .id == \"a\" }.select { n: .reports.where { .pay < staff.pay }.count() }",
+            "n"
+        ),
+        int(3)
+    );
+    // Another collection's name, with no row of it in reach, is that
+    // collection: every row's value.
+    assert_eq!(
+        db.table(
+            "teams.where { .id == \"t1\" }.select { all: staff.pay.sum(), most: staff.pay.max(), n: staff.pay.count() }",
+            &["all", "most", "n"]
+        ),
+        vec![vec![int(450), int(100), int(6)]]
+    );
+    // `staff.pay` is one value here, so reducing it is refused, and the
+    // message says how to ask for every row.
+    let error = db.try_rows("staff.select { id, all: staff.pay.sum() }").unwrap_err();
+    assert!(error.contains("one value") && error.contains("staff.sum(.pay)"), "{error}");
+    // Which is this, and it still works.
+    assert_eq!(
+        db.scalar("staff.where { .id == \"a\" }.select { all: staff.sum(.pay) }", "all"),
+        int(450)
+    );
+}
+
 /// Shorter ways to the same answer: a table of rows keyed by what a
 /// function matches on, calls that end once enough ordered rows are in
 /// hand, a sort through a reference that reads only the first rows, set
@@ -717,6 +753,159 @@ fn shorter_ways_give_the_same_answers() {
         ),
         Value::Null
     );
+}
+
+/// A filter on plain fields is decided from the fields' columns before a
+/// row is read. The rows chosen must be the rows the filter chooses, and a
+/// write must be seen by the next query.
+#[test]
+fn whole_columns_choose_the_rows_a_filter_chooses() {
+    let db = company();
+    let queries = [
+        "staff.where { .pay > 60 }.count()",
+        "staff.where { .pay >= 80 && .grade != null }.count()",
+        "staff.where { .grade == null }.count()",
+        "staff.where { .grade == 2 }.sort { .id.asc }",
+        "staff.where { .grade != 2 }.sort { .id.asc }",
+        "staff.where { .grade < 3 }.sort { .id.asc }",
+        "staff.where { .pay == 80.0 }.count()",
+        "staff.where { .pay < 90.5 && .boss != null }.sort { .id.desc }.limit(2)",
+        "staff.where { .boss == null }.count()",
+        "staff.where { .boss != null }.count()",
+        "staff.where { .boss == \"a\" }.count()",
+        "staff.where { .boss == \"a\" && .pay > 80 }.count()",
+        "staff.where { .id != \"a\" && .pay > 50 }.count()",
+        "staff.where { .pay > 50 && .reports.count() > 0 }.sort { .id.asc }",
+        "staff.where { .reports.count() > 0 && .pay > 50 }.sort { .id.asc }",
+        "staff.where { .median == null && .pay > 0 }.sort { .id.asc }.select { id }",
+        "staff.where { .median != 7 }.count()",
+        "staff.where { .pay > 60 }.where { .grade == 1 }.count()",
+        "staff.where { .pay > 1000 }.count()",
+        "staff.where { .pay > 60 }.team.count()",
+        "pings.where { .at >= \"2026-01-01T10:10:00Z\" }.count()",
+        "pings.where { .at < \"2026-01-01T10:10:00Z\" && .n > 0 }.sort { .id.asc }",
+        "pings.where { .n < 0 || .n > 4 }.count()",
+        "pings.where { .n != 1 }.sort { .n.desc, .id.asc }.limit(3)",
+        "jobs.where { .state == \"open\" }.count()",
+        "jobs.where { .state != \"open\" }.count()",
+        "jobs.where { .state starts_with \"o\" }.count()",
+        "jobs.where { .state >= \"open\" }.sort { .id.asc }",
+        // Sorts that are cut short take their keys from columns too.
+        "staff.sort { .pay.desc, .id.asc }.limit(3)",
+        "staff.sort { .pay.asc, .id.desc }.limit(4)",
+        "staff.sort { .grade.asc, .id.asc }.limit(4)",
+        "staff.sort { .grade.desc, .pay.asc, .id.asc }.limit(5)",
+        "staff.sort { .grade.desc, .id.asc }.offset(2).limit(3)",
+        "staff.where { .pay < 100 }.sort { .grade.asc, .id.desc }.limit(3)",
+        "staff.where { .reports.count() == 0 }.sort { .pay.desc, .id.asc }.limit(2)",
+        "staff.sort { .boss.asc, .id.asc }.limit(4)",
+        "staff.sort { .id.desc }.limit(2)",
+        "pings.sort { .at.desc, .id.asc }.limit(3)",
+        "pings.sort { .n.asc, .at.desc }.limit(4)",
+        "pings.where { .n > 0 }.sort { .at.asc }.limit(2).select { id, n }",
+        "jobs.sort { .state.desc, .id.asc }.limit(2)",
+        // Aggregates and groups read their fields from columns.
+        "staff.sum(.pay)",
+        "staff.avg(.pay)",
+        "staff.min(.grade)",
+        "staff.max(.pay)",
+        "staff.where { .pay > 60 }.sum(.pay)",
+        "staff.where { .grade != null }.avg(.grade)",
+        "staff.where { .pay > 1000 }.sum(.pay)",
+        "staff.where { .pay > 1000 }.max(.pay)",
+        "staff.select { n: count(), total: sum(.pay), graded: count(.grade), low: min(.pay) }",
+        "staff.group_by { .grade }.select { grade, n: count(), total: sum(.pay) }",
+        "staff.group_by { .team }.select { team, n: count(), top: max(.pay) }",
+        "staff.group_by { .boss }.select { boss, n: count() }",
+        "staff.where { .pay < 100 }.group_by { .grade }.select { grade, n: count(), lo: min(.pay), mean: avg(.pay) }",
+        "staff.group_by { .grade, .pay }.select { grade, pay, n: count() }",
+        "staff.group_by { .grade }.having { count() > 1 }.select { grade, n: count() }",
+        "pings.group_by { .who }.select { who, n: count(), last: max(.at), total: sum(.n) }",
+        "pings.where { .n > 0 }.group_by { .who }.select { who, first: min(.at) }",
+        "jobs.group_by { .state }.select { state, n: count() }",
+        // One field of the elements of a list the row holds, reduced.
+        "jobs.sort { .id.asc }.select { id, total: .notes.mins.sum(), top: .notes.max(.mins) }",
+        "jobs.sort { .id.asc }.select { id, mean: .notes.mins.avg(), low: .notes.min(.mins), last: .notes.kind.max() }",
+        "jobs.where { .notes.mins.sum() > 5 }.sort { .id.asc }",
+        "jobs.where { .notes.sum(.mins) <= 5 }.count()",
+        "staff.where { .id == \"e\" }.walk(.boss).select { id, paid: ._path.pay.sum(), top: ._path.pay.max() }",
+        // A costly filter ahead of a sort and a limit.
+        "staff.where { .reports.max(.pay) > 50 }.sort { .id.asc }.limit(2)",
+        "staff.where { .reports.count() >= 1 }.sort { .pay.desc, .id.asc }.limit(2)",
+    ];
+    let shape = |rows: Result<Vec<Document>, String>| {
+        rows.map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    let mut fields: Vec<(String, Value)> =
+                        row.fields.iter().map(|(name, value)| (name.clone(), value.clone())).collect();
+                    fields.sort_by(|left, right| left.0.cmp(&right.0));
+                    (row.id.clone(), fields)
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    let compare_all = |when: &str| {
+        let mut by_columns = 0;
+        for query in queries {
+            owl_db::executor::set_column_aggregation(false);
+            let reference = shape(db.try_rows(query));
+            owl_db::executor::set_column_aggregation(true);
+            // Columns are built the second time a collection is read after
+            // a write, so each question is asked twice.
+            let first = shape(db.try_rows(query));
+            let before = owl_db::executor::column_scans_run();
+            let fast = shape(db.try_rows(query));
+            by_columns += usize::from(owl_db::executor::column_scans_run() > before);
+            assert!(reference.is_ok(), "{when}: {query}: {reference:?}");
+            assert_eq!(first, reference, "{when}: {query}");
+            assert_eq!(fast, reference, "{when}: {query}");
+        }
+        // The comparison is only worth something if columns did the choosing.
+        assert!(by_columns >= 12, "{when}: only {by_columns} queries used columns");
+    };
+    compare_all("at first");
+    let count = |query: &str| db.scalar(query, "count");
+    assert_eq!(count("staff.where { .pay > 60 }.count()"), int(4));
+
+    // Every kind of write is seen by the next query.
+    db.script("staff.insert { id: \"z\", team: \"t1\", pay: 85 }");
+    assert_eq!(count("staff.where { .pay > 60 }.count()"), int(5));
+    db.rows("staff.where { .id == \"b\" }.update { pay: 10 }");
+    assert_eq!(count("staff.where { .pay > 60 }.count()"), int(4));
+    db.rows("staff.where { .id == \"z\" }.update { grade: 2 }");
+    assert_eq!(count("staff.where { .grade == 2 }.count()"), int(3));
+    db.rows("staff.where { .id == \"z\" }.delete()");
+    assert_eq!(count("staff.where { .pay > 60 }.count()"), int(3));
+    assert_eq!(count("staff.where { .grade == 2 }.count()"), int(2));
+    compare_all("after writes");
+
+    // Inside a transaction that has written, the rows are asked instead.
+    db.script(
+        "transaction {
+           staff.insert { id: \"y\", team: \"t1\", pay: 95 }
+           staff.where { .id == \"a\" }.update { pay: 1 }
+         }",
+    );
+    assert_eq!(count("staff.where { .pay > 60 }.count()"), int(3));
+    compare_all("after a transaction");
+
+    // What is kept of one collection outlives a write to another, and not
+    // a write to itself.
+    assert_eq!(count("pings.where { .n > 0 }.count()"), int(4));
+    db.rows("staff.where { .id == \"f\" }.update { pay: 91 }");
+    assert_eq!(count("pings.where { .n > 0 }.count()"), int(4));
+    assert_eq!(count("staff.where { .pay > 90 }.count()"), int(2));
+    db.rows("pings.where { .id == \"p1\" }.update { n: -5 }");
+    assert_eq!(count("pings.where { .n > 0 }.count()"), int(3));
+    db.script("pings.insert { id: \"p9\", who: \"a\", at: \"2026-02-01T00:00:00Z\", n: 9 }");
+    assert_eq!(count("pings.where { .n > 0 }.count()"), int(4));
+    assert_eq!(count("staff.where { .pay > 90 }.count()"), int(2));
+    // A new collection, which changes the schemas, drops everything kept.
+    db.script("schema extras { id: String, n: Integer }\nextras.insert [ { id: \"x1\", n: 1 }, { id: \"x2\", n: 5 } ]");
+    assert_eq!(count("extras.where { .n > 2 }.count()"), int(1));
+    assert_eq!(count("pings.where { .n > 0 }.count()"), int(4));
+    compare_all("after writes to other collections");
 }
 
 #[test]

@@ -17,6 +17,25 @@ use owl_db::Value;
 use std::time::Instant;
 use storefront::engines::Owl;
 
+/// A quick hash for short names, standing in for any map that does not pay
+/// for resistance to chosen keys.
+#[derive(Default)]
+struct QuickHasher(u64);
+
+impl std::hash::Hasher for QuickHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 = (self.0.rotate_left(5) ^ u64::from(*byte)).wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+    }
+}
+
+type QuickMap = std::collections::HashMap<String, Value, std::hash::BuildHasherDefault<QuickHasher>>;
+
 fn median_ms<T: PartialEq + std::fmt::Debug>(
     samples: usize,
     expect: &T,
@@ -111,6 +130,63 @@ fn filter(owl: &Owl, samples: usize) -> Result<()> {
     })?;
     line("  of which: asking the store for the rows", scan, total, engine);
     line("rows, each field from the row's map", median_ms(samples, &expect, || Ok(over_rows(&rows)))?, total, engine);
+    // The same rows copied afresh, so that what the next two lines gain
+    // from sitting side by side in memory can be told from what they gain
+    // from their layout.
+    let fresh: Vec<Box<std::collections::HashMap<String, Value>>> =
+        rows.iter()
+            .map(|row| Box::new(row.fields.iter().map(|(name, value)| (name.clone(), value.clone())).collect()))
+            .collect();
+    line(
+        "rows, the same map, copied afresh",
+        median_ms(samples, &expect, || {
+            Ok(fresh
+                .iter()
+                .filter(|row| null(row.get("assignee")) && !null(row.get("parent")) && null(row.get("closed")))
+                .count())
+        })?,
+        total,
+        engine,
+    );
+    // The same rows with a quicker hash for their field names.
+    let quick: Vec<Box<QuickMap>> = rows
+        .iter()
+        .map(|row| Box::new(row.fields.iter().map(|(name, value)| (name.clone(), value.clone())).collect()))
+        .collect();
+    line(
+        "rows, a quicker hash for field names",
+        median_ms(samples, &expect, || {
+            Ok(quick
+                .iter()
+                .filter(|row| null(row.get("assignee")) && !null(row.get("parent")) && null(row.get("closed")))
+                .count())
+        })?,
+        total,
+        engine,
+    );
+    // The same rows holding their fields in the schema's order, so a field
+    // is found by its place and nothing is hashed.
+    let mut names: Vec<&String> = rows.iter().flat_map(|row| row.fields.keys()).collect();
+    names.sort();
+    names.dedup();
+    let place = |name: &str| names.iter().position(|known| *known == name).unwrap_or(0);
+    let slots: Vec<Box<[Value]>> = rows
+        .iter()
+        .map(|row| names.iter().map(|name| row.fields.get(*name).cloned().unwrap_or(Value::Null)).collect())
+        .collect();
+    let (assignee, parent, closed) = (place("assignee"), place("parent"), place("closed"));
+    let is_null = |value: &Value| matches!(value, Value::Null);
+    line(
+        "rows, fields held in schema order",
+        median_ms(samples, &expect, || {
+            Ok(slots
+                .iter()
+                .filter(|row| is_null(&row[assignee]) && !is_null(&row[parent]) && is_null(&row[closed]))
+                .count())
+        })?,
+        total,
+        engine,
+    );
     line(
         "the store's columns, asked for and read",
         median_ms(samples, &expect, || Ok(over_batches(&batches(owl, "tasks", &fields)?)))?,
@@ -209,6 +285,79 @@ fn sort(owl: &Owl, samples: usize) -> Result<()> {
     Ok(())
 }
 
+/// The same count with a write before each query: to another collection,
+/// which leaves what is kept of this one alone, and to this collection,
+/// after which its columns are built again.
+fn mixed(owl: &Owl, samples: usize) -> Result<()> {
+    let question = "tasks.where { .assignee == null && .parent != null && .closed == null }.count()";
+    let ask = || -> Result<usize> { Ok(owl.query(question)?[0]["count"].as_u64().unwrap_or(0) as usize) };
+    let expect = ask()?;
+    let total = owl.query("tasks.count()")?[0]["count"].as_u64().unwrap_or(1) as usize;
+    let event = owl.query("events.limit(1).select { id }")?[0]["id"].as_str().unwrap_or("").to_string();
+    let turn = std::cell::Cell::new(0u64);
+    let write = |collection: &str, id: &str, field: &str| -> Result<()> {
+        turn.set(turn.get() + 1);
+        owl.query(&format!(
+            "{collection}.where {{ .id == \"{id}\" }}.update {{ {field}: {} }}",
+            turn.get() % 7
+        ))?;
+        Ok(())
+    };
+    println!("\nThe same count over {total} tasks, with a write before each query");
+    let alone = median_ms(samples, &expect, ask)?;
+    line("no write, the query alone", alone, total, alone);
+    let other_write = median_ms(samples, &(), || write("events", &event, "amount"))?;
+    line("a write to another collection, alone", other_write, total, alone);
+    line(
+        "a write to another collection, then the query",
+        median_ms(samples, &expect, || {
+            write("events", &event, "amount")?;
+            ask()
+        })?,
+        total,
+        alone,
+    );
+    let own_write = median_ms(samples, &(), || write("tasks", "t0002717", "points"))?;
+    line("a write to this collection, alone", own_write, total, alone);
+    line(
+        "a write to this collection, then the query",
+        median_ms(samples, &expect, || {
+            write("tasks", "t0002717", "points")?;
+            ask()
+        })?,
+        total,
+        alone,
+    );
+    owl_db::executor::set_column_aggregation(false);
+    let by_rows = median_ms(samples, &expect, || {
+        write("tasks", "t0002717", "points")?;
+        ask()
+    });
+    owl_db::executor::set_column_aggregation(true);
+    line("the same, with columns turned off", by_rows?, total, alone);
+    // Writes wait for the next sync of the log, which comes at intervals,
+    // so a write and a query timed together say little about the query.
+    // Here only the query is timed: the first after a write, and the next.
+    let mut first = Vec::new();
+    let mut second = Vec::new();
+    for _ in 0..samples.max(1) {
+        write("tasks", "t0002717", "points")?;
+        for timings in [&mut first, &mut second] {
+            let started = Instant::now();
+            std::hint::black_box(ask()?);
+            timings.push(started.elapsed().as_secs_f64() * 1000.0);
+        }
+    }
+    for (way, timings) in [
+        ("the first query after a write to this collection", &mut first),
+        ("the second query after it", &mut second),
+    ] {
+        timings.sort_by(f64::total_cmp);
+        line(way, timings[timings.len() / 2], total, alone);
+    }
+    Ok(())
+}
+
 pub fn run(owl: &Owl, samples: usize) -> Result<()> {
     for collection in ["tasks", "events"] {
         let (live, resident, lazy) = owl.residency(collection)?;
@@ -216,5 +365,6 @@ pub fn run(owl: &Owl, samples: usize) -> Result<()> {
     }
     println!("\nEach line: the time, the time per row, and how many times faster than the engine today.\n");
     filter(owl, samples)?;
-    sort(owl, samples)
+    sort(owl, samples)?;
+    mixed(owl, samples)
 }

@@ -20,7 +20,7 @@ use chrono::Utc;
 
 /// Helper function to create a test document
 fn create_test_document(id: &str, name: &str, status: &str) -> Document {
-    let mut fields = HashMap::new();
+    let mut fields = owl_db::Fields::default();
     fields.insert("name".to_string(), Value::String(name.to_string()));
     fields.insert("status".to_string(), Value::String(status.to_string()));
     fields.insert("created_at".to_string(), Value::String(Utc::now().to_rfc3339()));

@@ -527,7 +527,7 @@ mod tests {
             .put_document(&Document::with_id(
                 "event-1".into(),
                 "events".into(),
-                HashMap::from([
+                owl_db::Fields::from_iter([
                     ("message".into(), Value::String("boom".into())),
                     ("sequence".into(), Value::Integer(1)),
                     ("optional".into(), Value::Null),

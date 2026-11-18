@@ -1,10 +1,11 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::distributed::GlobalObjRef;
 pub use crate::storage_engine::ObjRef;
+
+pub use crate::fields::{FieldNameHasher, Fields};
 
 /// Unique identifier for documents
 pub type DocumentId = String;
@@ -14,7 +15,7 @@ pub type DocumentId = String;
 pub struct Document {
     pub id: DocumentId,
     pub schema: String,
-    pub fields: HashMap<String, Value>,
+    pub fields: Fields,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub version: u64, // Version number for optimistic locking
@@ -22,7 +23,7 @@ pub struct Document {
 
 impl Document {
     /// Create a new document with the given schema and fields
-    pub fn new(schema: String, fields: HashMap<String, Value>) -> Self {
+    pub fn new(schema: String, fields: crate::document::Fields) -> Self {
         let now = Utc::now();
         let id = Uuid::new_v4().to_string();
 
@@ -37,7 +38,7 @@ impl Document {
     }
 
     /// Create a document with a specific ID
-    pub fn with_id(id: DocumentId, schema: String, fields: HashMap<String, Value>) -> Self {
+    pub fn with_id(id: DocumentId, schema: String, fields: crate::document::Fields) -> Self {
         let now = Utc::now();
 
         Self {
@@ -51,7 +52,7 @@ impl Document {
     }
 
     /// Update the document's fields and timestamp
-    pub fn update_fields(&mut self, new_fields: HashMap<String, Value>) {
+    pub fn update_fields(&mut self, new_fields: crate::document::Fields) {
         self.fields.extend(new_fields);
         self.updated_at = Utc::now();
         self.version += 1; // Increment version on update
@@ -76,7 +77,7 @@ impl Document {
     }
 
     /// Create a new version of this document with updated fields
-    pub fn new_version_with_fields(&self, new_fields: HashMap<String, Value>) -> Self {
+    pub fn new_version_with_fields(&self, new_fields: crate::document::Fields) -> Self {
         let mut updated_fields = self.fields.clone();
         updated_fields.extend(new_fields);
 
@@ -92,7 +93,7 @@ impl Document {
 
     /// Preserve document identity and metadata while replacing the visible
     /// field set for a query projection.
-    pub fn with_projected_fields(&self, fields: HashMap<String, Value>) -> Self {
+    pub fn with_projected_fields(&self, fields: crate::document::Fields) -> Self {
         Self {
             id: self.id.clone(),
             schema: self.schema.clone(),
@@ -115,7 +116,7 @@ pub enum Value {
     Reference(ObjRef),             // Physical pointer to referenced document
     GlobalReference(GlobalObjRef), // Shard-aware physical pointer for distributed traversal
     List(Vec<Value>),
-    Object(HashMap<String, Value>), // Nested objects for schema evolution
+    Object(Fields), // Nested objects for schema evolution
     Null,
 }
 
@@ -225,7 +226,7 @@ impl Value {
     }
 
     /// Extract object value if this is an Object
-    pub fn as_object(&self) -> Option<&HashMap<String, Value>> {
+    pub fn as_object(&self) -> Option<&crate::document::Fields> {
         match self {
             Value::Object(obj) => Some(obj),
             _ => None,
@@ -233,7 +234,7 @@ impl Value {
     }
 
     /// Extract mutable object value if this is an Object
-    pub fn as_object_mut(&mut self) -> Option<&mut HashMap<String, Value>> {
+    pub fn as_object_mut(&mut self) -> Option<&mut crate::document::Fields> {
         match self {
             Value::Object(obj) => Some(obj),
             _ => None,
@@ -277,8 +278,8 @@ impl From<DateTime<Utc>> for Value {
     }
 }
 
-impl From<HashMap<String, Value>> for Value {
-    fn from(obj: HashMap<String, Value>) -> Self {
+impl From<crate::document::Fields> for Value {
+    fn from(obj: crate::document::Fields) -> Self {
         Value::Object(obj)
     }
 }
@@ -289,7 +290,7 @@ mod tests {
 
     #[test]
     fn test_document_creation() {
-        let mut fields = HashMap::new();
+        let mut fields = crate::document::Fields::default();
         fields.insert("name".to_string(), Value::String("Alice".to_string()));
         fields.insert("age".to_string(), Value::Integer(30));
 
@@ -306,7 +307,7 @@ mod tests {
 
     #[test]
     fn test_document_update() {
-        let mut fields = HashMap::new();
+        let mut fields = crate::document::Fields::default();
         fields.insert("name".to_string(), Value::String("Alice".to_string()));
 
         let mut doc = Document::new("users".to_string(), fields);
