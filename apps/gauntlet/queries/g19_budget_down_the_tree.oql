@@ -1,0 +1,8 @@
+// A value carried down a tree: for each unit, the budgets of every unit
+// from its root down to it, added up.
+units
+  .where { .parent == null }
+  .walk(.children)
+  .select { id, depth: ._depth, chain: ._path.budget.sum() }
+  .sort { .chain.desc, .id.asc }
+  .limit(20)

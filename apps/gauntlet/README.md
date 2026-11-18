@@ -33,7 +33,7 @@ and the `.oql` file has to produce the same rows.
   references, aggregates over embedded lists.
 - **`g` queries** need what the suite showed was missing: distinct counts and
   percentiles, set operations, recursion (`walk`), position functions
-  (`partition_by`, `prev`, `running_sum`, `rank`), and reaching the parent row
+  (`partition_by`, `prev`, `so_far()`, `rank`), routes and paths, and reaching the parent row
   from a list element.
 
 An `.oql` file that holds only comments marks a query OQL cannot express; the

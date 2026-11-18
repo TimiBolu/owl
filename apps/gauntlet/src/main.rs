@@ -6,6 +6,7 @@
 //! query OQL cannot express yet. `check` requires the same rows from both
 //! engines; `bench` also times them; `show` prints both answers.
 
+mod columns;
 mod data;
 
 use anyhow::{anyhow, Context, Result};
@@ -54,6 +55,14 @@ enum Command {
         #[arg(long, default_value_t = 5)]
         rows: usize,
         queries: Vec<String>,
+    },
+    /// An experiment: time two slow questions over rows, over the store's
+    /// column segments and over plain arrays.
+    Columns {
+        #[arg(long, default_value_t = 2000)]
+        people: usize,
+        #[arg(long, default_value_t = 21)]
+        samples: usize,
     },
 }
 
@@ -324,5 +333,6 @@ fn main() -> Result<()> {
         Command::Check { people, only } => run(people, only.as_deref(), None),
         Command::Bench { people, only, samples } => run(people, only.as_deref(), Some(samples)),
         Command::Show { people, rows, queries } => show(people, rows, &queries),
+        Command::Columns { people, samples } => columns::run(&load(people)?.owl, samples),
     }
 }

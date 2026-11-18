@@ -100,6 +100,7 @@ impl QueryMetrics {
             | crate::parser::Operation::Call(_)
             | crate::parser::Operation::Combine { .. }
             | crate::parser::Operation::Walk { .. }
+            | crate::parser::Operation::Last(_)
             | crate::parser::Operation::PartitionBy(_) => "select".to_string(),
             crate::parser::Operation::AggregateExpr { .. } => "aggregate".to_string(),
             crate::parser::Operation::Explain => "select".to_string(),

@@ -1,0 +1,8 @@
+// Every pair of people in the same unit at the same level: each row
+// matched with other rows of its own collection, which SQL does with a
+// self-join and OQL does by stepping through a function.
+people
+  .same_level()
+  .select { a: people.id, b: .id }
+  .sort { .a.asc, .b.asc }
+  .limit(200)

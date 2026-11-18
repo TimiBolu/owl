@@ -1,0 +1,14 @@
+// Each person beside the totals of their unit: what SQL writes as an
+// aggregate OVER a partition. Every row is kept.
+people
+  .sort { .id.asc }
+  .partition_by { .unit }
+  .select {
+    id,
+    unit_pay: sum(.salary),
+    size: count(),
+    best: max(.salary),
+    seniors: where { .level >= 5 }.count(),
+    k: row_number()
+  }
+  .limit(300)

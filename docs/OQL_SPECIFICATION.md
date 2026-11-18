@@ -265,7 +265,8 @@ literal syntax, and reads and writes are symmetric.
 | Range `x between a and b` | Out. `x >= a && x <= b` is already direct. |
 | Parentheses for conditions and for operands | Works |
 | A comparison is an ordinary boolean expression | Works |
-| A path through a collection compared with one value | An error, for `== != < <= > >=`: `.orders.total > 100` has a total for every order, and whether any or all must exceed 100 is not for the engine to guess. The message gives the spelling for "any": `.orders.where { .total > 100 }.exists()`, or `.orders.total contains 100` for equality. It used to be false for every row. `contains`, `in` and comparison with a list are unaffected, and so is a stored list compared with one value, which is a mismatch of types and false. |
+| A path through a collection compared with one value | An error, for `== != < <= > >=`: `.orders.total > 100` has a total for every order, and whether any or all must exceed 100 is not for the engine to guess. The message gives the spelling for "any": `.orders.where { .total > 100 }.exists()`, or `.orders.total contains 100` for equality. It used to be false for every row. `contains`, `in` and comparison with a list are unaffected. |
+| A field declared as a list compared with one value | An error, for `== != < <= > >=`: `.tags == "red"` on `tags: List(String)`. It is a mismatch of types and would be false for every row, when what was meant is `.tags contains "red"`, which the message gives. `.tags == ["red"]` and `.tags == null` are comparisons of like with like and are unaffected. On a collection with no schema nothing says the field is a list, so the quiet rule above still holds there. |
 
 ### 5.4 Conditionals
 
@@ -332,7 +333,7 @@ Gaps found:
 | A single referenced or embedded object | `.team.select { name }`, `.profile.select { city }` | Works: yields one object, and shaping can traverse onward (`.team.select { name, org: .org.name }`). |
 | A collection reached through a collection | `.teams.users`, `.teams.users.orders` on an org | Works: each step maps over the rows reached so far and flattens. |
 | A path step in a chain | `orders.where { .status == "paid" }.items.group_by { .product.id }`, `orgs.teams.users.count()` | Works, at the top level and between operations in an expression. Every row is replaced by the rows its path leads to, which is how a query reaches the line items inside its orders. |
-| The row an element came from | `orders.items.group_by { status: orders.status, .product.id }`, `.orders.items.select { sku, status: orders.status }` | Works at the top level for the collection the query starts from, and in a nested expression for any collection the path passes through. After a path step, the collection's name is the row each element was reached from, until a `select` or `group_by` reshapes the rows. In a nested expression the enclosing row's own collection still means the enclosing row. This is what `$unwind` and a join back to the parent are for elsewhere. |
+| The row an element came from | `orders.items.group_by { status: orders.status, .product.id }`, `users.orders.items.select { sku, status: orders.status }`, `.orders.items.select { sku, status: orders.status }` | Works for the collection a query starts from and for any collection its steps reach or pass through, at the top level and in a nested expression. After a path step, the collection's name is the row each element was reached from, until a `select` or `group_by` reshapes the rows. In a nested expression the enclosing row's own collection still means the enclosing row. This is what `$unwind` and a join back to the parent are for elsewhere. |
 
 ### 6.2 Operations
 
@@ -364,6 +365,7 @@ orders.group_by { .status }.select {
 | Order | `.sort { .a.asc, .b.desc }`, `.sort { .a desc }` | Works |
 | Order by an expression | `.sort { (.price * .qty).desc }`, `.sort { abs(.x - 5).asc }` | Works. The direction after a computed key used to be read as a field of the value, which left the rows unsorted. |
 | Limit, offset | `.limit(n)`, `.offset(n)` | Works with any expression: a literal, arithmetic, a `$parameter`, or a value computed from another collection. A negative or non-numeric count is an error. |
+| The final rows | `.last(n)` | Works: the last `n` rows, in the order they were in. The counterpart of `limit(n)`; takes any expression `limit` does. `last` is a word only when applied, so a field may be called `last`. |
 | First row | `.first()` | Works. Follow-on path works (`.first().amount`). |
 | First row, then shape it | `.first().select { id, amount }` | Works: one object, or `null` when there is no row. |
 | Non-emptiness | `.exists()` | Works |
@@ -375,8 +377,12 @@ orders.group_by { .status }.select {
 | Nearest neighbours | `.nearest { field, query, metric, k }` | Works (section 18) |
 | Distinct | `.distinct()` | Works. Rows are equal when all their fields are equal by value (`1` and `1.0` are one value; an object's field order is irrelevant). The first of each set is kept, so input order survives. |
 | Order of operations is the order written | `limit(2).where {..}` filters the first two rows | Works |
+| Join two collections, keeping every row | `(a + b).sort { .id.asc }`, `(.incoming + .outgoing).count()` | Works. `+` already joined two lists; two collections are the rows of the first followed by the rows of the second, duplicates kept, each still a row of its own collection. A query may start with such a sum in parentheses. The collections may be of different kinds. Where `union` gives a set, `+` gives everything. |
 | Set operations | `.union(query)`, `.intersect(query)`, `.except(query)` | Works. The argument is a query, a collection name or a list. Rows are equal as for `distinct()`, and the result is a set: a row appears once. The order is that of the rows the operation is called on, then, for a union, the other query's. Rows keep their collection and identity, so relationships can be followed from them. |
 | Walk a relationship to any depth | `.walk(.children)`, `.walk(.manager)`, `.walk(.blocked_by.blocker)`, `.walk(.children, 2)` | Works, at the top level and from a row (`below: .walk(.children).count()`). Every row reached by following the path one or more times, each once, nearest first, so a cycle ends the walk. The starting rows are included only if the path leads back to them. `._depth` is the number of steps that reached a row. A second argument limits the steps. |
+| The way to a walked row | `._path` | Works: the rows from the row the walk started at to the row itself, in order. It is a collection, so `._path.cost.sum()` adds along the way, `._path.count()` counts it, `._path.select { id }` lists it. When one step is through several relationships (`.uses.part`), the rows passed through are on the way too, so a quantity held on the row between two parts is read as `._path.qty`. A row on the way that lacks a field has no value for it. The way is kept only when the statement reads `_path`. |
+| Every route to a row | `.routes(.uses.part)`, `.routes(.blocked_by.blocker, 5)` | Works: as `walk`, but one row for every route to a row, not one row for each row reached. `walk` answers "what is reachable"; `routes` answers "in how many ways, and what does each cost". A route never passes through the same row twice, which is what ends it in a cycle. Rows carry `._depth` and `._path`. A bill of materials: `parts.where { .id == "bike" }.routes(.uses.part).select { id, needed: ._path.qty.product() }.group_by { .id }.select { id, needed: sum(.needed) }`. The number of routes can grow very fast with depth; past a million it is an error that asks for a depth. |
+| Multiply | `product(.qty)`, `.uses.qty.product()` | Works: an aggregate like `sum`. Whole numbers stay whole and overflow is an error. Of no values it is 1, as a sum of none is 0. `product` is a word only when applied. |
 | Partition for position functions | `.partition_by { .person }` | Works (section 11.1). Rows and their order are unchanged. |
 
 ### 6.3 Aggregate results on empty input
@@ -398,9 +404,8 @@ is an error. All of this works and is the same in every form.
 | `.children*.id`, `.orders.total * 2` | Error: a path through a collection has many values and arithmetic needs one. For `*` between two paths the message points at `walk` | Works |
 | `sort { nonesuch(.x).desc }` | Error: unknown function | Works. A sort key that cannot be worked out for one row is still `null` for that row. |
 
-Still open: after a `select`, names refer to what the `select` produced, and a
-misspelt one among them (`.select { id }.where { .nmae == 1 }`) still reads as
-`null`.
+After a `select`, a name is one the `select` produced or a relationship of the
+row; any other is the same error. With `select { * }` nothing can be ruled out.
 
 ---
 
@@ -542,9 +547,10 @@ events
   .select {
     id,
     n: row_number(),
-    total_so_far: running_sum(.amount),
+    total: so_far().amount.sum(),
+    recent: so_far().last(7).amount.avg(),
     gap: seconds_until(prev(.at), .at),
-    session: running_sum(if prev(.at) == null || seconds_until(prev(.at), .at) >= 21600 then 1 else 0)
+    session: so_far().where { prev(.at) == null || seconds_until(prev(.at), .at) >= 21600 }.count()
   }
 ```
 
@@ -552,8 +558,7 @@ events
 |---|---|---|
 | `row_number()` | The row's place, from 1 | Works |
 | `prev(value)`, `next(value)`, `prev(value, n)` | The value for the row `n` places before or after, null past the edge | Works |
-| `running_sum(value)`, `running_avg`, `running_min`, `running_max` | Over the rows up to and including this one | Works |
-| `running_count()`, `running_count(value)` | Rows so far, or rows so far with a value | Works |
+| `so_far()` | The rows of the partition from its first row to this one, in order, as a collection | Works |
 | `rank(value)`, `dense_rank(value)` | Rows that follow one another with equal values share a rank; `rank` then skips, `dense_rank` does not | Works |
 
 | Rule | Status |
@@ -561,10 +566,38 @@ events
 | The order is the order of the rows: `sort` before the `select` | Works |
 | `partition_by { keys }` makes the functions of the next `select` start again for each distinct key. A partition is all the rows with that key, wherever they fall | Works |
 | With no `partition_by` the rows are one sequence | Works |
-| The rows of a relationship are their own sequence: `.events.sort { .at.asc }.select { running_sum(.amount) }` | Works |
+| After `partition_by`, an aggregate or an operation with no receiver is over the row's partition, and every row is kept | Works: `select { id, total: sum(.hours), share: .hours / sum(.hours), first: sort { .at.asc }.first().id }`. This is the partition's rows as a collection, the same rule a group's rows follow, so a partition total, a share and a first or last value need no functions of their own. `partition_by { all: 1 }` makes one partition of everything. |
+| The rows of a relationship are their own sequence: `.events.sort { .at.asc }.select { so_far().amount.sum() }` | Works |
 | One function may be used inside another | Works |
 | A computed position can be filtered, grouped and sorted on by what follows the `select` | Works |
 | Outside a `select` a position function is an error | Works |
+
+**The rows so far.** A running total and a moving window are not functions of
+their own. `so_far()` is a collection, and what is asked of it is asked with
+the operations every collection has.
+
+| Wanted | Written | Status |
+|---|---|---|
+| A running total, average, least, greatest, count | `so_far().amount.sum()`, `.avg()`, `.min()`, `.max()`, `so_far().count()` | Works |
+| The same of a computed value | `so_far().sum(.price * .qty)` | Works |
+| A moving window | `so_far().last(7).amount.avg()` | Works |
+| A count that meets a condition | `so_far().where { .kind == "deploy" }.count()` | Works |
+| A filter inside a window | `so_far().last(30).where { .amount > 100 }.count()` | Works |
+| The last few that meet a condition | `so_far().where { .kind == "deploy" }.last(5).amount.avg()` | Works |
+| Anything else a collection takes | `so_far().amount.median()`, `so_far().amount.stddev()`, `so_far().sort { .amount.desc }.first().id` | Works |
+
+| Rule | Status |
+|---|---|
+| `so_far()` takes nothing and starts a chain; it is narrowed by what follows | Works |
+| It includes the row being shaped, and reaches back to the start of that row's partition | Works |
+| In a filter on it, `prev` and `next` are about the row being tested, so `so_far().where { prev(.at) == null }` finds the first row | Works |
+| Outside a `select` it is an error | Works |
+
+How each form runs is not part of its meaning, but it decides the cost. A
+reduction of every row so far, with or without filters before it, is carried
+from one row to the next: each row adds itself. A reduction of `last(n)` reads
+those `n` rows. Any other chain is given a copy of the rows so far for every
+row, so its cost grows with the square of the partition's size.
 
 A query that uses these runs on the general executor from the first such
 operation on; what precedes it still uses indexes and column reads.
@@ -646,9 +679,34 @@ operation on; what precedes it still uses indexes and column reads.
 | A function that returns a collection | Works: `fn seniors(least: Integer) { staff.where { .pay > least } }`, used as `seniors(70).count()` inside an expression. |
 | A function at the start of a query | Works: `seniors(70).sort { .id.asc }.select { id }`. When the body is a query it runs as if written out, and the rows are still rows of their collection, so relationships can be followed from them. |
 | A function that takes a collection | Works: `fn spread(rows) { rows.max(.pay) - rows.min(.pay) }`, called `spread(.reports)` or `.reports.spread()`. A relationship arrives as its rows, which the function can filter, aggregate and follow relationships from; a path of values arrives as those values. This is how a word that might have been built in is written in the language: `fn distinct_count(values) { values.distinct().count() }`. |
+| A path from a parameter that holds rows | Works: `rows.reports.count()`, `rows.pay.max()`, and `rows.pay` as the list of values. |
+| A function at the end of a chain | Works: `orders.total.stddev()`, `orders.where { .. }.headcount()`, `staff.paid_over(85).sort { .id.asc }`. The function is given the rows in hand as its first argument, and what is in the parentheses are its others. One that gives rows back gives the chain its rows to carry on with; any other value is the answer, in a row named after the function. |
+| A function of a row as a step | Works: with `fn mates(s: staff) { staff.where { .team == s.team && .id > s.id } }`, `staff.mates().select { a: staff.id, b: .id }` gives every pair once. A function whose first parameter is declared as a row of a collection is called for each row in hand, and the rows it gives for all of them carry on down the chain, still rows of their collection. The collection's name is the row the function was called for, as after a path step. This is how rows are paired with other rows; there is no join syntax. A function whose first parameter is not a row is given the rows together, as above. |
+| A function defined in a script | Works for every query on the connection after it. It used to vanish when the script ended. It is not stored in the database, so it does not outlast the connection. |
 | A parameter without a type | Works: `fn f(rows)` takes whatever it is given. |
 | A default value | Works: `fn raise(pay: Integer, by: Float = 0.1)`. Parameters with defaults may be left out from the end. |
 | Redefining a function | Works: the later definition replaces the earlier. A built-in cannot be redefined. |
+
+---
+
+### 15.1 The standard library
+
+`variance`, `stddev`, `variance_pop`, `stddev_pop` and `mode` are not built
+in. They are functions written in OQL, in `src/std.oql`, loaded with every
+database. Each takes a collection of values, so each works wherever a
+function does: `.orders.total.stddev()`, `stddev(.orders.total)`,
+`orders.total.stddev()`, and in a grouped `select`.
+
+| Rule | Status |
+|---|---|
+| The library is there with no setup | Works |
+| A library function is an ordinary function: defining one of the same name replaces it | Works |
+| `variance` and `stddev` estimate from a sample (divide by one less than the number of values) and are null for fewer than two; the `_pop` forms divide by the number and are null for none | Works |
+| `mode` is the value that occurs most often, the least of several that tie | Works |
+
+A statistic OQL lacks is added here, or by a user in the same way, before it
+is considered for the engine. `median` and `percentile` stay built in: they
+need the values sorted, which the language cannot yet say as cheaply.
 
 ---
 

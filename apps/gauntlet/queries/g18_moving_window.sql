@@ -1,0 +1,7 @@
+SELECT e.id,
+  AVG(e.amount) OVER (w ROWS BETWEEN 6 PRECEDING AND CURRENT ROW) AS recent,
+  SUM(CASE WHEN e.amount > 150 THEN 1 ELSE 0 END)
+    OVER (w ROWS BETWEEN 29 PRECEDING AND CURRENT ROW) AS large
+FROM events e
+WINDOW w AS (PARTITION BY e.person ORDER BY e.at, e.id)
+ORDER BY e.person, e.at, e.id LIMIT 500

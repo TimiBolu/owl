@@ -141,6 +141,7 @@ impl LogicalPlanner {
             | Operation::Call(_)
             | Operation::Combine { .. }
             | Operation::Walk { .. }
+            | Operation::Last(_)
             | Operation::PartitionBy(_)
             | Operation::Explain
             | Operation::Step(_)
