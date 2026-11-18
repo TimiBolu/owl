@@ -774,6 +774,13 @@ fn shorter_ways_give_the_same_answers() {
 #[test]
 fn whole_columns_choose_the_rows_a_filter_chooses() {
     let db = company();
+    db.script(
+        "schema posts { id: String, tags: List(String) }
+         posts.insert [
+           { id: \"p1\", tags: [\"a\", \"b\"] }, { id: \"p2\", tags: [\"b\"] },
+           { id: \"p3\", tags: [] }, { id: \"p4\", tags: [\"a\", \"c\", \"a\"] }
+         ]",
+    );
     let queries = [
         "staff.where { .pay > 60 }.count()",
         "staff.where { .pay >= 80 && .grade != null }.count()",
@@ -842,6 +849,25 @@ fn whole_columns_choose_the_rows_a_filter_chooses() {
         "jobs.where { .notes.mins.sum() > 5 }.sort { .id.asc }",
         "jobs.where { .notes.sum(.mins) <= 5 }.count()",
         "staff.where { .id == \"e\" }.walk(.boss).select { id, paid: ._path.pay.sum(), top: ._path.pay.max() }",
+        // The elements of a list each row holds, grouped: folded as they
+        // are read, with no row made of an element.
+        "jobs.notes.group_by { .kind }.select { kind, n: count(), total: sum(.mins) }",
+        "jobs.notes.group_by { .kind }.select { kind, most: max(.mins), least: min(.mins), mean: avg(.mins) }",
+        "jobs.notes.group_by { state: jobs.state, .kind }.select { state, kind, n: count(), total: sum(.mins) }",
+        "jobs.notes.group_by { whose: jobs.id }.select { whose, n: count() }",
+        "jobs.where { .state == \"open\" }.notes.group_by { .kind }.select { kind, n: count() }",
+        "jobs.where { .state == \"gone\" }.notes.group_by { .kind }.select { kind, n: count() }",
+        "jobs.notes.group_by { .kind }.having { count() > 1 }.select { kind, n: count() }",
+        "jobs.notes.group_by { .kind }.select { kind, n: count() }.sort { .n.desc, .kind.asc }.limit(1)",
+        "jobs.notes.group_by { long: .mins > 4 }.select { long, n: count() }",
+        "posts.tags.group_by { tag: . }.select { tag, n: count() }",
+        "posts.where { .id != \"p2\" }.tags.group_by { tag: . }.select { tag, n: count() }.sort { .n.desc, .tag.asc }",
+        "posts.tags.group_by { tag: ., whose: posts.id }.select { tag, whose, n: count() }",
+        // A sort of every row, by keys read where the rows hold them.
+        "staff.sort { .pay.desc, .id.asc }",
+        "staff.sort { .grade.asc, .id.desc }",
+        "staff.where { .pay > 50 }.sort { .team.id.asc, .pay.asc, .id.asc }",
+        "pings.sort { .who.id.desc, .at.asc }",
         // A costly filter ahead of a sort and a limit.
         "staff.where { .reports.max(.pay) > 50 }.sort { .id.asc }.limit(2)",
         "staff.where { .reports.count() >= 1 }.sort { .pay.desc, .id.asc }.limit(2)",

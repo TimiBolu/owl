@@ -197,6 +197,11 @@ the worst by 900 times. What closed most of that:
   memory from the held rows and kept until the collection is written, so only
   the rows that pass are read at all. Cut sorts, aggregates and groups read
   from the same columns.
+- The elements of a list each row holds, grouped (`tasks.worklog.group_by
+  {..}`), are folded as they are read. A row used to be made of every
+  element first, which for one query took as much memory again as the whole
+  database; those queries are now faster than SQLite's.
+- A sort of a whole collection reads its keys where the rows hold them.
 - A row holds its values in order and shares its field names with other rows
   of the same shape, so reading a field is an index and not a hash.
 - Rows are filtered, counted and stepped through where the store holds them,

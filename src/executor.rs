@@ -464,6 +464,25 @@ impl<S: DocumentStore> QueryExecutor<S> {
             });
         }
         self.validate_declared_paths(query)?;
+        // The elements of a list each row holds, grouped, are folded as
+        // they are read; no row is made of an element.
+        let unwinds = {
+            let leading = query
+                .operations
+                .iter()
+                .take_while(|operation| matches!(operation, Operation::Where(_)))
+                .count();
+            matches!(
+                &query.operations[leading..],
+                [Operation::Step(step), Operation::GroupBy(_), Operation::Select(_) | Operation::Having(_), ..]
+                    if step.path.len() == 1
+            )
+        };
+        if unwinds {
+            if let Some(documents) = self.aggregate_from_columns(query, true)? {
+                return Ok(documents);
+            }
+        }
         // Everything before the first operation that only this route knows
         // runs as a query of its own, with every shortcut open to it; the
         // rest is applied to its rows one operation at a time.
@@ -1373,7 +1392,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
             }
             _ => None,
         };
-        if filters == 0 && cut.is_none() && !matches!(next, Some(Operation::Step(_))) {
+        if filters == 0 && cut.is_none() && !matches!(next, Some(Operation::Step(_) | Operation::Sort(_))) {
             return Ok(None);
         }
         // A row that is kept is copied, down to the fields the query reads
@@ -1637,6 +1656,25 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     }
                 }
                 Ok(Some((kept, filters + 2)))
+            }
+            // A sort of every row: the rows are put in order by keys read
+            // where the rows hold them, and each is copied once, in its
+            // place. Copying every row's keys first costs more than the
+            // sort does, in time and in memory.
+            (Some(Operation::Sort(sort)), _) if cut.is_none() => {
+                self.check_sort_functions(sort)?;
+                let mut passing = Vec::new();
+                for row in stored.iter() {
+                    if passes(row)? {
+                        passing.push(row);
+                    }
+                }
+                let kept = self
+                    .sorted_positions_of_stored(&passing, sort, None)
+                    .into_iter()
+                    .map(|position| keep(passing[position]))
+                    .collect();
+                Ok(Some((kept, filters + 1)))
             }
             // Any other sort that is cut short: the rows are put in order
             // by their keys alone, and only those kept are copied.
@@ -2400,7 +2438,16 @@ impl<S: DocumentStore> QueryExecutor<S> {
             .iter()
             .take_while(|operation| matches!(operation, Operation::Where(_)))
             .count();
-        let rest = &query.operations[leading..];
+        // `tasks.worklog.group_by { .. }`: the elements of a list each row
+        // holds, grouped. They are read where the rows hold them, and no
+        // row is made of an element.
+        let unwound: Option<String> = match &query.operations[leading..] {
+            [Operation::Step(step), Operation::GroupBy(_), ..] if step.path.len() == 1 => {
+                Some(step.path[0].clone())
+            }
+            _ => None,
+        };
+        let rest = &query.operations[leading + usize::from(unwound.is_some())..];
         if !matches!(
             rest,
             [Operation::Count
@@ -2417,6 +2464,30 @@ impl<S: DocumentStore> QueryExecutor<S> {
         let Some(schema) = self.schema_of(&query.collection)? else {
             return Ok(None);
         };
+        // For elements, the fields are those the schema declares for an
+        // element of the list; a list of plain values has none.
+        let rows_schema = schema.clone();
+        let schema = match &unwound {
+            None => schema,
+            Some(list) => {
+                let mut declared = rows_schema.fields.get(list);
+                while let Some(FieldType::Optional(inner)) = declared {
+                    declared = Some(inner);
+                }
+                if !matches!(declared, Some(FieldType::List(_))) {
+                    return Ok(None);
+                }
+                let fields = match self.path_place(&Place::Rows(rows_schema.clone()), std::slice::from_ref(list)) {
+                    Ok(Place::Shape { fields, .. }) => fields.into_iter().collect(),
+                    Ok(_) => HashMap::new(),
+                    Err(_) => return Ok(None),
+                };
+                Arc::new(Schema::new(list.clone(), fields))
+            }
+        };
+        // What the group keys read of the row an element is in, by the
+        // collection's name: worked out once for the row.
+        let mut outers: Vec<String> = Vec::new();
 
         enum Shape {
             Terminal(String),
@@ -2488,7 +2559,28 @@ impl<S: DocumentStore> QueryExecutor<S> {
                         return Ok(None);
                     }
                     let position = plan.keys.len();
-                    plan.keys.push(RowInput::Expression(key.expression.clone()));
+                    let input = match (&unwound, &key.expression) {
+                        // `label: .`: the element itself.
+                        (Some(_), Expression::FieldAccess(access)) if access.path.is_empty() => RowInput::Itself,
+                        // `task_state: tasks.state`: a field of the row the
+                        // element is in.
+                        (Some(_), Expression::ChainedAccess { base, field })
+                            if matches!(base.as_ref(), Expression::Identifier(name) if *name == query.collection) =>
+                        {
+                            let at = outers.iter().position(|known| known == field).unwrap_or_else(|| {
+                                outers.push(field.clone());
+                                outers.len() - 1
+                            });
+                            RowInput::Outer(at)
+                        }
+                        // Anything else that names the row the element is
+                        // in is for the general way.
+                        (Some(_), expression) if Self::expression_names(expression, &query.collection) => {
+                            return Ok(None)
+                        }
+                        _ => RowInput::Expression(key.expression.clone()),
+                    };
+                    plan.keys.push(input);
                     plan.name_key(key.name.clone(), position, true);
                 }
                 plan.key_names.retain(|(name, _)| {
@@ -2528,12 +2620,43 @@ impl<S: DocumentStore> QueryExecutor<S> {
             _ => return Ok(None),
         };
 
-        let (filters, residual) =
-            Self::split_storage_filters(&query.collection, &schema, &query.operations[..leading]);
+        // Filters before the step are asked of the rows that hold the
+        // lists, not of the elements.
+        let (filters, residual) = match &unwound {
+            Some(_) => (Vec::new(), Vec::new()),
+            None => Self::split_storage_filters(&query.collection, &schema, &query.operations[..leading]),
+        };
         plan.residual = residual;
+        let of_rows: Vec<&Condition> = match &unwound {
+            Some(_) => query.operations[..leading]
+                .iter()
+                .filter_map(|operation| match operation {
+                    Operation::Where(block) => Some(&block.condition),
+                    _ => None,
+                })
+                .collect(),
+            None => Vec::new(),
+        };
 
         let needs_row = plan.needs_row();
-        if needs_row {
+        if needs_row && unwound.is_some() {
+            // An element stands in for a row only as far as its own
+            // fields: what else names the row it is in is not here.
+            let names_row = |input: &RowInput| match input {
+                RowInput::Expression(expression) => Self::expression_names(expression, &query.collection),
+                _ => false,
+            };
+            if plan.keys.iter().any(names_row)
+                || plan
+                    .aggregates
+                    .iter()
+                    .any(|aggregate| names_row(&aggregate.input) || !aggregate.filters.is_empty())
+                || plan.having.is_some() && plan.aggregates.is_empty()
+            {
+                return Ok(None);
+            }
+        }
+        if needs_row && unwound.is_none() {
             if !with_row_evaluation {
                 return Ok(None);
             }
@@ -2552,13 +2675,23 @@ impl<S: DocumentStore> QueryExecutor<S> {
         // When nothing asks for the row itself, the fields come from whole
         // columns, and the filters storage would have run are run on the
         // columns first.
-        let columns = match needs_row {
+        let columns = match needs_row || unwound.is_some() {
             false => self.fold_columns(&query.collection, &plan.fields, &filters)?,
             true => None,
         };
-        let batches = match &columns {
-            Some(_) => Vec::new(),
-            None => match self
+        // The rows whose lists are read, as the store holds them.
+        let holders: Vec<Arc<Document>> = match &unwound {
+            Some(_) => match self.store.scan_documents_shared(&query.collection)? {
+                Some(rows) => rows,
+                None => return Ok(None),
+            },
+            None => Vec::new(),
+        };
+        let outer_values: std::cell::RefCell<Vec<Value>> = std::cell::RefCell::new(Vec::new());
+        let itself: std::cell::RefCell<Value> = std::cell::RefCell::new(Value::Null);
+        let batches = match (&columns, &unwound) {
+            (Some(_), _) | (_, Some(_)) => Vec::new(),
+            (None, None) => match self
                 .store
                 .scan_projected_batches(&query.collection, &filters, &plan.fields, 4096)?
             {
@@ -2600,6 +2733,8 @@ impl<S: DocumentStore> QueryExecutor<S> {
             for key in &plan.keys {
                 key_values.push(match key {
                     RowInput::Rows | RowInput::Slot(_) => Held::Owned(Value::Null),
+                    RowInput::Outer(at) => Held::Owned(outer_values.borrow()[*at].clone()),
+                    RowInput::Itself => Held::Owned(itself.borrow().clone()),
                     evaluated => {
                         self.fold_input(evaluated, document, &current, &mut memos, &mut remembered)?
                     }
@@ -2684,6 +2819,61 @@ impl<S: DocumentStore> QueryExecutor<S> {
             }
             Ok(true)
         };
+        if let Some(list) = &unwound {
+            let wants_itself = plan.keys.iter().any(|key| matches!(key, RowInput::Itself));
+            'holders: for holder in &holders {
+                for condition in &of_rows {
+                    if !self.evaluate_condition(holder, condition)? {
+                        continue 'holders;
+                    }
+                }
+                let Some(Value::List(items)) = holder.fields.get(list) else {
+                    continue;
+                };
+                if !outers.is_empty() {
+                    let mut outer = outer_values.borrow_mut();
+                    outer.clear();
+                    for name in &outers {
+                        outer.push(self.get_field_value(holder, &FieldAccess { path: vec![name.clone()] })?);
+                    }
+                }
+                for item in items {
+                    match item {
+                        Value::Object(fields) => {
+                            for (slot, name) in plan.fields.iter().enumerate() {
+                                current[slot] = fields.get(name).map(ProjectedValueRef::Value);
+                            }
+                        }
+                        // What a list within a list, or a gap in one, means
+                        // is for the general way to say.
+                        Value::List(_) | Value::Null => return Ok(None),
+                        _ => current.iter_mut().for_each(|value| *value = None),
+                    }
+                    if wants_itself {
+                        *itself.borrow_mut() = item.clone();
+                    }
+                    if needs_row {
+                        // The evaluator is shown the element as a row of
+                        // its own: its fields, or the value it is.
+                        scratch.fields.clear();
+                        match item {
+                            Value::Object(fields) => {
+                                for (name, value) in fields.iter() {
+                                    scratch.fields.set(name, value.clone());
+                                }
+                            }
+                            value => {
+                                scratch.fields.set(SCALAR_ROW_FIELD, value.clone());
+                            }
+                        }
+                    }
+                    if !each(&current, &scratch)? {
+                        return Ok(None);
+                    }
+                }
+            }
+            COLUMN_SCANS_RUN.with(|runs| runs.set(runs.get() + 1));
+        } else {
         match &columns {
             // From whole columns: no row is read.
             Some((batch, chosen)) => {
@@ -2759,6 +2949,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     }
                 }
             }
+        }
         }
         drop(each);
 
@@ -3032,7 +3223,9 @@ impl<S: DocumentStore> QueryExecutor<S> {
         remembered: &mut Vec<Value>,
     ) -> OQLResult<Held> {
         match input {
-            RowInput::Rows | RowInput::Slot(_) => Ok(Held::Owned(Value::Null)),
+            RowInput::Rows | RowInput::Slot(_) | RowInput::Outer(_) | RowInput::Itself => {
+                Ok(Held::Owned(Value::Null))
+            }
             RowInput::Path(path) => self.get_field_value(document, path).map(Held::Owned),
             RowInput::Expression(expression) => {
                 self.evaluate_expression(document, expression).map(Held::Owned)
@@ -13777,6 +13970,11 @@ enum RowInput {
     Path(FieldAccess),
     /// An expression the evaluator computes.
     Expression(Expression),
+    /// For an element of a list a row holds: a field of that row, worked
+    /// out once for the row.
+    Outer(usize),
+    /// For an element of a list: the element itself.
+    Itself,
 }
 
 struct FoldAggregate {
@@ -13890,7 +14088,9 @@ impl FoldPlan {
 
     /// Whether any part needs the evaluator, and so a row to give it.
     fn needs_row(&self) -> bool {
-        let evaluated = |input: &RowInput| !matches!(input, RowInput::Rows | RowInput::Slot(_));
+        let evaluated = |input: &RowInput| {
+            !matches!(input, RowInput::Rows | RowInput::Slot(_) | RowInput::Outer(_) | RowInput::Itself)
+        };
         !self.residual.is_empty()
             || self.keys.iter().any(evaluated)
             || self
