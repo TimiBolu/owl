@@ -335,24 +335,28 @@ impl SimulatedNetwork {
     }
 
     /// Check if message should be reordered
-    fn should_reorder_message(&self) -> bool {
+    ///
+    /// Takes the generator from the caller, which already holds its lock:
+    /// locking it again here would wait on that same lock forever.
+    fn should_reorder_message(&self, rng: &mut StdRng) -> bool {
         let config = self.failure_config.lock().unwrap();
         if config.reorder_rate <= 0.0 {
             return false;
         }
 
-        let mut rng = self.rng.lock().unwrap();
         rng.gen::<f64>() < config.reorder_rate
     }
 
     /// Check if network is congested
-    fn is_congested(&self) -> bool {
+    ///
+    /// Takes the generator from the caller, which already holds its lock:
+    /// locking it again here would wait on that same lock forever.
+    fn is_congested(&self, rng: &mut StdRng) -> bool {
         let config = self.failure_config.lock().unwrap();
         if config.congestion_rate <= 0.0 {
             return false;
         }
 
-        let mut rng = self.rng.lock().unwrap();
         rng.gen::<f64>() < config.congestion_rate
     }
 
@@ -436,14 +440,14 @@ impl Network for SimulatedNetwork {
             Duration::from_nanos((base_latency.as_nanos() as f64 * jitter_factor) as u64);
 
         // Check for network congestion
-        if self.is_congested() {
+        if self.is_congested(&mut rng) {
             let config = self.failure_config.lock().unwrap();
             latency += config.congestion_latency;
         }
 
         // Check for message reordering
         let mut delivery_time = current_time + latency;
-        if self.should_reorder_message() {
+        if self.should_reorder_message(&mut rng) {
             let config = self.failure_config.lock().unwrap();
             let reorder_delay =
                 Duration::from_nanos(rng.gen_range(0..config.max_reorder_delay.as_nanos()) as u64);
