@@ -1,103 +1,205 @@
 # Owl
 
-Owl is an object-graph database with a programmer-native query language, a
-schema-compiled storage engine, and first-class reference traversal. The entire
-system — language, runtime, and storage — is implemented in Rust with no
-external database or FFI dependency.
+**An object-graph database written in Rust.** Your data is already a graph of
+objects that point at each other. Owl lets you query it that way: you follow a
+reference with a dot, and you never write a join.
 
-Owl is under active development and not yet suitable for production data.
+[Website](https://owldb.tech) ·
+[The language in seven chapters](https://owldb.tech/#language) ·
+[Run it](#run-it) ·
+[Help Owl grow](#help-owl-grow)
+
+> Owl is under active development and not yet suitable for production data.
+
+If Owl looks useful, or just interesting, a star on this repository helps other
+people find it.
+
+## A first look
+
+```oql
+orders
+  .where { .status == "paid" }
+  .sort { .total.desc }
+  .limit(3)
+  .select { id, who: .customer.name, total }
+```
+
+```json
+[
+  { "id": "o1", "who": "Ada",  "total": 125.0 },
+  { "id": "o6", "who": "Ada",  "total": 97.0 },
+  { "id": "o2", "who": "Bola", "total": 85.0 }
+]
+```
+
+`.customer` is a reference from an order to a customer. `.customer.name` walks
+it. There is no join to write and no key to match.
+
+## Run it
+
+Owl needs only a Rust toolchain.
+
+```bash
+# 1. Start a server
+cargo run --release -p owl-server -- --data shop.owl
+
+# 2. Declare two collections and add a row to each
+curl 127.0.0.1:7878/v1/script --json '{"source": "schema customers { id: String, name: String }\nschema orders { id: String, customer: Ref(customers), total: Float }\ncustomers.insert { id: \"c1\", name: \"Ada\" }\norders.insert { id: \"o1\", customer: \"c1\", total: 12.5 }"}'
+
+# 3. Follow the reference from order to customer
+curl 127.0.0.1:7878/v1/query --json '{"query": "orders.select { id, who: .customer.name }"}'
+```
+
+```json
+{"rows":[{"id":"o1","who":"Ada"}]}
+```
+
+[apps/owl-server](apps/owl-server) documents the HTTP interface, and
+[drivers/go](drivers/go) is a client for it. To embed Owl in a Rust program,
+see [Using OQL from Rust](#using-oql-from-rust).
 
 ## What makes Owl different
 
-Most databases force you to reconstruct relationships by hand. Owl treats
-references between objects as first-class navigable connections, so traversing
-`orders.customer.name` is part of the query model, not an afterthought bolted
-onto a key-value or document store.
+Most databases make you reconstruct relationships by hand. Owl treats a
+reference between two objects as a connection you can walk, in either
+direction, as part of the query model itself.
 
-The core idea: if your data is already modeled as an object graph, the database
-should let you query it that way.
+- **No joins.** `orders.customer.name` is a path, not a join condition.
+- **The way back is free.** Declare `customer: Ref(customers)` on an order and
+  every customer has `.orders`, with an index Owl keeps for you.
+- **One set of steps.** A collection, a list inside a document and a
+  relationship followed backwards all take the same `where`, `select`, `sort`
+  and `count`.
+- **One language for everything.** Reads, writes, rules, functions and
+  transactions are all OQL.
+- **Its own engine.** There is no other database underneath: no RocksDB and no
+  FFI.
 
-## Query language (OQL)
+## The language (OQL)
 
-OQL is a collection pipeline language. Anything that behaves like a collection —
-a top-level table, a nested array, a reverse relationship — supports the same
-operations: `where`, `select`, `sort`, `limit`, `group_by`, `count`, `sum`,
-`avg`, `min`, `max`, `nearest`.
+The [website](https://owldb.tech/#language) walks through each of these with a
+drawing. Every example below runs against the same small shop.
 
-Two syntactic forms lower to the same execution path:
-
-```oql
-// Chained form
-events
-    .where { .level == "error" && .occurred_at >= $from }
-    .sort { .occurred_at desc }
-    .limit(100)
-    .select {
-        id,
-        occurred_at,
-        message,
-        application: .application.name
-    }
-```
+### A schema
 
 ```oql
-// Scoped block form (same semantics, better for composition)
-events {
-    where { .level == "error" }
-    select { id, message, app: .application.name }
-    limit 100
+schema customers {
+  id: String,
+  name: String,
+  email: String unique
+}
+
+schema orders {
+  id: String,
+  customer: Ref(customers),
+  status: String,
+  total: Float,
+  items: List({ product: Ref(products), qty: Integer })
 }
 ```
 
-References resolve naturally through the object graph:
+### Following references, both ways
 
 ```oql
-// Forward traversal — null-safe, no joins
-orders.select {
-    id,
-    customer_name: .customer.name,
-    items: .customer.orders.where { .total > 100 }
+// Forward: a field on the far side of a reference
+orders.where { .customer.country == "NG" }.select { id, who: .customer.name }
+
+// Back: every order that points at this customer
+customers.select {
+  name,
+  orders: .orders.count(),
+  spent: .orders.where { .status == "paid" }.sum(.total)
 }
 ```
 
+A path that cannot be followed gives `null`. It is not an error.
+
+### Grouping, recursion and positions
+
 ```oql
-// Reverse traversal — walk back across a reference field
-companies.select {
-    id,
-    order_count: .findings.where { .status == "open" }.count()
+// One pile per status, measured
+orders.group_by { .status }.select { status, n: count(), revenue: sum(.total) }
+
+// A tree walked to any depth, then across to its products
+categories.where { .id == "home" }.walk(.children).products.select { name, price }
+
+// Each customer's largest order
+orders
+  .sort { .customer.id.asc, .total.desc }
+  .partition_by { .customer }
+  .select { id, who: .customer.name, total, place: row_number() }
+  .where { .place == 1 }
+```
+
+### Two forms of the same query
+
+Any query can be written as a chain or as a block. They mean the same thing. A
+block can also name something once and use it again.
+
+```oql
+customers {
+  paid = .orders.where { .status == "paid" }
+  spent = paid.sum(.total)
+
+  where { spent > 80 }
+  sort { .id.asc }
+  select { name, orders: paid.count(), spent: spent }
 }
 ```
 
-Mutations use the same collection roots:
+### Functions
+
+Functions are written in OQL and kept in the database, so every program that
+talks to it shares one definition.
 
 ```oql
-users.insert {
-    id: "user1",
-    name: "Alice",
-    age: 28,
-    profile: { bio: "Engineer", preferences: { theme: "dark" } }
+fn spent(c: customers) {
+  c.orders.where { .status == "paid" }.sum(.total)
 }
 
-users.where { .id == "user1" }.update { age: 29 }
-users.where { .id == "user1" }.delete()
+fn tier(spent) {
+  if spent >= 200 then "gold" else if spent >= 80 then "silver" else "bronze"
+}
+
+customers.select { name, tier: tier(spent(*)) }
 ```
 
-Reusable pipelines via bindings:
+A function can also return a collection, and then it chains like a built-in
+step. With an `also_ordered` function of your own that returns a customer's
+other orders, you can write `orders.where { .id == "o1" }.also_ordered()`.
+
+### Writing, and the rules that guard it
 
 ```oql
-open_findings = findings.where { .workflow.status == "OPEN" }
-
-open_findings
-    .select { id, severity }
-    .limit(20)
+customers.insert { id: "chen", name: "Chen", email: "chen@shop.test" }
+products.where { .id == "kettle" && .stock > 0 }.update { stock -= 1 }
+customers.upsert on id { id: "chen", name: "Chen W." }
+orders.where { .status == "cancelled" }.delete()
 ```
 
-User-defined functions, correlated subqueries via collection-name scope anchors,
-match expressions, conditional expressions, and vector `nearest` search are all
-part of the current language surface.
+A schema declares what must always be true: `unique`, `check(.price >= 0)`,
+`Ref(customers)` and `on delete cascade`. Owl refuses any write that would
+break one, and says why in terms of your schema:
 
-Runtime values enter a query through `$name` parameters, never by building
-query text:
+```
+'customers' document 'eve' has email "ada@shop.test", which must be unique,
+and another document already has it
+```
+
+One statement is all or nothing. A `transaction` block makes several
+statements one:
+
+```oql
+transaction {
+  orders.insert { id: "o4", customer: "ada", product: "kettle", qty: 2, status: "paid" }
+  products.where { .id == "kettle" }.update { stock -= 2 }
+}
+```
+
+### Parameters
+
+Values enter a query as `$name` parameters. A parameter is never read as query
+text, whatever it holds.
 
 ```rust
 use owl_db::{bind_parameters, parse_oql, Value};
@@ -215,7 +317,18 @@ full document. This is the primary mechanism for selective field reads.
 - Per-operator profiling with execution stats
 - Reverse reference prefiltering exploits the object graph model directly
 
-## Build
+## Around the core
+
+| | |
+|---|---|
+| [owl-server](apps/owl-server) | Owl as a network service: JSON over HTTP, transactions, backups |
+| [Go driver](drivers/go) | A client for owl-server, standard library only |
+| [Loggr](apps/loggr) | An error investigation workbench built on Owl's Rust API. It exercises ingestion, batch commit, indexes, references and checkpoints end to end |
+| [Storefront](apps/storefront) | A commerce workload: sixteen queries, each checked against SQLite for the same rows and then timed against it |
+| [Gauntlet](apps/gauntlet) | Queries built to be hard (deep hierarchies, many-to-many, skew), checked and timed against SQLite the same way |
+| [Website](website) | The site at [owldb.tech](https://owldb.tech) |
+
+## Build and test
 
 Owl requires only a Rust toolchain.
 
@@ -229,22 +342,6 @@ The focused storage invariant tests and the OQL conformance suites are the
 release gate. The wider historical
 test suite contains known failures in experimental features (distributed,
 simulation, columnar) that are outside the trusted single-node path.
-
-## Loggr — first application
-
-[Loggr](apps/loggr/) is a local-first error investigation workbench built on
-Owl's public Rust API. It stores structured logs, exceptions, stack traces, and
-trace context, and serves an HTTP query interface.
-
-```bash
-cargo run -p loggr -- serve --db ./loggr.owl
-cargo run -p loggr -- demo --count 240
-cargo run -p loggr -- check --db ./loggr.owl
-```
-
-Loggr exercises the ingestion, batch commit, index, reference, and checkpoint
-paths end to end. It is the forcing workload that keeps the storage engine
-honest for real application shapes, not just microbenchmarks.
 
 ## What is not supported
 
@@ -275,7 +372,9 @@ Do not interpret their presence as a supported capability.
 | `src/oql_runner.rs` | `OQLRunner` for executing `.oql` files |
 | `src/admin/` | Admin CLI: backup, cluster, health, index management |
 | `src/distributed/` | Experimental: consistent hashing, shard manager, Raft, global ObjRef |
-| `apps/loggr/` | First application: error investigation workbench |
+| `apps/` | owl-server, Loggr, and the Storefront and Gauntlet suites |
+| `drivers/go/` | Go client for owl-server |
+| `website/` | The site at owldb.tech |
 | `oql/` | OQL example files and syntax fixtures |
 | `benches/` | Index scan, ingest, navigation benchmarks |
 | `docs/` | Design documents and architecture specs |
@@ -284,7 +383,8 @@ Do not interpret their presence as a supported capability.
 
 - [Storage Engine Architecture](docs/STORAGE_ENGINE_ARCHITECTURE.md) — canonical storage design, invariants, disk layout
 - [OQL Language Description](docs/OWL_LANGUAGE_DESCRIPTION.md) — language contract and design principles
-- [OQL Implementation Status](docs/OQL_IMPLEMENTATION_STATUS.md) — what parses, executes, and is tested
+- [OQL Specification](docs/OQL_SPECIFICATION.md) — the language in full
+- [Scoped Block Semantics](docs/OWL_SCOPED_BLOCK_SEMANTICS.md) — what the block form means, rule by rule
 - [Owl Core Technical Description](docs/OWL_CORE_TECHNICAL_DESCRIPTION.md) — system-level design connecting query, storage, and distribution
 - [Loggr Product and Architecture](docs/LOGGR_PRODUCT_AND_ARCHITECTURE.md) — first application spec
 - [Improved Syntax Guide](oql/IMPROVED_SYNTAX_GUIDE.md) — bindings, functions, correlation, method calls
@@ -304,9 +404,40 @@ Performance claims require reproducible comparisons with equal durability,
 batching, compression, cache, hardware, and dataset settings. The benchmark
 suite targets Log, Ledger, Game, and Commerce workload profiles.
 
-## Contributing
+## Help Owl grow
 
-The current priority is storage correctness and a single connected query path.
-Useful contributions include deterministic crash tests, format fuzzing, record
-codec work, typed key encoding, differential index tests, and reproducible
-workload benchmarks.
+Owl is early and built in the open. There are three ways to help, from ten
+seconds to a weekend.
+
+**Star it.** A star costs nothing, and it is how other people come across a
+project this new.
+
+**Try it and say what broke.** Run it against data shaped like yours. A query
+Owl gets wrong, or cannot express, is the most useful report there is.
+[Open an issue](https://github.com/TimiBolu/owl/issues/new) with the schema, the
+query, and what you expected.
+
+**Help build it.** The current priority is storage correctness and a single
+connected query path. Useful contributions include:
+
+- deterministic crash tests
+- format fuzzing
+- record codec work
+- typed key encoding
+- differential index tests
+- reproducible workload benchmarks
+- a query that Storefront or Gauntlet should cover and does not
+
+Before you start on something large, open an issue to say what you plan, so
+the work is not duplicated. Before you open a pull request, run the release
+gate:
+
+```bash
+cargo check --all-targets
+cargo test --lib storage_engine
+cargo test --test oql_language_conformance_test --test oql_dual_representation_test
+```
+
+A change to what a query means should come with a test in
+`tests/oql_language_conformance_test.rs`. A change to the HTTP interface
+should come with one in `apps/owl-server/tests`.

@@ -735,3 +735,24 @@ h3 { margin: 0 0 10px; font: 800 21px/1.2 var(--body); }
 .foot-nav { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 10px 22px; margin-bottom: 14px; }
 .foot-nav a { text-decoration: none; border-bottom: 2px solid transparent; padding-bottom: 2px; }
 .foot-nav a:hover, .foot-nav a:focus-visible { border-bottom-color: var(--ink); }
+
+/* ---------- Join in ---------- */
+.join { padding-top: 60px; }
+.join-cards { margin-top: 44px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 22px; align-items: stretch; }
+.join-card {
+  position: relative; display: flex; flex-direction: column; padding: 28px 26px 30px;
+  border: 3px solid var(--ink); border-radius: 22px; background: var(--paper-2); box-shadow: 6px 7px 0 var(--ink);
+}
+.join-card .num { font: 600 12px/1 var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--ink-soft); margin-bottom: 14px; }
+.join-card p { margin: 0 0 14px; }
+.join-card .btn { margin-top: auto; align-self: flex-start; padding: 15px 22px; font-size: 13px; }
+.join-card .wanted { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 22px; }
+.join-card .wanted i { font-style: normal; font-size: 14px; padding: 5px 11px; border: 2px solid var(--ink); border-radius: 999px; }
+.star-card { background: var(--tape); }
+.star-card .btn.solid { box-shadow: 5px 6px 0 var(--paper-2); }
+.star-card .btn.solid:hover { box-shadow: 3px 3px 0 var(--paper-2); }
+.big-star { position: absolute; top: -34px; right: 18px; width: 84px; transform: rotate(12deg); transition: transform .5s cubic-bezier(.3, 1.6, .5, 1); }
+.big-star path { fill: var(--paper-2); stroke: var(--ink); stroke-width: 5; stroke-linejoin: round; }
+.star-card:hover .big-star { transform: rotate(-14deg) scale(1.15); }
+
+@media (max-width: 980px) { .join-cards { grid-template-columns: 1fr; gap: 34px; } }

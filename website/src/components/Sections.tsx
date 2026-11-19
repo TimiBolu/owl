@@ -254,6 +254,66 @@ export function Start() {
   );
 }
 
+// What the README lists as the most useful contributions right now.
+const WANTED = ["crash tests", "format fuzzing", "the record codec", "key encoding", "index tests", "repeatable benchmarks"];
+
+/** A plain ask, at the end of the page: a star, a try, or a hand. */
+export function Join() {
+  return (
+    <section className="band join" id="join">
+      <div className="wrap">
+        <p className="eyebrow">Join in</p>
+        <h2>
+          Owl is young.
+          <br />
+          Help it grow.
+        </h2>
+        <p className="sub">
+          Owl is being built in the open, and it is early. If you like where it is going, here are three ways to help,
+          from ten seconds to a weekend.
+        </p>
+
+        <div className="join-cards">
+          <article className="join-card star-card">
+            <svg className="big-star" viewBox="0 0 120 120" aria-hidden="true">
+              <path filter="url(#rough-fine)" d="M60 8 L74 44 L112 46 L82 70 L92 108 L60 86 L28 108 L38 70 L8 46 L46 44Z" />
+            </svg>
+            <span className="num">Ten seconds</span>
+            <h3>Give it a star</h3>
+            <p>A star costs nothing, and it is how other people come across a project this new.</p>
+            <a className="btn solid" href={GITHUB_URL} target="_blank" rel="noopener noreferrer">
+              Star Owl on GitHub
+            </a>
+          </article>
+
+          <article className="join-card">
+            <span className="num">Ten minutes</span>
+            <h3>Try it and say what broke</h3>
+            <p>Run the three commands above against data shaped like yours. A query Owl gets wrong, or cannot say, is the most useful report there is.</p>
+            <a className="btn" href={`${GITHUB_URL}/issues/new`} target="_blank" rel="noopener noreferrer">
+              Open an issue
+            </a>
+          </article>
+
+          <article className="join-card">
+            <span className="num">A weekend</span>
+            <h3>Help build it</h3>
+            <p>The priority right now is getting storage right. Good places to start:</p>
+            <p className="wanted">
+              {WANTED.map((item) => (
+                <i key={item}>{item}</i>
+              ))}
+            </p>
+            <a className="btn" href={`${GITHUB_URL}#help-owl-grow`} target="_blank" rel="noopener noreferrer">
+              How to contribute
+            </a>
+          </article>
+        </div>
+      </div>
+    </section>
+  );
+}
+
 export function Footer() {
   return (
     <footer className="foot">
