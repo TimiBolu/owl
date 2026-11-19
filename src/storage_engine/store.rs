@@ -7977,6 +7977,40 @@ fn document_index_value(document: &Document, path: &str) -> Option<Value> {
     Some(value.clone())
 }
 
+/// What to tell whoever tried to write `candidate`: a refusal in the terms of
+/// the schema they wrote, since a repeated value is their mistake to correct
+/// and not a fault in storage.
+fn unique_violation(index: &ScalarIndexDefinition, candidate: &Document) -> OQLError {
+    let held = index
+        .fields
+        .iter()
+        .map(|field| {
+            let name = field.trim_start_matches('.');
+            match document_index_value(candidate, field) {
+                Some(Value::String(text)) => format!("{name} \"{text}\""),
+                Some(Value::Integer(integer)) => format!("{name} {integer}"),
+                Some(Value::Float(float)) => format!("{name} {float}"),
+                Some(Value::Boolean(boolean)) => format!("{name} {boolean}"),
+                Some(Value::DateTime(instant)) => format!("{name} {}", instant.to_rfc3339()),
+                Some(Value::Null) | None => format!("{name} null"),
+                Some(_) => format!("that {name}"),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" with ");
+    let rule = if index.fields.len() == 1 {
+        "which must be unique"
+    } else {
+        "which together must be unique"
+    };
+    OQLError::SchemaValidation {
+        message: format!(
+            "'{}' document '{}' has {held}, {rule}, and another document already has it",
+            index.schema, candidate.id
+        ),
+    }
+}
+
 fn validate_unique_candidate(
     state: &State,
     planned: &HashMap<ObjRef, Option<Document>>,
@@ -7985,15 +8019,7 @@ fn validate_unique_candidate(
     candidate: &Document,
 ) -> OQLResult<()> {
     let candidate_key = document_index_key(candidate, index)?;
-    let duplicate = || {
-        OQLError::storage_error(
-            &format!(
-                "unique scalar index '{}' would contain a duplicate key",
-                index.name
-            ),
-            None,
-        )
-    };
+    let duplicate = || unique_violation(index, candidate);
     // The index already knows which stored documents hold this key. Only
     // an index this same batch creates, which has no entries yet, leaves
     // every document to be read.
@@ -8035,13 +8061,7 @@ fn validate_unique_candidate(
             None => &stored,
         };
         if visible.schema == index.schema && document_index_key(visible, index)? == candidate_key {
-            return Err(OQLError::storage_error(
-                &format!(
-                    "unique scalar index '{}' would contain a duplicate key",
-                    index.name
-                ),
-                None,
-            ));
+            return Err(duplicate());
         }
     }
     for (object_ref, document) in planned {
@@ -8052,13 +8072,7 @@ fn validate_unique_candidate(
             if document.schema == index.schema
                 && document_index_key(document, index)? == candidate_key
             {
-                return Err(OQLError::storage_error(
-                    &format!(
-                        "unique scalar index '{}' would contain a duplicate key",
-                        index.name
-                    ),
-                    None,
-                ));
+                return Err(duplicate());
             }
         }
     }
@@ -14877,7 +14891,13 @@ mod tests {
                 WriteOperation::PutDocument(user("two")),
             ])
             .unwrap_err();
-        assert!(error.to_string().contains("duplicate"));
+        // The refusal is the writer's to act on, so it speaks of their
+        // collection, field and value and is not reported as a storage fault.
+        assert!(matches!(error, OQLError::SchemaValidation { .. }), "{error}");
+        let message = error.to_string();
+        for part in ["'users'", "email \"same@example.com\"", "must be unique"] {
+            assert!(message.contains(part), "{message}");
+        }
         assert_eq!(store.committed_lsn(), 1);
         assert!(store.scan_documents("users").unwrap().is_empty());
     }
