@@ -3448,8 +3448,11 @@ impl StoreCore {
                 &self.record_delta_paths,
                 &self.index_delta_paths,
                 SegmentVerification::Open,
-                None,
+                // The base holds no rows decoded: each is read once, as
+                // it is compacted.
+                Some(0),
             )?;
+            base.decoded_budget = None;
             // The base is the published checkpoint, which the store's own
             // read handles are open on. With them it reads a record from
             // its file when the record is wanted, as the live state does,
@@ -5500,6 +5503,21 @@ impl RustStore {
                     )?;
                 }
                 mark_scalar_indexes_clean(&mut state)?;
+                // What this generation wrote is in its record file. A
+                // database with a budget reads it from there from now on,
+                // and so holds the records of one generation at a time
+                // while it opens, not of all of them.
+                if state.bounded() {
+                    if let Some(handles) = state.checkpoint_records.clone() {
+                        handles
+                            .lock()
+                            .map_err(|_| OQLError::generic("checkpoint read handle lock poisoned"))?
+                            .generation_record_roots
+                            .insert(0, record_root);
+                        state.object_records.mark_clean();
+                        evict_clean_records(&mut state);
+                    }
+                }
             }
         } else if manifest.delta_len > 0 {
             let delta_path = &wal_delta_paths[manifest.slot as usize];
