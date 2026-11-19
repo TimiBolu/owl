@@ -10239,6 +10239,54 @@ impl DocumentStore for RustStore {
         Ok(Some(documents))
     }
 
+    fn scan_documents_in_chunks(
+        &self,
+        schema: &str,
+        visit: &mut dyn FnMut(&[Arc<Document>]) -> OQLResult<bool>,
+    ) -> OQLResult<Option<bool>> {
+        /// Documents decoded and shown at a time.
+        const CHUNK: usize = 1_024;
+        if !self.pending_operations()?.is_empty() {
+            return Ok(None);
+        }
+        let written = |state: &State| state.collection_stamps.get(schema).copied().unwrap_or(0);
+        let (object_refs, stamp) = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+            (logical_collection_object_refs(&state, schema)?, written(&state))
+        };
+        for chunk in object_refs.chunks(CHUNK) {
+            // The state is read for one chunk and let go before the
+            // documents are shown, since what is done with them may read
+            // the store again.
+            let documents = {
+                let state = self
+                    .state
+                    .read()
+                    .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+                if written(&state) != stamp {
+                    return Ok(None);
+                }
+                let mut documents = Vec::with_capacity(chunk.len());
+                for object_ref in chunk {
+                    match sourced_document(&state, *object_ref)? {
+                        Some((document, _)) => documents.push(document),
+                        // Every row listed is there while nothing has
+                        // been written.
+                        None => return Ok(None),
+                    }
+                }
+                documents
+            };
+            if !visit(&documents)? {
+                return Ok(Some(false));
+            }
+        }
+        Ok(Some(true))
+    }
+
     fn scan_documents_shared(&self, schema: &str) -> OQLResult<Option<Vec<Arc<Document>>>> {
         if !self.pending_operations()?.is_empty() {
             return Ok(None);
