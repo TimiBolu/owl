@@ -2307,6 +2307,7 @@ impl Parser {
 
     fn parse_scoped_query(&mut self, collection: String) -> Result<OQLQuery, ParseError> {
         self.expect_token(Token::LeftBrace)?;
+        let block_start = self.position;
 
         let mut operations = Vec::new();
         let mut locals: std::collections::HashMap<String, Expression> =
@@ -2337,6 +2338,15 @@ impl Parser {
                 if locals.contains_key(&name) {
                     return Err(ParseError::InvalidSyntax(format!(
                         "Scoped binding '{}' is already defined",
+                        name
+                    )));
+                }
+                // A name is visible only after its definition. An earlier
+                // entry that already used it was lowered without it, and
+                // would quietly read a collection or field of that name.
+                if self.scoped_name_is_used_between(&name, block_start, self.position) {
+                    return Err(ParseError::InvalidSyntax(format!(
+                        "Scoped binding '{}' is used before it is defined",
                         name
                     )));
                 }
@@ -2400,6 +2410,20 @@ impl Parser {
         })
     }
 
+    /// Whether the tokens in `start..end` use `name` as a bare name. A field
+    /// of the current row (`.name`, `row.name`), a key (`name: ..`) and a
+    /// function call (`name(..)`) are not uses of a local.
+    fn scoped_name_is_used_between(&self, name: &str, start: usize, end: usize) -> bool {
+        (start..end).any(|position| {
+            matches!(&self.tokens[position], Token::Identifier(found) if found == name)
+                && !matches!(self.tokens.get(position.wrapping_sub(1)), Some(Token::Dot))
+                && !matches!(
+                    self.tokens.get(position + 1),
+                    Some(Token::Colon | Token::LeftParen)
+                )
+        })
+    }
+
     fn substitute_scoped_locals_operation(
         operation: &Operation,
         locals: &std::collections::HashMap<String, Expression>,
@@ -2413,7 +2437,21 @@ impl Parser {
                     .fields
                     .iter()
                     .map(|field| SelectField {
-                        alias: field.alias.clone(),
+                        // A shorthand field keeps the name it was written
+                        // with: `select { spent }` is keyed `spent` whether
+                        // `spent` is a stored field or a local.
+                        alias: field.alias.clone().or_else(|| match &field.expression {
+                            Expression::Identifier(name) if locals.contains_key(name) => {
+                                Some(name.clone())
+                            }
+                            Expression::FieldAccess(access)
+                                if access.path.len() == 1
+                                    && locals.contains_key(&access.path[0]) =>
+                            {
+                                Some(access.path[0].clone())
+                            }
+                            _ => None,
+                        }),
                         expression: Self::substitute_scoped_locals_expression(
                             &field.expression,
                             locals,
