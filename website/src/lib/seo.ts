@@ -81,9 +81,11 @@ export function homeJsonLd(dateModified: string) {
         applicationCategory: "DeveloperApplication",
         applicationSubCategory: "Database",
         codeRepository: GITHUB_URL,
+        license: "https://opensource.org/license/mit",
+        isAccessibleForFree: true,
         programmingLanguage: "Rust",
         creativeWorkStatus: "Under active development, not yet for production data",
-        keywords: "object-graph database, OQL, query language, references, Rust, embedded database, vector search",
+        keywords: "object-graph database, OQL, query language, references, Rust, open source, embedded database, vector search",
         featureList: [
           "OQL, a query language that follows references instead of joining",
           "Chain and block forms of the same query",
