@@ -959,6 +959,366 @@ pub(crate) struct CheckpointIndex {
     pub name: String,
     pub unique: bool,
     pub entries: Vec<(Vec<u8>, Vec<ObjRef>)>,
+    /// The index as pages already encoded and kept in a file, in place of
+    /// `entries`, so that the index of a large database is never all in
+    /// memory.
+    pub spooled: Option<SpooledIndexPages>,
+}
+
+/// One index's pages, encoded and waiting in a working file.
+#[derive(Debug, Clone)]
+pub(crate) struct SpooledIndexPages {
+    file: Arc<IndexPagesFile>,
+    pages: Vec<SpooledIndexPage>,
+}
+
+#[derive(Debug, Clone)]
+struct SpooledIndexPage {
+    offset: u64,
+    len: usize,
+    first_key: Option<Vec<u8>>,
+    last_key: Option<Vec<u8>>,
+}
+
+/// The working file encoded index pages wait in. Removed when dropped.
+struct IndexPagesFile {
+    filesystem: Arc<dyn FileSystem>,
+    path: PathBuf,
+    file: Option<Box<dyn FileHandle>>,
+}
+
+impl std::fmt::Debug for IndexPagesFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("IndexPagesFile").field("path", &self.path).finish()
+    }
+}
+
+impl Drop for IndexPagesFile {
+    fn drop(&mut self) {
+        self.file = None;
+        let _ = self.filesystem.remove(&self.path);
+    }
+}
+
+/// Sorts the entries of every index of a checkpoint without holding them
+/// all: entries are taken in any order, sorted a bounded amount at a time
+/// into runs on disk, and merged into encoded pages.
+pub(crate) struct IndexSorter {
+    filesystem: Arc<dyn FileSystem>,
+    prefix: PathBuf,
+    /// Each index's schema, name and whether it is unique, by its number.
+    identities: Vec<(String, String, bool)>,
+    /// The keys of the entries not yet written to a run, end to end.
+    keys: Vec<u8>,
+    /// Those entries: index number, where its key is, and the row.
+    items: Vec<(u16, u32, u32, ObjRef)>,
+    runs: Vec<PathBuf>,
+    /// Entries are written to a run once they take about this much.
+    run_bytes: usize,
+}
+
+/// One sorted run being read back.
+struct IndexRun {
+    file: Box<dyn FileHandle>,
+    offset: usize,
+    end: usize,
+    buffer: Vec<u8>,
+    position: usize,
+}
+
+impl IndexRun {
+    const READ_BYTES: usize = 64 << 10;
+
+    fn take(&mut self, length: usize) -> OQLResult<&[u8]> {
+        if self.buffer.len() - self.position < length {
+            let kept = self.buffer.split_off(self.position);
+            self.buffer = kept;
+            self.position = 0;
+            let wanted = (length - self.buffer.len()).max(Self::READ_BYTES).min(self.end - self.offset);
+            if self.buffer.len() + wanted < length {
+                return Err(OQLError::storage_error("an index run ends inside an entry", None));
+            }
+            let more = read_exact_at(self.file.as_ref(), self.offset, wanted)?;
+            self.offset += wanted;
+            self.buffer.extend_from_slice(&more);
+        }
+        let start = self.position;
+        self.position += length;
+        Ok(&self.buffer[start..start + length])
+    }
+
+    fn next(&mut self) -> OQLResult<Option<(u16, Vec<u8>, ObjRef)>> {
+        if self.position == self.buffer.len() && self.offset == self.end {
+            return Ok(None);
+        }
+        let header = self.take(14)?;
+        let index = u16::from_le_bytes([header[0], header[1]]);
+        let key_len = u32::from_le_bytes([header[2], header[3], header[4], header[5]]) as usize;
+        let mut packed = [0u8; 8];
+        packed.copy_from_slice(&header[6..14]);
+        let key = self.take(key_len)?.to_vec();
+        Ok(Some((index, key, ObjRef::new(u64::from_le_bytes(packed)))))
+    }
+}
+
+impl IndexSorter {
+    const RUN_BYTES: usize = 8 << 20;
+
+    pub(crate) fn new(
+        filesystem: Arc<dyn FileSystem>,
+        prefix: PathBuf,
+        identities: Vec<(String, String, bool)>,
+    ) -> OQLResult<Self> {
+        if identities.len() > u16::MAX as usize {
+            return Err(OQLError::storage_error("a checkpoint has too many indexes", None));
+        }
+        Ok(Self {
+            filesystem,
+            prefix,
+            identities,
+            keys: Vec::new(),
+            items: Vec::new(),
+            runs: Vec::new(),
+            run_bytes: Self::RUN_BYTES,
+        })
+    }
+
+    pub(crate) fn push(&mut self, index: usize, key: &[u8], object_ref: ObjRef) -> OQLResult<()> {
+        let offset = as_u32(self.keys.len(), "index sort buffer")?;
+        let length = as_u32(key.len(), "index key")?;
+        self.keys.extend_from_slice(key);
+        self.items.push((index as u16, offset, length, object_ref));
+        if self.keys.len() + self.items.len() * std::mem::size_of::<(u16, u32, u32, ObjRef)>()
+            >= self.run_bytes
+        {
+            self.spill()?;
+        }
+        Ok(())
+    }
+
+    fn sort(&mut self) {
+        let keys = &self.keys;
+        let key = |item: &(u16, u32, u32, ObjRef)| &keys[item.1 as usize..(item.1 + item.2) as usize];
+        self.items.sort_unstable_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| key(left).cmp(key(right)))
+                .then_with(|| left.3.packed().cmp(&right.3.packed()))
+        });
+    }
+
+    fn spill(&mut self) -> OQLResult<()> {
+        self.sort();
+        let path = PathBuf::from(format!("{}.{}", self.prefix.display(), self.runs.len()));
+        let mut file = self.filesystem.create(&path).map_err(|error| {
+            OQLError::storage_error(&format!("create index run: {error}"), None)
+        })?;
+        // Named before it is written, so that a failure still removes it.
+        self.runs.push(path);
+        let mut pending = Vec::with_capacity(1 << 20);
+        for (index, offset, length, object_ref) in &self.items {
+            pending.extend_from_slice(&index.to_le_bytes());
+            pending.extend_from_slice(&length.to_le_bytes());
+            pending.extend_from_slice(&object_ref.packed().to_le_bytes());
+            pending.extend_from_slice(&self.keys[*offset as usize..(*offset + *length) as usize]);
+            if pending.len() >= 1 << 20 {
+                write_all_handle(file.as_mut(), &pending)?;
+                pending.clear();
+            }
+        }
+        write_all_handle(file.as_mut(), &pending)?;
+        file.flush().map_err(|error| {
+            OQLError::storage_error(&format!("flush index run: {error}"), None)
+        })?;
+        self.keys.clear();
+        self.items.clear();
+        Ok(())
+    }
+
+    /// Merge everything taken into the pages of each index, in the order
+    /// the indexes were named.
+    pub(crate) fn finish(mut self) -> OQLResult<Vec<CheckpointIndex>> {
+        self.sort();
+        let mut runs = Vec::with_capacity(self.runs.len());
+        for path in &self.runs {
+            let end = self.filesystem.file_size(path).map_err(|error| {
+                OQLError::storage_error(&format!("inspect index run: {error}"), None)
+            })? as usize;
+            let file = self.filesystem.open(path).map_err(|error| {
+                OQLError::storage_error(&format!("open index run: {error}"), None)
+            })?;
+            runs.push(IndexRun { file, offset: 0, end, buffer: Vec::new(), position: 0 });
+        }
+        // The smallest entry of each source, the entries still in memory
+        // being the last source.
+        let held = runs.len();
+        let mut heads = std::collections::BinaryHeap::new();
+        for (source, run) in runs.iter_mut().enumerate() {
+            if let Some((index, key, object_ref)) = run.next()? {
+                heads.push(std::cmp::Reverse((index, key, object_ref.packed(), source)));
+            }
+        }
+        let mut next_held = 0usize;
+        let held_entry = |sorter: &Self, at: usize| {
+            sorter.items.get(at).map(|(index, offset, length, object_ref)| {
+                (
+                    *index,
+                    sorter.keys[*offset as usize..(*offset + *length) as usize].to_vec(),
+                    object_ref.packed(),
+                    held,
+                )
+            })
+        };
+        if let Some(entry) = held_entry(&self, next_held) {
+            heads.push(std::cmp::Reverse(entry));
+            next_held += 1;
+        }
+
+        let pages_path = PathBuf::from(format!("{}.pages", self.prefix.display()));
+        let mut pages_file = IndexPagesFile {
+            filesystem: self.filesystem.clone(),
+            path: pages_path.clone(),
+            file: Some(self.filesystem.create(&pages_path).map_err(|error| {
+                OQLError::storage_error(&format!("create index pages: {error}"), None)
+            })?),
+        };
+        let mut written = 0u64;
+        let mut spooled: Vec<Vec<SpooledIndexPage>> = vec![Vec::new(); self.identities.len()];
+        // The page being filled, and the key and rows being gathered.
+        let mut page: Vec<(Vec<u8>, Vec<ObjRef>)> = Vec::new();
+        let mut page_len = 0usize;
+        let mut group: Option<(Vec<u8>, Vec<ObjRef>)> = None;
+
+        for number in 0..self.identities.len() {
+            let (schema, name, unique) = self.identities[number].clone();
+            let fixed = INDEX_BLOCK_HEADER_LEN + schema.len() + name.len() + INDEX_ROUTING_HEADER_LEN;
+            page_len = fixed;
+            let mut emit = |page: &mut Vec<(Vec<u8>, Vec<ObjRef>)>,
+                            spooled: &mut Vec<SpooledIndexPage>,
+                            last: bool|
+             -> OQLResult<()> {
+                let first = spooled.is_empty();
+                let entries = std::mem::take(page);
+                let count = entries.len();
+                let first_key = entries.first().map(|entry| entry.0.clone());
+                let last_key = entries.last().map(|entry| entry.0.clone());
+                let block = encode_index_page(
+                    &CheckpointIndex {
+                        schema: schema.clone(),
+                        name: name.clone(),
+                        unique,
+                        entries,
+                        spooled: None,
+                    },
+                    0..count,
+                    first,
+                    last,
+                )?;
+                let file = pages_file
+                    .file
+                    .as_mut()
+                    .ok_or_else(|| OQLError::storage_error("index pages file is closed", None))?;
+                write_all_handle(file.as_mut(), &block)?;
+                spooled.push(SpooledIndexPage { offset: written, len: block.len(), first_key, last_key });
+                written += block.len() as u64;
+                Ok(())
+            };
+            let mut close_group = |group: &mut Option<(Vec<u8>, Vec<ObjRef>)>,
+                                   page: &mut Vec<(Vec<u8>, Vec<ObjRef>)>,
+                                   page_len: &mut usize,
+                                   spooled: &mut Vec<SpooledIndexPage>|
+             -> OQLResult<()> {
+                let Some((key, mut postings)) = group.take() else {
+                    return Ok(());
+                };
+                postings.sort_unstable();
+                postings.dedup();
+                if postings.is_empty() || (unique && postings.len() != 1) {
+                    return Err(OQLError::storage_error(
+                        "compaction index violates posting constraints",
+                        None,
+                    ));
+                }
+                // The rule a page of entries held in memory is cut by.
+                let entry_len = index_entry_len(&key, &postings)?;
+                let first_key_len = page.first().map_or(key.len(), |entry| entry.0.len());
+                if !page.is_empty()
+                    && *page_len + entry_len + first_key_len + key.len() > INDEX_PAGE_TARGET_BYTES
+                {
+                    emit(page, spooled, false)?;
+                    *page_len = fixed;
+                }
+                *page_len += entry_len;
+                page.push((key, postings));
+                Ok(())
+            };
+            while heads
+                .peek()
+                .is_some_and(|std::cmp::Reverse(head)| head.0 as usize == number)
+            {
+                let Some(std::cmp::Reverse((_, key, packed, source))) = heads.pop() else {
+                    break;
+                };
+                let refill = if source == held {
+                    let entry = held_entry(&self, next_held);
+                    next_held += 1;
+                    entry
+                } else {
+                    runs[source]
+                        .next()?
+                        .map(|(index, key, object_ref)| (index, key, object_ref.packed(), source))
+                };
+                if let Some(entry) = refill {
+                    heads.push(std::cmp::Reverse(entry));
+                }
+                match &mut group {
+                    Some((current, postings)) if *current == key => postings.push(ObjRef::new(packed)),
+                    _ => {
+                        close_group(&mut group, &mut page, &mut page_len, &mut spooled[number])?;
+                        group = Some((key, vec![ObjRef::new(packed)]));
+                    }
+                }
+            }
+            close_group(&mut group, &mut page, &mut page_len, &mut spooled[number])?;
+            // The last page of the index, which is its only page, and an
+            // empty one, when the index has no entries.
+            emit(&mut page, &mut spooled[number], true)?;
+        }
+        let _ = page_len;
+        if heads.pop().is_some() {
+            return Err(OQLError::storage_error("an index entry names no index", None));
+        }
+        drop(runs);
+        if let Some(mut file) = pages_file.file.take() {
+            file.flush().map_err(|error| {
+                OQLError::storage_error(&format!("flush index pages: {error}"), None)
+            })?;
+        }
+        pages_file.file = Some(self.filesystem.open(&pages_path).map_err(|error| {
+            OQLError::storage_error(&format!("open index pages: {error}"), None)
+        })?);
+        let pages_file = Arc::new(pages_file);
+        Ok(self
+            .identities
+            .iter()
+            .zip(spooled)
+            .map(|((schema, name, unique), pages)| CheckpointIndex {
+                schema: schema.clone(),
+                name: name.clone(),
+                unique: *unique,
+                entries: Vec::new(),
+                spooled: Some(SpooledIndexPages { file: pages_file.clone(), pages }),
+            })
+            .collect())
+    }
+}
+
+impl Drop for IndexSorter {
+    fn drop(&mut self) {
+        for path in &self.runs {
+            let _ = self.filesystem.remove(path);
+        }
+    }
 }
 
 pub(crate) struct CheckpointIndexPage {
@@ -2618,6 +2978,16 @@ pub(crate) fn write_segment_file(
     let mut index_pages = Vec::new();
     let mut indexes_len = 0usize;
     for index in ordered_indexes {
+        if let Some(spooled) = &index.spooled {
+            let last_page = spooled.pages.len().saturating_sub(1);
+            for (page, described) in spooled.pages.iter().enumerate() {
+                indexes_len = indexes_len.checked_add(described.len).ok_or_else(|| {
+                    OQLError::storage_error("checkpoint index region overflow", None)
+                })?;
+                index_pages.push((index, page..page, page == 0, page == last_page));
+            }
+            continue;
+        }
         let ranges = plan_index_pages(index)?;
         let last_page = ranges.len() - 1;
         for (page, range) in ranges.into_iter().enumerate() {
@@ -2754,13 +3124,24 @@ pub(crate) fn write_segment_file(
     let mut published_indexes = Vec::<PublishedIndexPages>::new();
     let mut index_offset = SEGMENT_HEADER_LEN + metadata.len() + directory_len + records_len;
     for (index, range, first, last) in index_pages {
-        let first_key = index.entries[range.clone()]
-            .first()
-            .map(|entry| entry.0.clone());
-        let last_key = index.entries[range.clone()]
-            .last()
-            .map(|entry| entry.0.clone());
-        let block = encode_index_page(index, range, first, last)?;
+        let (first_key, last_key, block) = match &index.spooled {
+            Some(spooled) => {
+                let described = &spooled.pages[range.start];
+                let file = spooled.file.file.as_ref().ok_or_else(|| {
+                    OQLError::storage_error("index pages file is closed", None)
+                })?;
+                (
+                    described.first_key.clone(),
+                    described.last_key.clone(),
+                    read_exact_at(file.as_ref(), described.offset as usize, described.len)?,
+                )
+            }
+            None => (
+                index.entries[range.clone()].first().map(|entry| entry.0.clone()),
+                index.entries[range.clone()].last().map(|entry| entry.0.clone()),
+                encode_index_page(index, range, first, last)?,
+            ),
+        };
         write_all_handle(file.as_mut(), &block)?;
         internal.update(&block);
         if first {
@@ -3771,6 +4152,7 @@ fn decode_indexes(bytes: &[u8], count: usize) -> OQLResult<Vec<CheckpointIndex>>
                 ));
             }
             indexes.push(CheckpointIndex {
+                spooled: None,
                 schema: page.schema,
                 name: page.name,
                 unique: page.unique,
@@ -4448,12 +4830,14 @@ mod tests {
             records: vec![(object_ref, Arc::from(vec![9; 128 * 1024]))],
             indexes: vec![
                 CheckpointIndex {
+                    spooled: None,
                     schema: "logs".into(),
                     name: "by_timestamp".into(),
                     unique: true,
                     entries: large_index_entries,
                 },
                 CheckpointIndex {
+                    spooled: None,
                     schema: "logs".into(),
                     name: "by_level".into(),
                     unique: false,
@@ -4573,6 +4957,7 @@ mod tests {
     #[test]
     fn legacy_whole_index_block_decodes_as_one_page() {
         let index = CheckpointIndex {
+            spooled: None,
             schema: "events".into(),
             name: "by_level".into(),
             unique: false,
@@ -4606,6 +4991,7 @@ mod tests {
     #[test]
     fn routing_prefix_is_authenticated_without_reading_entry_payload() {
         let index = CheckpointIndex {
+            spooled: None,
             schema: "events".into(),
             name: "incoming".into(),
             unique: false,
@@ -4726,6 +5112,7 @@ mod tests {
             },
             records: Vec::new(),
             indexes: vec![CheckpointIndex {
+                spooled: None,
                 schema: "events".into(),
                 name: "by_level".into(),
                 unique: false,
@@ -4886,4 +5273,90 @@ mod tests {
             assert!(!filesystem.exists(&artifact));
         }
     }
+    /// Index entries sorted through runs on disk come out as the very
+    /// pages the entries held in memory would be written as, and the
+    /// working files are gone once the pages are.
+    #[test]
+    fn index_entries_sorted_on_disk_make_the_same_pages() {
+        use crate::simulation::RealFileSystem;
+        let directory = tempfile::TempDir::new().unwrap();
+        let filesystem: Arc<dyn FileSystem> = Arc::new(RealFileSystem::new());
+        let identities = vec![
+            ("orders".to_string(), "by_status".to_string(), false),
+            ("orders".to_string(), "by_id".to_string(), true),
+            ("empty".to_string(), "by_nothing".to_string(), false),
+            ("people".to_string(), "by_name".to_string(), false),
+        ];
+        // Entries in no order at all, with repeats, and far more than one
+        // run or one page holds.
+        let mut entries = Vec::new();
+        for row in 0..20_000u64 {
+            let scrambled = row.wrapping_mul(2_654_435_761) % 20_000;
+            entries.push((0usize, format!("status-{}", scrambled % 7).into_bytes(), ObjRef::new(scrambled + 1)));
+            entries.push((1usize, format!("id-{scrambled:08}").into_bytes(), ObjRef::new(scrambled + 1)));
+            entries.push((3usize, format!("name-{}", scrambled % 3_000).into_bytes(), ObjRef::new(scrambled + 1)));
+            if row % 100 == 0 {
+                // The same entry twice counts once.
+                entries.push((3usize, format!("name-{}", scrambled % 3_000).into_bytes(), ObjRef::new(scrambled + 1)));
+            }
+        }
+        let mut sorter = IndexSorter::new(
+            filesystem.clone(),
+            directory.path().join("sort"),
+            identities.clone(),
+        )
+        .unwrap();
+        sorter.run_bytes = 64 << 10;
+        for (index, key, object_ref) in &entries {
+            sorter.push(*index, key, *object_ref).unwrap();
+        }
+        assert!(sorter.runs.len() > 5, "{} runs", sorter.runs.len());
+        let sorted = sorter.finish().unwrap();
+        assert_eq!(sorted.len(), identities.len());
+
+        for (number, (schema, name, unique)) in identities.iter().enumerate() {
+            let mut held = BTreeMap::<Vec<u8>, Vec<ObjRef>>::new();
+            for (index, key, object_ref) in &entries {
+                if *index == number {
+                    held.entry(key.clone()).or_default().push(*object_ref);
+                }
+            }
+            let mut held: Vec<(Vec<u8>, Vec<ObjRef>)> = held.into_iter().collect();
+            for (_, postings) in &mut held {
+                postings.sort_unstable();
+                postings.dedup();
+            }
+            let held = CheckpointIndex {
+                schema: schema.clone(),
+                name: name.clone(),
+                unique: *unique,
+                entries: held,
+                spooled: None,
+            };
+            let ranges = plan_index_pages(&held).unwrap();
+            let spooled = sorted[number].spooled.as_ref().unwrap();
+            assert_eq!(sorted[number].schema, *schema);
+            assert_eq!(spooled.pages.len(), ranges.len(), "{schema}.{name}");
+            let last = ranges.len() - 1;
+            for (page, range) in ranges.into_iter().enumerate() {
+                let expected = encode_index_page(&held, range.clone(), page == 0, page == last).unwrap();
+                let described = &spooled.pages[page];
+                let file = spooled.file.file.as_ref().unwrap();
+                let found = read_exact_at(file.as_ref(), described.offset as usize, described.len).unwrap();
+                assert!(found == expected, "{schema}.{name} page {page}");
+                assert_eq!(described.first_key, held.entries[range.clone()].first().map(|entry| entry.0.clone()));
+                assert_eq!(described.last_key, held.entries[range].last().map(|entry| entry.0.clone()));
+            }
+        }
+        // A unique index with a key twice is refused.
+        let mut twice = IndexSorter::new(filesystem.clone(), directory.path().join("twice"), identities.clone()).unwrap();
+        twice.push(1, b"id-1", ObjRef::new(1)).unwrap();
+        twice.push(1, b"id-1", ObjRef::new(2)).unwrap();
+        assert!(twice.finish().is_err());
+
+        drop(sorted);
+        let left: Vec<_> = std::fs::read_dir(directory.path()).unwrap().map(|entry| entry.unwrap().file_name()).collect();
+        assert!(left.is_empty(), "working files left behind: {left:?}");
+    }
+
 }

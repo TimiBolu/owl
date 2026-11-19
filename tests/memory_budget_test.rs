@@ -615,11 +615,77 @@ fn a_compaction_works_from_files_and_leaves_none_behind() {
         let left: Vec<String> = std::fs::read_dir(home.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with("spooled.owl") && name.ends_with(".records"))
+            .filter(|name| {
+                name.starts_with("spooled.owl") && (name.ends_with(".records") || name.contains("index-run"))
+            })
             .collect();
         assert!(left.is_empty(), "working files left behind: {left:?}");
     }
     let store = Arc::new(RustStore::new(&path, SIZE).unwrap());
     assert_eq!(answers(&store), expected, "opened again");
     store.verify_integrity().unwrap();
+}
+
+/// A database with a budget opens without taking the records of its
+/// checkpoint into memory: it reads each from the file when it is wanted.
+/// A log written after that checkpoint is replayed over those records,
+/// with updates and deletes of rows that were never in memory, and the
+/// database then answers as one that held everything all along.
+#[test]
+fn a_log_is_replayed_over_records_left_on_file() {
+    let changes = [
+        r#"orders.where { .id == "o005" }.update { total: 9999.5, note: "changed" }"#,
+        r#"orders.where { .status == "void" && .total > 300 }.delete"#,
+        r#"orders.where { .customer == "c07" }.update { status: "paid" }"#,
+        r#"orders.where { .id == "o010" }.update { items: [{ sku: "only", qty: 8 }] }"#,
+        r#"customers.where { .id == "c39" }.update { tier: "gold" }"#,
+        r#"orders.insert { id: "o900", customer: "c03", total: 12.5, status: "open", items: [{ sku: "new", qty: 2 }] }"#,
+        r#"orders.where { .id == "o399" }.delete"#,
+    ];
+    let home = TempDir::new().unwrap();
+    let expected = {
+        let plain = Arc::new(RustStore::new(home.path().join("plain.owl"), SIZE).unwrap());
+        plain.set_decoded_bytes_budget(None).unwrap();
+        load(&plain);
+        for change in changes {
+            rows(&plain, change).unwrap();
+        }
+        answers(&plain)
+    };
+
+    for compacted in [false, true] {
+        let path = home.path().join(format!("replayed-{compacted}.owl"));
+        {
+            let store = Arc::new(RustStore::new(&path, SIZE).unwrap());
+            store.set_decoded_bytes_budget(Some(64 << 10)).unwrap();
+            load(&store);
+            store.checkpoint().unwrap();
+            if compacted {
+                store.compact().unwrap();
+            }
+        }
+        // Opened on the checkpoint, changed, and closed with the changes
+        // only in the log.
+        {
+            let store = Arc::new(RustStore::new(&path, SIZE).unwrap());
+            store.set_decoded_bytes_budget(Some(64 << 10)).unwrap();
+            for change in changes {
+                rows(&store, change).unwrap();
+            }
+            assert_eq!(answers(&store), expected, "compacted {compacted}: changed");
+        }
+        // Opened again: the log is replayed over what the files hold.
+        let store = Arc::new(RustStore::new(&path, SIZE).unwrap());
+        assert_eq!(answers(&store), expected, "compacted {compacted}: replayed");
+        store.verify_integrity().unwrap();
+        // And the same once that is checkpointed and compacted in turn.
+        store.set_decoded_bytes_budget(Some(64 << 10)).unwrap();
+        store.checkpoint().unwrap();
+        store.compact().unwrap();
+        assert_eq!(answers(&store), expected, "compacted {compacted}: compacted after");
+        drop(store);
+        let store = Arc::new(RustStore::new(&path, SIZE).unwrap());
+        assert_eq!(answers(&store), expected, "compacted {compacted}: opened last");
+        store.verify_integrity().unwrap();
+    }
 }
