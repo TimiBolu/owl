@@ -12701,13 +12701,31 @@ impl<S: DocumentStore> QueryExecutor<S> {
             }
             _ => return Ok(None),
         };
-        let Some(referred) = self.store.scan_documents_shared(&target)? else {
-            return Ok(None);
-        };
+        // Of each row referred to, its id and the value it sorts by. The
+        // rows themselves are not kept, and when the store does not hold
+        // them all they are read a bounded number at a time.
         let access = FieldAccess { path: vec![field.clone()] };
-        let mut keys = Vec::with_capacity(referred.len());
-        for row in &referred {
-            keys.push(self.get_field_value(row, &access)?);
+        let mut referred: Vec<crate::document::DocumentId> = Vec::new();
+        let mut keys: Vec<Value> = Vec::new();
+        match self.store.scan_documents_shared(&target)? {
+            Some(rows) => {
+                for row in &rows {
+                    referred.push(row.id.clone());
+                    keys.push(self.get_field_value(row, &access)?);
+                }
+            }
+            None => {
+                let shown = self.store.scan_documents_in_chunks(&target, &mut |rows| {
+                    for row in rows {
+                        referred.push(row.id.clone());
+                        keys.push(self.get_field_value(row, &access)?);
+                    }
+                    Ok(true)
+                })?;
+                if shown != Some(true) {
+                    return Ok(None);
+                }
+            }
         }
         let descending = matches!(first.direction, crate::parser::SortDirection::Desc);
         let mut order: Vec<usize> = (0..referred.len()).collect();
@@ -12728,7 +12746,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
             }
             for row in self.store.scan_referencing_documents_shared(
                 &target,
-                &referred[*at].id,
+                &referred[*at],
                 Some(collection),
                 Some(through),
             )? {
