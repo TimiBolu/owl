@@ -1,6 +1,6 @@
 use super::checkpoint::{
     cleanup_typed_locator_spools, decode_segment_file, open_typed_segment_handles,
-    write_segment_file, BaseSegmentHandle, CheckpointImage, CheckpointIndex, CheckpointInfo,
+    write_segment_file, BaseSegmentHandle, CheckpointImage, RecordSpool, CheckpointIndex, CheckpointInfo,
     CheckpointMetadata, DecodedCheckpoint, FileIndexBase, IndexPageDescriptor, Manifest,
     PublishedIndexPages, SegmentIndexReader, SegmentVerification, TypedLocatorLeaf,
     TypedSegmentFileDescriptor, TypedSegmentHandle,
@@ -485,9 +485,11 @@ struct State {
     /// holds is decoded from there again, and any other row from its
     /// record, which is then kept in memory in its place.
     decoded_budget: Option<usize>,
-    /// The most memory, roughly, that the rows held decoded may take, or
-    /// `None` for no limit. Past it the oldest are let go, as with
-    /// `decoded_budget`. A database gets one by default, sized from the
+    /// The most memory, roughly, that the store may take for what it
+    /// keeps so as not to read it again, or `None` for no limit: half for
+    /// the rows held decoded, a quarter for column segments held decoded
+    /// and a quarter for columns and row lists kept between queries. Past
+    /// their share the oldest rows are let go, as with `decoded_budget`. A database gets one by default, sized from the
     /// machine, so that it cannot grow without limit; while everything
     /// fits within it nothing is let go and nothing is slower.
     decoded_bytes_budget: Option<usize>,
@@ -567,6 +569,26 @@ impl State {
         self.decoded_budget.is_some() || (self.decoded_bytes_budget.is_some() && self.let_go_for_bytes)
     }
 
+    /// The budget is one figure for everything the store keeps so as not
+    /// to read it again, shared out: half for the rows held decoded, a
+    /// quarter for the column segments held decoded, and a quarter for
+    /// the columns and row lists kept between queries.
+    fn rows_bytes(&self) -> Option<usize> {
+        self.decoded_bytes_budget.map(|bytes| bytes / 2)
+    }
+
+    /// The share of the budget for column segments held decoded.
+    fn segment_bytes(&self) -> usize {
+        self.decoded_bytes_budget
+            .map_or(SEGMENT_BYTES_UNDER_A_BUDGET, |bytes| (bytes / 4).max(1))
+    }
+
+    /// The share of the budget for what is kept between queries.
+    fn kept_bytes(&self) -> usize {
+        self.decoded_bytes_budget
+            .map_or(BUILT_COLUMNS_LIMIT, |bytes| bytes / 4)
+    }
+
     fn index_pages(&self) -> Arc<std::sync::atomic::AtomicUsize> {
         self.index_page_limit.store(
             if self.tight() { INDEX_PAGES_UNDER_A_BUDGET } else { 0 },
@@ -575,7 +597,7 @@ impl State {
         // A database short of memory also bounds the column segments this
         // process holds decoded. One that is not leaves that as it finds it.
         if self.tight() {
-            crate::storage_engine::checkpoint::segments_loaded().set_limit(SEGMENT_BYTES_UNDER_A_BUDGET);
+            crate::storage_engine::checkpoint::segments_loaded().set_limit(self.segment_bytes());
         }
         self.index_page_limit.clone()
     }
@@ -630,7 +652,7 @@ fn enforce_decoded_budget(state: &mut State) -> OQLResult<()> {
         return Ok(());
     }
     let budget = state.decoded_budget.unwrap_or(usize::MAX);
-    let bytes = state.decoded_bytes_budget.unwrap_or(usize::MAX);
+    let bytes = state.rows_bytes().unwrap_or(usize::MAX);
     if state.object_directory.bytes() > bytes && !state.let_go_for_bytes {
         // Memory is short from here on: what is cached is bounded too.
         state.let_go_for_bytes = true;
@@ -2032,6 +2054,9 @@ struct BuiltColumns {
     /// empties it.
     epoch: (u64, u64),
     collections: HashMap<String, BuiltCollection>,
+    /// The most bytes to keep: the store's share of its budget for this,
+    /// as it was when the cache was last asked for a collection.
+    limit: usize,
 }
 
 /// What is kept of one collection's rows between queries.
@@ -2080,7 +2105,8 @@ impl BuiltCollection {
     }
 }
 
-/// The cache of built columns holds about this much at most. Past it,
+/// The cache of built columns holds about this much at most where the
+/// store has no budget; with one, it holds its share of that. Past it,
 /// other collections' columns are dropped, and if that is not enough the
 /// query reads rows instead.
 const BUILT_COLUMNS_LIMIT: usize = 256 << 20;
@@ -2090,6 +2116,7 @@ impl BuiltColumns {
     /// from has since been written.
     fn of<'a>(&'a mut self, state: &State, schema: &str) -> &'a mut BuiltCollection {
         static STAMPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        self.limit = state.kept_bytes();
         let epoch = (state.catalog_stamp, state.typed_base_lsn);
         if self.epoch != epoch {
             self.epoch = epoch;
@@ -2113,10 +2140,10 @@ impl BuiltColumns {
         let held = |collections: &HashMap<String, BuiltCollection>| -> usize {
             collections.values().map(|kept| kept.bytes).sum()
         };
-        if held(&self.collections) + more > BUILT_COLUMNS_LIMIT {
+        if held(&self.collections) + more > self.limit {
             self.collections.retain(|name, _| name == schema);
         }
-        held(&self.collections) + more <= BUILT_COLUMNS_LIMIT
+        held(&self.collections) + more <= self.limit
     }
 }
 
@@ -2807,8 +2834,21 @@ impl RustStore {
             .state
             .read()
             .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+        let mut parts = Self::breakdown_of(&state);
+        drop(state);
+        if let Ok(built) = self.built_columns.lock() {
+            let bytes: usize = built.collections.values().map(|kept| kept.bytes).sum();
+            parts.push(("columns and row lists kept between queries".to_string(), built.collections.len(), bytes));
+        }
+        Ok(parts)
+    }
+
+    /// What one state holds in memory, part by part.
+    fn breakdown_of(state: &State) -> Vec<(String, usize, usize)> {
         let mut parts = Vec::new();
-        parts.push(("rows held decoded".to_string(), state.object_directory.len(), 0));
+        parts.push(("rows held decoded".to_string(), state.object_directory.len(), state.object_directory.bytes()));
+        let (segments, segment_bytes) = crate::storage_engine::checkpoint::segments_loaded().held();
+        parts.push(("column segments held decoded (as encoded)".to_string(), segments, segment_bytes));
         let (records, record_bytes) = state.object_records.held_in_memory();
         parts.push(("records held as bytes".to_string(), records, record_bytes));
         let ids: usize = state.collection_rows.values().map(BTreeMap::len).sum();
@@ -2851,12 +2891,7 @@ impl RustStore {
         parts.push(("rows changed since the column segments".to_string(), delta, delta * 72));
         parts.push(("order rows were decoded in".to_string(), state.decoded_order.len(), state.decoded_order.capacity() * 8));
         parts.push(("recent commits kept for open transactions".to_string(), state.conflicts.recent.len(), 0));
-        drop(state);
-        if let Ok(built) = self.built_columns.lock() {
-            let bytes: usize = built.collections.values().map(|kept| kept.bytes).sum();
-            parts.push(("columns and row lists kept between queries".to_string(), built.collections.len(), bytes));
-        }
-        Ok(parts)
+        parts
     }
 
     /// Remove files unreachable from the newest durable manifest.
@@ -3395,6 +3430,7 @@ impl StoreCore {
         // The previous published checkpoint plus the sealed WAL are immutable
         // durable inputs. The compaction overlay retains encoded records and
         // tombstones only; documents are decoded later in bounded row groups.
+        let live_is_tight = self.state.read().map(|state| state.tight()).unwrap_or(false);
         let reconstructed = (|| {
             let recovery_started = Instant::now();
             let (mut base, _) = RustStore::recover_checkpoint(
@@ -3409,6 +3445,15 @@ impl StoreCore {
                 SegmentVerification::Open,
                 None,
             )?;
+            // The base is the published checkpoint, which the store's own
+            // read handles are open on. With them it reads a record from
+            // its file when the record is wanted, as the live state does,
+            // and need not hold every record's bytes for the length of the
+            // compaction.
+            base.checkpoint_records = Some(self.checkpoint_read_handles.clone());
+            // If the database is short of memory, so is its compaction.
+            base.let_go_for_bytes |= live_is_tight;
+            evict_clean_records(&mut base);
             let run_prefix = sidecar_path(&self.wal_path, "compaction");
             let run_manifest = sidecar_path(&self.wal_path, "compaction-runs");
             let (plan, valid_length) = replay_wal_for_compaction(
@@ -3444,7 +3489,11 @@ impl StoreCore {
             );
             let image_started = Instant::now();
             let image = checkpoint_image_from_compaction(&base, &plan, sequence)?;
-            let live_objects = image.records.len().saturating_add(
+            let live_objects = image
+                .records
+                .len()
+                .saturating_add(image.record_spool.as_ref().map_or(0, |spool| spool.len()))
+                .saturating_add(
                 image
                     .typed_segments
                     .iter()
@@ -3694,6 +3743,11 @@ impl StoreCore {
                     }
                 }
                 state.object_schema_versions.remove(object_ref);
+            }
+            // The rows that moved into segments leave these maps mostly
+            // empty; give the room back.
+            if state.object_schema_versions.capacity() > 4 * state.object_schema_versions.len().max(64) {
+                state.object_schema_versions.shrink_to_fit();
             }
             (retired.len(), None)
         };
@@ -6351,6 +6405,7 @@ fn checkpoint_image_with_records(
     );
     records.retain(|(object_ref, _)| !authoritative_rows.contains(object_ref));
     Ok(CheckpointImage {
+        record_spool: None,
         sequence,
         checkpoint_lsn: state.committed_lsn,
         metadata: CheckpointMetadata {
@@ -6481,8 +6536,17 @@ fn checkpoint_image_from_compaction(
     plan: &CompactionPlan,
     sequence: u64,
 ) -> OQLResult<CheckpointImage> {
-    const TARGET_ROWS: usize = 65_536;
-    let mut records = Vec::<(ObjRef, Arc<[u8]>)>::new();
+    // The rows of a segment are held decoded while it is built. A database
+    // short of memory builds smaller segments, which also lets it hold a
+    // few of them at a time within its share for segments, not one.
+    #[allow(non_snake_case)]
+    let TARGET_ROWS: usize = if state.tight() { 8_192 } else { 65_536 };
+    // Records go to a file of their own as they are produced, and are read
+    // back when the image is written.
+    let mut records = RecordSpool::create(
+        plan.filesystem.clone(),
+        sidecar_path(&plan.manifest_path, "records"),
+    )?;
     let mut typed_segments = Vec::<Arc<[u8]>>::new();
     let mut scalar_entries = state
         .scalar_indexes
@@ -6606,9 +6670,9 @@ fn checkpoint_image_from_compaction(
                     &mut typed_segments,
                     &mut records,
                 )?;
-                records.push((
+                records.push(
                     row.object_ref,
-                    row.record.unwrap_or(Arc::from(RecordCodec::encode(
+                    &row.record.unwrap_or(Arc::from(RecordCodec::encode(
                         &row.document,
                         row.object_ref,
                         state
@@ -6621,7 +6685,7 @@ fn checkpoint_image_from_compaction(
                                 )
                             })?,
                     )?)),
-                ));
+                )?;
             }
         }
         flush_compaction_typed_chunk(
@@ -6666,10 +6730,11 @@ fn checkpoint_image_from_compaction(
     });
 
     Ok(CheckpointImage {
+        record_spool: Some(Arc::new(records.finish()?)),
         sequence,
         checkpoint_lsn: state.committed_lsn,
         metadata: checkpoint_metadata_from_state(state),
-        records,
+        records: Vec::new(),
         indexes,
         typed_segments,
     })
@@ -6705,7 +6770,7 @@ fn flush_compaction_typed_chunk(
     schema_name: &str,
     chunk: &mut Vec<CompactionRow>,
     typed_segments: &mut Vec<Arc<[u8]>>,
-    records: &mut Vec<(ObjRef, Arc<[u8]>)>,
+    records: &mut RecordSpool,
 ) -> OQLResult<()> {
     if chunk.is_empty() {
         return Ok(());
@@ -6724,14 +6789,14 @@ fn flush_compaction_typed_chunk(
         .ok_or_else(|| OQLError::storage_error("compaction compiled schema is missing", None))?;
     let Some(schema) = state.schemas.get(schema_name) else {
         for row in chunk.iter() {
-            records.push((
+            records.push(
                 row.object_ref,
-                row.record.clone().unwrap_or(Arc::from(RecordCodec::encode(
+                &row.record.clone().unwrap_or(Arc::from(RecordCodec::encode(
                     &row.document,
                     row.object_ref,
                     compiled,
                 )?)),
-            ));
+            )?;
         }
         chunk.clear();
         return Ok(());
@@ -6745,14 +6810,14 @@ fn flush_compaction_typed_chunk(
         typed_segments.push(Arc::from(segment.encode()?));
     } else {
         for row in chunk.iter() {
-            records.push((
+            records.push(
                 row.object_ref,
-                row.record.clone().unwrap_or(Arc::from(RecordCodec::encode(
+                &row.record.clone().unwrap_or(Arc::from(RecordCodec::encode(
                     &row.document,
                     row.object_ref,
                     compiled,
                 )?)),
-            ));
+            )?;
         }
     }
     chunk.clear();
@@ -7526,7 +7591,7 @@ fn restore_checkpoint(
         // The rest are known by the schema and id their records state, and
         // decoded if they are ever asked for.
         let room = match state
-            .decoded_bytes_budget
+            .rows_bytes()
             .is_some_and(|bytes| state.object_directory.bytes() >= bytes)
         {
             true => 0,
@@ -7607,7 +7672,7 @@ fn restore_checkpoint(
                         .decoded_budget
                         .map_or(true, |budget| state.object_directory.len() < budget)
                         && state
-                            .decoded_bytes_budget
+                            .rows_bytes()
                             .map_or(true, |bytes| state.object_directory.bytes() < bytes);
                     match document {
                         Some(document) if room => {

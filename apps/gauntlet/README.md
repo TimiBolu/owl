@@ -171,13 +171,34 @@ lists its files. For the same 74,612 rows, about 25 MB as text:
 | SQLite's files for the same data | 19.3 MB |
 
 A database opened and told nothing takes a budget of a quarter of the
-machine's memory for the rows it holds decoded (`OWL_DECODED_BYTES` sets it;
-0 for none). While the data fits within it nothing is let go and nothing is
-slower: the suite runs within a few percent of having no budget. Past it the
-oldest rows are let go and read again when wanted, and the caches of index
-pages and column segments are bounded too. With the budget at 4 MB the same
-database holds 7 MB after compaction and 25 MB after every query has run,
-and the suite takes about twice as long as with the default.
+machine's memory (`OWL_DECODED_BYTES` sets it; 0 for none). The budget is one
+figure for everything the store keeps so as not to read it again: half for
+the rows held decoded, a quarter for column segments held decoded, and a
+quarter for the columns and row lists kept between queries. While the data
+fits within it nothing is let go and nothing is slower. Past it the oldest
+are let go and read again when wanted.
+
+### Larger than memory
+
+Not yet. At ten times the data (746,012 rows, 228 MB on disk) under a 16 MB
+budget, measured with `gauntlet memory --people 20000`:
+
+| | |
+|---|---|
+| Held after reopening, before any query | 37 MB |
+| Held after every query has run | 61 MB |
+| At most during the first compaction | 421 MB |
+| At most during a compaction of the compacted database | 277 MB |
+| At most during the worst query (`g14_unwind_with_parent`) | 637 MB |
+
+What is held is near the budget plus about 45 MB the budget does not cover:
+bookkeeping for every row outside the column segments, which grows with the
+data. A compaction reads the rows it compacts from the checkpoint files,
+keeps the records it writes in a working file, and builds smaller segments
+when memory is short, but it still collects every index entry and every
+encoded segment before writing them. Eight queries copy every row they
+touch. With so small a share for kept columns, the whole run also took
+several times as long as with the earlier, looser limits.
 
 A compaction keeps the copy it replaced, as something to fall back to;
 `compact_and_reclaim` removes it once the new one has been read back and

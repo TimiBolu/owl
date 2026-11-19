@@ -87,8 +87,141 @@ pub(crate) struct CheckpointImage {
     pub checkpoint_lsn: u64,
     pub metadata: CheckpointMetadata,
     pub records: Vec<(ObjRef, Arc<[u8]>)>,
+    /// Further records, kept in a file of their own until the image is
+    /// written, so that an image of a large database is not all in memory.
+    pub record_spool: Option<Arc<RecordSpool>>,
     pub indexes: Vec<CheckpointIndex>,
     pub typed_segments: Vec<Arc<[u8]>>,
+}
+
+/// Records written to a file as they are produced, to be read back one at
+/// a time when the checkpoint that holds them is written. What stays in
+/// memory is where each is, not what it holds. The file is removed when
+/// the spool is dropped.
+pub(crate) struct RecordSpool {
+    filesystem: Arc<dyn FileSystem>,
+    path: PathBuf,
+    file: Option<Box<dyn FileHandle>>,
+    /// Each record's reference, offset in the file, length and checksum.
+    entries: Vec<(ObjRef, u64, u32, u32)>,
+    written: u64,
+    /// Bytes not yet handed to the file.
+    pending: Vec<u8>,
+}
+
+impl std::fmt::Debug for RecordSpool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RecordSpool")
+            .field("path", &self.path)
+            .field("records", &self.entries.len())
+            .field("bytes", &self.written)
+            .finish()
+    }
+}
+
+impl RecordSpool {
+    const PENDING_BYTES: usize = 1 << 20;
+
+    pub(crate) fn create(filesystem: Arc<dyn FileSystem>, path: PathBuf) -> OQLResult<Self> {
+        let file = filesystem.create(&path).map_err(|error| {
+            OQLError::storage_error(&format!("create record spool: {error}"), None)
+        })?;
+        Ok(Self {
+            filesystem,
+            path,
+            file: Some(file),
+            entries: Vec::new(),
+            written: 0,
+            pending: Vec::with_capacity(Self::PENDING_BYTES),
+        })
+    }
+
+    pub(crate) fn push(&mut self, object_ref: ObjRef, record: &[u8]) -> OQLResult<()> {
+        let offset = self.written + self.pending.len() as u64;
+        self.entries.push((
+            object_ref,
+            offset,
+            as_u32(record.len(), "object record")?,
+            crc32fast::hash(record),
+        ));
+        self.pending.extend_from_slice(record);
+        if self.pending.len() >= Self::PENDING_BYTES {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> OQLResult<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| OQLError::storage_error("record spool is closed", None))?;
+        write_all_handle(file.as_mut(), &self.pending)?;
+        self.written += self.pending.len() as u64;
+        self.pending.clear();
+        Ok(())
+    }
+
+    /// Hand everything to the file; nothing more is pushed after this.
+    pub(crate) fn finish(mut self) -> OQLResult<Self> {
+        self.flush()?;
+        self.pending = Vec::new();
+        if let Some(mut file) = self.file.take() {
+            file.flush().map_err(|error| {
+                OQLError::storage_error(&format!("flush record spool: {error}"), None)
+            })?;
+        }
+        // Read back through a handle opened for reading.
+        self.file = Some(self.filesystem.open(&self.path).map_err(|error| {
+            OQLError::storage_error(&format!("open record spool: {error}"), None)
+        })?);
+        Ok(self)
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn read(&self, offset: u64, length: u32) -> OQLResult<Vec<u8>> {
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| OQLError::storage_error("record spool is closed", None))?;
+        read_exact_at(file.as_ref(), offset as usize, length as usize)
+    }
+}
+
+impl Drop for RecordSpool {
+    fn drop(&mut self) {
+        self.file = None;
+        let _ = self.filesystem.remove(&self.path);
+    }
+}
+
+/// A record of an image being written: held in memory, or in the spool.
+enum ImageRecord<'a> {
+    Held(&'a [u8]),
+    Spooled { offset: u64, length: u32, checksum: u32 },
+}
+
+impl ImageRecord<'_> {
+    fn len(&self) -> usize {
+        match self {
+            ImageRecord::Held(record) => record.len(),
+            ImageRecord::Spooled { length, .. } => *length as usize,
+        }
+    }
+
+    fn checksum(&self) -> u32 {
+        match self {
+            ImageRecord::Held(record) => crc32fast::hash(record),
+            ImageRecord::Spooled { checksum, .. } => *checksum,
+        }
+    }
 }
 
 pub(crate) struct DecodedCheckpoint {
@@ -542,6 +675,12 @@ impl SegmentsLoaded {
     /// Hold at most this many bytes of decoded segments; zero for no limit.
     pub(crate) fn set_limit(&self, bytes: usize) {
         self.limit.store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How many segments are tracked as held, and their bytes as encoded.
+    /// Nothing is tracked while there is no limit.
+    pub(crate) fn held(&self) -> (usize, usize) {
+        self.held.lock().map_or((0, 0), |held| (held.1.len(), held.0))
     }
 
     fn note(&self, segment: std::sync::Weak<Mutex<Option<Arc<TypedSegment>>>>, bytes: usize) {
@@ -2446,7 +2585,23 @@ pub(crate) fn write_segment_file(
     let metadata = bincode::serialize(&image.metadata).map_err(|error| {
         OQLError::serialization_error(&format!("cannot encode checkpoint metadata: {error}"), None)
     })?;
-    let mut records = image.records.iter().collect::<Vec<_>>();
+    let mut records = image
+        .records
+        .iter()
+        .map(|(object_ref, record)| (*object_ref, ImageRecord::Held(record)))
+        .collect::<Vec<_>>();
+    if let Some(spool) = &image.record_spool {
+        records.extend(spool.entries.iter().map(|(object_ref, offset, length, checksum)| {
+            (
+                *object_ref,
+                ImageRecord::Spooled {
+                    offset: *offset,
+                    length: *length,
+                    checksum: *checksum,
+                },
+            )
+        }));
+    }
     records.sort_by_key(|(object_ref, _)| object_ref.packed());
     let records_len = records.iter().try_fold(0usize, |total, (_, record)| {
         total
@@ -2560,7 +2715,7 @@ pub(crate) fn write_segment_file(
             entry + 16,
             as_u32(record.len(), "object record")?,
         );
-        put_u32(&mut directory, entry + 20, crc32fast::hash(record));
+        put_u32(&mut directory, entry + 20, record.checksum());
         record_offset += record.len();
     }
     let root_checksum = checkpoint_root_checksum(&header, &[&metadata, &directory]);
@@ -2575,8 +2730,26 @@ pub(crate) fn write_segment_file(
         internal.update(bytes);
     }
     for (_, record) in records {
-        write_all_handle(file.as_mut(), record)?;
-        internal.update(record);
+        match record {
+            ImageRecord::Held(record) => {
+                write_all_handle(file.as_mut(), record)?;
+                internal.update(record);
+            }
+            ImageRecord::Spooled { offset, length, checksum } => {
+                let spool = image.record_spool.as_ref().ok_or_else(|| {
+                    OQLError::storage_error("a spooled record has no spool", None)
+                })?;
+                let record = spool.read(offset, length)?;
+                if crc32fast::hash(&record) != checksum {
+                    return Err(OQLError::storage_error(
+                        "a spooled record does not read back as it was written",
+                        None,
+                    ));
+                }
+                write_all_handle(file.as_mut(), &record)?;
+                internal.update(&record);
+            }
+        }
     }
     let mut published_indexes = Vec::<PublishedIndexPages>::new();
     let mut index_offset = SEGMENT_HEADER_LEN + metadata.len() + directory_len + records_len;
@@ -3399,6 +3572,7 @@ pub(crate) fn decode_segment(segment: &[u8]) -> OQLResult<CheckpointImage> {
         .map(|segment| segment.encode().map(Arc::from))
         .collect::<OQLResult<Vec<_>>>()?;
     Ok(CheckpointImage {
+        record_spool: None,
         sequence,
         checkpoint_lsn,
         metadata,
@@ -4161,6 +4335,7 @@ mod tests {
     #[test]
     fn empty_checkpoint_and_manifest_round_trip() {
         let image = CheckpointImage {
+            record_spool: None,
             sequence: 9,
             checkpoint_lsn: 42,
             metadata: CheckpointMetadata {
@@ -4200,6 +4375,7 @@ mod tests {
     #[test]
     fn production_reader_accepts_format_two_segment_header() {
         let image = CheckpointImage {
+            record_spool: None,
             sequence: 3,
             checkpoint_lsn: 8,
             metadata: CheckpointMetadata {
@@ -4256,6 +4432,7 @@ mod tests {
             })
             .collect();
         let image = CheckpointImage {
+            record_spool: None,
             sequence: 7,
             checkpoint_lsn: 11,
             metadata: CheckpointMetadata {
@@ -4534,6 +4711,7 @@ mod tests {
     #[test]
     fn persisted_index_blocks_round_trip_and_have_independent_checksums() {
         let image = CheckpointImage {
+            record_spool: None,
             sequence: 3,
             checkpoint_lsn: 7,
             metadata: CheckpointMetadata {

@@ -295,6 +295,7 @@ fn memory(people: usize) -> Result<()> {
         println!("    {name:<44} {:>8.1} MB", *size as f64 / 1e6);
     }
     owl.compact()?;
+    report("after compaction", start);
     let files = files_of(directory.path());
     let compacted: u64 = files.iter().map(|(_, size)| size).sum();
     println!("{:<44} {:>8.1} MB", "the same after compaction", compacted as f64 / 1e6);
@@ -302,6 +303,7 @@ fn memory(people: usize) -> Result<()> {
         println!("    {name:<44} {:>8.1} MB", *size as f64 / 1e6);
     }
     owl.compact_and_reclaim()?;
+    report("after compacting again", start);
     let reclaimed: u64 = files_of(directory.path()).iter().map(|(_, size)| size).sum();
     println!(
         "{:<44} {:>8.1} MB",
@@ -320,7 +322,14 @@ fn memory(people: usize) -> Result<()> {
         let size: u64 = files_of(other.path()).iter().map(|(_, size)| size).sum();
         println!("{:<44} {:>8.1} MB", "SQLite's files for the same data", size as f64 / 1e6);
     }
-    report("after compaction", start);
+    // Loading SQLite generated the data again, which is not Owl's doing.
+    PEAK_BYTES.store(0, std::sync::atomic::Ordering::Relaxed);
+    // Close the database and open it again: what a restart holds before a
+    // single question is asked, and what the questions then bring in.
+    drop(owl);
+    report("closed", start);
+    let owl = Owl::open_with(&path, include_str!("../schema.oql"))?;
+    report("opened again", start);
     for round in 1..=2 {
         for query in &queries {
             if let Some(oql) = &query.oql {

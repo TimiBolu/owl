@@ -586,3 +586,40 @@ fn a_budget_in_bytes_bounds_memory_and_changes_no_answer() {
     let reopened = Arc::new(RustStore::new(&path, SIZE).unwrap());
     same(&answers(&reopened), &after, "reopened");
 }
+
+/// A compaction keeps the records it writes in a file of its own while it
+/// works, and reads the rows it compacts from the checkpoint files. Neither
+/// changes what the compacted database answers, before or after it is
+/// opened again, and the working file does not outlast the compaction.
+#[test]
+fn a_compaction_works_from_files_and_leaves_none_behind() {
+    let home = TempDir::new().unwrap();
+    let path = home.path().join("spooled.owl");
+    let expected = {
+        let plain = Arc::new(RustStore::new(home.path().join("plain.owl"), SIZE).unwrap());
+        load(&plain);
+        answers(&plain)
+    };
+    {
+        let store = Arc::new(RustStore::new(&path, SIZE).unwrap());
+        // Small enough that rows are let go and memory counts as short.
+        store.set_decoded_bytes_budget(Some(64 << 10)).unwrap();
+        load(&store);
+        store.checkpoint().unwrap();
+        store.compact().unwrap();
+        assert_eq!(answers(&store), expected, "compacted");
+        // Again, now that every row is in the checkpoint files.
+        store.compact_and_reclaim().unwrap();
+        assert_eq!(answers(&store), expected, "compacted twice");
+        store.verify_integrity().unwrap();
+        let left: Vec<String> = std::fs::read_dir(home.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("spooled.owl") && name.ends_with(".records"))
+            .collect();
+        assert!(left.is_empty(), "working files left behind: {left:?}");
+    }
+    let store = Arc::new(RustStore::new(&path, SIZE).unwrap());
+    assert_eq!(answers(&store), expected, "opened again");
+    store.verify_integrity().unwrap();
+}
