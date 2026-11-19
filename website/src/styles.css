@@ -243,6 +243,8 @@ h3 { margin: 0 0 10px; font: 800 21px/1.2 var(--body); }
   .wide { display: none; }
   .key { font-size: 0; padding: 7px; gap: 0; }
   .key kbd { font-size: 11px; }
+  .two, .cards { grid-template-columns: 1fr; }
+  .two { gap: 44px; }
   .band { padding: 80px 0; }
   .code-card { padding: 22px 20px; min-height: 0; }
   .code-card pre { font-size: 14px; }
