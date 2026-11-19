@@ -220,16 +220,17 @@ this size fell from about 690 MB to 234 MB.
   list, held whole.
 - A sort through a reference that is cut to a few rows (`g18`, `g10`) goes
   through the rows referred to in order and reads only the rows that refer
-  to each, whether or not the store holds the rows referred to. At twice
-  the data that took `g18` from 37 MB to about 1 MB; it has not been
-  measured at ten times.
+  to each, whether or not the store holds the rows referred to: 174 MB and
+  75 MB before, 3 MB each now.
 - A sort on plain fields cut to a few rows (`h19`) reads only the rows that
-  can be among those kept, by the sort fields' columns. That holds at twice
-  the data (49 MB to 6 MB) and not at ten times (144 MB), where the columns
-  no longer fit the share of the budget for what is kept between queries.
+  can be among those kept, by the sort fields' columns. When those columns
+  are more than may be kept between queries they are made for the one query
+  and let go: 222 MB before, 28 MB now, most of it the 15,000 rows its
+  offset passes over.
 
 The whole run took 1,828 seconds, several times what it takes with the
-earlier, looser limits.
+earlier, looser limits; that was before the last two of these, and the
+figure for all queries together above is from that run too.
 
 A compaction keeps the copy it replaced, as something to fall back to;
 `compact_and_reclaim` removes it once the new one has been read back and

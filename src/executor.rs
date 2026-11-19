@@ -1589,6 +1589,10 @@ impl<S: DocumentStore> QueryExecutor<S> {
         // are still in the running; and what the columns were stamped.
         let mut listed: Option<(Option<Arc<Vec<Arc<Document>>>>, u64)> = None;
         let mut origin: Option<Vec<u32>> = None;
+        // The columns themselves, when they came without the rows: a sort
+        // that is cut short goes by them, and the store may not have kept
+        // them to be asked for again.
+        let mut alone: Option<crate::storage::ColumnBatch> = None;
         if !asked.is_empty() && COLUMN_AGGREGATION.with(|enabled| enabled.get()) {
             // With the rows when the store holds them all; the columns
             // alone when it does not, and then only the rows the columns
@@ -1623,6 +1627,9 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     origin = Some(chosen);
                 }
                 listed = Some((rows, batch.stamp()));
+                if matches!(listed, Some((None, _))) && names.is_empty() {
+                    alone = Some(batch);
+                }
             }
         }
         // A sort cut to a few rows, with no filter, over a collection the
@@ -1632,7 +1639,9 @@ impl<S: DocumentStore> QueryExecutor<S> {
             (&listed, &origin, cut, conditions.is_empty())
         {
             let wanted_rows = offset.saturating_add(limit);
-            if let Some(candidates) = self.cut_sort_by_columns(&query.collection, sort, *stamp, wanted_rows)? {
+            if let Some(candidates) =
+                self.cut_sort_by_columns(&query.collection, sort, *stamp, wanted_rows, alone.as_ref())?
+            {
                 self.check_sort_functions(sort)?;
                 let lent: Vec<&Arc<Document>> = candidates.iter().collect();
                 let kept = self
@@ -12521,6 +12530,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
         sort: &SortBlock,
         stamp: u64,
         wanted: usize,
+        columns: Option<&crate::storage::ColumnBatch>,
     ) -> OQLResult<Option<Vec<Arc<Document>>>> {
         let Some(names) = Self::plain_sort_fields(sort) else {
             return Ok(None);
@@ -12537,13 +12547,23 @@ impl<S: DocumentStore> QueryExecutor<S> {
         if leading.is_empty() || wanted == 0 {
             return Ok(None);
         }
-        let Some(batches) = self.store.scan_columns(collection, &names)? else {
-            return Ok(None);
+        // The columns of the sort's fields, in the order it names them:
+        // those in hand, or asked for now.
+        let asked;
+        let batch = match columns {
+            Some(batch) => batch,
+            None => {
+                asked = match self.store.scan_columns(collection, &names)? {
+                    Some(batches) => batches,
+                    None => return Ok(None),
+                };
+                match asked.as_slice() {
+                    [batch] => batch,
+                    _ => return Ok(None),
+                }
+            }
         };
-        let [batch] = batches.as_slice() else {
-            return Ok(None);
-        };
-        if batch.stamp() != stamp || wanted >= batch.rows() {
+        if batch.stamp() != stamp || wanted >= batch.rows() || batch.fields() != names.len() {
             return Ok(None);
         }
         let columns: Vec<(crate::storage::Column<'_>, bool)> = leading

@@ -9755,7 +9755,28 @@ impl RustStore {
                     made.push((name, Arc::new(column)));
                 }
                 if !built.makes_room(schema, bytes) {
-                    return Ok(None);
+                    // More than may be kept between queries. They are made
+                    // already, so they are given for this once and not
+                    // kept: the next query that wants them makes them
+                    // again, which costs it a pass over the collection and
+                    // no more memory than this.
+                    let kept = built.of(&state, schema);
+                    let mut columns = Vec::with_capacity(fields.len());
+                    for name in fields {
+                        let column = made
+                            .iter()
+                            .find(|(made, _)| made == name)
+                            .map(|(_, column)| column.clone())
+                            .or_else(|| kept.columns.get(name).cloned());
+                        match column {
+                            Some(column) => columns.push(column),
+                            None => return Ok(None),
+                        }
+                    }
+                    let Some(count) = columns.first().map(|column| column.rows()) else {
+                        return Ok(None);
+                    };
+                    return Ok(Some((None, ColumnBatch::new(kept.stamp, count, columns))));
                 }
                 let kept = built.of(&state, schema);
                 if kept.refs.is_none() {
