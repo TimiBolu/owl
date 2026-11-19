@@ -250,6 +250,125 @@ fn shorthand_scoped_locals_in_select_are_keyed_by_their_names() {
 }
 
 #[test]
+fn a_name_that_is_never_defined_is_an_error_when_the_query_runs() {
+    let temp = TempDir::new().unwrap();
+    let store = Arc::new(RustStore::new(temp.path().join("undefined.owl"), 16 << 20).unwrap());
+    let executor = QueryExecutor::new_with_real_clock(store);
+    let setup = parse_oql_file(
+        r#"
+        schema customers {
+          id: String,
+          name: String
+        }
+
+        schema orders {
+          id: String,
+          customer: Ref(customers),
+          status: String,
+          total: Float
+        }
+
+        customers.insert { id: "c1", name: "Ada" }
+        orders.insert { id: "o1", customer: "c1", status: "paid", total: 10.0 }
+        notes.insert { id: "n1", customer: "c1" }
+        "#,
+    )
+    .unwrap();
+    let setup_result = execute_oql_file(&setup, &executor).unwrap();
+    assert!(setup_result.errors.is_empty(), "{:?}", setup_result.errors);
+
+    // Parsed without schemas, as the server parses: `paid` may still be a
+    // collection or a script binding, so only running the query can tell.
+    let never_defined = r#"
+        customers {
+          spent = paid.sum(.total)
+          select { name, spent }
+        }
+    "#;
+    let error = executor
+        .execute_query(&parse_oql(never_defined).unwrap())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("'paid' is not defined"), "{error}");
+
+    // The same through a script, and in chain form.
+    let script = parse_oql_file(never_defined).unwrap();
+    let result = execute_oql_file(&script, &executor).unwrap();
+    assert!(
+        result.errors.iter().any(|error| error.contains("'paid' is not defined")),
+        "{:?}",
+        result.errors
+    );
+    let chained = executor
+        .execute_query(&parse_oql("customers.select { name, spent: paid.sum(.total) }").unwrap())
+        .unwrap_err()
+        .to_string();
+    assert!(chained.contains("'paid' is not defined"), "{chained}");
+
+    // A near miss is pointed at the collection it resembles.
+    let misspelt = executor
+        .execute_query(&parse_oql("customers.select { name, n: order.count() }").unwrap())
+        .unwrap_err()
+        .to_string();
+    assert!(misspelt.contains("Did you mean 'orders'?"), "{misspelt}");
+
+    // Names that are defined still work: a script binding, a collection
+    // with a schema but no rows yet, and one with rows but no schema.
+    let defined = parse_oql_file(
+        r#"
+        schema refunds {
+          id: String,
+          total: Float
+        }
+        paid = orders.where { .status == "paid" }
+        customers.select { name, spent: paid.sum(.total) }
+        customers.select { name, refunded: refunds.sum(.total) }
+        customers.select { name, notes: notes.count() }
+        "#,
+    )
+    .unwrap();
+    let result = execute_oql_file(&defined, &executor).unwrap();
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+
+    // A collection nobody declared is still empty when it is the one
+    // being queried, not an error.
+    let rows = executor
+        .execute_query(&parse_oql("nobody.where { .id == \"x\" }").unwrap())
+        .unwrap();
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn function_locals_cannot_be_used_before_they_are_defined() {
+    let out_of_order = parse_oql_file(
+        r#"
+        fn spread(values) {
+          width = top - values.min()
+          top = values.max()
+          width
+        }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        out_of_order.contains("local name 'top' in function 'spread' is used before it is defined"),
+        "{out_of_order}"
+    );
+
+    parse_oql_file(
+        r#"
+        fn spread(values) {
+          top = values.max()
+          width = top - values.min()
+          width
+        }
+        "#,
+    )
+    .unwrap();
+}
+
+#[test]
 fn scoped_query_requires_one_final_select() {
     let missing = parse_oql(
         r#"
