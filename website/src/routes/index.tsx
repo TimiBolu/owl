@@ -3,7 +3,7 @@ import { Forms } from "../components/Forms";
 import { Functions } from "../components/Functions";
 import { Hero } from "../components/Hero";
 import { Language } from "../components/Language";
-import { Engine, Evidence, Footer, Hud, InkFilters, Sentence, Start } from "../components/Sections";
+import { Engine, Evidence, Footer, Hud, InkFilters, Join, Sentence, Start } from "../components/Sections";
 import {
   HOME_DESCRIPTION,
   HOME_TITLE,
@@ -66,6 +66,7 @@ function Home() {
         <Engine />
         <Evidence />
         <Start />
+        <Join />
       </main>
       <Footer />
     </>

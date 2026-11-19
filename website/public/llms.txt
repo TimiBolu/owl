@@ -85,4 +85,5 @@ curl 127.0.0.1:7878/v1/query --json '{"query": "orders.count()"}'
 
 - [Home](https://owldb.tech/)
 - [Source code](https://github.com/TimiBolu/owl)
+- [How to contribute](https://github.com/TimiBolu/owl#help-owl-grow)
 - [Sitemap](https://owldb.tech/sitemap.xml)

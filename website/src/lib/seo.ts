@@ -31,6 +31,7 @@ export const SECTIONS = [
   ["engine", "The engine", "How Owl stores objects, records, writes and indexes."],
   ["evidence", "Evidence", "How every answer is checked against SQLite before anything is timed."],
   ["start", "Run it", "Three commands from nothing to a first answer."],
+  ["join", "Join in", "Star Owl on GitHub, try it, or help build it."],
 ] as const;
 
 const SITE_ID = `${SITE_URL}/#website`;

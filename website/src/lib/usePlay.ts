@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { GITHUB_URL } from "./seo";
 
-const LINES = ["who?", "who: .customer.name", "no joins.", "I read your schema.", "ask me at night.", "you again?"];
+const LINES = ["who?", "who: .customer.name", "no joins.", "I read your schema.", "ask me at night.", "a star would be nice.", "you again?"];
 
 /** How far a pupil moves toward a point, capped at `reach`. */
 function pull(box: DOMRect, x: number, y: number, reach: number) {
