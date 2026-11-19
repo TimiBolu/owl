@@ -206,6 +206,12 @@ impl Fields {
     }
 
     /// Set a field, giving back the value it had.
+    /// Make room for exactly `additional` more fields, where growing as a
+    /// list does would make room for as many again.
+    pub fn reserve_exact(&mut self, additional: usize) {
+        self.values.reserve_exact(additional);
+    }
+
     pub fn insert(&mut self, name: String, value: Value) -> Option<Value> {
         self.set(&name, value)
     }

@@ -5235,15 +5235,18 @@ impl<S: DocumentStore> QueryExecutor<S> {
         documents: Vec<Document>,
         condition: &Condition,
     ) -> OQLResult<Vec<Document>> {
-        let mut filtered = Vec::new();
-
-        for document in documents {
-            if self.evaluate_condition(&document, condition)? {
-                filtered.push(document);
+        // The rows that pass are moved up over those that do not, in the
+        // list they came in, so that no second list is made.
+        let mut documents = documents;
+        let mut kept = 0;
+        for at in 0..documents.len() {
+            if self.evaluate_condition(&documents[at], condition)? {
+                documents.swap(kept, at);
+                kept += 1;
             }
         }
-
-        Ok(filtered)
+        documents.truncate(kept);
+        Ok(documents)
     }
 
     /// Apply nearest-neighbor vector search to the current document set.
@@ -9192,13 +9195,40 @@ impl<S: DocumentStore> QueryExecutor<S> {
         documents: Vec<Document>,
         select_block: &SelectBlock,
     ) -> OQLResult<Vec<Document>> {
-        let frame = std::rc::Rc::new(WindowFrame::new(documents)?);
-        WINDOWS.with(|frames| frames.borrow_mut().push(frame.clone()));
-        let _guard = WindowGuard;
-        let mut projected = Vec::with_capacity(frame.rows.len());
-        for (position, row) in frame.rows.iter().enumerate() {
-            frame.position.set(position);
-            projected.push(row.with_projected_fields(self.select_row(row, select_block)?));
+        // The rows of one frame are shaped, each with the others in reach,
+        // and the frame is let go.
+        let shape = |rows: Vec<Document>, projected: &mut Vec<Document>| -> OQLResult<()> {
+            let frame = std::rc::Rc::new(WindowFrame::new(rows)?);
+            WINDOWS.with(|frames| frames.borrow_mut().push(frame.clone()));
+            let _guard = WindowGuard;
+            for (position, row) in frame.rows.iter().enumerate() {
+                frame.position.set(position);
+                projected.push(row.with_projected_fields(self.select_row(row, select_block)?));
+            }
+            Ok(())
+        };
+        let mut documents = documents;
+        let mut projected = Vec::with_capacity(documents.len());
+        match WindowFrame::partitions_in_turn(&documents) {
+            // Each partition's rows come together, one partition after
+            // another, as they do when the rows were sorted by what they
+            // are partitioned by. A row's reach is its own partition, so
+            // each is shaped on its own and let go before the next is
+            // begun: the rows as they came and the rows as they are shaped
+            // are then never both held in full.
+            Some(lengths) if lengths.len() > 1 => {
+                // Taken from the end, so that what is left can shrink.
+                documents.reverse();
+                for length in lengths {
+                    let mut rows = documents.split_off(documents.len() - length);
+                    rows.reverse();
+                    if documents.capacity() > 2 * documents.len() + 1_024 {
+                        documents.shrink_to_fit();
+                    }
+                    shape(rows, &mut projected)?;
+                }
+            }
+            _ => shape(documents, &mut projected)?,
         }
         Ok(projected)
     }
@@ -12237,8 +12267,13 @@ impl<S: DocumentStore> QueryExecutor<S> {
         mut documents: Vec<Document>,
         block: &GroupByBlock,
     ) -> OQLResult<Vec<Document>> {
+        // Each row is marked with the number of its partition: the first
+        // key met is 0, the next 1. A number costs a row nothing beyond
+        // the field; the key itself would be a list held by every row.
+        let mut numbers: HashMap<Vec<u8>, i64> = HashMap::new();
+        let mut key = Vec::with_capacity(block.fields.len() + block.computed.len());
         for document in &mut documents {
-            let mut key = Vec::with_capacity(block.fields.len() + block.computed.len());
+            key.clear();
             for field in &block.fields {
                 key.push(Self::canonical_key_value(&self.get_field_value(document, field)?));
             }
@@ -12247,9 +12282,16 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     &self.evaluate_expression(document, &computed.expression)?,
                 ));
             }
+            let encoded = bincode::serialize(&key).map_err(|error| OQLError::Generic {
+                message: format!("Failed to encode partition key: {error}"),
+            })?;
+            let next = numbers.len() as i64;
+            let number = *numbers.entry(encoded).or_insert(next);
+            // Room for the one field, not for as many again.
+            document.fields.reserve_exact(1);
             document
                 .fields
-                .insert(PARTITION_FIELD.to_string(), Value::List(key));
+                .insert(PARTITION_FIELD.to_string(), Value::Integer(number));
         }
         Ok(documents)
     }
@@ -12967,7 +13009,27 @@ impl<S: DocumentStore> QueryExecutor<S> {
             .iter()
             .map(|document| self.sort_keys(document, sort_block))
             .collect();
-        let order = self.sorted_positions(&keys, sort_block, keep);
+        let mut order = self.sorted_positions(&keys, sort_block, keep);
+        // The keys have done their work; they are not held while the rows
+        // are moved.
+        drop(keys);
+        let mut documents = documents;
+        if order.len() == documents.len() {
+            // Every row is kept, so the rows are moved to their places
+            // where they are, a cycle at a time, with no second list.
+            for start in 0..order.len() {
+                let mut at = start;
+                loop {
+                    let from = std::mem::replace(&mut order[at], at);
+                    if from == start || from == at {
+                        break;
+                    }
+                    documents.swap(at, from);
+                    at = from;
+                }
+            }
+            return Ok(documents);
+        }
         let mut rows: Vec<Option<Document>> = documents.into_iter().map(Some).collect();
         Ok(order
             .into_iter()
@@ -13850,7 +13912,7 @@ const WALK_PATH_FIELD: &str = "_path";
 /// The rows a `select` is shaping, for the functions that depend on a row's
 /// position among them: `row_number`, `prev`, `so_far()` and the rest.
 struct WindowFrame {
-    rows: Vec<Document>,
+    rows: Arc<Vec<Document>>,
     /// The row being shaped.
     position: std::cell::Cell<usize>,
     /// Each partition's rows, as positions in `rows`, in order.
@@ -14026,7 +14088,7 @@ impl WindowFrame {
             partitioned: rows
                 .first()
                 .is_some_and(|row| row.fields.contains_key(PARTITION_FIELD)),
-            rows,
+            rows: Arc::new(rows),
             position: std::cell::Cell::new(0),
             members,
             place,
@@ -14050,8 +14112,35 @@ impl WindowFrame {
         })
     }
 
+    /// How many rows each partition has, when the partitions come one
+    /// after another, each one's rows together. `None` when the rows are
+    /// not partitioned, or a partition's rows are apart.
+    fn partitions_in_turn(rows: &[Document]) -> Option<Vec<usize>> {
+        let mut lengths: Vec<usize> = Vec::new();
+        let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+        let mut current: Option<&Value> = None;
+        for row in rows {
+            let key = row.fields.get(PARTITION_FIELD)?;
+            if current == Some(key) {
+                *lengths.last_mut()? += 1;
+                continue;
+            }
+            // A key met before has rows in two places.
+            if !seen.insert(bincode::serialize(key).ok()?) {
+                return None;
+            }
+            current = Some(key);
+            lengths.push(1);
+        }
+        Some(lengths)
+    }
+
     /// Every row of a partition, in order.
     fn rows_of(&self, partition: usize) -> Arc<Vec<Document>> {
+        // A frame of one partition lends its own rows.
+        if self.members.len() == 1 && self.members[partition].len() == self.rows.len() {
+            return self.rows.clone();
+        }
         self.together
             .borrow_mut()
             .entry(partition)

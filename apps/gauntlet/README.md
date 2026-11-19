@@ -210,10 +210,12 @@ longer needs the collection in memory; at ten times the data those three
 had needed 637, 515 and 341 MB. A sort cut to a few rows (`h19`) reads only the
 rows that can be among those kept, and a count of rows passing a filter
 (`h15`) keeps none: 49 MB and 36 MB at twice the data, now 6 MB and 2 MB.
-What needs the most now are the window queries (`g13`, `g12`, `g18`), about
-60 MB each at twice the data whatever the budget: the rows are copied once
-in order and again as they are shaped, and a partition's rows once more for
-`so_far()`. With so small
+The window queries (`g13`, `g12`) needed about 63 MB at twice the data
+whatever the budget, and need 37 MB: a sort now moves the rows into place
+where they are and a filter keeps the rows that pass in the list they came
+in, where each made a second list; and a select after `partition_by` shapes
+one partition and lets it go before the next. They are still not bounded:
+the rows a query sorts are one list, held whole. With so small
 a share for kept columns, the whole run also took several times as long as
 with the earlier, looser limits.
 

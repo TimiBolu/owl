@@ -2135,3 +2135,71 @@ fn a_function_of_a_row_is_a_step() {
     // The tree form is still there for when pairs are not wanted flat.
     assert_eq!(db.scalar("staff.where { .id == \"b\" }.select { n: peers(*).count() }", "n"), int(2));
 }
+
+/// A select after `partition_by` shapes each partition with its own rows
+/// in reach. When each partition's rows come together it does so a
+/// partition at a time; when they are interleaved it holds them all. The
+/// two must give every row the same answer, whatever the row asks of its
+/// position: its neighbours, its number, the rows so far, the whole
+/// partition.
+#[test]
+fn a_partition_is_shaped_the_same_together_or_apart() {
+    let directory = TempDir::new().unwrap();
+    let executor = QueryExecutor::new_with_real_clock(Arc::new(
+        RustStore::new(directory.path().join("owl"), 16 << 20).unwrap(),
+    ));
+    let mut script = String::from(
+        "schema readings { id: String, station: String, at: Integer, level: Integer }\nreadings.insert [\n",
+    );
+    for index in 0..120 {
+        script.push_str(&format!(
+            "  {{ id: \"r{index:03}\", station: \"s{}\", at: {}, level: {} }},\n",
+            index % 7,
+            (index * 37) % 101,
+            (index * 13) % 29
+        ));
+    }
+    script.truncate(script.len() - 2);
+    script.push_str("\n]");
+    let report = execute_oql_file(&parse_oql_file(&script).unwrap(), &executor).unwrap();
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+
+    let shaped = "select {
+        id,
+        number: row_number(),
+        before: prev(.level),
+        after: next(.level),
+        running: so_far().level.sum(),
+        recent: so_far().last(3).level.avg(),
+        high: so_far().where { .level > 14 }.count(),
+        rank: rank(.at),
+        whole: count(),
+        top: max(.level),
+        share: .level * 100 / sum(.level)
+    }";
+    let ask = |sort: &str| -> Vec<String> {
+        let query = format!("readings.sort {{ {sort} }}.partition_by {{ .station }}.{shaped}.sort {{ .id.asc }}");
+        executor
+            .execute_query(&parse_oql(&query).unwrap_or_else(|error| panic!("{error}\n{query}")))
+            .unwrap_or_else(|error| panic!("{error}\n{query}"))
+            .iter()
+            .map(|row| {
+                let mut fields: Vec<String> =
+                    row.fields.iter().map(|(name, value)| format!("{name}={value:?}")).collect();
+                fields.sort();
+                fields.join(" ")
+            })
+            .collect()
+    };
+    // Each station's readings together, in order of time within it.
+    let together = ask(".station.asc, .at.asc, .id.asc");
+    // In order of time alone: the stations are interleaved, and each
+    // station's readings are still in order of time among themselves.
+    let apart = ask(".at.asc, .id.asc");
+    assert_eq!(together.len(), 120);
+    assert_eq!(together, apart);
+    // And the answers are of the partition, not of the whole.
+    assert!(together.iter().any(|row| row.contains("whole=Integer(18)")), "{:?}", &together[..2]);
+    assert!(together.iter().all(|row| !row.contains("whole=Integer(120)")));
+    assert!(together.iter().any(|row| row.contains("number=Integer(1) ")));
+}
