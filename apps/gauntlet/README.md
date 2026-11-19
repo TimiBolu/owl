@@ -187,8 +187,9 @@ budget, measured with `gauntlet memory --people 20000`:
 |---|---|
 | At most while reopening | 47 MB |
 | Held after reopening, before any query | 37 MB |
-| Held after every query has run | 61 MB |
-| At most during the first compaction | 249 MB |
+| Held after every query has run | 54 MB |
+| At most while every query runs | 234 MB |
+| At most during the first compaction | 245 MB |
 | At most during a compaction of the compacted database | 126 MB |
 
 What is held is near the budget plus about 45 MB the budget does not cover:
@@ -204,20 +205,31 @@ change entries. A database not yet compacted has most of its rows in that
 form (114 MB held at this size, against 54 MB once compacted), and a
 compaction holds a second copy of it in the base it rebuilds. 
 
-Queries are not there either. Grouping the elements of a list every row
-holds (`g14`, `h16`, `h17`) reads the rows a bounded number at a time and no
-longer needs the collection in memory; at ten times the data those three
-had needed 637, 515 and 341 MB. A sort cut to a few rows (`h19`) reads only the
-rows that can be among those kept, and a count of rows passing a filter
-(`h15`) keeps none: 49 MB and 36 MB at twice the data, now 6 MB and 2 MB.
-The window queries (`g13`, `g12`) needed about 63 MB at twice the data
-whatever the budget, and need 37 MB: a sort now moves the rows into place
-where they are and a filter keeps the rows that pass in the list they came
-in, where each made a second list; and a select after `partition_by` shapes
-one partition and lets it go before the next. They are still not bounded:
-the rows a query sorts are one list, held whole. With so small
-a share for kept columns, the whole run also took several times as long as
-with the earlier, looser limits.
+Queries are not there either, though the most they hold between them at
+this size fell from about 690 MB to 234 MB.
+
+- Grouping the elements of a list every row holds (`g14`, `h16`, `h17`)
+  reads the rows a bounded number at a time: 637, 515 and 348 MB before, and
+  under 55 MB each now.
+- A count of rows passing a filter (`h15`) keeps none of them.
+- A sort moves the rows into place where they are and a filter keeps the
+  rows that pass in the list they came in, where each made a second list;
+  and a select after `partition_by` shapes one partition and lets it go
+  before the next. The window queries (`g13`, `g12`) went from about 300 MB
+  to about 176 MB. They are not bounded: the rows a query sorts are one
+  list, held whole.
+- A sort through a reference that is cut to a few rows (`g18`, `g10`) goes
+  through the rows referred to in order and reads only the rows that refer
+  to each, whether or not the store holds the rows referred to. At twice
+  the data that took `g18` from 37 MB to about 1 MB; it has not been
+  measured at ten times.
+- A sort on plain fields cut to a few rows (`h19`) reads only the rows that
+  can be among those kept, by the sort fields' columns. That holds at twice
+  the data (49 MB to 6 MB) and not at ten times (144 MB), where the columns
+  no longer fit the share of the budget for what is kept between queries.
+
+The whole run took 1,828 seconds, several times what it takes with the
+earlier, looser limits.
 
 A compaction keeps the copy it replaced, as something to fall back to;
 `compact_and_reclaim` removes it once the new one has been read back and
