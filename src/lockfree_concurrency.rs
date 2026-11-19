@@ -11,7 +11,7 @@ use crate::simulation::Clock;
 use std::collections::HashMap;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 /// Lock type for document access
@@ -682,8 +682,10 @@ impl VersionChain {
 
 /// Lock-free version store for MVCC
 pub struct LockFreeVersionStore {
-    /// Map from document key to version chain
-    version_chains: AtomicPtr<HashMap<String, Arc<VersionChain>>>,
+    /// Map from document key to version chain. The chains are lock-free;
+    /// finding one is not. The map used to be swapped by pointer and the
+    /// old map freed at once, while other threads were still reading it.
+    version_chains: RwLock<HashMap<String, Arc<VersionChain>>>,
     /// Clock for timestamps
     clock: Arc<dyn Clock>,
     /// Next version number
@@ -694,57 +696,38 @@ impl LockFreeVersionStore {
     /// Create a new lock-free version store
     pub fn new(clock: Arc<dyn Clock>) -> Self {
         Self {
-            version_chains: AtomicPtr::new(Box::into_raw(Box::new(HashMap::new()))),
+            version_chains: RwLock::new(HashMap::new()),
             clock,
             next_version: AtomicUsize::new(1),
         }
     }
 
+    /// The chain of a document that already has versions.
+    fn chain(&self, document_key: &str) -> Option<Arc<VersionChain>> {
+        self.chains().get(document_key).cloned()
+    }
+
+    /// The map of chains, for reading. A panic in another thread cannot
+    /// leave the map half written, so a poisoned lock is still usable.
+    fn chains(&self) -> std::sync::RwLockReadGuard<'_, HashMap<String, Arc<VersionChain>>> {
+        self.version_chains
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Get or create a version chain for a document
     fn get_or_create_chain(&self, document_key: &str) -> Arc<VersionChain> {
-        // This is a simplified implementation
-        // In a full lock-free implementation, we'd need lock-free hash map operations
-        // For now, we'll use a basic approach with atomic operations
-
-        // Load the current chains map
-        let chains_ptr = self.version_chains.load(Ordering::Acquire);
-
-        unsafe {
-            if let Some(chain) = (*chains_ptr).get(document_key) {
-                return chain.clone();
-            }
-
-            // Create new chain (this would need proper lock-free implementation)
-            let new_chain = Arc::new(VersionChain::new(document_key.to_string()));
-
-            // In a full implementation, we'd use lock-free hash map insertion here
-            // For now, this is a simplified version that may have race conditions
-            let mut new_chains = (*chains_ptr).clone();
-            new_chains.insert(document_key.to_string(), new_chain.clone());
-
-            // This is not truly lock-free due to the HashMap clone
-            // A production implementation would use a lock-free hash map
-            let new_chains_ptr = Box::into_raw(Box::new(new_chains));
-
-            // Try to update the chains pointer
-            match self.version_chains.compare_exchange_weak(
-                chains_ptr,
-                new_chains_ptr,
-                Ordering::Release,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    // Success - clean up old chains
-                    let _ = Box::from_raw(chains_ptr);
-                    new_chain
-                }
-                Err(_) => {
-                    // Failed - clean up new chains and retry
-                    let _ = Box::from_raw(new_chains_ptr);
-                    self.get_or_create_chain(document_key) // Recursive retry
-                }
-            }
+        if let Some(chain) = self.chain(document_key) {
+            return chain;
         }
+        // Another thread may have created the chain since the read above:
+        // `entry` keeps whichever came first.
+        self.version_chains
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(document_key.to_string())
+            .or_insert_with(|| Arc::new(VersionChain::new(document_key.to_string())))
+            .clone()
     }
 
     /// Add a new version to the store
@@ -798,10 +781,9 @@ impl LockFreeVersionStore {
         document_key: &str,
         hazard_index: usize,
     ) -> Option<Document> {
-        let chains_ptr = self.version_chains.load(Ordering::Acquire);
-
+        // The entries of a chain live until the store is dropped.
         unsafe {
-            if let Some(chain) = (*chains_ptr).get(document_key) {
+            if let Some(chain) = self.chain(document_key) {
                 if let Some(version_entry) = chain.get_latest_committed(hazard_index) {
                     return Some((*version_entry).document.clone());
                 }
@@ -830,10 +812,9 @@ impl LockFreeVersionStore {
         transaction_id: &str,
         hazard_index: usize,
     ) -> Option<Document> {
-        let chains_ptr = self.version_chains.load(Ordering::Acquire);
-
+        // The entries of a chain live until the store is dropped.
         unsafe {
-            if let Some(chain) = (*chains_ptr).get(document_key) {
+            if let Some(chain) = self.chain(document_key) {
                 // First check for uncommitted version by this transaction
                 if let Some(version_entry) =
                     chain.get_version_for_transaction(transaction_id, hazard_index)
@@ -853,10 +834,9 @@ impl LockFreeVersionStore {
 
     /// Commit a version
     pub fn commit_version(&self, document_key: &str, version: u64) -> bool {
-        let chains_ptr = self.version_chains.load(Ordering::Acquire);
-
+        // The entries of a chain live until the store is dropped.
         unsafe {
-            if let Some(chain) = (*chains_ptr).get(document_key) {
+            if let Some(chain) = self.chain(document_key) {
                 return chain.commit_version(version);
             }
         }
@@ -866,10 +846,9 @@ impl LockFreeVersionStore {
 
     /// Mark a version as deleted
     pub fn delete_version(&self, document_key: &str, version: u64) -> bool {
-        let chains_ptr = self.version_chains.load(Ordering::Acquire);
-
+        // The entries of a chain live until the store is dropped.
         unsafe {
-            if let Some(chain) = (*chains_ptr).get(document_key) {
+            if let Some(chain) = self.chain(document_key) {
                 return chain.mark_version_deleted(version);
             }
         }
@@ -879,10 +858,9 @@ impl LockFreeVersionStore {
 
     /// Get version statistics
     pub fn get_version_stats(&self, document_key: &str) -> VersionStats {
-        let chains_ptr = self.version_chains.load(Ordering::Acquire);
-
+        // The entries of a chain live until the store is dropped.
         unsafe {
-            if let Some(chain) = (*chains_ptr).get(document_key) {
+            if let Some(chain) = self.chain(document_key) {
                 let mut stats = VersionStats::default();
                 let mut current = chain.head.load(Ordering::Acquire);
 
@@ -909,12 +887,8 @@ impl LockFreeVersionStore {
 
     /// Cleanup old versions for all documents
     pub fn cleanup_all_versions(&self) {
-        let chains_ptr = self.version_chains.load(Ordering::Acquire);
-
-        unsafe {
-            for (_, chain) in (*chains_ptr).iter() {
-                chain.cleanup_old_versions(10); // Keep last 10 versions
-            }
+        for chain in self.chains().values() {
+            chain.cleanup_old_versions(10); // Keep last 10 versions
         }
     }
 }
@@ -922,10 +896,13 @@ impl LockFreeVersionStore {
 impl Drop for LockFreeVersionStore {
     fn drop(&mut self) {
         // Clean up all version chains and entries
-        let chains_ptr = self.version_chains.load(Ordering::Relaxed);
+        let chains = self
+            .version_chains
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         unsafe {
-            for (_, chain) in (*chains_ptr).iter() {
+            for chain in chains.values() {
                 let mut current = chain.head.load(Ordering::Relaxed);
 
                 while !current.is_null() {
@@ -934,8 +911,6 @@ impl Drop for LockFreeVersionStore {
                     current = next;
                 }
             }
-
-            let _ = Box::from_raw(chains_ptr);
         }
     }
 }
@@ -1019,12 +994,11 @@ impl LockFreeConcurrencyManager {
 
     /// Get statistics
     pub fn get_statistics(&self) -> LockFreeStatistics {
-        let chains_ptr = self.version_store.version_chains.load(Ordering::Acquire);
         let (total_chains, total_versions) = unsafe {
             let mut chains = 0;
             let mut versions = 0;
 
-            for (_, chain) in (*chains_ptr).iter() {
+            for chain in self.version_store.chains().values() {
                 chains += 1;
                 let mut current = chain.head.load(Ordering::Acquire);
 
