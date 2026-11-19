@@ -834,11 +834,8 @@ impl LockFreeVersionStore {
 
     /// Commit a version
     pub fn commit_version(&self, document_key: &str, version: u64) -> bool {
-        // The entries of a chain live until the store is dropped.
-        unsafe {
-            if let Some(chain) = self.chain(document_key) {
-                return chain.commit_version(version);
-            }
+        if let Some(chain) = self.chain(document_key) {
+            return chain.commit_version(version);
         }
 
         false
@@ -846,11 +843,8 @@ impl LockFreeVersionStore {
 
     /// Mark a version as deleted
     pub fn delete_version(&self, document_key: &str, version: u64) -> bool {
-        // The entries of a chain live until the store is dropped.
-        unsafe {
-            if let Some(chain) = self.chain(document_key) {
-                return chain.mark_version_deleted(version);
-            }
+        if let Some(chain) = self.chain(document_key) {
+            return chain.mark_version_deleted(version);
         }
 
         false
