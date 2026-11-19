@@ -24,7 +24,7 @@ pub mod simulation;
 pub mod storage;
 pub mod storage_engine;
 pub mod streaming;
-// pub mod transaction; // Deprecated RocksDB-era layer; pending Zig-native redesign.
+// pub mod transaction; // Deprecated RocksDB-era layer; pending redesign.
 pub mod performance;
 pub mod type_syntax;
 pub mod value_semantics;

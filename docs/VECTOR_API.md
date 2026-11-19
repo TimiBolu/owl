@@ -46,5 +46,5 @@ These endpoints are available on `owl-explorer` server.
 ## Notes
 
 - Index metadata is WAL-backed and recovers after restart.
-- Query execution currently uses exact nearest path with Zig kernel.
+- Query execution currently uses the exact nearest path.
 - Optional Mojo acceleration is runtime-loaded with `OWL_MOJO_KERNELS_LIB`.

@@ -414,7 +414,7 @@ If you encounter issues during upgrade:
 - Adaptive compression
 
 **Breaking Changes:**
-- RocksDB backend deprecated (use Zig storage engine)
+- RocksDB backend deprecated (use Owl's own storage engine)
 - Storage format changed (requires migration)
 
 **Migration Steps:**

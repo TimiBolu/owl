@@ -298,7 +298,7 @@ impl ConsistentHashRing {
 
     /// Hash a virtual node (shard_id, vnode_index) -> u64
     fn hash_vnode(&self, shard_id: ShardId, vnode_index: u32) -> u64 {
-        // Use Wyhash for speed - same as Zig std.hash.Wyhash
+        // Use Wyhash for speed
         let mut hasher = wyhash::WyHash::with_seed(0);
         shard_id.hash(&mut hasher);
         vnode_index.hash(&mut hasher);
