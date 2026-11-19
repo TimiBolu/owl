@@ -2091,6 +2091,11 @@ struct BuiltCollection {
     asked: u32,
     /// The statement that asked last.
     asked_by: u64,
+    /// What a set of fields' columns took, with all that goes with them,
+    /// when they were last made and found to be more than may be kept.
+    /// Making columns is a pass over the collection, so a set known not
+    /// to fit is not made again only to be let go.
+    too_big: HashMap<Vec<String>, usize>,
 }
 
 impl BuiltCollection {
@@ -2141,7 +2146,14 @@ impl BuiltColumns {
             collections.values().map(|kept| kept.bytes).sum()
         };
         if held(&self.collections) + more > self.limit {
-            self.collections.retain(|name, _| name == schema);
+            // What the running statement has itself asked for stays: a
+            // query that reads two collections would otherwise drop the
+            // first one's columns to keep the second's, and make them
+            // again the next time it ran, a pass over the collection each
+            // time.
+            let statement = crate::storage::statement_now();
+            self.collections
+                .retain(|name, kept| name == schema || kept.asked_by == statement);
         }
         held(&self.collections) + more <= self.limit
     }
@@ -9631,6 +9643,7 @@ impl RustStore {
         schema: &str,
         fields: &[String],
         with_rows: bool,
+        for_once: bool,
     ) -> OQLResult<Option<(Option<Arc<Vec<Arc<Document>>>>, ColumnBatch)>> {
         if !self.pending_operations()?.is_empty() {
             return Ok(None);
@@ -9719,6 +9732,17 @@ impl RustStore {
             let missing: Vec<&String> =
                 fields.iter().filter(|name| !kept.columns.contains_key(*name)).collect();
             if !missing.is_empty() {
+                // Columns already found to be more than may be kept are
+                // not made again, unless the caller has no other way.
+                let wanted: Vec<String> = missing.iter().map(|name| (*name).clone()).collect();
+                if !for_once {
+                    if let Some(known) = kept.too_big.get(&wanted).copied() {
+                        if kept.bytes + known > built.limit {
+                            return Ok(None);
+                        }
+                    }
+                }
+                let kept = built.of(&state, schema);
                 let refs = match &kept.refs {
                     Some(refs) => refs.clone(),
                     None => Arc::new(logical_collection_object_refs(&state, schema)?),
@@ -9755,11 +9779,17 @@ impl RustStore {
                     made.push((name, Arc::new(column)));
                 }
                 if !built.makes_room(schema, bytes) {
-                    // More than may be kept between queries. They are made
-                    // already, so they are given for this once and not
-                    // kept: the next query that wants them makes them
-                    // again, which costs it a pass over the collection and
-                    // no more memory than this.
+                    // More than may be kept between queries, which is
+                    // remembered: a caller with another way is told so at
+                    // once the next time, where making these again for
+                    // every query would cost it a pass over the collection
+                    // each time.
+                    built.of(&state, schema).too_big.insert(wanted, bytes);
+                    if !for_once {
+                        return Ok(None);
+                    }
+                    // For one whose other way is to read every row, they
+                    // are made already: given for this once and not kept.
                     let kept = built.of(&state, schema);
                     let mut columns = Vec::with_capacity(fields.len());
                     for name in fields {
@@ -10634,7 +10664,13 @@ impl DocumentStore for RustStore {
 
     fn scan_columns(&self, schema: &str, fields: &[String]) -> OQLResult<Option<Vec<ColumnBatch>>> {
         Ok(self
-            .rows_and_columns(schema, fields, false)?
+            .rows_and_columns(schema, fields, false, false)?
+            .map(|(_, batch)| vec![batch]))
+    }
+
+    fn scan_columns_for_once(&self, schema: &str, fields: &[String]) -> OQLResult<Option<Vec<ColumnBatch>>> {
+        Ok(self
+            .rows_and_columns(schema, fields, false, true)?
             .map(|(_, batch)| vec![batch]))
     }
 
@@ -10644,7 +10680,7 @@ impl DocumentStore for RustStore {
         fields: &[String],
     ) -> OQLResult<Option<(Arc<Vec<Arc<Document>>>, ColumnBatch)>> {
         Ok(self
-            .rows_and_columns(schema, fields, true)?
+            .rows_and_columns(schema, fields, true, false)?
             .and_then(|(rows, batch)| Some((rows?, batch))))
     }
     fn scan_projected_batches(

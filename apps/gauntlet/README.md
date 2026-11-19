@@ -228,9 +228,24 @@ this size fell from about 690 MB to 234 MB.
   and let go: 222 MB before, 28 MB now, most of it the 15,000 rows its
   offset passes over.
 
-The whole run took 1,828 seconds, several times what it takes with the
-earlier, looser limits; that was before the last two of these, and the
-figure for all queries together above is from that run too.
+The whole run took 1,828 seconds; that was before the last two of these,
+and the figure for all queries together above is from that run too.
+
+A tight budget costs speed, and that has not improved. At the suite's
+ordinary size, after compaction, timed against SQLite:
+
+| Budget | Faster | Within 5x | Beyond | Owl time over SQLite's, whole suite |
+|---|---|---|---|---|
+| The default (a quarter of the machine's memory) | 15 | 26 | 3 | 1.3 |
+| 16 MB | 7 | 20 | 17 | 3.1 |
+| 4 MB | 5 | 19 | 20 | 3.6 |
+
+With little kept between queries, a query that would have read a column
+reads rows from their files, each decoded whole. The furthest behind at 4 MB
+are `h04_colleagues` (about 100 times), then a dozen between 14 and 27
+times. A set of columns found to be more than may be kept is remembered, so
+that the pass that makes them is not made again only for them to be let go:
+that took `h14_skewed_tenant` from 198 ms to 56 ms.
 
 A compaction keeps the copy it replaced, as something to fall back to;
 `compact_and_reclaim` removes it once the new one has been read back and
