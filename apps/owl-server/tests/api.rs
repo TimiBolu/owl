@@ -298,6 +298,63 @@ async fn what_owl_refuses_is_reported_with_a_code() {
 }
 
 #[tokio::test]
+async fn a_repeated_unique_value_is_refused_in_the_callers_terms() {
+    let service = Service::with_shop().await;
+    service.seed().await;
+    let refused = |status: StatusCode, answer: &Value| {
+        assert_eq!((status, code(answer)), (StatusCode::UNPROCESSABLE_ENTITY, "rejected"), "{answer}");
+        let message = answer["error"]["message"].as_str().unwrap().to_string();
+        // It names the collection, the field and the value, and says nothing of storage.
+        for part in ["'customers'", "email \"ada@x.org\"", "unique"] {
+            assert!(message.contains(part), "{message}");
+        }
+        assert!(!message.to_lowercase().contains("storage"), "{message}");
+        message
+    };
+
+    // A new document with an email already taken.
+    let (status, answer) = service
+        .post(
+            "/v1/insert",
+            json!({ "collection": "customers", "documents": [
+                { "id": "c3", "name": "Eve", "email": "ada@x.org", "joined": "2026-03-01" }
+            ] }),
+        )
+        .await;
+    assert!(refused(status, &answer).contains("'c3'"));
+
+    // An existing document changed to an email already taken.
+    let (status, answer) = service
+        .post("/v1/query", json!({ "query": r#"customers.where { .id == "c2" }.update { email: "ada@x.org" }"# }))
+        .await;
+    assert!(refused(status, &answer).contains("'c2'"));
+
+    // One repeat in a batch refuses the whole batch, whether the email is
+    // held by a stored document or by another document of the same batch.
+    for documents in [
+        json!([
+            { "id": "c4", "name": "Dee", "email": "dee@x.org", "joined": "2026-03-02" },
+            { "id": "c5", "name": "Eve", "email": "ada@x.org", "joined": "2026-03-03" }
+        ]),
+        json!([
+            { "id": "c6", "name": "Fay", "email": "ada@x.org", "joined": "2026-03-04" },
+            { "id": "c7", "name": "Gil", "email": "gil@x.org", "joined": "2026-03-05" }
+        ]),
+    ] {
+        let (status, answer) = service
+            .post("/v1/insert", json!({ "collection": "customers", "documents": documents }))
+            .await;
+        refused(status, &answer);
+    }
+
+    // Nothing above changed anything.
+    assert_eq!(
+        service.rows("customers.sort { .id.asc }.select { id, email }").await,
+        vec![json!({ "id": "c1", "email": "ada@x.org" }), json!({ "id": "c2", "email": "bo@x.org" })]
+    );
+}
+
+#[tokio::test]
 async fn a_transaction_is_private_until_it_commits() {
     let service = Service::with_shop().await;
     service.seed().await;
