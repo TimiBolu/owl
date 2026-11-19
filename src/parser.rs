@@ -125,6 +125,11 @@ pub const ROWS_OF: &str = "$of";
 /// first row to the row being shaped, in order.
 pub const ROWS_SO_FAR: &str = "$so_far";
 
+/// The `$` names the parser writes into a query itself, as `Identifier`
+/// nodes. They are not query parameters: [`query_parameters`] leaves them
+/// out, and the tokenizer refuses a parameter spelled like one.
+const PARSER_NAMES: [&str; 3] = [CURRENT_ROWS, ROWS_SO_FAR, OMITTED_FIELD];
+
 /// Operations and aggregates that are words only where they are applied, so
 /// that data may still have fields called `median` or `union`.
 pub const STAGE_WORDS: [&str; 11] = [
@@ -244,6 +249,20 @@ impl Tokenizer {
         while !remaining.is_empty() {
             match Self::next_token(remaining) {
                 Ok((rest, token)) => {
+                    // A parameter may not take a name the parser uses for
+                    // its own markers, or it would be read as the marker.
+                    if let Token::Identifier(name) = &token {
+                        if PARSER_NAMES.contains(&name.as_str()) {
+                            let line = input[..input.len() - remaining.len()]
+                                .matches('\n')
+                                .count()
+                                + 1;
+                            return Err(TokenizeError::ParseError(format!(
+                                "line {line}: {name} is a name Owl keeps for itself; \
+                                 give the parameter another name"
+                            )));
+                        }
+                    }
                     if !matches!(token, Token::Whitespace | Token::Comment(_)) {
                         tokens.push(token);
                         offsets.push(input.len() - remaining.len());
@@ -6622,7 +6641,8 @@ pub fn resolve_query_with_value_bindings(
 }
 
 /// The names of the query parameters (`$name`) a query still expects, without
-/// the `$`.
+/// the `$`. The parser's own markers (`so_far()`, the rows in hand, an
+/// omitted field) are carried the same way and are not parameters.
 pub fn query_parameters(query: &OQLQuery) -> std::collections::BTreeSet<String> {
     // Parameters are carried as `Identifier("$name")` nodes. Walking the
     // serialized tree finds them wherever the grammar can place an
@@ -6632,7 +6652,9 @@ pub fn query_parameters(query: &OQLQuery) -> std::collections::BTreeSet<String> 
             serde_json::Value::Object(fields) => {
                 if let Some(serde_json::Value::String(name)) = fields.get("Identifier") {
                     if let Some(parameter) = name.strip_prefix('$') {
-                        found.insert(parameter.to_string());
+                        if !PARSER_NAMES.contains(&name.as_str()) {
+                            found.insert(parameter.to_string());
+                        }
                     }
                 }
                 fields.values().for_each(|value| collect(value, found));
