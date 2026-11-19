@@ -6,7 +6,7 @@ Scope: reliable single-node engine, implemented entirely in Rust
 ## 1. Decision
 
 Owl has one storage engine. It is not a versioned alternative to the previous
-engine and it has no Zig or other native storage dependency. Rust owns the whole
+engine and it has no native storage dependency. Rust owns the whole
 correctness boundary:
 
 - object identity and the object directory
@@ -1185,7 +1185,7 @@ managed KV keys. A claim of universally faster pointer chasing is not.
 
 ### Milestone A — Rust ownership and WAL nucleus
 
-- remove the Zig tree, crate dependency, FFI adapters, and native metrics bridge
+- remove the native storage tree, crate dependency, FFI adapters, and native metrics bridge
 - introduce stable `ObjRef`
 - add checksummed, versioned WAL batches and contiguous LSN recovery
 - implement Rust object directory and atomic batch publication

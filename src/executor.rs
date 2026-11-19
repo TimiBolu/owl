@@ -8984,7 +8984,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
 
     /// Resolve a reference and continue field path navigation
     ///
-    /// This implements O(1) pointer-based navigation when using Zig storage.
+    /// This implements O(1) pointer-based navigation when the store resolves references directly.
     /// For other storage backends, falls back to document lookup.
     fn resolve_reference_and_continue(
         &self,

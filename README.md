@@ -241,7 +241,7 @@ execute as a script.
 
 ## Storage engine
 
-The storage engine is entirely Rust-owned. There is no RocksDB, no Zig, no FFI.
+The storage engine is entirely Rust-owned. There is no RocksDB and no FFI.
 Rust owns the full correctness boundary: identity, records, WAL, indexes,
 checkpoints, compaction, and recovery.
 

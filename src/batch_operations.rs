@@ -7,7 +7,7 @@
 //! - Batch insert with single WAL fsync
 //! - Atomic batch semantics (all or nothing)
 //! - Batch validation and error handling
-//! - Integration with Zig storage layer for batch allocation
+//! - Integration with the storage layer for batch allocation
 
 use crate::document::{Document, Value};
 use crate::error::{OQLError, OQLResult};

@@ -190,7 +190,7 @@ impl WALFirstStorage {
         reservation: &Reservation,
         document: &Document,
     ) -> OQLResult<()> {
-        // Rust owns logical document framing, Zig handles allocation/read/write primitives.
+        // This layer owns logical document framing; the store handles allocation, reads and writes.
         let payload = self.encode_serialized_doc(&SerializedDocument::new(document.clone()))?;
 
         // Write to arena at reserved location

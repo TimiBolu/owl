@@ -63,7 +63,7 @@ if [ -f "./oql_e2e_test_db" ]; then
     echo "✅ Database file created successfully"
     echo "   Location: ./oql_e2e_test_db"
     echo "   Size: $DB_SIZE"
-    echo "   Format: Zig Arena binary"
+    echo "   Format: Owl database file"
 else
     echo "❌ Database file not found"
     exit 1

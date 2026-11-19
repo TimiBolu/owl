@@ -70,7 +70,7 @@ export function Dashboard() {
                     title="Memory Usage"
                     value={formatBytesLocal(metrics.memory_usage_bytes)}
                     icon={HardDrive}
-                    description="Zig Arena Allocator"
+                    description="Storage engine"
                     trend={`${(metrics.memory_usage_bytes / (1024 * 1024 * 1024) * 100).toFixed(1)}% of 1GB`}
                     trendUp={metrics.memory_usage_bytes < 1024 * 1024 * 800}
                 />

@@ -36,7 +36,6 @@ This guide provides step-by-step instructions for installing and configuring Owl
 
 ### Software Dependencies
 
-- **Zig**: 0.11.0+ (for building from source)
 - **Rust**: 1.70.0+ (for building from source)
 - **systemd**: For service management
 - **Optional**: Docker 20.10+ (for containerized deployment)
@@ -121,7 +120,6 @@ cd owl
 
 # Install dependencies
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-# Install Zig from https://ziglang.org/download/
 
 # Build
 cargo build --release

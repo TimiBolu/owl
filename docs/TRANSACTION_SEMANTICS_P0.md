@@ -31,7 +31,7 @@ transaction {
 
 ## Isolation level in P0
 
-- Effective model: single active local transaction per `ZigStore` instance.
+- Effective model: single active local transaction per store instance.
 - Concurrent second `begin` while one is active is rejected.
 - This gives serial execution for local explicit transactions.
 
