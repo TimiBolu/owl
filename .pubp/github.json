@@ -1,0 +1,60 @@
+{
+  "version": 1,
+  "authorization": {
+    "owners": ["TimiBolu"],
+    "repositories": ["owl"]
+  },
+  "services": [
+    {
+      "name": "public",
+      "repo_path": "website",
+      "strategy": "docker_server",
+      "path_patterns": [
+        "website/**",
+        ".pubp/github.json"
+      ]
+    }
+  ],
+  "rules": [
+    {
+      "name": "owl-website-prod-pr-check",
+      "event": "pull_request",
+      "intent": "check",
+      "actions": ["opened", "reopened", "synchronize"],
+      "branches": ["main"],
+      "require_pr": true,
+      "target": {
+        "tenant": "owl",
+        "app": "website",
+        "environment": "prod",
+        "type": "prod",
+        "owner_template": "github:{owner}:{repo}:prod",
+        "deploy_strategy": "blue_green",
+        "labels": {
+          "backing_namespace": "env-website-prod",
+          "github_owner": "{owner}",
+          "github_repo": "{repo}"
+        }
+      }
+    },
+    {
+      "name": "owl-website-prod",
+      "event": "push",
+      "intent": "deploy",
+      "branches": ["main"],
+      "target": {
+        "tenant": "owl",
+        "app": "website",
+        "environment": "prod",
+        "type": "prod",
+        "owner_template": "github:{owner}:{repo}:prod",
+        "deploy_strategy": "blue_green",
+        "labels": {
+          "backing_namespace": "env-website-prod",
+          "github_owner": "{owner}",
+          "github_repo": "{repo}"
+        }
+      }
+    }
+  ]
+}

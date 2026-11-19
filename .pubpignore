@@ -1,0 +1,21 @@
+# Only website/ is published. Keep the database's build output and data out of the upload.
+.git
+target
+databases
+binaries
+vendor
+*.owl
+*.wal
+*.sb
+.env
+.env.*
+**/.env
+**/.env.*
+**/node_modules
+**/dist
+**/.output
+**/.nitro
+**/.tanstack
+.DS_Store
+**/.DS_Store
+*.log
