@@ -95,6 +95,161 @@ fn scoped_bindings_cannot_shadow_or_be_redefined() {
 }
 
 #[test]
+fn scoped_bindings_cannot_be_used_before_they_are_defined() {
+    // Defined later in the block: the earlier use would otherwise be lowered
+    // without the local and quietly read a collection named `paid`.
+    let defined_later = parse_oql(
+        r#"
+        customers {
+          spent = paid.sum(.total)
+          paid = .orders.where { .status == "paid" }
+          select { name, spent }
+        }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        defined_later.contains("Scoped binding 'paid' is used before it is defined"),
+        "{defined_later}"
+    );
+
+    // An earlier query transform counts as a use too.
+    let used_in_where = parse_oql(
+        r#"
+        wallets {
+          where { .balance >= minimum }
+          minimum = 50
+          select { id }
+        }
+        "#,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        used_in_where.contains("Scoped binding 'minimum' is used before it is defined"),
+        "{used_in_where}"
+    );
+
+    // A stored field, a key and a definition in terms of the collection of
+    // the same name are not uses of the local.
+    parse_oql(
+        r#"
+        customers {
+          where { .paid == true }
+          labels = { paid: "yes" }
+          paid = paid.where { .customer.id == customers.id }
+          select { name, paid: paid.count() }
+        }
+        "#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_scoped_name_that_is_never_defined_is_rejected_against_a_schema() {
+    // Without schemas a bare name may be a collection or a script binding,
+    // so only a parse that knows the schemas can reject it.
+    let registry = SchemaRegistry::new();
+    registry
+        .register(Schema::new(
+            "customers".into(),
+            HashMap::from([
+                ("id".into(), FieldType::String),
+                ("name".into(), FieldType::String),
+            ]),
+        ))
+        .unwrap();
+    let never_defined = parse_oql_with_schema(
+        r#"
+        customers {
+          spent = paid.sum(.total)
+          select { name, spent }
+        }
+        "#,
+        registry,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(never_defined.contains("'paid' not found"), "{never_defined}");
+}
+
+#[test]
+fn shorthand_scoped_locals_in_select_are_keyed_by_their_names() {
+    let query = parse_oql(
+        r#"
+        customers {
+          paid = .orders.where { .status == "paid" }
+          spent = paid.sum(.total)
+          select { name, orders: paid.count(), spent, paid, total: spent }
+        }
+        "#,
+    )
+    .unwrap();
+    let Operation::Select(select) = query.operations.last().unwrap() else {
+        panic!("scoped query must lower to a final select");
+    };
+    let aliases: Vec<Option<&str>> = select
+        .fields
+        .iter()
+        .map(|field| field.alias.as_deref())
+        .collect();
+    assert_eq!(
+        aliases,
+        vec![None, Some("orders"), Some("spent"), Some("paid"), Some("total")]
+    );
+
+    let temp = TempDir::new().unwrap();
+    let store = Arc::new(RustStore::new(temp.path().join("shorthand.owl"), 16 << 20).unwrap());
+    let executor = QueryExecutor::new_with_real_clock(store);
+    let setup = parse_oql_file(
+        r#"
+        schema customers {
+          id: String,
+          name: String
+        }
+
+        schema orders {
+          id: String,
+          customer: Ref(customers),
+          status: String,
+          total: Float
+        }
+
+        customers.insert { id: "c1", name: "Ada" }
+        orders.insert { id: "o1", customer: "c1", status: "paid", total: 10.0 }
+        orders.insert { id: "o2", customer: "c1", status: "paid", total: 5.5 }
+        orders.insert { id: "o3", customer: "c1", status: "open", total: 99.0 }
+        "#,
+    )
+    .unwrap();
+    let setup_result = execute_oql_file(&setup, &executor).unwrap();
+    assert!(setup_result.errors.is_empty(), "{:?}", setup_result.errors);
+
+    // Two shorthand locals in one select used to collide on `computed`.
+    let rows = executor
+        .execute_query(
+            &parse_oql(
+                r#"
+                customers {
+                  paid = .orders.where { .status == "paid" }
+                  spent = paid.sum(.total)
+                  paid_count = paid.count()
+                  select { name, spent, paid_count }
+                }
+                "#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get_field("name"), Some(&Value::String("Ada".into())));
+    assert_eq!(rows[0].get_field("spent"), Some(&Value::Float(15.5)));
+    assert_eq!(rows[0].get_field("paid_count"), Some(&Value::Integer(2)));
+    assert_eq!(rows[0].get_field("computed"), None);
+}
+
+#[test]
 fn scoped_query_requires_one_final_select() {
     let missing = parse_oql(
         r#"
