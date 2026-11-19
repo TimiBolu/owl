@@ -222,6 +222,14 @@ This is allowed and desirable.
 
 It is one of the main reasons the scoped form exists.
 
+### Rule 4. A name that is never defined is an error
+
+A bare name that is not a local, a script binding or a collection is rejected.
+The parser cannot tell these apart without the schemas, so the check is made
+when the query runs: inside a query over a collection that has a schema, a
+name with no schema and no documents is reported as not defined instead of
+being read as an empty collection.
+
 ## Shadowing
 
 Shadowing should be simple and conservative.

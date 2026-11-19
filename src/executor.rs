@@ -2422,6 +2422,38 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
     }
 
+    /// A bare name read as a collection inside a query over a declared
+    /// collection must name something: by here every local, script binding
+    /// and parameter has been replaced by its expression, so what is left
+    /// is a collection. One with no schema and no documents is far more
+    /// often a misspelt or never-defined name than an empty collection, and
+    /// reading it as empty turns the mistake into a wrong answer.
+    fn check_collection_is_known(&self, name: &str) -> OQLResult<()> {
+        if name.starts_with('$') || name.starts_with('_') {
+            return Ok(());
+        }
+        let holds_documents = match self.store.collection_len(name)? {
+            Some(len) => len > 0,
+            None => !self.store.scan_documents(name)?.is_empty(),
+        };
+        if holds_documents {
+            return Ok(());
+        }
+        let names = self.schema_names()?;
+        let closest = names
+            .iter()
+            .map(|known| (Self::edit_distance(known, name), known))
+            .filter(|(distance, _)| *distance <= 2)
+            .min()
+            .map(|(_, known)| format!(" Did you mean '{known}'?"))
+            .unwrap_or_default();
+        Err(OQLError::SchemaValidation {
+            message: format!(
+                "'{name}' is not defined: no collection, binding or local has that name.{closest}"
+            ),
+        })
+    }
+
     fn check_expression(&self, place: &Place, expression: &Expression) -> OQLResult<()> {
         let check = |node: &Expression| self.check_expression(place, node);
         match expression {
@@ -2443,7 +2475,10 @@ impl<S: DocumentStore> QueryExecutor<S> {
             Expression::QueryExpression { query } => {
                 let rows = match self.schema_of(&query.collection)? {
                     Some(schema) => Place::Rows(schema),
-                    None => Place::Any,
+                    None => {
+                        self.check_collection_is_known(&query.collection)?;
+                        Place::Any
+                    }
                 };
                 self.check_operations(rows, &query.operations)
             }

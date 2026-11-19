@@ -2020,6 +2020,7 @@ impl Parser {
 
         // Parse function body: any number of local names, then the value.
         self.expect_token(Token::LeftBrace)?;
+        let body_start = self.position;
         let mut locals: std::collections::HashMap<String, Expression> =
             std::collections::HashMap::new();
         while let (Some(Token::Identifier(local)), Some(Token::Assign)) =
@@ -2035,6 +2036,11 @@ impl Parser {
             if locals.contains_key(&local) {
                 return Err(ParseError::InvalidSyntax(format!(
                     "local name '{local}' is already defined in function '{name}'"
+                )));
+            }
+            if self.scoped_name_is_used_between(&local, body_start, self.position) {
+                return Err(ParseError::InvalidSyntax(format!(
+                    "local name '{local}' in function '{name}' is used before it is defined"
                 )));
             }
             self.advance();
