@@ -1625,6 +1625,25 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 listed = Some((rows, batch.stamp()));
             }
         }
+        // A sort cut to a few rows, with no filter, over a collection the
+        // store does not hold whole: only the rows that can be among those
+        // kept are read.
+        if let (Some((None, stamp)), None, Some((sort, offset, limit, taken)), true) =
+            (&listed, &origin, cut, conditions.is_empty())
+        {
+            let wanted_rows = offset.saturating_add(limit);
+            if let Some(candidates) = self.cut_sort_by_columns(&query.collection, sort, *stamp, wanted_rows)? {
+                self.check_sort_functions(sort)?;
+                let lent: Vec<&Arc<Document>> = candidates.iter().collect();
+                let kept = self
+                    .sorted_positions_of_stored(&lent, sort, Some(wanted_rows))
+                    .into_iter()
+                    .skip(offset)
+                    .map(|position| keep(lent[position]))
+                    .collect();
+                return Ok(Some((kept, filters + taken)));
+            }
+        }
         // The rows to go on with: those the columns left, or every row.
         let narrowed: Vec<Arc<Document>>;
         let stored: &[Arc<Document>] = match (&listed, &origin) {
@@ -1653,6 +1672,30 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     Some(rows) => {
                         narrowed = rows;
                         &narrowed
+                    }
+                    // The store does not hold every row. A count needs
+                    // none of them kept: they are read a bounded number at
+                    // a time and counted as they pass.
+                    None if matches!((next, operations.get(filters + 1)), (Some(Operation::Count), None)) => {
+                        let mut count = 0usize;
+                        let shown = self.store.scan_documents_in_chunks(&query.collection, &mut |rows| {
+                            for row in rows {
+                                count += usize::from(passes(row)?);
+                            }
+                            Ok(true)
+                        })?;
+                        if shown != Some(true) {
+                            return Ok(None);
+                        }
+                        return Ok(Some((
+                            self.apply_count_operation(Vec::new()).map(|mut rows| {
+                                rows[0]
+                                    .fields
+                                    .insert("count".to_string(), Value::Integer(count as i64));
+                                rows
+                            })?,
+                            operations.len(),
+                        )));
                     }
                     None => return Ok(None),
                 }
@@ -12351,6 +12394,119 @@ impl<S: DocumentStore> QueryExecutor<S> {
         Some(names)
     }
 
+    /// How two rows of a column sort against each other, ascending. A row
+    /// without a value sorts as null does against any value.
+    fn column_order(column: &crate::storage::Column<'_>, mine: usize, theirs: usize) -> std::cmp::Ordering {
+        use crate::storage::{Column, ColumnData};
+        use crate::value_semantics::sort_order;
+        use std::cmp::Ordering;
+        let null = Value::Null;
+        match (column.has_value(mine), column.has_value(theirs)) {
+            (false, false) => Ordering::Equal,
+            (true, true) => match column.data() {
+                ColumnData::Integers(values) => values[mine].cmp(&values[theirs]),
+                ColumnData::DateTimes(values) => values[mine].cmp(&values[theirs]),
+                ColumnData::Strings { offsets, bytes } => {
+                    Column::text(offsets, bytes, mine).cmp(Column::text(offsets, bytes, theirs))
+                }
+                ColumnData::Floats(values) => sort_order(&Value::Float(values[mine]), &Value::Float(values[theirs])),
+                ColumnData::Booleans(values) => values[mine].cmp(&values[theirs]),
+                ColumnData::References(values) => {
+                    sort_order(&Value::Reference(values[mine]), &Value::Reference(values[theirs]))
+                }
+            },
+            (mine_has, _) => {
+                // Any value of the column's kind stands for the one that
+                // is there.
+                let some = match column.data() {
+                    ColumnData::Integers(_) => Value::Integer(0),
+                    ColumnData::DateTimes(values) => Value::DateTime(values[0]),
+                    ColumnData::Strings { .. } => Value::String(String::new()),
+                    ColumnData::Floats(_) => Value::Float(0.0),
+                    ColumnData::Booleans(_) => Value::Boolean(false),
+                    ColumnData::References(values) => Value::Reference(values[0]),
+                };
+                match mine_has {
+                    true => sort_order(&some, &null),
+                    false => sort_order(&null, &some),
+                }
+            }
+        }
+    }
+
+    /// The rows a sort keeps when it is cut to a few, without reading the
+    /// rest: the keys ahead of the row's id are compared by their columns
+    /// to find which rows can be among those kept, and only those rows are
+    /// fetched and put in order. `None` when it cannot be done this way.
+    fn cut_sort_by_columns(
+        &self,
+        collection: &str,
+        sort: &SortBlock,
+        stamp: u64,
+        wanted: usize,
+    ) -> OQLResult<Option<Vec<Arc<Document>>>> {
+        let Some(names) = Self::plain_sort_fields(sort) else {
+            return Ok(None);
+        };
+        // The keys that come before the id, each a field with a column.
+        let leading: Vec<&crate::parser::SortField> = sort
+            .fields
+            .iter()
+            .take_while(|field| match &field.expression {
+                Expression::FieldAccess(access) => names.contains(&access.path[0]),
+                _ => false,
+            })
+            .collect();
+        if leading.is_empty() || wanted == 0 {
+            return Ok(None);
+        }
+        let Some(batches) = self.store.scan_columns(collection, &names)? else {
+            return Ok(None);
+        };
+        let [batch] = batches.as_slice() else {
+            return Ok(None);
+        };
+        if batch.stamp() != stamp || wanted >= batch.rows() {
+            return Ok(None);
+        }
+        let columns: Vec<(crate::storage::Column<'_>, bool)> = leading
+            .iter()
+            .filter_map(|field| match &field.expression {
+                Expression::FieldAccess(access) => {
+                    let at = names.iter().position(|name| *name == access.path[0])?;
+                    Some((batch.column(at), matches!(field.direction, crate::parser::SortDirection::Desc)))
+                }
+                _ => None,
+            })
+            .collect();
+        let compare = |left: &u32, right: &u32| {
+            for (column, descending) in &columns {
+                let order = Self::column_order(column, *left as usize, *right as usize);
+                let order = if *descending { order.reverse() } else { order };
+                if order.is_ne() {
+                    return order;
+                }
+            }
+            std::cmp::Ordering::Equal
+        };
+        // The row that would be last of those kept, by the leading keys:
+        // every row that does not sort after it may be among them.
+        let mut order: Vec<u32> = (0..batch.rows() as u32).collect();
+        order.select_nth_unstable_by(wanted - 1, compare);
+        let last = order[wanted - 1];
+        drop(order);
+        let candidates: Vec<u32> = (0..batch.rows() as u32)
+            .filter(|row| compare(row, &last).is_le())
+            .collect();
+        // So many ties that most of the collection is still in the
+        // running: nothing is saved.
+        if candidates.len() > batch.rows() / 2 {
+            return Ok(None);
+        }
+        COLUMN_SCANS_RUN.with(|runs| runs.set(runs.get() + 1));
+        self.store.rows_of_columns(collection, stamp, &candidates)
+    }
+
     /// The positions of `rows` in sorted order, as
     /// [`Self::sorted_positions_of_stored`] gives them, with the keys read
     /// from the sort fields' columns and not from the rows. `places[n]` is
@@ -12366,9 +12522,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
         places: &[u32],
         keep: Option<usize>,
     ) -> OQLResult<Option<Vec<usize>>> {
-        use crate::storage::{Column, ColumnData};
-        use crate::value_semantics::sort_order;
-        use std::cmp::Ordering;
+        use crate::storage::Column;
         let Some(names) = Self::plain_sort_fields(sort) else {
             return Ok(None);
         };
@@ -12394,48 +12548,11 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 _ => None,
             })
             .collect();
-        // A row without a value sorts as null does against any value.
-        let null = Value::Null;
         let compare = |left: &usize, right: &usize| {
             for (field, key) in sort.fields.iter().zip(&keys) {
                 let order = match key {
                     None => rows[*left].id.cmp(&rows[*right].id),
-                    Some(column) => {
-                        let (mine, theirs) = (places[*left] as usize, places[*right] as usize);
-                        match (column.has_value(mine), column.has_value(theirs)) {
-                            (false, false) => Ordering::Equal,
-                            (true, true) => match column.data() {
-                                ColumnData::Integers(values) => values[mine].cmp(&values[theirs]),
-                                ColumnData::DateTimes(values) => values[mine].cmp(&values[theirs]),
-                                ColumnData::Strings { offsets, bytes } => Column::text(offsets, bytes, mine)
-                                    .cmp(Column::text(offsets, bytes, theirs)),
-                                ColumnData::Floats(values) => {
-                                    sort_order(&Value::Float(values[mine]), &Value::Float(values[theirs]))
-                                }
-                                ColumnData::Booleans(values) => values[mine].cmp(&values[theirs]),
-                                ColumnData::References(values) => sort_order(
-                                    &Value::Reference(values[mine]),
-                                    &Value::Reference(values[theirs]),
-                                ),
-                            },
-                            (mine_has, _) => {
-                                // Any value of the column's kind stands for
-                                // the one that is there.
-                                let some = match column.data() {
-                                    ColumnData::Integers(_) => Value::Integer(0),
-                                    ColumnData::DateTimes(values) => Value::DateTime(values[0]),
-                                    ColumnData::Strings { .. } => Value::String(String::new()),
-                                    ColumnData::Floats(_) => Value::Float(0.0),
-                                    ColumnData::Booleans(_) => Value::Boolean(false),
-                                    ColumnData::References(values) => Value::Reference(values[0]),
-                                };
-                                match mine_has {
-                                    true => sort_order(&some, &null),
-                                    false => sort_order(&null, &some),
-                                }
-                            }
-                        }
-                    }
+                    Some(column) => Self::column_order(column, places[*left] as usize, places[*right] as usize),
                 };
                 let order = match field.direction {
                     crate::parser::SortDirection::Asc => order,

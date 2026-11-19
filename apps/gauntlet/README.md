@@ -207,9 +207,13 @@ compaction holds a second copy of it in the base it rebuilds.
 Queries are not there either. Grouping the elements of a list every row
 holds (`g14`, `h16`, `h17`) reads the rows a bounded number at a time and no
 longer needs the collection in memory; at ten times the data those three
-had needed 637, 515 and 341 MB. What needs the most now are sorts and
-running windows over a whole collection (`g13`, `g12`, `h19`, `g18`), which
-hold every row they order: about 60 MB each at twice the data. With so small
+had needed 637, 515 and 341 MB. A sort cut to a few rows (`h19`) reads only the
+rows that can be among those kept, and a count of rows passing a filter
+(`h15`) keeps none: 49 MB and 36 MB at twice the data, now 6 MB and 2 MB.
+What needs the most now are the window queries (`g13`, `g12`, `g18`), about
+60 MB each at twice the data whatever the budget: the rows are copied once
+in order and again as they are shaped, and a partition's rows once more for
+`so_far()`. With so small
 a share for kept columns, the whole run also took several times as long as
 with the earlier, looser limits.
 
