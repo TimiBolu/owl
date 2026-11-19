@@ -616,7 +616,7 @@ fn a_compaction_works_from_files_and_leaves_none_behind() {
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .filter(|name| {
-                name.starts_with("spooled.owl") && (name.ends_with(".records") || name.contains("index-run"))
+                name.starts_with("spooled.owl") && (name.ends_with(".records") || name.ends_with(".segments") || name.contains("index-run"))
             })
             .collect();
         assert!(left.is_empty(), "working files left behind: {left:?}");

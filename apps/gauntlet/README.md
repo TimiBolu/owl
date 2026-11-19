@@ -188,8 +188,8 @@ budget, measured with `gauntlet memory --people 20000`:
 | At most while reopening | 47 MB |
 | Held after reopening, before any query | 37 MB |
 | Held after every query has run | 61 MB |
-| At most during the first compaction | 295 MB |
-| At most during a compaction of the compacted database | 173 MB |
+| At most during the first compaction | 278 MB |
+| At most during a compaction of the compacted database | 133 MB |
 | At most during the worst query (`g14_unwind_with_parent`) | 637 MB |
 
 What is held is near the budget plus about 45 MB the budget does not cover:
@@ -198,9 +198,10 @@ data. Opening a database does not take the records of its checkpoint into
 memory; each is read from its file when it is wanted. A compaction reads the
 rows it compacts the same way, keeps the records it writes in a working
 file, sorts its index entries on disk a bounded amount at a time, and builds
-smaller segments when memory is short. It still holds every encoded segment
-until the image is written, and the bookkeeping for every row of the base it
-rebuilds. Eight queries copy every row they
+smaller segments when memory is short. Its column segments go to a working file as each is built.
+What a compaction still holds grows with the data: the bookkeeping for every
+row of the base it rebuilds, and, for a database not yet compacted, the
+recent writes that rebuilding replays into memory. Eight queries copy every row they
 touch. With so small a share for kept columns, the whole run also took
 several times as long as with the earlier, looser limits.
 

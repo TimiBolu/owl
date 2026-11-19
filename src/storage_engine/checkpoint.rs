@@ -92,6 +92,135 @@ pub(crate) struct CheckpointImage {
     pub record_spool: Option<Arc<RecordSpool>>,
     pub indexes: Vec<CheckpointIndex>,
     pub typed_segments: Vec<Arc<[u8]>>,
+    /// Further encoded segments, after those held, kept in a file of their
+    /// own until the image is written.
+    pub segment_spool: Option<Arc<SegmentSpool>>,
+}
+
+/// Encoded column segments written to a file as they are built, to be read
+/// back one at a time when the checkpoint that holds them is written. The
+/// file is removed when the spool is dropped.
+pub(crate) struct SegmentSpool {
+    filesystem: Arc<dyn FileSystem>,
+    path: PathBuf,
+    file: Option<Box<dyn FileHandle>>,
+    /// Where each segment is in the file, and what its header says of it.
+    entries: Vec<(u64, TypedSegmentDescriptor)>,
+    written: u64,
+}
+
+impl std::fmt::Debug for SegmentSpool {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SegmentSpool")
+            .field("path", &self.path)
+            .field("segments", &self.entries.len())
+            .field("bytes", &self.written)
+            .finish()
+    }
+}
+
+impl SegmentSpool {
+    pub(crate) fn create(filesystem: Arc<dyn FileSystem>, path: PathBuf) -> OQLResult<Self> {
+        let file = filesystem.create(&path).map_err(|error| {
+            OQLError::storage_error(&format!("create segment spool: {error}"), None)
+        })?;
+        Ok(Self { filesystem, path, file: Some(file), entries: Vec::new(), written: 0 })
+    }
+
+    pub(crate) fn push(&mut self, segment: &[u8]) -> OQLResult<()> {
+        let descriptor = TypedSegment::descriptor(segment)?;
+        if descriptor.encoded_len != segment.len() {
+            return Err(OQLError::storage_error(
+                "an encoded segment is not the length its header states",
+                None,
+            ));
+        }
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| OQLError::storage_error("segment spool is closed", None))?;
+        write_all_handle(file.as_mut(), segment)?;
+        self.entries.push((self.written, descriptor));
+        self.written += segment.len() as u64;
+        Ok(())
+    }
+
+    /// Hand everything to the file; nothing more is pushed after this.
+    pub(crate) fn finish(mut self) -> OQLResult<Self> {
+        if let Some(mut file) = self.file.take() {
+            file.flush().map_err(|error| {
+                OQLError::storage_error(&format!("flush segment spool: {error}"), None)
+            })?;
+        }
+        self.file = Some(self.filesystem.open(&self.path).map_err(|error| {
+            OQLError::storage_error(&format!("open segment spool: {error}"), None)
+        })?);
+        Ok(self)
+    }
+
+    /// How many rows the segments hold between them.
+    pub(crate) fn rows(&self) -> usize {
+        self.entries.iter().map(|(_, descriptor)| descriptor.row_count).sum()
+    }
+
+    fn read(&self, number: usize) -> OQLResult<Arc<[u8]>> {
+        let (offset, descriptor) = self
+            .entries
+            .get(number)
+            .ok_or_else(|| OQLError::storage_error("segment spool has no such segment", None))?;
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| OQLError::storage_error("segment spool is closed", None))?;
+        Ok(Arc::from(read_exact_at(file.as_ref(), *offset as usize, descriptor.encoded_len)?))
+    }
+}
+
+impl Drop for SegmentSpool {
+    fn drop(&mut self) {
+        self.file = None;
+        let _ = self.filesystem.remove(&self.path);
+    }
+}
+
+/// The encoded segments of an image being written, those held and then
+/// those spooled, by their number in the image.
+struct ImageSegments<'a> {
+    held: &'a [Arc<[u8]>],
+    spooled: Option<&'a SegmentSpool>,
+}
+
+impl<'a> ImageSegments<'a> {
+    fn of(image: &'a CheckpointImage) -> Self {
+        Self { held: &image.typed_segments, spooled: image.segment_spool.as_deref() }
+    }
+
+    fn len(&self) -> usize {
+        self.held.len() + self.spooled.map_or(0, |spool| spool.entries.len())
+    }
+
+    fn descriptor(&self, number: usize) -> OQLResult<TypedSegmentDescriptor> {
+        match self.held.get(number) {
+            Some(segment) => TypedSegment::descriptor(segment),
+            None => self
+                .spooled
+                .and_then(|spool| spool.entries.get(number - self.held.len()))
+                .map(|(_, descriptor)| *descriptor)
+                .ok_or_else(|| OQLError::storage_error("an image has no such segment", None)),
+        }
+    }
+
+    /// The segment's bytes, read from the spool if that is where it is.
+    fn bytes(&self, number: usize) -> OQLResult<Arc<[u8]>> {
+        match self.held.get(number) {
+            Some(segment) => Ok(segment.clone()),
+            None => self
+                .spooled
+                .ok_or_else(|| OQLError::storage_error("an image has no such segment", None))?
+                .read(number - self.held.len()),
+        }
+    }
 }
 
 /// Records written to a file as they are produced, to be read back one at
@@ -2261,13 +2390,13 @@ fn prepare_typed_locator<'a>(
     filesystem: &'a dyn FileSystem,
     path: &Path,
     sequence: u64,
-    segments: &[Arc<[u8]>],
+    segments: &ImageSegments<'_>,
 ) -> OQLResult<PreparedTypedLocator<'a>> {
     let mut collection_slots = BTreeMap::<u16, usize>::new();
     let mut fences = Vec::<(usize, String, String)>::new();
     let mut live_count = 0usize;
-    for (segment_index, encoded) in segments.iter().enumerate() {
-        let segment = TypedSegment::decode(encoded)?;
+    for segment_index in 0..segments.len() {
+        let segment = TypedSegment::decode(&segments.bytes(segment_index)?)?;
         if !segment.authoritative {
             continue;
         }
@@ -2294,8 +2423,8 @@ fn prepare_typed_locator<'a>(
     };
     let mut chunk = Vec::<LocatorSortEntry>::with_capacity(LOCATOR_SORT_CHUNK_ENTRIES);
     let mut runs = Vec::<PathBuf>::with_capacity(initial_run_count);
-    for (segment_index, encoded) in segments.iter().enumerate() {
-        let segment = TypedSegment::decode(encoded)?;
+    for segment_index in 0..segments.len() {
+        let segment = TypedSegment::decode(&segments.bytes(segment_index)?)?;
         if !segment.authoritative {
             continue;
         }
@@ -2997,13 +3126,15 @@ pub(crate) fn write_segment_file(
             index_pages.push((index, range, page == 0, page == last_page));
         }
     }
-    let typed_segments_len = image
-        .typed_segments
+    let segments = ImageSegments::of(image);
+    let segment_descriptors = (0..segments.len())
+        .map(|number| segments.descriptor(number))
+        .collect::<OQLResult<Vec<_>>>()?;
+    let typed_segments_len = segment_descriptors
         .iter()
-        .try_fold(0usize, |total, segment| total.checked_add(segment.len()))
+        .try_fold(0usize, |total, descriptor| total.checked_add(descriptor.encoded_len))
         .ok_or_else(|| OQLError::storage_error("typed segment region overflow", None))?;
-    let typed_locator =
-        prepare_typed_locator(filesystem, path, image.sequence, &image.typed_segments)?;
+    let typed_locator = prepare_typed_locator(filesystem, path, image.sequence, &segments)?;
     let total_len = SEGMENT_HEADER_LEN
         .checked_add(metadata.len())
         .and_then(|length| length.checked_add(directory_len))
@@ -3014,11 +3145,10 @@ pub(crate) fn write_segment_file(
         .ok_or_else(|| OQLError::storage_error("checkpoint segment length overflow", None))?;
     let typed_segments_start = total_len - typed_segments_len;
     let mut typed_offset = typed_segments_start;
-    let typed_segment_descriptors = image
-        .typed_segments
+    let typed_segment_descriptors = segment_descriptors
         .iter()
-        .map(|segment| {
-            let descriptor = TypedSegment::descriptor(segment)?;
+        .map(|descriptor| {
+            let descriptor = *descriptor;
             let location = TypedSegmentFileDescriptor {
                 offset: typed_offset,
                 descriptor,
@@ -3172,9 +3302,16 @@ pub(crate) fn write_segment_file(
         index_offset += block.len();
     }
     typed_locator.write_to(file.as_mut(), &mut internal)?;
-    for segment in &image.typed_segments {
-        write_all_handle(file.as_mut(), segment)?;
-        internal.update(segment);
+    for number in 0..segments.len() {
+        let segment = segments.bytes(number)?;
+        if segment.len() != segment_descriptors[number].encoded_len {
+            return Err(OQLError::storage_error(
+                "a segment does not read back at the length it was written",
+                None,
+            ));
+        }
+        write_all_handle(file.as_mut(), &segment)?;
+        internal.update(&segment);
     }
     let internal_checksum = internal.finalize();
     file.seek(SeekFrom::Start(56)).map_err(|error| {
@@ -3953,6 +4090,7 @@ pub(crate) fn decode_segment(segment: &[u8]) -> OQLResult<CheckpointImage> {
         .map(|segment| segment.encode().map(Arc::from))
         .collect::<OQLResult<Vec<_>>>()?;
     Ok(CheckpointImage {
+        segment_spool: None,
         record_spool: None,
         sequence,
         checkpoint_lsn,
@@ -4717,6 +4855,7 @@ mod tests {
     #[test]
     fn empty_checkpoint_and_manifest_round_trip() {
         let image = CheckpointImage {
+            segment_spool: None,
             record_spool: None,
             sequence: 9,
             checkpoint_lsn: 42,
@@ -4757,6 +4896,7 @@ mod tests {
     #[test]
     fn production_reader_accepts_format_two_segment_header() {
         let image = CheckpointImage {
+            segment_spool: None,
             record_spool: None,
             sequence: 3,
             checkpoint_lsn: 8,
@@ -4814,6 +4954,7 @@ mod tests {
             })
             .collect();
         let image = CheckpointImage {
+            segment_spool: None,
             record_spool: None,
             sequence: 7,
             checkpoint_lsn: 11,
@@ -5097,6 +5238,7 @@ mod tests {
     #[test]
     fn persisted_index_blocks_round_trip_and_have_independent_checksums() {
         let image = CheckpointImage {
+            segment_spool: None,
             record_spool: None,
             sequence: 3,
             checkpoint_lsn: 7,
@@ -5228,7 +5370,13 @@ mod tests {
         let expected = encode_typed_locator(&segments).unwrap();
         let filesystem = SimulatedFileSystem::new(151);
         let base = Path::new("spillable-locator.owl");
-        let prepared = prepare_typed_locator(&filesystem, base, 77, &segments).unwrap();
+        let prepared = prepare_typed_locator(
+            &filesystem,
+            base,
+            77,
+            &ImageSegments { held: &segments, spooled: None },
+        )
+        .unwrap();
         assert_eq!(prepared.len(), expected.len());
         let pages_path = prepared.pages_path.clone();
         let journal_path = prepared.journal_path.clone();
