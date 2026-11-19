@@ -61,6 +61,9 @@ enum Command {
     Memory {
         #[arg(long, default_value_t = 2000)]
         people: usize,
+        /// Only run queries whose name contains this text.
+        #[arg(long)]
+        only: Option<String>,
     },
     /// An experiment: time two slow questions over rows, over the store's
     /// column segments and over plain arrays.
@@ -232,8 +235,8 @@ fn resident_megabytes() -> f64 {
     LIVE_BYTES.load(std::sync::atomic::Ordering::Relaxed) as f64 / (1024.0 * 1024.0)
 }
 
-fn memory(people: usize) -> Result<()> {
-    let queries = queries(None)?;
+fn memory(people: usize, only: Option<&str>) -> Result<()> {
+    let queries = queries(only)?;
     let start = resident_megabytes();
     let directory = tempfile::TempDir::new()?;
     let path = directory.path().join("gauntlet.owl");
@@ -523,6 +526,6 @@ fn main() -> Result<()> {
         Command::Bench { people, only, samples } => run(people, only.as_deref(), Some(samples)),
         Command::Show { people, rows, queries } => show(people, rows, &queries),
         Command::Columns { people, samples } => columns::run(&load(people)?.owl, samples),
-        Command::Memory { people } => memory(people),
+        Command::Memory { people, only } => memory(people, only.as_deref()),
     }
 }

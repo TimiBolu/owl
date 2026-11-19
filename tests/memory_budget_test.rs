@@ -730,3 +730,51 @@ fn lists_are_folded_without_holding_the_collection() {
         assert!(store.decoded_documents() < ORDERS / 2, "{} held after", store.decoded_documents());
     }
 }
+
+/// A sort cut to a few rows reads only the rows that can be among those
+/// kept, and a count of rows that pass a filter keeps none of them. With
+/// most rows not held, both answer as a store that holds every row does:
+/// with an offset, with keys that tie, descending, and when so many rows
+/// tie that nothing is saved.
+#[test]
+fn cut_sorts_and_counts_do_not_need_the_collection() {
+    let questions = [
+        r#"orders.sort { .total.asc, .id.asc }.offset(150).limit(7).select { id, total }"#,
+        r#"orders.sort { .total.desc, .id.asc }.limit(5).select { id, total }"#,
+        r#"orders.sort { .status.asc, .id.desc }.offset(3).limit(9).select { id, status }"#,
+        r#"orders.sort { .status.desc, .total.asc, .id.asc }.offset(140).limit(6).select { id }"#,
+        r#"orders.sort { .id.asc }.offset(390).limit(20).select { id }"#,
+        r#"customers.sort { .tier.asc, .id.asc }.offset(18).limit(4).select { id, tier }"#,
+        r#"customers.sort { .name.desc }.offset(2).limit(3)"#,
+        r#"orders.where { .items.where { .qty > 2 }.count() >= 1 }.count()"#,
+        r#"orders.where { .status == "paid" && .items.where { .sku == "s3" }.exists() }.count()"#,
+        r#"customers.where { .orders.where { .total > 300 }.count() > 2 }.count()"#,
+    ];
+    let home = TempDir::new().unwrap();
+    let (plain, _) = reference(home.path());
+    let expected: Vec<_> = questions.iter().map(|question| rows(&plain, question)).collect();
+    for (question, answer) in questions.iter().zip(&expected) {
+        assert!(answer.as_ref().is_ok_and(|rows| !rows.is_empty()), "{question}: {answer:?}");
+    }
+
+    let store = Arc::new(RustStore::new(home.path().join("short.owl"), SIZE).unwrap());
+    store.set_decoded_bytes_budget(Some(64 << 10)).unwrap();
+    load(&store);
+    for compacted in [false, true] {
+        store.checkpoint().unwrap();
+        if compacted {
+            store.compact().unwrap();
+        }
+        // Twice over: the second time the columns are kept from the first.
+        for round in 0..2 {
+            for (question, expected) in questions.iter().zip(&expected) {
+                assert_eq!(
+                    &rows(&store, question),
+                    expected,
+                    "compacted {compacted}, round {round}: {question}"
+                );
+            }
+        }
+        assert!(store.decoded_documents() < ORDERS / 2, "{} held", store.decoded_documents());
+    }
+}
