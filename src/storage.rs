@@ -771,6 +771,15 @@ pub trait DocumentStore: Send + Sync + 'static {
     fn scan_columns(&self, _schema: &str, _fields: &[String]) -> OQLResult<Option<Vec<ColumnBatch>>> {
         Ok(None)
     }
+    /// [`Self::scan_columns`], for a caller whose only other way is to
+    /// read every row: when the columns are more than the store may keep
+    /// between queries, it makes them all the same, gives them for this
+    /// once and lets them go. Making them is a pass over the collection,
+    /// so a caller with a cheaper way, such as an index, asks
+    /// `scan_columns` and takes its `None`.
+    fn scan_columns_for_once(&self, schema: &str, fields: &[String]) -> OQLResult<Option<Vec<ColumnBatch>>> {
+        self.scan_columns(schema, fields)
+    }
     /// Something the caller made from columns stamped `stamp`, kept under
     /// `key` for as long as those columns are good. `None` when nothing was
     /// kept, or something has been committed since.

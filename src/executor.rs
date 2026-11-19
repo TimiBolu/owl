@@ -1597,14 +1597,19 @@ impl<S: DocumentStore> QueryExecutor<S> {
             // With the rows when the store holds them all; the columns
             // alone when it does not, and then only the rows the columns
             // leave are fetched.
+            // A sort cut to a few rows with no filter has no other way
+            // than reading every row, so it takes columns the store makes
+            // for it alone. A filter may have an index to go by.
+            let alone_for_a_cut = names.is_empty() && cut.is_some();
             let columns = match self.store.scan_rows_and_columns(&query.collection, &asked)? {
                 Some((rows, batch)) => Some((Some(rows), batch)),
-                None => self
-                    .store
-                    .scan_columns(&query.collection, &asked)?
-                    .filter(|batches| batches.len() == 1)
-                    .and_then(|mut batches| batches.pop())
-                    .map(|batch| (None, batch)),
+                None => match alone_for_a_cut {
+                    true => self.store.scan_columns_for_once(&query.collection, &asked)?,
+                    false => self.store.scan_columns(&query.collection, &asked)?,
+                }
+                .filter(|batches| batches.len() == 1)
+                .and_then(|mut batches| batches.pop())
+                .map(|batch| (None, batch)),
             };
             if let Some((rows, batch)) = columns {
                 let mut chosen: Vec<u32> = Vec::new();
