@@ -689,3 +689,44 @@ fn a_log_is_replayed_over_records_left_on_file() {
         store.verify_integrity().unwrap();
     }
 }
+
+/// The elements of a list every row holds are folded as the rows are read.
+/// When the store holds only some of the rows, they are read a bounded
+/// number at a time, and the answers are those of a store that holds them
+/// all.
+#[test]
+fn lists_are_folded_without_holding_the_collection() {
+    let questions = [
+        r#"orders.items.group_by { .sku }.select { sku, lines: count(), units: sum(.qty) }.sort { .sku.asc }"#,
+        r#"orders.where { .status == "void" }.items.group_by { .sku }.select { sku, units: sum(.qty) }.sort { .sku.asc }"#,
+        r#"orders.items.group_by { status: orders.status, sku: .sku }.select { status, sku, units: sum(.qty) }.sort { .status.asc, .sku.asc }"#,
+        r#"orders.items.group_by { .qty }.select { qty, n: count() }.sort { .qty.asc }"#,
+    ];
+    let home = TempDir::new().unwrap();
+    let (plain, _) = reference(home.path());
+    let expected: Vec<_> = questions.iter().map(|question| rows(&plain, question)).collect();
+    for answer in &expected {
+        assert!(answer.as_ref().is_ok_and(|rows| !rows.is_empty()), "{answer:?}");
+    }
+
+    let store = Arc::new(RustStore::new(home.path().join("short.owl"), SIZE).unwrap());
+    store.set_decoded_bytes_budget(Some(64 << 10)).unwrap();
+    load(&store);
+    for compacted in [false, true] {
+        store.checkpoint().unwrap();
+        if compacted {
+            store.compact().unwrap();
+        }
+        // Far fewer rows are held than the collection has.
+        assert!(store.decoded_documents() < ORDERS / 2, "{} held", store.decoded_documents());
+        for (question, expected) in questions.iter().zip(&expected) {
+            let before = owl_db::executor::column_scans_run();
+            assert_eq!(&rows(&store, question), expected, "compacted {compacted}: {question}");
+            assert!(
+                owl_db::executor::column_scans_run() > before,
+                "compacted {compacted}: answered the long way: {question}"
+            );
+        }
+        assert!(store.decoded_documents() < ORDERS / 2, "{} held after", store.decoded_documents());
+    }
+}

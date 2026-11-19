@@ -190,7 +190,6 @@ budget, measured with `gauntlet memory --people 20000`:
 | Held after every query has run | 61 MB |
 | At most during the first compaction | 249 MB |
 | At most during a compaction of the compacted database | 126 MB |
-| At most during the worst query (`g14_unwind_with_parent`) | 637 MB |
 
 What is held is near the budget plus about 45 MB the budget does not cover:
 bookkeeping for every row outside the column segments, which grows with the
@@ -203,9 +202,16 @@ is built. What still grows with the data is the bookkeeping for every row
 outside the column segments: its id, its schema version, its index and
 change entries. A database not yet compacted has most of its rows in that
 form (114 MB held at this size, against 54 MB once compacted), and a
-compaction holds a second copy of it in the base it rebuilds. Eight queries copy every row they
-touch. With so small a share for kept columns, the whole run also took
-several times as long as with the earlier, looser limits.
+compaction holds a second copy of it in the base it rebuilds. 
+
+Queries are not there either. Grouping the elements of a list every row
+holds (`g14`, `h16`, `h17`) reads the rows a bounded number at a time and no
+longer needs the collection in memory; at ten times the data those three
+had needed 637, 515 and 341 MB. What needs the most now are sorts and
+running windows over a whole collection (`g13`, `g12`, `h19`, `g18`), which
+hold every row they order: about 60 MB each at twice the data. With so small
+a share for kept columns, the whole run also took several times as long as
+with the earlier, looser limits.
 
 A compaction keeps the copy it replaced, as something to fall back to;
 `compact_and_reclaim` removes it once the new one has been read back and

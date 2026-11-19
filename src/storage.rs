@@ -726,6 +726,22 @@ pub trait DocumentStore: Send + Sync + 'static {
     fn scan_documents_shared(&self, _schema: &str) -> OQLResult<Option<Vec<Arc<Document>>>> {
         Ok(None)
     }
+    /// Show `visit` every document of a collection, in the order
+    /// `scan_documents` gives, a bounded number at a time, so that reading
+    /// a collection does not need all of it in memory at once. `visit`
+    /// returns whether to go on.
+    ///
+    /// `Some(true)` when every document was shown, `Some(false)` when
+    /// `visit` stopped it. `None` when the store cannot do this, or the
+    /// collection was written to part way through: what the caller made
+    /// of the documents shown so far is then of no use to it.
+    fn scan_documents_in_chunks(
+        &self,
+        _schema: &str,
+        _visit: &mut dyn FnMut(&[Arc<Document>]) -> OQLResult<bool>,
+    ) -> OQLResult<Option<bool>> {
+        Ok(None)
+    }
     /// How many documents a collection holds, when the store knows without
     /// reading them.
     fn collection_len(&self, _schema: &str) -> OQLResult<Option<usize>> {

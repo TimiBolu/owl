@@ -2732,14 +2732,6 @@ impl<S: DocumentStore> QueryExecutor<S> {
             false => self.fold_columns(&query.collection, &plan.fields, &filters)?,
             true => None,
         };
-        // The rows whose lists are read, as the store holds them.
-        let holders: Vec<Arc<Document>> = match &unwound {
-            Some(_) => match self.store.scan_documents_shared(&query.collection)? {
-                Some(rows) => rows,
-                None => return Ok(None),
-            },
-            None => Vec::new(),
-        };
         let outer_values: std::cell::RefCell<Vec<Value>> = std::cell::RefCell::new(Vec::new());
         let itself: std::cell::RefCell<Value> = std::cell::RefCell::new(Value::Null);
         let batches = match (&columns, &unwound) {
@@ -2874,14 +2866,17 @@ impl<S: DocumentStore> QueryExecutor<S> {
         };
         if let Some(list) = &unwound {
             let wants_itself = plan.keys.iter().any(|key| matches!(key, RowInput::Itself));
-            'holders: for holder in &holders {
+            let fields = plan.fields.len();
+            // What is done with one row whose list is read. `false` when
+            // this way of answering cannot go on.
+            let mut one_holder = |holder: &Document| -> OQLResult<bool> {
                 for condition in &of_rows {
                     if !self.evaluate_condition(holder, condition)? {
-                        continue 'holders;
+                        return Ok(true);
                     }
                 }
                 let Some(Value::List(items)) = holder.fields.get(list) else {
-                    continue;
+                    return Ok(true);
                 };
                 if !outers.is_empty() {
                     let mut outer = outer_values.borrow_mut();
@@ -2890,6 +2885,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                         outer.push(self.get_field_value(holder, &FieldAccess { path: vec![name.clone()] })?);
                     }
                 }
+                let mut current: Vec<Option<ProjectedValueRef<'_>>> = vec![None; fields];
                 for item in items {
                     match item {
                         Value::Object(fields) => {
@@ -2899,7 +2895,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                         }
                         // What a list within a list, or a gap in one, means
                         // is for the general way to say.
-                        Value::List(_) | Value::Null => return Ok(None),
+                        Value::List(_) | Value::Null => return Ok(false),
                         _ => current.iter_mut().for_each(|value| *value = None),
                     }
                     if wants_itself {
@@ -2921,6 +2917,35 @@ impl<S: DocumentStore> QueryExecutor<S> {
                         }
                     }
                     if !each(&current, &scratch)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            };
+            // The rows as the store holds them, when it holds them all.
+            // When it does not, they are read a bounded number at a time,
+            // so that the lists of a large collection are folded without
+            // the collection ever being in memory.
+            match self.store.scan_documents_shared(&query.collection)? {
+                Some(holders) => {
+                    for holder in &holders {
+                        if !one_holder(holder)? {
+                            return Ok(None);
+                        }
+                    }
+                }
+                None => {
+                    let mut went_on = true;
+                    let shown = self.store.scan_documents_in_chunks(&query.collection, &mut |holders| {
+                        for holder in holders {
+                            if !one_holder(holder)? {
+                                went_on = false;
+                                return Ok(false);
+                            }
+                        }
+                        Ok(true)
+                    })?;
+                    if shown != Some(true) || !went_on {
                         return Ok(None);
                     }
                 }
