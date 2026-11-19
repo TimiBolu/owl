@@ -246,6 +246,11 @@ impl ColumnBatch {
         self.stamp
     }
 
+    /// How many fields' columns the batch holds.
+    pub fn fields(&self) -> usize {
+        self.columns.len()
+    }
+
     /// How many rows the batch holds. Row `n` of every column is the same
     /// row: the `n`th the store gives when asked for the collection's rows.
     pub fn rows(&self) -> usize {
