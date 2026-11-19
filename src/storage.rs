@@ -734,7 +734,9 @@ pub trait DocumentStore: Send + Sync + 'static {
     /// Show `visit` every document of a collection, in the order
     /// `scan_documents` gives, a bounded number at a time, so that reading
     /// a collection does not need all of it in memory at once. `visit`
-    /// returns whether to go on.
+    /// returns whether to go on. With `fields`, a document read from its
+    /// record may hold only those fields; one the store already holds is
+    /// shown whole.
     ///
     /// `Some(true)` when every document was shown, `Some(false)` when
     /// `visit` stopped it. `None` when the store cannot do this, or the
@@ -743,6 +745,7 @@ pub trait DocumentStore: Send + Sync + 'static {
     fn scan_documents_in_chunks(
         &self,
         _schema: &str,
+        _fields: Option<&[String]>,
         _visit: &mut dyn FnMut(&[Arc<Document>]) -> OQLResult<bool>,
     ) -> OQLResult<Option<bool>> {
         Ok(None)
