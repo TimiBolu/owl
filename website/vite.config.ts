@@ -21,7 +21,12 @@ export default defineConfig({
       routeRules: {
         // Pages: always revalidate, so a deploy shows up at once.
         "/**": { headers: { ...SECURITY_HEADERS, "cache-control": "no-cache" } },
-        "/favicon.svg": { headers: { ...SECURITY_HEADERS, "cache-control": "public, max-age=86400" } },
+        // Unhashed public files: cache for a day.
+        ...Object.fromEntries(
+          ["/og-image.png", "/logo.png", "/favicon.ico", "/favicon.svg", "/apple-touch-icon.png", "/icon-192.png", "/icon-512.png", "/site.webmanifest", "/llms.txt"].map(
+            (path) => [path, { headers: { ...SECURITY_HEADERS, "cache-control": "public, max-age=86400" } }],
+          ),
+        ),
         "/assets/**": { headers: { ...SECURITY_HEADERS, "cache-control": "public, max-age=31536000, immutable" } },
         "/health-check": { headers: { "cache-control": "no-store", "x-robots-tag": "noindex, nofollow, noarchive" } },
       },

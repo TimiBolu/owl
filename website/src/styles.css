@@ -728,3 +728,8 @@ h3 { margin: 0 0 10px; font: 800 21px/1.2 var(--body); }
 }
 .wrow { max-height: 54px; }
 .wrow .stayed { text-decoration: underline dashed 2px; text-underline-offset: 4px; }
+
+/* ---------- Footer links ---------- */
+.foot-nav { flex-basis: 100%; display: flex; flex-wrap: wrap; gap: 10px 22px; margin-bottom: 14px; }
+.foot-nav a { text-decoration: none; border-bottom: 2px solid transparent; padding-bottom: 2px; }
+.foot-nav a:hover, .foot-nav a:focus-visible { border-bottom-color: var(--ink); }

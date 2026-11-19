@@ -1,0 +1,88 @@
+# Owl
+
+> Owl is an object-graph database written in Rust. References between objects are part of the data model, so a query follows them with a dot instead of joining tables. It has its own query language, OQL, a storage engine with no other database underneath, and an HTTP server. It is under active development and not yet suitable for production data.
+
+## The idea
+
+If your data is already a graph of objects that point at each other, the database should let you query it that way. `orders.customer.name` is a path you walk, not a join you write.
+
+## The language, OQL
+
+A query starts from a collection and applies steps. The same steps work on a top-level collection, a list inside a document, and a relationship followed backwards.
+
+```oql
+orders
+  .where { .status == "paid" }
+  .sort { .total.desc }
+  .limit(3)
+  .select { id, who: .customer.name, total }
+```
+
+- Steps: `where`, `select`, `sort`, `limit`, `offset`, `group_by`, `having`, `count`, `sum`, `avg`, `min`, `max`, `first`, `nearest`.
+- Forward reference: `.customer.name`. Reverse reference: `.orders` on a customer, derived from the schema with its own index.
+- Recursion: `.walk(.children)` follows a relationship to any depth.
+- Row positions: `partition_by`, `row_number()`, `rank()`, `prev()`, `so_far()`.
+- Values enter a query as `$name` parameters and are never read as query text.
+
+## Two forms of the same query
+
+Every query can be written as a chain or as a block. They mean the same thing. A block can also name a value once and reuse it.
+
+```oql
+customers {
+  paid = .orders.where { .status == "paid" }
+  spent = paid.sum(.total)
+
+  where { spent > 80 }
+  select { name, orders: paid.count(), spent: spent }
+}
+```
+
+## Functions
+
+Functions are written in OQL and kept in the database. One can take a row, a value or a whole collection, and can return a value or a collection that chains like a built-in step.
+
+```oql
+fn spent(c: customers) {
+  c.orders.where { .status == "paid" }.sum(.total)
+}
+
+customers.select { name, spent: spent(*) }
+```
+
+## Writing data and rules
+
+```oql
+customers.insert { id: "chen", name: "Chen", email: "chen@shop.test" }
+products.where { .id == "kettle" && .stock > 0 }.update { stock -= 1 }
+customers.upsert on id { id: "chen", name: "Chen W." }
+orders.where { .status == "cancelled" }.delete()
+```
+
+A schema declares its rules: `unique`, `check(.price >= 0)`, `Ref(customers)` and `on delete cascade`. Owl refuses any write that would break one. A single statement is atomic, and a `transaction { ... }` block makes several statements succeed or fail together.
+
+## The engine
+
+- Every object has a stable 64-bit identity that is not a file position, so data can move without rewriting references.
+- Records are compiled from the schema: field names are stored once, and a query decodes only the fields it asks for.
+- Every commit is checksummed and synced to a write-ahead log; recovery loads the last checkpoint and replays the rest.
+- Indexes: ordered, unique, composite, a reverse index for every reference, and vector search.
+
+## What Owl is not, today
+
+- It runs on one machine. The clustering code is experimental.
+- Writes are applied one at a time.
+- It has no syntax yet for changing a schema.
+
+## Running it
+
+```bash
+cargo run --release -p owl-server -- --data shop.owl
+curl 127.0.0.1:7878/v1/query --json '{"query": "orders.count()"}'
+```
+
+## Links
+
+- [Home](https://owldb.tech/)
+- [Source code](https://github.com/TimiBolu/owl)
+- [Sitemap](https://owldb.tech/sitemap.xml)

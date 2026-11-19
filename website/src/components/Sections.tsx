@@ -1,5 +1,5 @@
 import type { CSSProperties } from "react";
-import { GITHUB_URL } from "../lib/seo";
+import { GITHUB_URL, SECTIONS } from "../lib/seo";
 
 const SENTENCE = "Every reference is a path you can walk. No joins. No second language for lists.";
 
@@ -257,6 +257,16 @@ export function Start() {
 export function Footer() {
   return (
     <footer className="foot">
+      <nav className="foot-nav" aria-label="Sections of this page">
+        {SECTIONS.map(([id, name]) => (
+          <a key={id} href={`#${id}`}>
+            {name}
+          </a>
+        ))}
+        <a href={GITHUB_URL} target="_blank" rel="noopener noreferrer">
+          GitHub
+        </a>
+      </nav>
       <span>owl</span>
       <span>An object-graph database, written in Rust. Still awake.</span>
     </footer>

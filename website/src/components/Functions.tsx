@@ -1,3 +1,4 @@
+import { Offstage } from "./Offstage";
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { CUSTOMERS, ORDERS } from "../lib/shop";
@@ -238,6 +239,17 @@ function Kinds() {
         ))}
       </div>
       <h3 className="tour-title">{kind.title}</h3>
+      {KINDS.map((other, i) =>
+        i === at ? null : (
+          <Offstage
+            key={other.name}
+            title={other.title}
+            code={[other.define, other.use]}
+            notes={[other.about, `Good for: ${other.goodFor.join(", ")}.`]}
+            answer={other.answer}
+          />
+        ),
+      )}
       <div className="kinds-stage">
         <div className="kinds-left">
           <div className="code-card form-code">
