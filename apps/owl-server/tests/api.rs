@@ -228,6 +228,38 @@ async fn values_travel_as_parameters_not_as_query_text() {
 }
 
 #[tokio::test]
+async fn a_running_total_needs_no_parameter() {
+    let service = Service::with_shop().await;
+    service.seed().await;
+    // `so_far()` is carried inside the query under a `$` name of Owl's own,
+    // which is not a parameter the caller owes a value for.
+    let rows = service
+        .rows("orders.sort { .id.asc }.select { id, running: so_far().total.sum() }")
+        .await;
+    assert_eq!(rows, vec![json!({ "id": "o1", "running": 12.5 }), json!({ "id": "o2", "running": 52.5 })]);
+
+    let answer = service
+        .ok(
+            "/v1/query",
+            json!({
+                "query": "orders.where { .total >= $least }.sort { .id.asc }.select { id, running: so_far().total.sum() }",
+                "params": { "least": 20 }
+            }),
+        )
+        .await;
+    assert_eq!(answer["rows"], json!([{ "id": "o2", "running": 40.0 }]));
+
+    // A parameter that really is missing is still refused.
+    let (status, body) = service
+        .post(
+            "/v1/query",
+            json!({ "query": "orders.where { .total >= $least }.select { id, running: so_far().total.sum() }" }),
+        )
+        .await;
+    assert_eq!((status, code(&body)), (StatusCode::BAD_REQUEST, "invalid_request"), "{body}");
+}
+
+#[tokio::test]
 async fn what_owl_refuses_is_reported_with_a_code() {
     let service = Service::with_shop().await;
     service.seed().await;

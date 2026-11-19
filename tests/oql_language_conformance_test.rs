@@ -797,6 +797,73 @@ fn parameters_carry_values_into_a_fixed_query() {
 }
 
 #[test]
+fn the_parsers_own_names_are_not_parameters() {
+    let db = twin_collections();
+    let nothing = HashMap::new();
+
+    // `so_far()`, a receiver-less operation and an omitted field are carried
+    // as `$` names of the parser's own. None of them asks the host for a value.
+    for text in [
+        "typed.sort { .id.asc }.select { id, running: so_far().qty.sum() }",
+        "typed.select { n: count(), some: where { .qty > 0 }.count() }",
+        "typed.sort { .id.asc }.select { *, -label }",
+    ] {
+        let query = parse_oql(text).unwrap();
+        assert!(owl_db::query_parameters(&query).is_empty(), "{text}");
+        let bound = bind_parameters(&query, &nothing).unwrap();
+        assert_eq!(bound, query, "{text}");
+        let fields = |query| -> Vec<_> {
+            let rows: Vec<Document> = db.executor.execute_query(query).unwrap();
+            rows.into_iter().map(|row| row.fields).collect()
+        };
+        assert_eq!(fields(&bound), fields(&query), "{text}");
+    }
+
+    // A value under one of those names is ignored, not spliced in.
+    let running = parse_oql("typed.sort { .id.asc }.select { id, running: so_far().qty.sum() }")
+        .unwrap();
+    let bound = bind_parameters(
+        &running,
+        &HashMap::from([("so_far".to_string(), Value::Integer(1))]),
+    )
+    .unwrap();
+    assert_eq!(bound, running);
+
+    // Beside a real parameter, only the real one is asked for.
+    let mixed = parse_oql(
+        "typed.where { .qty > $min }.sort { .id.asc }.select { id, running: so_far().qty.sum() }",
+    )
+    .unwrap();
+    assert_eq!(
+        owl_db::query_parameters(&mixed).into_iter().collect::<Vec<_>>(),
+        ["min"]
+    );
+    let missing = bind_parameters(&mixed, &nothing).unwrap_err();
+    assert!(missing.contains("$min") && !missing.contains("so_far"), "{missing}");
+    let bound = bind_parameters(
+        &mixed,
+        &HashMap::from([("min".to_string(), Value::Integer(-1000))]),
+    )
+    .unwrap();
+    let fields = |query| -> Vec<_> {
+        let rows: Vec<Document> = db.executor.execute_query(query).unwrap();
+        rows.into_iter().map(|row| row.fields).collect()
+    };
+    assert_eq!(fields(&bound), fields(&running));
+    assert_eq!(fields(&bound).len(), 5);
+
+    // Written as a parameter, such a name is refused rather than read as the marker.
+    for text in [
+        "typed.where { .qty > $so_far }",
+        "typed.where { .qty > $rows }",
+        "typed.select { id, x: $omit }",
+    ] {
+        let error = parse_oql(text).unwrap_err().to_string();
+        assert!(error.contains("keeps for itself"), "{text}: {error}");
+    }
+}
+
+#[test]
 fn a_script_value_satisfies_a_parameter_of_the_same_name() {
     let db = Db::new();
     let file = parse_oql_file(
