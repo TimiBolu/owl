@@ -1,6 +1,6 @@
 use super::checkpoint::{
     cleanup_typed_locator_spools, decode_segment_file, open_typed_segment_handles,
-    write_segment_file, BaseSegmentHandle, CheckpointImage, IndexSorter, RecordSpool, CheckpointIndex, CheckpointInfo,
+    write_segment_file, BaseSegmentHandle, CheckpointImage, IndexSorter, RecordSpool, SegmentSpool, CheckpointIndex, CheckpointInfo,
     CheckpointMetadata, DecodedCheckpoint, FileIndexBase, IndexPageDescriptor, Manifest,
     PublishedIndexPages, SegmentIndexReader, SegmentVerification, TypedLocatorLeaf,
     TypedSegmentFileDescriptor, TypedSegmentHandle,
@@ -3498,6 +3498,7 @@ impl StoreCore {
                 .records
                 .len()
                 .saturating_add(image.record_spool.as_ref().map_or(0, |spool| spool.len()))
+                .saturating_add(image.segment_spool.as_ref().map_or(0, |spool| spool.rows()))
                 .saturating_add(
                 image
                     .typed_segments
@@ -6435,6 +6436,7 @@ fn checkpoint_image_with_records(
     );
     records.retain(|(object_ref, _)| !authoritative_rows.contains(object_ref));
     Ok(CheckpointImage {
+        segment_spool: None,
         record_spool: None,
         sequence,
         checkpoint_lsn: state.committed_lsn,
@@ -6577,7 +6579,11 @@ fn checkpoint_image_from_compaction(
         plan.filesystem.clone(),
         sidecar_path(&plan.manifest_path, "records"),
     )?;
-    let mut typed_segments = Vec::<Arc<[u8]>>::new();
+    // So do the column segments, each as it is built.
+    let mut typed_segments = SegmentSpool::create(
+        plan.filesystem.clone(),
+        sidecar_path(&plan.manifest_path, "segments"),
+    )?;
     // Index entries are sorted on disk a bounded amount at a time, and
     // come back as encoded pages: every declared index, then the index of
     // what refers to what.
@@ -6745,13 +6751,14 @@ fn checkpoint_image_from_compaction(
     let indexes = index_entries.finish()?;
 
     Ok(CheckpointImage {
+        segment_spool: Some(Arc::new(typed_segments.finish()?)),
         record_spool: Some(Arc::new(records.finish()?)),
         sequence,
         checkpoint_lsn: state.committed_lsn,
         metadata: checkpoint_metadata_from_state(state),
         records: Vec::new(),
         indexes,
-        typed_segments,
+        typed_segments: Vec::new(),
     })
 }
 
@@ -6783,7 +6790,7 @@ fn flush_compaction_typed_chunk(
     state: &State,
     schema_name: &str,
     chunk: &mut Vec<CompactionRow>,
-    typed_segments: &mut Vec<Arc<[u8]>>,
+    typed_segments: &mut SegmentSpool,
     records: &mut RecordSpool,
 ) -> OQLResult<()> {
     if chunk.is_empty() {
@@ -6821,7 +6828,7 @@ fn flush_compaction_typed_chunk(
         .collect::<Vec<_>>();
     let segment = TypedSegment::build(compiled, schema, &rows)?;
     if segment.authoritative {
-        typed_segments.push(Arc::from(segment.encode()?));
+        typed_segments.push(&segment.encode()?)?;
     } else {
         for row in chunk.iter() {
             records.push(
