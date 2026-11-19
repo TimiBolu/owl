@@ -269,8 +269,8 @@ export function Join() {
           Help it grow.
         </h2>
         <p className="sub">
-          Owl is being built in the open, and it is early. If you like where it is going, here are three ways to help,
-          from ten seconds to a weekend.
+          Owl is open source under the MIT license, and it is early. If you like where it is going, here are three ways
+          to help, from ten seconds to a weekend.
         </p>
 
         <div className="join-cards">
@@ -328,7 +328,7 @@ export function Footer() {
         </a>
       </nav>
       <span>owl</span>
-      <span>An object-graph database, written in Rust. Still awake.</span>
+      <span>An object-graph database, written in Rust. MIT licensed. Still awake.</span>
     </footer>
   );
 }

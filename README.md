@@ -406,8 +406,8 @@ suite targets Log, Ledger, Game, and Commerce workload profiles.
 
 ## Help Owl grow
 
-Owl is early and built in the open. There are three ways to help, from ten
-seconds to a weekend.
+Owl is early, and it is open source under the [MIT license](LICENSE). There
+are three ways to help, from ten seconds to a weekend.
 
 **Star it.** A star costs nothing, and it is how other people come across a
 project this new.
@@ -441,3 +441,9 @@ cargo test --test oql_language_conformance_test --test oql_dual_representation_t
 A change to what a query means should come with a test in
 `tests/oql_language_conformance_test.rs`. A change to the HTTP interface
 should come with one in `apps/owl-server/tests`.
+
+## License
+
+Owl is released under the [MIT license](LICENSE). You may use, change and
+share it, including in commercial work, as long as the license text stays with
+it.

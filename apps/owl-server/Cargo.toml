@@ -2,6 +2,7 @@
 name = "owl-server"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 description = "Owl as a network service: OQL, prepared inserts and transactions over HTTP"
 
 [lib]

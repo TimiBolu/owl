@@ -81,6 +81,10 @@ cargo run --release -p owl-server -- --data shop.owl
 curl 127.0.0.1:7878/v1/query --json '{"query": "orders.count()"}'
 ```
 
+## License
+
+Owl is open source under the MIT license.
+
 ## Links
 
 - [Home](https://owldb.tech/)
