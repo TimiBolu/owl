@@ -1,0 +1,16 @@
+.git
+.env
+.env.*
+.preview
+**/.env
+**/.env.*
+**/.preview
+**/node_modules
+**/dist
+**/.output
+**/.nitro
+**/.tanstack
+**/.cache
+.DS_Store
+**/.DS_Store
+*.log
