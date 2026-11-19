@@ -1,3 +1,4 @@
+import { Offstage } from "./Offstage";
 import { useEffect, useRef, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 
@@ -118,6 +119,9 @@ function Verbs() {
         ))}
       </div>
       <h3 className="tour-title">{verb.title}</h3>
+      {VERBS.map((other, i) =>
+        i === at ? null : <Offstage key={other.name} title={other.title} code={[other.code]} notes={[other.about]} answer={[other.answer]} />,
+      )}
       <div className="kinds-stage">
         <div className="code-card form-code verb-code">
           <span className="form-tag">You write</span>
@@ -245,6 +249,16 @@ function Rules() {
       </div>
       <div className="guard-right">
         <p className="guard-label">Try to break it</p>
+        {TRIES.map((other, i) =>
+          i === at ? null : (
+            <Offstage
+              key={other.label}
+              title={other.label}
+              code={[other.code]}
+              notes={[other.refused ? `Refused. Owl says: ${other.says}` : other.says]}
+            />
+          ),
+        )}
         <div className="guard-tries">
           {TRIES.map((t, i) => (
             <button key={t.label} className={i === at ? "on" : ""} onClick={() => setAt(i)}>

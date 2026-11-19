@@ -13,7 +13,8 @@ middleware/            www → apex 308, noindex on every non-canonical host
 src/routes/            index, health-check, robots.txt, sitemap.xml (and the 404 in __root)
 src/components/        Hero (owl, draggable graph), Language (tabs), Sections (the rest)
 src/lib/usePlay.ts     everything that moves after load; the page is complete without it
-src/lib/seo.ts         titles, description, and CANONICAL_HOST
+src/lib/seo.ts         titles, descriptions, share text, JSON-LD and CANONICAL_HOST
+scripts/og/            renders public/og-image.png and the icons
 ```
 
 ## Local
@@ -51,3 +52,13 @@ Keep the `_pubp-challenge` TXT records.
 
 `CANONICAL_HOST` in `src/lib/seo.ts` is the only host search engines may index. Every other
 host answers with `X-Robots-Tag: noindex`.
+
+## SEO and sharing
+
+- One canonical origin, `https://owldb.tech/`. `www` gets a 308 redirect, and pubp preview hosts answer with `X-Robots-Tag: noindex`.
+- The page has a title, a description, a canonical link and a robots meta tag, plus Open Graph and Twitter tags with a 1200×630 image. That image is what WhatsApp, Slack and X show when the link is shared.
+- JSON-LD in `src/lib/seo.ts`: WebSite, WebPage (with each section as a part) and the software itself.
+- The site serves `robots.txt`, `sitemap.xml` (with the image), `llms.txt`, a web manifest and icons.
+- Every tab's content is in the HTML even when another tab is showing (`src/components/Offstage.tsx`), so a crawler reads all of it.
+- Fonts are self-hosted and the two used on the first screen are preloaded.
+- After changing `scripts/og/og.html` or the favicon, run `scripts/og/build-images.sh`.

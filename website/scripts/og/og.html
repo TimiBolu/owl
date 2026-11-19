@@ -1,0 +1,52 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+@font-face{font-family:'Anton';src:url("../../node_modules/@fontsource/anton/files/anton-latin-400-normal.woff2")}
+@font-face{font-family:'Lexend';font-weight:100 900;src:url("../../node_modules/@fontsource-variable/lexend/files/lexend-latin-wght-normal.woff2")}
+@font-face{font-family:'JB';font-weight:100 800;src:url("../../node_modules/@fontsource-variable/jetbrains-mono/files/jetbrains-mono-latin-wght-normal.woff2")}
+html,body{margin:0;width:1200px;height:630px;overflow:hidden}
+body{position:relative;background:#e9e0c9;color:#14120f;font-family:'Lexend',sans-serif}
+.hills{position:absolute;left:0;right:0;bottom:0;width:1200px;height:330px}
+.brand{position:absolute;left:64px;top:52px;display:flex;align-items:center;background:#14120f;color:#e9e0c9;font:400 38px/1 'Anton';letter-spacing:.04em;padding:9px 16px 10px}
+.brand i{display:grid;place-items:center;width:32px;height:32px;margin-right:4px;border-radius:50%;background:#e9e0c9}
+.brand i::after{content:"";width:13px;height:13px;border-radius:50%;background:#14120f}
+.tag{position:absolute;right:64px;top:62px;font:600 19px/1 'JB';letter-spacing:.14em;text-transform:uppercase}
+h1{position:absolute;left:58px;top:150px;margin:0;display:flex;flex-direction:column;align-items:flex-start;font:400 92px/.95 'Anton';text-transform:uppercase}
+h1 span{position:relative;display:inline-block;background:#14120f;color:#e9e0c9;padding:8px 20px 10px;margin-top:-4px}
+h1 span:nth-child(1){transform:rotate(-1.2deg);clip-path:polygon(0 4%,99% 0,100% 96%,1% 100%)}
+h1 span:nth-child(2){transform:rotate(.6deg);clip-path:polygon(1% 0,100% 3%,98.5% 100%,0 97%);z-index:1}
+h1 span:nth-child(3){transform:rotate(-.5deg);clip-path:polygon(0 2%,98% 0,100% 100%,1.5% 98%)}
+h1 span::after{content:"";position:absolute;height:24px;background:#f2c230;opacity:.92}
+h1 span:nth-child(1)::after{left:-12px;top:30%;width:60px;transform:rotate(-8deg)}
+h1 span:nth-child(2)::after{right:-14px;top:46%;width:66px;transform:rotate(5deg)}
+h1 span:nth-child(3)::after{left:-10px;bottom:16%;width:50px;transform:rotate(-4deg)}
+.chips{position:absolute;left:64px;top:476px;display:flex;align-items:center;font:600 24px/1 'JB'}
+.chips span{padding:11px 17px;border:3px solid #14120f;border-radius:999px;background:#f4eedd}
+.chips span:last-child{background:#f2c230}
+.chips i{width:26px;height:3px;background:#14120f}
+.foot{position:absolute;left:66px;bottom:40px;margin:0;font-size:25px;font-weight:300}
+.foot b{font-weight:800}
+.owl{position:absolute;right:70px;bottom:0;width:300px}
+</style></head>
+<body>
+<svg class="hills" viewBox="0 0 1600 500" preserveAspectRatio="none">
+  <path d="M0 260 L140 210 L300 250 L470 180 L640 240 L820 200 L1000 150 L1180 215 L1360 170 L1600 230 L1600 500 L0 500Z" fill="#14120f" opacity=".07"/>
+  <path d="M0 320 L200 270 L380 310 L560 260 L760 330 L940 280 L1150 325 L1330 265 L1600 315 L1600 500 L0 500Z" fill="#14120f" opacity=".09"/>
+  <path d="M0 400 C300 370 520 420 800 392 C1100 362 1340 418 1600 386 L1600 500 L0 500Z" fill="#14120f" opacity=".06"/>
+</svg>
+<div class="brand"><i></i>WL</div>
+<div class="tag">An object-graph database</div>
+<h1><span>Your data is</span><span>already a graph.</span><span>Query it that way.</span></h1>
+<div class="chips"><span>orders</span><i></i><span>customer</span><i></i><span>name</span></div>
+<p class="foot"><b>owldb.tech</b> · follow references, never write a join</p>
+<svg class="owl" viewBox="-60 0 360 300" overflow="visible">
+  <path d="M-260 266 C-80 248 110 276 240 260 S 420 250 520 262" fill="none" stroke="#14120f" stroke-width="9" stroke-linecap="round"/>
+  <path d="M62 72 L48 20 L98 50Z M178 72 L192 20 L142 50Z" fill="#14120f"/>
+  <path d="M120 40 C60 40 44 95 46 150 C48 215 80 258 120 258 C160 258 192 215 194 150 C196 95 180 40 120 40Z" fill="#14120f"/>
+  <path d="M60 150 C58 200 78 234 100 249 M180 150 C182 200 162 234 140 249 M98 178 q11 11 22 0 q11 11 22 0 M109 200 q11 11 22 0 M98 222 q11 11 22 0 q11 11 22 0" fill="none" stroke="#e9e0c9" stroke-width="2.5" stroke-linecap="round" opacity=".4"/>
+  <circle cx="90" cy="108" r="31" fill="#f4eedd"/><circle cx="150" cy="108" r="31" fill="#f4eedd"/>
+  <circle cx="82" cy="112" r="13" fill="#14120f"/><circle cx="142" cy="112" r="13" fill="#14120f"/>
+  <path d="M120 124 L109 139 L120 153 L131 139Z" fill="#f2c230"/>
+  <path d="M96 256 v14 M104 256 v15 M112 256 v14 M128 256 v14 M136 256 v15 M144 256 v14" stroke="#f2c230" stroke-width="5" stroke-linecap="round"/>
+</svg>
+</body></html>

@@ -1,3 +1,4 @@
+import { Offstage } from "./Offstage";
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { CUSTOMERS, ORDERS } from "../lib/shop";
@@ -226,6 +227,11 @@ function Names() {
           </button>
         ))}
       </div>
+      {GROW.map((other, i) =>
+        i === step ? null : (
+          <Offstage key={other.button} title={other.button} code={[other.chain, other.block]} notes={[other.note]} answer={other.answer} />
+        ),
+      )}
       <p className="names-note" key={step}>
         {now.note}
       </p>

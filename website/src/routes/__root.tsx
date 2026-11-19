@@ -2,6 +2,8 @@
 import { HeadContent, Outlet, Scripts, createRootRoute } from "@tanstack/react-router";
 import type { ReactNode } from "react";
 import { SITE_NAME } from "../lib/seo";
+import antonLatin from "../../node_modules/@fontsource/anton/files/anton-latin-400-normal.woff2?url";
+import lexendLatin from "../../node_modules/@fontsource-variable/lexend/files/lexend-latin-wght-normal.woff2?url";
 import styles from "../styles.css?url";
 
 // Runs before first paint. Marks <html class="js"> so styles that hide content until it is
@@ -14,11 +16,19 @@ export const Route = createRootRoute({
       { charSet: "utf-8" },
       { name: "viewport", content: "width=device-width, initial-scale=1" },
       { name: "application-name", content: SITE_NAME },
+      { name: "apple-mobile-web-app-title", content: SITE_NAME },
+      { name: "format-detection", content: "telephone=no" },
       { name: "theme-color", content: "#e9e0c9" },
     ],
     links: [
+      // The headline and body fonts, fetched early so the first screen does not wait on the stylesheet.
+      { rel: "preload", href: antonLatin, as: "font", type: "font/woff2", crossOrigin: "anonymous" },
+      { rel: "preload", href: lexendLatin, as: "font", type: "font/woff2", crossOrigin: "anonymous" },
       { rel: "stylesheet", href: styles },
+      { rel: "icon", href: "/favicon.ico", sizes: "48x48" },
       { rel: "icon", href: "/favicon.svg", type: "image/svg+xml" },
+      { rel: "apple-touch-icon", href: "/apple-touch-icon.png" },
+      { rel: "manifest", href: "/site.webmanifest" },
     ],
   }),
   component: RootComponent,

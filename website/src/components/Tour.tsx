@@ -1,3 +1,4 @@
+import { Offstage } from "./Offstage";
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { BucketsVisual, LinksVisual, PipelineVisual, PlaceVisual, SchemaVisual, TreeVisual } from "./TourVisuals";
@@ -243,6 +244,11 @@ export function Tour() {
       </div>
 
       <h3 className="tour-title">{current.title}</h3>
+      {CHAPTERS.map((c, i) =>
+        i === chapter ? null : (
+          <Offstage key={c.name} title={c.title} code={[c.code.map((piece) => piece.code).join("")]} notes={c.steps} answer={c.answer} />
+        ),
+      )}
 
       <div className="tour-stage">
         <div className="tour-left">
