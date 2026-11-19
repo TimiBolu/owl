@@ -751,6 +751,12 @@ fn cut_sorts_and_counts_do_not_need_the_collection() {
         r#"orders.sort { .customer.name.asc, .total.desc, .id.asc }.limit(6).select { id, who: .customer.name }"#,
         r#"orders.sort { .customer.id.desc, .id.asc }.offset(4).limit(9).select { id }"#,
         r#"orders.where { .status == "paid" }.sort { .customer.id.asc, .id.asc }.limit(8).select { id, total }"#,
+        // By id alone, with a filter that reads other rows: the rows are
+        // read in order of id and the reading stops once enough pass.
+        r#"customers.where { .orders.where { .total > 300 }.exists() }.sort { .id.asc }.limit(4).select { id, name }"#,
+        r#"customers.where { .id != "c00" && .orders.where { .status == "void" }.count() > 2 }.sort { .id.asc }.offset(3).limit(5).select { id }"#,
+        r#"orders.where { .items.where { .qty > 3 }.exists() }.sort { .id.asc }.offset(40).limit(6).select { id, total }"#,
+        r#"orders.where { .customer.tier == "gold" && .items.where { .sku == "s1" }.exists() }.sort { .id.asc }.limit(500).select { id }"#,
         r#"orders.where { .items.where { .qty > 2 }.count() >= 1 }.count()"#,
         r#"orders.where { .status == "paid" && .items.where { .sku == "s3" }.exists() }.count()"#,
         r#"customers.where { .orders.where { .total > 300 }.count() > 2 }.count()"#,

@@ -7298,6 +7298,49 @@ fn record_document(
     )))
 }
 
+/// [`sourced_document`], decoding a row that is read from its record only
+/// as far as the fields in `wanted`. A row held decoded, or read from a
+/// column segment, comes whole.
+fn sourced_document_reading(
+    state: &State,
+    object_ref: ObjRef,
+    wanted: Option<&HashSet<String>>,
+) -> OQLResult<Option<Arc<Document>>> {
+    let Some(wanted) = wanted else {
+        return Ok(sourced_document(state, object_ref)?.map(|(document, _)| document));
+    };
+    if state.object_directory.contains_key(&object_ref)
+        || state.typed_row_locations.get(&object_ref)?.is_some()
+    {
+        return Ok(sourced_document(state, object_ref)?.map(|(document, _)| document));
+    }
+    let Some(version) = state.object_schema_versions.get(&object_ref) else {
+        return Ok(None);
+    };
+    let record = match state.object_records.get(&object_ref) {
+        Some(record) => record.clone(),
+        None => state
+            .checkpoint_records
+            .as_ref()
+            .map(|files| {
+                files
+                    .lock()
+                    .map_err(|_| OQLError::generic("checkpoint read handle lock poisoned"))?
+                    .record(object_ref)
+            })
+            .transpose()?
+            .flatten()
+            .ok_or_else(|| {
+                OQLError::storage_error("a live row is neither decoded nor held as a record", None)
+            })?,
+    };
+    let compiled = state
+        .compiled_schemas
+        .get(&(object_ref.collection_id(), *version))
+        .ok_or_else(|| OQLError::storage_error("compiled schema is missing", None))?;
+    Ok(Some(Arc::new(RecordCodec::decode_projection(&record, compiled, Some(wanted))?)))
+}
+
 fn sourced_document(
     state: &State,
     object_ref: ObjRef,
@@ -10307,10 +10350,18 @@ impl DocumentStore for RustStore {
     fn scan_documents_in_chunks(
         &self,
         schema: &str,
+        fields: Option<&[String]>,
         visit: &mut dyn FnMut(&[Arc<Document>]) -> OQLResult<bool>,
     ) -> OQLResult<Option<bool>> {
-        /// Documents decoded and shown at a time.
+        // A row read from its record is decoded only as far as the fields
+        // asked for: a long list nobody reads is most of the work of
+        // decoding the row that holds it.
+        let wanted: Option<HashSet<String>> = fields.map(|fields| fields.iter().cloned().collect());
+        /// Documents decoded and shown at a time: few to begin with, since
+        /// a caller may have what it wants from the first of them, and
+        /// more each time up to this many.
         const CHUNK: usize = 1_024;
+        const FIRST_CHUNK: usize = 32;
         if !self.pending_operations()?.is_empty() {
             return Ok(None);
         }
@@ -10322,7 +10373,12 @@ impl DocumentStore for RustStore {
                 .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
             (logical_collection_object_refs(&state, schema)?, written(&state))
         };
-        for chunk in object_refs.chunks(CHUNK) {
+        let mut remaining = object_refs.as_slice();
+        let mut size = FIRST_CHUNK;
+        while !remaining.is_empty() {
+            let (chunk, rest) = remaining.split_at(size.min(remaining.len()));
+            remaining = rest;
+            size = (size * 2).min(CHUNK);
             // The state is read for one chunk and let go before the
             // documents are shown, since what is done with them may read
             // the store again.
@@ -10336,8 +10392,8 @@ impl DocumentStore for RustStore {
                 }
                 let mut documents = Vec::with_capacity(chunk.len());
                 for object_ref in chunk {
-                    match sourced_document(&state, *object_ref)? {
-                        Some((document, _)) => documents.push(document),
+                    match sourced_document_reading(&state, *object_ref, wanted.as_ref())? {
+                        Some(document) => documents.push(document),
                         // Every row listed is there while nothing has
                         // been written.
                         None => return Ok(None),

@@ -1690,9 +1690,45 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     // The store does not hold every row. A count needs
                     // none of them kept: they are read a bounded number at
                     // a time and counted as they pass.
+                    // A sort by id alone that is cut to a few rows: the
+                    // rows come in order of id, so they are read a bounded
+                    // number at a time and the reading stops once enough
+                    // have passed the filter. Without this every row would
+                    // be read and judged, however early the first few pass.
+                    None if cut.is_some_and(|(sort, ..)| {
+                        matches!(
+                            sort.fields.as_slice(),
+                            [key] if matches!(key.direction, crate::parser::SortDirection::Asc)
+                                && matches!(&key.expression, Expression::FieldAccess(field) if field.path == ["id"])
+                        )
+                    }) =>
+                    {
+                        let (_, offset, limit, taken) = cut.expect("checked just above");
+                        let wanted_rows = offset.saturating_add(limit);
+                        let mut kept = Vec::new();
+                        let mut passed = 0usize;
+                        let shown = self.store.scan_documents_in_chunks(&query.collection, wanted.as_deref(), &mut |rows| {
+                            for row in rows {
+                                if passed >= wanted_rows {
+                                    return Ok(false);
+                                }
+                                if passes(row)? {
+                                    if passed >= offset {
+                                        kept.push(keep(row));
+                                    }
+                                    passed += 1;
+                                }
+                            }
+                            Ok(passed < wanted_rows)
+                        })?;
+                        if shown.is_none() {
+                            return Ok(None);
+                        }
+                        return Ok(Some((kept, filters + taken)));
+                    }
                     None if matches!((next, operations.get(filters + 1)), (Some(Operation::Count), None)) => {
                         let mut count = 0usize;
-                        let shown = self.store.scan_documents_in_chunks(&query.collection, &mut |rows| {
+                        let shown = self.store.scan_documents_in_chunks(&query.collection, wanted.as_deref(), &mut |rows| {
                             for row in rows {
                                 count += usize::from(passes(row)?);
                             }
@@ -3028,7 +3064,25 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 }
                 None => {
                     let mut went_on = true;
-                    let shown = self.store.scan_documents_in_chunks(&query.collection, &mut |holders| {
+                    // Only the fields the query reads are decoded: the
+                    // list itself, and what it asks of the row holding it.
+                    // Of the row that holds a list, the fold reads the
+                    // list, what the query names of the row beside it, and
+                    // what the filters ahead of the step read: as a count
+                    // of the rows passing those filters would.
+                    let mut asked: Vec<Operation> = query.operations[..leading].to_vec();
+                    asked.push(Operation::Count);
+                    let read = self
+                        .fields_read_by_operations(&query.collection, &asked)
+                        .map(|mut read| {
+                            for name in std::iter::once(list).chain(outers.iter()) {
+                                if !read.contains(name) {
+                                    read.push(name.clone());
+                                }
+                            }
+                            read
+                        });
+                    let shown = self.store.scan_documents_in_chunks(&query.collection, read.as_deref(), &mut |holders| {
                         for holder in holders {
                             if !one_holder(holder)? {
                                 went_on = false;
@@ -12740,7 +12794,8 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 }
             }
             None => {
-                let shown = self.store.scan_documents_in_chunks(&target, &mut |rows| {
+                let only = [field.clone()];
+                let shown = self.store.scan_documents_in_chunks(&target, Some(&only), &mut |rows| {
                     for row in rows {
                         referred.push(row.id.clone());
                         keys.push(self.get_field_value(row, &access)?);

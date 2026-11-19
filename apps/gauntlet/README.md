@@ -231,21 +231,33 @@ this size fell from about 690 MB to 234 MB.
 The whole run took 1,828 seconds; that was before the last two of these,
 and the figure for all queries together above is from that run too.
 
-A tight budget costs speed, and that has not improved. At the suite's
-ordinary size, after compaction, timed against SQLite:
+A tight budget costs speed. At the suite's ordinary size, after compaction,
+timed against SQLite:
 
 | Budget | Faster | Within 5x | Beyond | Owl time over SQLite's, whole suite |
 |---|---|---|---|---|
-| The default (a quarter of the machine's memory) | 15 | 26 | 3 | 1.3 |
-| 16 MB | 7 | 20 | 17 | 3.1 |
-| 4 MB | 5 | 19 | 20 | 3.6 |
+| The default (a quarter of the machine's memory) | 15 | 26 | 3 | 1.2 |
+| 16 MB | 7 | 23 | 14 | 2.7 |
+| 4 MB | 6 | 23 | 15 | 2.8 |
 
 With little kept between queries, a query that would have read a column
-reads rows from their files, each decoded whole. The furthest behind at 4 MB
-are `h04_colleagues` (about 100 times), then a dozen between 14 and 27
-times. A set of columns found to be more than may be kept is remembered, so
-that the pass that makes them is not made again only for them to be let go:
-that took `h14_skewed_tenant` from 198 ms to 56 ms.
+reads rows from their files. What has been done about that:
+
+- A set of columns found to be more than may be kept is remembered, so that
+  the pass that makes them is not made again only for them to be let go
+  (`h14_skewed_tenant`, 198 ms to 56 ms at 4 MB).
+- A sort by id cut to a few rows, behind a filter that reads other rows,
+  reads the rows in order of id and stops once enough have passed. Before,
+  it did that only when the store happened to hold every row, and judged
+  the whole collection when it did not: `h04_colleagues` took 1.6 ms or
+  55 ms on the same query and budget, and takes about 2 ms.
+- Rows read a number at a time are read few at first, and are decoded only
+  as far as the fields the query reads (`h17_label_histogram`, 166 ms to
+  85 ms at 4 MB).
+
+Fifteen queries are still more than five times behind at 4 MB, the furthest
+`h13_late_limit` at about 36 times. About half the time of a scan from
+files is a read for each row.
 
 A compaction keeps the copy it replaced, as something to fall back to;
 `compact_and_reclaim` removes it once the new one has been read back and
