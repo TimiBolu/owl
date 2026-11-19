@@ -1,6 +1,6 @@
 use super::checkpoint::{
     cleanup_typed_locator_spools, decode_segment_file, open_typed_segment_handles,
-    write_segment_file, BaseSegmentHandle, CheckpointImage, RecordSpool, CheckpointIndex, CheckpointInfo,
+    write_segment_file, BaseSegmentHandle, CheckpointImage, IndexSorter, RecordSpool, CheckpointIndex, CheckpointInfo,
     CheckpointMetadata, DecodedCheckpoint, FileIndexBase, IndexPageDescriptor, Manifest,
     PublishedIndexPages, SegmentIndexReader, SegmentVerification, TypedLocatorLeaf,
     TypedSegmentFileDescriptor, TypedSegmentHandle,
@@ -2678,8 +2678,13 @@ impl RustStore {
         let recovered_lsn = state.committed_lsn;
         // The state reads evicted records back through the same handles the
         // store keeps current.
-        let checkpoint_read_handles = Arc::new(Mutex::new(CheckpointReadHandles::default()));
+        // Recovery may have left it a handle on the base segment already;
+        // the store keeps that one, and brings it up to date below.
         let mut state = state;
+        let checkpoint_read_handles = state
+            .checkpoint_records
+            .take()
+            .unwrap_or_else(|| Arc::new(Mutex::new(CheckpointReadHandles::default())));
         state.checkpoint_records = Some(checkpoint_read_handles.clone());
         let core = Arc::new(StoreCore {
             filesystem,
@@ -5355,7 +5360,30 @@ impl RustStore {
             ));
         }
         let restore_started = Instant::now();
-        let mut state = restore_checkpoint(image, filesystem.clone(), decoded_budget)?;
+        // The records of the base segment are in its file. With a handle
+        // on that file, a database with a budget reads one when it is
+        // wanted and never holds them all at once, even while it opens.
+        // What is replayed over the base stays in memory, as before, and
+        // is found there first.
+        let base_records = BaseSegmentHandle::open(
+            filesystem.clone(),
+            &segment_paths[manifest.segment_slot as usize],
+            manifest,
+        )
+        .ok();
+        let mut state = restore_checkpoint(
+            image,
+            filesystem.clone(),
+            decoded_budget,
+            base_records.is_some(),
+        )?;
+        if base_records.is_some() {
+            state.checkpoint_records = Some(Arc::new(Mutex::new(CheckpointReadHandles {
+                record_root: None,
+                generation_record_roots: Vec::new(),
+                base_segment: base_records,
+            })));
+        }
         tracing::debug!(
             target: "owl_db::storage_engine::recovery",
             elapsed_ms = restore_started.elapsed().as_secs_f64() * 1_000.0,
@@ -6370,6 +6398,7 @@ fn checkpoint_image_with_records(
                     OQLError::storage_error("scalar index catalog has no checkpoint data", None)
                 })?;
             indexes.push(CheckpointIndex {
+                spooled: None,
                 schema: definition.schema.clone(),
                 name: definition.name.clone(),
                 unique: definition.unique,
@@ -6380,6 +6409,7 @@ fn checkpoint_image_with_records(
         }
     }
     indexes.push(CheckpointIndex {
+        spooled: None,
         schema: REVERSE_INDEX_SCHEMA.into(),
         name: REVERSE_INDEX_NAME.into(),
         unique: false,
@@ -6548,18 +6578,27 @@ fn checkpoint_image_from_compaction(
         sidecar_path(&plan.manifest_path, "records"),
     )?;
     let mut typed_segments = Vec::<Arc<[u8]>>::new();
-    let mut scalar_entries = state
+    // Index entries are sorted on disk a bounded amount at a time, and
+    // come back as encoded pages: every declared index, then the index of
+    // what refers to what.
+    let mut index_identities = state
         .scalar_indexes
         .values()
         .flatten()
-        .map(|definition| {
-            (
-                (definition.schema.clone(), definition.name.clone()),
-                BTreeMap::<Vec<u8>, Vec<ObjRef>>::new(),
-            )
-        })
+        .map(|definition| (definition.schema.clone(), definition.name.clone(), definition.unique))
+        .collect::<Vec<_>>();
+    let index_numbers = index_identities
+        .iter()
+        .enumerate()
+        .map(|(number, (schema, name, _))| ((schema.clone(), name.clone()), number))
         .collect::<HashMap<_, _>>();
-    let mut reverse_entries = BTreeMap::<Vec<u8>, Vec<ObjRef>>::new();
+    let reverse_number = index_identities.len();
+    index_identities.push((REVERSE_INDEX_SCHEMA.into(), REVERSE_INDEX_NAME.into(), false));
+    let mut index_entries = IndexSorter::new(
+        plan.filesystem.clone(),
+        sidecar_path(&plan.manifest_path, "index-run"),
+        index_identities,
+    )?;
     let mut collection_names = state.collection_ids.keys().cloned().collect::<Vec<_>>();
     for schema in &plan.schemas {
         if !collection_names.contains(schema) {
@@ -6649,7 +6688,7 @@ fn checkpoint_image_from_compaction(
                     )?,
                 }
             };
-            add_compaction_indexes(state, &row, &mut scalar_entries, &mut reverse_entries)?;
+            add_compaction_indexes(state, &row, &index_numbers, reverse_number, &mut index_entries)?;
             let current_version = state.current_schema_versions.get(&schema_name).copied();
             if current_version == Some(row.schema_version) {
                 typed_chunk.push(row);
@@ -6703,31 +6742,7 @@ fn checkpoint_image_from_compaction(
         ));
     }
 
-    let mut indexes = Vec::new();
-    for definitions in state.scalar_indexes.values() {
-        for definition in definitions {
-            let mut entries = scalar_entries
-                .remove(&(definition.schema.clone(), definition.name.clone()))
-                .unwrap_or_default()
-                .into_iter()
-                .collect::<Vec<_>>();
-            normalize_compaction_postings(&mut entries, definition.unique)?;
-            indexes.push(CheckpointIndex {
-                schema: definition.schema.clone(),
-                name: definition.name.clone(),
-                unique: definition.unique,
-                entries,
-            });
-        }
-    }
-    let mut reverse_entries = reverse_entries.into_iter().collect::<Vec<_>>();
-    normalize_compaction_postings(&mut reverse_entries, false)?;
-    indexes.push(CheckpointIndex {
-        schema: REVERSE_INDEX_SCHEMA.into(),
-        name: REVERSE_INDEX_NAME.into(),
-        unique: false,
-        entries: reverse_entries,
-    });
+    let indexes = index_entries.finish()?;
 
     Ok(CheckpointImage {
         record_spool: Some(Arc::new(records.finish()?)),
@@ -6743,8 +6758,9 @@ fn checkpoint_image_from_compaction(
 fn add_compaction_indexes(
     state: &State,
     row: &CompactionRow,
-    scalar_entries: &mut HashMap<(String, String), BTreeMap<Vec<u8>, Vec<ObjRef>>>,
-    reverse_entries: &mut BTreeMap<Vec<u8>, Vec<ObjRef>>,
+    index_numbers: &HashMap<(String, String), usize>,
+    reverse_number: usize,
+    entries: &mut IndexSorter,
 ) -> OQLResult<()> {
     for definition in state
         .scalar_indexes
@@ -6752,15 +6768,13 @@ fn add_compaction_indexes(
         .into_iter()
         .flatten()
     {
-        scalar_entries
-            .get_mut(&(definition.schema.clone(), definition.name.clone()))
-            .ok_or_else(|| OQLError::storage_error("compaction index builder is missing", None))?
-            .entry(document_index_key(&row.document, definition)?)
-            .or_default()
-            .push(row.object_ref);
+        let number = *index_numbers
+            .get(&(definition.schema.clone(), definition.name.clone()))
+            .ok_or_else(|| OQLError::storage_error("compaction index builder is missing", None))?;
+        entries.push(number, &document_index_key(&row.document, definition)?, row.object_ref)?;
     }
     for key in document_reverse_keys(&row.document) {
-        reverse_entries.entry(key).or_default().push(row.object_ref);
+        entries.push(reverse_number, &key, row.object_ref)?;
     }
     Ok(())
 }
@@ -6821,23 +6835,6 @@ fn flush_compaction_typed_chunk(
         }
     }
     chunk.clear();
-    Ok(())
-}
-
-fn normalize_compaction_postings(
-    entries: &mut [(Vec<u8>, Vec<ObjRef>)],
-    unique: bool,
-) -> OQLResult<()> {
-    for (_, postings) in entries {
-        postings.sort_unstable();
-        postings.dedup();
-        if postings.is_empty() || (unique && postings.len() != 1) {
-            return Err(OQLError::storage_error(
-                "compaction index violates posting constraints",
-                None,
-            ));
-        }
-    }
     Ok(())
 }
 
@@ -7420,6 +7417,7 @@ fn restore_checkpoint(
     image: DecodedCheckpoint,
     filesystem: Arc<dyn FileSystem>,
     decoded_budget: Option<usize>,
+    records_on_file: bool,
 ) -> OQLResult<State> {
     let DecodedCheckpoint {
         sequence: _,
@@ -7689,7 +7687,10 @@ fn restore_checkpoint(
                     .object_schema_versions
                     .insert(object_ref, schema_version)
                     .is_some()
-                || state.object_records.insert(object_ref, record).is_some()
+                // A record is kept in memory unless the database has a
+                // budget and can read it from the file it came from.
+                || (!(records_on_file && state.bounded())
+                    && state.object_records.insert(object_ref, record).is_some())
             {
                 return Err(OQLError::storage_error(
                     "checkpoint contains duplicate live objects",
