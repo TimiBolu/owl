@@ -255,9 +255,17 @@ reads rows from their files. What has been done about that:
   as far as the fields the query reads (`h17_label_histogram`, 166 ms to
   85 ms at 4 MB).
 
-Fifteen queries are still more than five times behind at 4 MB, the furthest
-`h13_late_limit` at about 36 times. About half the time of a scan from
-files is a read for each row.
+- Rows read a number at a time are read in the order their records lie in
+  the file and shown in the order asked for. A scan goes in order of id and
+  the file is in order of reference, so nearly three lookups in four had
+  made a read of their own; about one in forty does now
+  (`h17_label_histogram`, 5.6 to 3.0 times SQLite at 4 MB).
+
+About fifteen queries are still more than five times behind at 4 MB, the
+furthest `h13_late_limit` and `h21_rollup_fixed_depth` at about 25 times.
+Most of them do not read rows a number at a time, so the last of these did
+not reach them, and the suite's time as a whole barely moved with it. Those
+looked into so far each had a cause of its own.
 
 A compaction keeps the copy it replaced, as something to fall back to;
 `compact_and_reclaim` removes it once the new one has been read back and

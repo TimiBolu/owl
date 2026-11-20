@@ -10390,16 +10390,23 @@ impl DocumentStore for RustStore {
                 if written(&state) != stamp {
                     return Ok(None);
                 }
-                let mut documents = Vec::with_capacity(chunk.len());
-                for object_ref in chunk {
-                    match sourced_document_reading(&state, *object_ref, wanted.as_ref())? {
-                        Some(document) => documents.push(document),
+                // The rows are shown in the order listed, and read in the
+                // order their records lie in the file, which is the order
+                // of their references: one stretch of the file read then
+                // serves the rows that follow, where reading them as
+                // listed would seek back and forth for each.
+                let mut in_file_order: Vec<usize> = (0..chunk.len()).collect();
+                in_file_order.sort_unstable_by_key(|at| chunk[*at].packed());
+                let mut read: Vec<Option<Arc<Document>>> = vec![None; chunk.len()];
+                for at in in_file_order {
+                    match sourced_document_reading(&state, chunk[at], wanted.as_ref())? {
+                        Some(document) => read[at] = Some(document),
                         // Every row listed is there while nothing has
                         // been written.
                         None => return Ok(None),
                     }
                 }
-                documents
+                read.into_iter().flatten().collect::<Vec<_>>()
             };
             if !visit(&documents)? {
                 return Ok(Some(false));
