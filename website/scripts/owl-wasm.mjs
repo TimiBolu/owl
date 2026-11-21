@@ -23,7 +23,10 @@ cpSync(join(built, "owl_wasm.js"), join(served, "owl_wasm.js"));
 cpSync(join(built, "owl_wasm_bg.wasm"), join(served, "owl_wasm_bg.wasm"));
 cpSync(join(built, "snippets"), join(served, "snippets"), { recursive: true });
 
-const commit = execFileSync("git", ["-C", crate, "rev-parse", "--short", "HEAD"]).toString().trim();
+const head = execFileSync("git", ["-C", crate, "rev-parse", "--short", "HEAD"]).toString().trim();
+// Changes to the engine or its wrapper that no commit holds yet are part of what was built.
+const changed = execFileSync("git", ["-C", crate, "status", "--porcelain", "--", join(crate, "src"), join(crate, "..", "..", "src")]).toString().trim();
+const commit = changed ? `${head} and uncommitted changes` : head;
 const bytes = statSync(join(served, "owl_wasm_bg.wasm")).size;
 writeFileSync(join(served, "build.json"), JSON.stringify({ builtFrom: commit, bytes }, null, 2) + "\n");
 console.log(`\npublic/owl: engine built from ${commit}, ${(bytes / 1048576).toFixed(1)} MB`);

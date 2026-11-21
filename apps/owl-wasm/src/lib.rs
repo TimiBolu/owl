@@ -18,6 +18,8 @@ pub mod pool;
 use owl_db::simulation::filesystem::{FileSystem, SimulatedFileSystem};
 use pool::PoolFileSystem;
 use owl_db::storage::RustStore;
+use owl_db::schema::{FieldType, Schema, SchemaConstraint};
+use owl_db::storage::DocumentStore;
 use owl_db::{execute_oql_file, parse_oql_file, Document, OQLFile, OQLFileStatement, QueryExecutor, Value};
 use serde_json::{json, Value as Json};
 use std::sync::Arc;
@@ -73,6 +75,15 @@ impl Owl {
     pub fn files(&self) -> String {
         let files = self.kept.as_ref().map(PoolFileSystem::files).unwrap_or_default();
         json!(files.iter().map(|(name, size)| json!({ "name": name, "size": size })).collect::<Vec<_>>()).to_string()
+    }
+
+    /// What is in the database, as JSON: each collection with how many
+    /// rows it has, its fields (the id, then the rest by name) with their
+    /// types as OQL writes them, the collection each reference points at,
+    /// the names by which other collections' references reach it, and the
+    /// rules its schema states.
+    pub fn describe(&self) -> String {
+        self.describe_to_json().to_string()
     }
 
     /// Fold the log into the database's checkpoint, so that the log does
@@ -148,6 +159,76 @@ impl Owl {
         json!({ "rows": rows, "columns": columns, "ran": ran, "errors": errors })
     }
 
+    fn describe_to_json(&self) -> Json {
+        let store = self.executor.store();
+        let mut names = store.list_schemas().unwrap_or_default();
+        // The engine keeps its own things in collections named with a `$`.
+        names.retain(|name| !name.starts_with('$'));
+        let schemas: Vec<Schema> = names.iter().filter_map(|name| store.get_schema(name).ok().flatten()).collect();
+        let collections: Vec<Json> = schemas
+            .iter()
+            .map(|schema| {
+                // The engine keeps a schema's fields by name, not in the
+                // order they were written: the id first, then by name.
+                let mut order: Vec<&String> = schema.fields.keys().collect();
+                order.sort_by_key(|name| (name.as_str() != "id", name.as_str()));
+                let fields: Vec<Json> = order
+                    .iter()
+                    .filter_map(|name| Some((*name, schema.fields.get(*name)?)))
+                    .map(|(name, field_type)| {
+                        json!({
+                            "name": name,
+                            "type": type_text(schema, name, field_type),
+                            "ref": target_of(field_type),
+                            "optional": field_type.is_optional(),
+                            "list": matches!(plain(field_type), FieldType::List(_)),
+                            "kind": plain(field_type).type_name(),
+                        })
+                    })
+                    .collect();
+                // The references of other collections that point here, and
+                // the name each is reached by from this side.
+                let mut reached_by = Vec::new();
+                for other in &schemas {
+                    let mut fields: Vec<(&String, &FieldType)> = other.fields.iter().collect();
+                    fields.sort_by(|left, right| left.0.cmp(right.0));
+                    for (field, field_type) in fields {
+                        if target_of(field_type).as_deref() != Some(schema.name.as_str()) {
+                            continue;
+                        }
+                        let name = other
+                            .constraints
+                            .iter()
+                            .find_map(|constraint| match constraint {
+                                SchemaConstraint::ReverseName { field: named, name } if named == field => Some(name.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| other.name.clone());
+                        reached_by.push(json!({ "name": name, "from": other.name, "field": field }));
+                    }
+                }
+                let rules: Vec<String> = schema
+                    .constraints
+                    .iter()
+                    .filter_map(|constraint| match constraint {
+                        SchemaConstraint::Unique { fields, .. } => Some(format!("unique({})", fields.join(", "))),
+                        SchemaConstraint::CheckExpression { expression } => Some(format!("check({expression})")),
+                        SchemaConstraint::Default { field, expression } => Some(format!("{field} defaults to {expression}")),
+                        _ => None,
+                    })
+                    .collect();
+                json!({
+                    "name": schema.name,
+                    "rows": store.collection_len(&schema.name).ok().flatten(),
+                    "fields": fields,
+                    "reachedBy": reached_by,
+                    "rules": rules,
+                })
+            })
+            .collect();
+        json!(collections)
+    }
+
     /// Whether a field is the query's own, not one the engine keeps beside.
     fn shown(name: &str) -> bool {
         !name.starts_with('_') && !name.starts_with('$')
@@ -166,6 +247,53 @@ impl Owl {
                 })
                 .collect(),
         )
+    }
+}
+
+/// A field's type with `Optional` taken off.
+fn plain(field_type: &FieldType) -> &FieldType {
+    match field_type {
+        FieldType::Optional(inner) => plain(inner),
+        other => other,
+    }
+}
+
+/// The collection a field refers to, when it is a reference or a list of them.
+fn target_of(field_type: &FieldType) -> Option<String> {
+    match field_type {
+        FieldType::Reference(reference) => Some(reference.target_schema.clone()),
+        FieldType::Optional(inner) | FieldType::List(inner) => target_of(inner),
+        _ => None,
+    }
+}
+
+/// A field's type as OQL writes it. The shape of an embedded object is
+/// kept beside the schema's fields, under the path that reaches it.
+fn type_text(schema: &Schema, path: &str, field_type: &FieldType) -> String {
+    let shape = |path: &str| {
+        schema.constraints.iter().find_map(|constraint| match constraint {
+            SchemaConstraint::Shape { path: named, fields } if named == path => Some(format!(
+                "{{ {} }}",
+                fields
+                    .iter()
+                    .map(|(name, inner)| format!("{name}: {}", type_text(schema, &format!("{path}.{name}"), inner)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+            _ => None,
+        })
+    };
+    match field_type {
+        FieldType::Object => shape(path).unwrap_or_else(|| "Object".to_string()),
+        FieldType::Vector { dim } => format!("Vector({dim})"),
+        FieldType::Reference(reference) if reference.required => format!("Ref({})", reference.target_schema),
+        FieldType::Reference(reference) => format!("Optional(Ref({}))", reference.target_schema),
+        FieldType::List(inner) => match inner.as_ref() {
+            FieldType::Object => format!("List({})", shape(&format!("{path}[]")).unwrap_or_else(|| "Object".to_string())),
+            other => format!("List({})", type_text(schema, &format!("{path}[]"), other)),
+        },
+        FieldType::Optional(inner) => format!("Optional({})", type_text(schema, path, inner)),
+        other => other.type_name().to_string(),
     }
 }
 
@@ -217,6 +345,22 @@ mod tests {
                 { "title": "The Dispossessed", "year": 1974, "by": "Ursula" }
             ])
         );
+        // The database says what is in it.
+        let described = owl.describe_to_json();
+        let books = described.as_array().unwrap().iter().find(|c| c["name"] == "books").unwrap();
+        assert_eq!(books["rows"], json!(3));
+        assert_eq!(
+            books["fields"].as_array().unwrap().iter().map(|f| f["name"].as_str().unwrap()).collect::<Vec<_>>(),
+            ["id", "author", "title", "year"],
+            "the id, then the rest by name"
+        );
+        assert_eq!(books["fields"][1]["type"], json!("Ref(authors)"));
+        assert_eq!(books["fields"][1]["ref"], json!("authors"));
+        let authors = described.as_array().unwrap().iter().find(|c| c["name"] == "authors").unwrap();
+        assert_eq!(authors["reachedBy"], json!([{ "name": "books", "from": "books", "field": "author" }]));
+        // Nothing of the engine's own is shown.
+        assert!(described.as_array().unwrap().iter().all(|c| !c["name"].as_str().unwrap().starts_with('$')));
+
         // The database is still there for the next thing asked.
         let again = owl.run_to_json("authors.sort { .id.asc }.select { id, books: .books.count() }");
         assert_eq!(again["errors"], json!([]), "{again}");
@@ -262,6 +406,34 @@ mod tests {
             );
             assert_eq!(answer["errors"], json!([]), "{answer}");
             assert_eq!(count(&owl), json!(2));
+            // Shapes inside lists, optional references and reverse names
+            // are described as they were written.
+            let more = owl.run_to_json(
+                r#"schema reviews {
+                     id: String,
+                     book: Ref(books) as notes,
+                     by: Optional(Ref(authors)),
+                     stars: Integer,
+                     lines: List({ page: Integer, text: String }),
+                     check(.stars >= 1)
+                   }"#,
+            );
+            assert_eq!(more["errors"], json!([]), "{more}");
+            let described = owl.describe_to_json();
+            let find = |name: &str| described.as_array().unwrap().iter().find(|c| c["name"] == name).unwrap().clone();
+            let reviews = find("reviews");
+            let types: Vec<String> =
+                reviews["fields"].as_array().unwrap().iter().map(|f| f["type"].as_str().unwrap().to_string()).collect();
+            assert_eq!(
+                types,
+                ["String", "Ref(books)", "Optional(Ref(authors))", "List({ page: Integer, text: String })", "Integer"]
+            );
+            assert_eq!(reviews["rows"], json!(0));
+            assert!(reviews["rules"].as_array().unwrap().iter().any(|rule| rule.as_str().unwrap().starts_with("check(")));
+            assert!(find("books")["reachedBy"]
+                .as_array()
+                .unwrap()
+                .contains(&json!({ "name": "notes", "from": "reviews", "field": "book" })));
         }
         // From the log alone.
         let expected = {

@@ -117,7 +117,7 @@ export function usePlay() {
       const k = e.key.toLowerCase();
       if (k === "l") document.getElementById("language")?.scrollIntoView();
       if (k === "g") window.open(GITHUB_URL, "_blank", "noopener,noreferrer");
-      if (k === "p") location.assign("/play");
+      if (k === "t") location.assign("/try");
       if (k === "h") {
         scrollTo({ top: 0 });
         hoot();

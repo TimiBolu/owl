@@ -62,7 +62,14 @@ async function topUp() {
 
 function about() {
   const files = kept ? JSON.parse(owl.files()) : [];
-  return { kept, why, files: files.length, bytes: files.reduce((total, file) => total + file.size, 0) };
+  return {
+    kept,
+    why,
+    files: files.length,
+    bytes: files.reduce((total, file) => total + file.size, 0),
+    // What is in the database now: its collections, their fields and how many rows each has.
+    collections: JSON.parse(owl.describe()),
+  };
 }
 
 const ready = init().then(start);
@@ -93,7 +100,7 @@ self.onmessage = async ({ data: { id, kind, source } }) => {
   } catch (error) {
     answer = {
       result: { rows: [], columns: [], ran: 0, errors: [String(error?.message ?? error)], ms: 0 },
-      about: owl ? about() : { kept: false, why: "no engine", files: 0, bytes: 0 },
+      about: owl ? about() : { kept: false, why: "no engine", files: 0, bytes: 0, collections: [] },
     };
   }
   self.postMessage({ id, ...answer });
