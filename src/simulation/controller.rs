@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::Duration;
+use web_time::Duration;
 
 use super::{
     Clock, FileSystem, Network, RealClock, RealFileSystem, RealNetwork, RealScheduler, Scheduler,
@@ -151,7 +151,7 @@ impl Simulation {
 #[derive(Debug, Clone)]
 pub struct SimulationStats {
     pub seed: u64,
-    pub current_time: std::time::Instant,
+    pub current_time: web_time::Instant,
     pub pending_events: usize,
     pub queued_tasks: usize,
     pub active_tasks: usize,

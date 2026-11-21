@@ -18,7 +18,7 @@ use crate::error::{ErrorContext, OQLError, OQLResult};
 use crate::simulation::Clock;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 /// ACID property validation result
 #[derive(Debug, Clone, PartialEq)]

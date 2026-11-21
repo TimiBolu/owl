@@ -17,7 +17,7 @@ use crate::simulation::Clock;
 use crate::transaction::{TransactionManager, TransactionContext, TransactionState as RustTxnState};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 use uuid::Uuid;
 
 /// Distributed transaction ID that spans both Rust and Zig layers

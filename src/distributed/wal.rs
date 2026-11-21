@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::io::SeekFrom;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use web_time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Log Sequence Number for ordering WAL entries
 pub type LSN = u64;

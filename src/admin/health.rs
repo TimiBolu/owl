@@ -2,7 +2,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::thread;
-use std::time::Duration;
+use web_time::Duration;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HealthReport {

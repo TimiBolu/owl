@@ -431,8 +431,8 @@ impl DistributedQueryPlanner {
     fn create_initial_plan(&self, query: &OQLQuery) -> OQLResult<DistributedPlan> {
         let plan_id = format!(
             "plan_{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            web_time::SystemTime::now()
+                .duration_since(web_time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         );

@@ -6,7 +6,7 @@ use crate::monitoring::{MonitoringSystem, QueryMetrics};
 use lazy_static::lazy_static;
 use prometheus::{Counter, CounterVec, Gauge, HistogramOpts, HistogramVec, Opts, Registry};
 use std::sync::Arc;
-use std::time::Instant;
+use web_time::Instant;
 use tracing::{debug, info, span, Level, Span};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -389,7 +389,7 @@ mod tests {
             operation: "test".to_string(),
         };
 
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(web_time::Duration::from_millis(10));
         op.finish();
     }
 }

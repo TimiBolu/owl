@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 /// Lock type for document access
 #[derive(Debug, Clone, PartialEq)]

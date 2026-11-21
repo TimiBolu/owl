@@ -7393,7 +7393,7 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
             }
             OQLFileStatement::Query(query) => {
                 query_count += 1;
-                let start_time = std::time::Instant::now();
+                let start_time = web_time::Instant::now();
                 let resolved_query = match resolve_query_with_bindings(query, &query_bindings) {
                     Ok(q) => resolve_query_with_value_bindings(&q, &value_bindings),
                     Err(e) => {

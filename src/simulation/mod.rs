@@ -17,4 +17,4 @@ pub use scheduler::{RealScheduler, Scheduler, SimulatedScheduler};
 
 // Re-export common types
 pub use std::sync::Arc;
-pub use std::time::{Duration, Instant};
+pub use web_time::{Duration, Instant};

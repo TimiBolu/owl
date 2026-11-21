@@ -5,7 +5,7 @@ use crate::error::{ErrorContext, OQLError, OQLResult};
 use crate::simulation::Clock;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 /// Lock type for document access
 #[derive(Debug, Clone, PartialEq)]
@@ -659,7 +659,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::thread;
-    use std::time::Duration;
+    use web_time::Duration;
 
     #[test]
     fn test_basic_locking() {

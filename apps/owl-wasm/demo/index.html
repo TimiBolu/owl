@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Owl in the browser</title>
+<style>
+  :root {
+    --page: #f6f4ef; --card: #fffdf9; --ink: #1d1b16; --soft: #6b6659; --line: #ddd8cc;
+    --accent: #7a4f1d; --accent-ink: #fffdf9; --bad: #a3271a; --code: #f0ece2;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --page: #16150f; --card: #1f1d16; --ink: #ece7da; --soft: #a39d8c; --line: #38342a;
+      --accent: #d9a35b; --accent-ink: #16150f; --bad: #f08a7c; --code: #26231b;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--page); color: var(--ink); font: 16px/1.5 system-ui, sans-serif; }
+  main { max-width: 980px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 1.6rem; margin: 0 0 4px; letter-spacing: -0.01em; }
+  .lede { color: var(--soft); margin: 0 0 20px; max-width: 62ch; }
+  .status { font: 13px var(--mono); color: var(--soft); margin: 0 0 16px; min-height: 1.4em; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; }
+  .samples { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 10px; }
+  .samples button {
+    font: 13px system-ui, sans-serif; color: var(--ink); background: transparent;
+    border: 1px solid var(--line); border-radius: 999px; padding: 5px 12px; cursor: pointer;
+  }
+  .samples button:hover { border-color: var(--accent); color: var(--accent); }
+  textarea {
+    display: block; width: 100%; min-height: 200px; resize: vertical; border: 0; outline: 0;
+    background: transparent; color: var(--ink); font: 14px/1.55 var(--mono); padding: 14px 16px;
+    tab-size: 2; white-space: pre; overflow: auto;
+  }
+  .bar {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    border-top: 1px solid var(--line); padding: 10px 12px;
+  }
+  .run {
+    font: 600 14px system-ui, sans-serif; color: var(--accent-ink); background: var(--accent);
+    border: 0; border-radius: 7px; padding: 8px 16px; cursor: pointer;
+  }
+  .run:disabled { opacity: 0.5; cursor: default; }
+  .hint, .took { font: 13px var(--mono); color: var(--soft); }
+  .took { margin-left: auto; }
+  .reset { font: 13px system-ui, sans-serif; color: var(--soft); background: none; border: 0; cursor: pointer; text-decoration: underline; }
+  h2 { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--soft); margin: 28px 0 8px; }
+  .out { padding: 0; overflow: hidden; }
+  .scroll { overflow: auto; max-height: 460px; }
+  table { border-collapse: collapse; width: 100%; font: 13px/1.45 var(--mono); }
+  th, td { text-align: left; padding: 7px 14px; border-bottom: 1px solid var(--line); vertical-align: top; white-space: nowrap; }
+  th { position: sticky; top: 0; background: var(--code); color: var(--soft); font-weight: 600; }
+  tr:last-child td { border-bottom: 0; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  td.null { color: var(--soft); font-style: italic; }
+  .note { padding: 14px 16px; color: var(--soft); font-size: 14px; }
+  .errors { padding: 14px 16px; color: var(--bad); font: 13px/1.55 var(--mono); white-space: pre-wrap; }
+  footer { margin-top: 28px; color: var(--soft); font-size: 13px; max-width: 70ch; }
+  code { font-family: var(--mono); background: var(--code); padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Owl in the browser</h1>
+  <p class="lede">The same engine the server runs, compiled to WebAssembly. Everything below happens in this page: there is no server, and the database is gone when you close the tab.</p>
+  <p class="status" id="status">Loading the engine…</p>
+
+  <div class="samples" id="samples"></div>
+  <div class="card">
+    <textarea id="source" spellcheck="false" aria-label="OQL to run"></textarea>
+    <div class="bar">
+      <button class="run" id="run" disabled>Run</button>
+      <span class="hint">⌘ or Ctrl + Enter</span>
+      <button class="reset" id="reset">Start over with an empty database</button>
+      <span class="took" id="took"></span>
+    </div>
+  </div>
+
+  <h2>Answer</h2>
+  <div class="card out"><div id="answer"><div class="note">Run something to see its rows here.</div></div></div>
+
+  <footer>
+    The page loads a library of books when the engine starts, so the samples have something to ask.
+    Schemas, inserts and functions you run stay until you start over. Rows are shown for the last statement when it is a query.
+  </footer>
+</main>
+
+<script type="module">
+import init, { Owl } from "../pkg/owl_wasm.js";
+
+const LIBRARY = `schema authors { id: String, name: String, born: Integer, country: String }
+schema books {
+  id: String, title: String, year: Integer, pages: Integer,
+  author: Ref(authors), tags: List(String)
+}
+authors.insert [
+  { id: "a1", name: "Ursula K. Le Guin", born: 1929, country: "US" },
+  { id: "a2", name: "Italo Calvino", born: 1923, country: "IT" },
+  { id: "a3", name: "Octavia Butler", born: 1947, country: "US" },
+  { id: "a4", name: "Stanisław Lem", born: 1921, country: "PL" }
+]
+books.insert [
+  { id: "b1", title: "The Dispossessed", year: 1974, pages: 387, author: "a1", tags: ["utopia", "physics"] },
+  { id: "b2", title: "Invisible Cities", year: 1972, pages: 165, author: "a2", tags: ["cities"] },
+  { id: "b3", title: "The Lathe of Heaven", year: 1971, pages: 184, author: "a1", tags: ["dreams"] },
+  { id: "b4", title: "Kindred", year: 1979, pages: 264, author: "a3", tags: ["time", "history"] },
+  { id: "b5", title: "Parable of the Sower", year: 1993, pages: 299, author: "a3", tags: ["utopia"] },
+  { id: "b6", title: "Solaris", year: 1961, pages: 204, author: "a4", tags: ["ocean", "contact"] },
+  { id: "b7", title: "The Left Hand of Darkness", year: 1969, pages: 304, author: "a1", tags: ["contact"] },
+  { id: "b8", title: "If on a winter's night a traveler", year: 1979, pages: 260, author: "a2", tags: ["books"] }
+]`;
+
+const SAMPLES = [
+  ["Through a reference", `// No join: a book's author is one step away.
+books
+  .where { .author.country == "US" }
+  .sort { .year.asc }
+  .select { title, year, by: .author.name }`],
+  ["Back across it", `// And an author's books are one step back.
+authors
+  .sort { .born.asc }
+  .select { name, books: .books.count(), pages: .books.sum(.pages), first: .books.min(.year) }`],
+  ["Group and count", `books
+  .group_by { decade: .year - .year % 10 }
+  .select { decade, books: count(), longest: max(.pages) }
+  .sort { .decade.asc }`],
+  ["Inside a list", `// Every tag of every book, counted.
+books.tags
+  .group_by { tag: . }
+  .select { tag, books: count() }
+  .sort { .books.desc, .tag.asc }`],
+  ["A running total", `books
+  .sort { .year.asc, .id.asc }
+  .select { year, title, pages, pages_so_far: so_far().pages.sum(), number: row_number() }`],
+  ["Your own function", `fn era(year) { if year < 1970 then "sixties" else if year < 1980 then "seventies" else "later" }
+
+books
+  .group_by { era: era(.year) }
+  .select { era, books: count() }
+  .sort { .books.desc }`],
+  ["Write, then read", `books.insert { id: "b9", title: "The Cyberiad", year: 1965, pages: 295, author: "a4", tags: ["robots"] }
+
+authors.where { .id == "a4" }.select { name, titles: .books.sort { .year.asc }.select { title, year } }`],
+];
+
+const $ = (id) => document.getElementById(id);
+const status = $("status"), source = $("source"), runButton = $("run"), took = $("took"), answer = $("answer");
+let owl = null;
+
+function open() {
+  const started = performance.now();
+  owl = new Owl();
+  const loaded = JSON.parse(owl.run(LIBRARY));
+  const ms = performance.now() - started;
+  if (loaded.errors.length) throw new Error(loaded.errors.join("\n"));
+  return ms;
+}
+
+function cell(value) {
+  const td = document.createElement("td");
+  if (value === null) { td.textContent = "null"; td.className = "null"; }
+  else if (typeof value === "number") { td.textContent = String(value); td.className = "num"; }
+  else if (typeof value === "object") td.textContent = JSON.stringify(value);
+  else td.textContent = String(value);
+  return td;
+}
+
+function show(result) {
+  answer.replaceChildren();
+  if (result.errors.length) {
+    const box = document.createElement("div");
+    box.className = "errors";
+    box.textContent = result.errors.join("\n");
+    answer.append(box);
+    return;
+  }
+  if (!result.rows.length) {
+    const note = document.createElement("div");
+    note.className = "note";
+    note.textContent = result.ran ? `Done: ${result.ran} statement${result.ran === 1 ? "" : "s"} ran, and the last gave no rows.` : "Nothing to run.";
+    answer.append(note);
+    return;
+  }
+  // In the order the query gave them, which the rows as JSON do not keep.
+  const names = result.columns;
+  const table = document.createElement("table");
+  const head = table.createTHead().insertRow();
+  for (const name of names) { const th = document.createElement("th"); th.textContent = name; head.append(th); }
+  const body = table.createTBody();
+  for (const row of result.rows.slice(0, 500)) {
+    const tr = body.insertRow();
+    for (const name of names) tr.append(cell(name in row ? row[name] : null));
+  }
+  const scroll = document.createElement("div");
+  scroll.className = "scroll";
+  scroll.append(table);
+  answer.append(scroll);
+  if (result.rows.length > 500) {
+    const note = document.createElement("div");
+    note.className = "note";
+    note.textContent = `Showing the first 500 of ${result.rows.length} rows.`;
+    answer.append(note);
+  }
+}
+
+function run() {
+  if (!owl) return;
+  const started = performance.now();
+  let result;
+  try { result = JSON.parse(owl.run(source.value)); }
+  catch (error) { result = { rows: [], columns: [], ran: 0, errors: [String(error)] }; }
+  const ms = performance.now() - started;
+  took.textContent = `${ms < 10 ? ms.toFixed(2) : ms.toFixed(0)} ms · ${result.rows.length} row${result.rows.length === 1 ? "" : "s"}`;
+  show(result);
+}
+
+for (const [name, text] of SAMPLES) {
+  const button = document.createElement("button");
+  button.textContent = name;
+  button.addEventListener("click", () => { source.value = text; run(); });
+  $("samples").append(button);
+}
+source.value = SAMPLES[0][1];
+runButton.addEventListener("click", run);
+source.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) { event.preventDefault(); run(); }
+});
+$("reset").addEventListener("click", () => {
+  owl.free();
+  const ms = open();
+  status.textContent = `A new database, with the library loaded again in ${ms.toFixed(0)} ms.`;
+  answer.replaceChildren(Object.assign(document.createElement("div"), { className: "note", textContent: "Run something to see its rows here." }));
+  took.textContent = "";
+});
+
+try {
+  const started = performance.now();
+  await init();
+  const fetched = performance.now() - started;
+  const opened = open();
+  status.textContent = `Engine ready in ${fetched.toFixed(0)} ms; database opened and library loaded in ${opened.toFixed(0)} ms.`;
+  runButton.disabled = false;
+  run();
+} catch (error) {
+  status.textContent = `The engine did not start: ${error}`;
+}
+</script>
+</body>
+</html>

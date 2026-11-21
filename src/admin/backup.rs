@@ -4,7 +4,6 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
 use super::config::OwlConfig;
 
@@ -694,7 +693,9 @@ impl BackupManager {
             let meta = fs::metadata(&file)?;
             let modified = meta.modified().ok();
             let ts = modified
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                // A file's times are the standard library's, whatever the
+                // clock is.
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
             if ts > newest {

@@ -7,7 +7,7 @@ use crate::distributed::consistent_hash::{ConsistentHashRing, ShardId};
 use crate::error::{OQLError, OQLResult};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 /// Node identifier in the cluster
 pub type NodeId = String;

@@ -252,7 +252,7 @@ impl ClusterManager {
     }
 
     fn generate_node_id(&self) -> u32 {
-        use std::time::{SystemTime, UNIX_EPOCH};
+        use web_time::{SystemTime, UNIX_EPOCH};
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         (now.as_secs() % 10000) as u32
     }

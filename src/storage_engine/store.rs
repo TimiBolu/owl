@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 const WAL_MAGIC: [u8; 4] = *b"OWLW";
 /// Current WAL frame format. The 24-byte header is:
@@ -2756,18 +2756,31 @@ impl RustStore {
         core.evict_clean_record_bytes()?;
         let (maintenance_sender, maintenance_receiver) = mpsc::sync_channel(1);
         let worker_core = core.clone();
-        let maintenance_worker = thread::Builder::new()
-            .name("owl-checkpoint-maintenance".to_string())
-            .spawn(move || maintenance_worker(worker_core, maintenance_receiver))
-            .map_err(|error| {
-                OQLError::generic(&format!(
-                    "cannot start checkpoint maintenance worker: {error}"
-                ))
-            })?;
+        // A browser has no threads to give. There the store runs with no
+        // maintenance worker: nothing checkpoints of its own accord, and a
+        // checkpoint is made when it is asked for. The receiving end is
+        // kept so that asking for maintenance finds somewhere to ask.
+        #[cfg(target_arch = "wasm32")]
+        let maintenance_worker = {
+            let _ = worker_core;
+            std::mem::forget(maintenance_receiver);
+            None
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let maintenance_worker = Some(
+            thread::Builder::new()
+                .name("owl-checkpoint-maintenance".to_string())
+                .spawn(move || maintenance_worker(worker_core, maintenance_receiver))
+                .map_err(|error| {
+                    OQLError::generic(&format!(
+                        "cannot start checkpoint maintenance worker: {error}"
+                    ))
+                })?,
+        );
         let store = Self {
             core,
             maintenance_sender,
-            maintenance_worker: Mutex::new(Some(maintenance_worker)),
+            maintenance_worker: Mutex::new(maintenance_worker),
         };
         // Recovery must preserve checkpoint debt. Otherwise a large WAL that
         // survived a restart can remain below the commit threshold forever
@@ -4858,6 +4871,9 @@ impl StoreCore {
 
 impl Drop for RustStore {
     fn drop(&mut self) {
+        // With no worker to hear it, as in a browser, the message would
+        // wait for room that never comes.
+        #[cfg(not(target_arch = "wasm32"))]
         let _ = self.maintenance_sender.send(MaintenanceMessage::Shutdown);
         if let Ok(mut worker) = self.maintenance_worker.lock() {
             if let Some(worker) = worker.take() {
@@ -12142,7 +12158,7 @@ mod tests {
             let (entered, timeout) = self
                 .checkpoint_entered
                 .1
-                .wait_timeout_while(entered, std::time::Duration::from_secs(2), |entered| {
+                .wait_timeout_while(entered, web_time::Duration::from_secs(2), |entered| {
                     !*entered
                 })
                 .unwrap();
@@ -14500,7 +14516,7 @@ mod tests {
             let result = writer.put_document(&document("a"));
             let _ = reply.send(result);
         });
-        let result = response.recv_timeout(std::time::Duration::from_secs(2));
+        let result = response.recv_timeout(web_time::Duration::from_secs(2));
         if result.is_err() {
             fs.release_checkpoint();
         }
@@ -14517,7 +14533,7 @@ mod tests {
             let result = second_writer.put_document(&document("b"));
             let _ = second_reply.send(result);
         });
-        let second_result = second_response.recv_timeout(std::time::Duration::from_secs(2));
+        let second_result = second_response.recv_timeout(web_time::Duration::from_secs(2));
         if second_result.is_err() {
             fs.release_checkpoint();
         }

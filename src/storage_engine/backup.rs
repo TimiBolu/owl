@@ -178,8 +178,8 @@ impl RustStore {
             Ok(BackupInfo {
                 database: database_name(database)?,
                 committed_lsn,
-                created_unix_seconds: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
+                created_unix_seconds: web_time::SystemTime::now()
+                    .duration_since(web_time::UNIX_EPOCH)
                     .map_or(0, |since| since.as_secs()),
                 files,
             })
