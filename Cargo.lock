@@ -986,6 +986,8 @@ dependencies = [
 name = "owl-wasm"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
+ "js-sys",
  "owl_db",
  "serde_json",
  "wasm-bindgen",

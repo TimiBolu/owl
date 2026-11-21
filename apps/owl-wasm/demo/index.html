@@ -21,7 +21,9 @@
   main { max-width: 980px; margin: 0 auto; padding: 32px 16px 64px; }
   h1 { font-size: 1.6rem; margin: 0 0 4px; letter-spacing: -0.01em; }
   .lede { color: var(--soft); margin: 0 0 20px; max-width: 62ch; }
-  .status { font: 13px var(--mono); color: var(--soft); margin: 0 0 16px; min-height: 1.4em; }
+  .status { font: 13px var(--mono); color: var(--soft); margin: 0 0 4px; min-height: 1.4em; }
+  .keeping { font: 13px var(--mono); color: var(--accent); margin: 0 0 16px; min-height: 1.4em; }
+  .keeping.not { color: var(--soft); }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; }
   .samples { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 10px; }
   .samples button {
@@ -64,8 +66,9 @@
 <body>
 <main>
   <h1>Owl in the browser</h1>
-  <p class="lede">The same engine the server runs, compiled to WebAssembly. Everything below happens in this page: there is no server, and the database is gone when you close the tab.</p>
+  <p class="lede">The same engine the server runs, compiled to WebAssembly. Everything below happens in this page: there is no server. The database is kept in this browser's own file system, so it is still here when you come back.</p>
   <p class="status" id="status">Loading the engine…</p>
+  <p class="keeping" id="keeping"></p>
 
   <div class="samples" id="samples"></div>
   <div class="card">
@@ -73,7 +76,7 @@
     <div class="bar">
       <button class="run" id="run" disabled>Run</button>
       <span class="hint">⌘ or Ctrl + Enter</span>
-      <button class="reset" id="reset">Start over with an empty database</button>
+      <button class="reset" id="reset">Forget this database and start over</button>
       <span class="took" id="took"></span>
     </div>
   </div>
@@ -82,13 +85,24 @@
   <div class="card out"><div id="answer"><div class="note">Run something to see its rows here.</div></div></div>
 
   <footer>
-    The page loads a library of books when the engine starts, so the samples have something to ask.
-    Schemas, inserts and functions you run stay until you start over. Rows are shown for the last statement when it is a query.
+    A new database is given a library of books, so the samples have something to ask.
+    Schemas, inserts and functions you run are kept, across reloads too, until you start over. Rows are shown for the last statement when it is a query.
+    Open in a second tab, the page holds its database in memory: one tab at a time can have the files.
   </footer>
 </main>
 
 <script type="module">
-import init, { Owl } from "../pkg/owl_wasm.js";
+// The engine runs in a worker, where a browser lets it keep its files.
+const worker = new Worker(new URL("./worker.js", import.meta.url), { type: "module" });
+const waiting = new Map();
+let asked = 0;
+worker.onmessage = ({ data }) => { waiting.get(data.id)?.(data); waiting.delete(data.id); };
+worker.onerror = (event) => { status.textContent = `The engine did not start: ${event.message}`; };
+const ask = (kind, source) => new Promise((answered) => {
+  const id = ++asked;
+  waiting.set(id, answered);
+  worker.postMessage({ id, kind, source });
+});
 
 const LIBRARY = `schema authors { id: String, name: String, born: Integer, country: String }
 schema books {
@@ -146,16 +160,15 @@ authors.where { .id == "a4" }.select { name, titles: .books.sort { .year.asc }.s
 ];
 
 const $ = (id) => document.getElementById(id);
-const status = $("status"), source = $("source"), runButton = $("run"), took = $("took"), answer = $("answer");
-let owl = null;
+const status = $("status"), source = $("source"), runButton = $("run"), took = $("took"), answer = $("answer"), keeping = $("keeping");
 
-function open() {
-  const started = performance.now();
-  owl = new Owl();
-  const loaded = JSON.parse(owl.run(LIBRARY));
-  const ms = performance.now() - started;
-  if (loaded.errors.length) throw new Error(loaded.errors.join("\n"));
-  return ms;
+const size = (bytes) => bytes < 1024 ? `${bytes} bytes` : bytes < 1048576 ? `${(bytes / 1024).toFixed(0)} KB` : `${(bytes / 1048576).toFixed(1)} MB`;
+
+function tell(about) {
+  keeping.textContent = about.kept
+    ? `Kept in this browser: ${about.files} files, ${size(about.bytes)}. Reload the page and it is still here.`
+    : `Held in memory only, and gone when the tab closes: ${/Access Handle/.test(about.why) ? "another tab has this database open" : about.why || "this browser did not give it files to keep"}.`;
+  keeping.className = about.kept ? "keeping" : "keeping not";
 }
 
 function cell(value) {
@@ -167,53 +180,67 @@ function cell(value) {
   return td;
 }
 
+function note(text) {
+  return Object.assign(document.createElement("div"), { className: "note", textContent: text });
+}
+
 function show(result) {
   answer.replaceChildren();
   if (result.errors.length) {
-    const box = document.createElement("div");
-    box.className = "errors";
-    box.textContent = result.errors.join("\n");
-    answer.append(box);
+    answer.append(Object.assign(document.createElement("div"), { className: "errors", textContent: result.errors.join("\n") }));
     return;
   }
   if (!result.rows.length) {
-    const note = document.createElement("div");
-    note.className = "note";
-    note.textContent = result.ran ? `Done: ${result.ran} statement${result.ran === 1 ? "" : "s"} ran, and the last gave no rows.` : "Nothing to run.";
-    answer.append(note);
+    answer.append(note(result.ran ? `Done: ${result.ran} statement${result.ran === 1 ? "" : "s"} ran, and the last gave no rows.` : "Nothing to run."));
     return;
   }
   // In the order the query gave them, which the rows as JSON do not keep.
   const names = result.columns;
   const table = document.createElement("table");
   const head = table.createTHead().insertRow();
-  for (const name of names) { const th = document.createElement("th"); th.textContent = name; head.append(th); }
+  for (const name of names) head.append(Object.assign(document.createElement("th"), { textContent: name }));
   const body = table.createTBody();
   for (const row of result.rows.slice(0, 500)) {
     const tr = body.insertRow();
     for (const name of names) tr.append(cell(name in row ? row[name] : null));
   }
-  const scroll = document.createElement("div");
-  scroll.className = "scroll";
+  const scroll = Object.assign(document.createElement("div"), { className: "scroll" });
   scroll.append(table);
   answer.append(scroll);
-  if (result.rows.length > 500) {
-    const note = document.createElement("div");
-    note.className = "note";
-    note.textContent = `Showing the first 500 of ${result.rows.length} rows.`;
-    answer.append(note);
-  }
+  if (result.rows.length > 500) answer.append(note(`Showing the first 500 of ${result.rows.length} rows.`));
 }
 
-function run() {
-  if (!owl) return;
-  const started = performance.now();
-  let result;
-  try { result = JSON.parse(owl.run(source.value)); }
-  catch (error) { result = { rows: [], columns: [], ran: 0, errors: [String(error)] }; }
-  const ms = performance.now() - started;
+async function run() {
+  runButton.disabled = true;
+  const { result, about } = await ask("run", source.value);
+  runButton.disabled = false;
+  const ms = result.ms;
   took.textContent = `${ms < 10 ? ms.toFixed(2) : ms.toFixed(0)} ms · ${result.rows.length} row${result.rows.length === 1 ? "" : "s"}`;
   show(result);
+  tell(about);
+}
+
+// A database found here already has its books; a new one is given them.
+async function begin() {
+  const started = performance.now();
+  // A collection nobody has declared counts as empty, so "new" is no books
+  // and no authors.
+  const found = await ask("run", "books.count()");
+  const authors = await ask("run", "authors.count()");
+  const empty = (asked) => asked.result.errors.length > 0 || asked.result.rows[0]?.count === 0;
+  let said;
+  if (empty(found) && empty(authors)) {
+    const loaded = await ask("run", LIBRARY);
+    if (loaded.result.errors.length) throw new Error(loaded.result.errors.join("\n"));
+    said = `A new database, with a library of books loaded, in ${(performance.now() - started).toFixed(0)} ms.`;
+  } else {
+    const books = found.result.rows[0].count;
+    said = found.about.kept
+      ? `Found the database kept here, with ${books} books, in ${(performance.now() - started).toFixed(0)} ms.`
+      : `A database with ${books} books.`;
+  }
+  status.textContent = said;
+  tell((await ask("about")).about);
 }
 
 for (const [name, text] of SAMPLES) {
@@ -227,22 +254,19 @@ runButton.addEventListener("click", run);
 source.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) { event.preventDefault(); run(); }
 });
-$("reset").addEventListener("click", () => {
-  owl.free();
-  const ms = open();
-  status.textContent = `A new database, with the library loaded again in ${ms.toFixed(0)} ms.`;
-  answer.replaceChildren(Object.assign(document.createElement("div"), { className: "note", textContent: "Run something to see its rows here." }));
+$("reset").addEventListener("click", async () => {
+  runButton.disabled = true;
+  await ask("forget");
+  await begin();
+  answer.replaceChildren(note("Run something to see its rows here."));
   took.textContent = "";
+  runButton.disabled = false;
 });
 
 try {
-  const started = performance.now();
-  await init();
-  const fetched = performance.now() - started;
-  const opened = open();
-  status.textContent = `Engine ready in ${fetched.toFixed(0)} ms; database opened and library loaded in ${opened.toFixed(0)} ms.`;
+  await begin();
   runButton.disabled = false;
-  run();
+  await run();
 } catch (error) {
   status.textContent = `The engine did not start: ${error}`;
 }
