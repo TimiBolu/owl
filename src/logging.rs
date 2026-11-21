@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::Instant;
+use web_time::Instant;
 use tracing::{debug, error, info, warn, Level};
 use uuid::Uuid;
 
@@ -84,8 +84,8 @@ impl LogEntry {
             message,
             layer,
             component,
-            timestamp_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            timestamp_ms: web_time::SystemTime::now()
+                .duration_since(web_time::UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64,
             duration_ms: None,
@@ -513,7 +513,7 @@ mod tests {
     fn test_timed_operation() {
         let logger = ComponentLogger::new("test".to_string(), "rust".to_string());
         let op = logger.timed_operation("test_operation".to_string());
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(web_time::Duration::from_millis(10));
         op.finish();
     }
 }

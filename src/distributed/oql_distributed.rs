@@ -784,7 +784,7 @@ impl DistributedOQLEngine {
 
         // Generate ID if not provided
         let id = document_id.unwrap_or_else(|| {
-            use std::time::{SystemTime, UNIX_EPOCH};
+            use web_time::{SystemTime, UNIX_EPOCH};
             let timestamp = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -809,7 +809,7 @@ impl DistributedOQLEngine {
                 // Handle built-in functions
                 match name.as_str() {
                     "now" => {
-                        use std::time::{SystemTime, UNIX_EPOCH};
+                        use web_time::{SystemTime, UNIX_EPOCH};
                         let timestamp = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap_or_default()
@@ -1035,7 +1035,7 @@ impl DistributedOQLEngine {
 
     /// Generate a unique transaction ID
     fn generate_transaction_id(&self) -> TxnId {
-        use std::time::{SystemTime, UNIX_EPOCH};
+        use web_time::{SystemTime, UNIX_EPOCH};
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()

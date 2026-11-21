@@ -5,7 +5,7 @@ use crate::document::Document;
 use crate::error::OQLResult;
 use crate::storage::{ProjectedRowBatch, ProjectedRows, Storage};
 use std::collections::BTreeMap;
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 pub const DEFAULT_CHUNK_ROWS: usize = 1024;
 

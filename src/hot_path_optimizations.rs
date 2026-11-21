@@ -622,7 +622,7 @@ pub fn profiling() -> bool {
 macro_rules! profile_call {
     ($func_name:expr, $code:block) => {{
         if $crate::hot_path_optimizations::profiling() {
-            let start = std::time::Instant::now();
+            let start = web_time::Instant::now();
             let result = $code;
             let duration = start.elapsed().as_nanos() as u64;
 

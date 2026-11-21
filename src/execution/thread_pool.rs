@@ -95,7 +95,7 @@ impl ThreadPool {
     /// Wait for all active tasks to complete
     pub fn wait_for_completion(&self) {
         while self.active_tasks.load(Ordering::SeqCst) > 0 {
-            thread::sleep(std::time::Duration::from_millis(1));
+            thread::sleep(web_time::Duration::from_millis(1));
         }
     }
 
@@ -182,7 +182,7 @@ impl Worker {
                 // Wait if queue is empty
                 while queue.is_empty() && !shutdown.load(Ordering::SeqCst) {
                     queue = condvar
-                        .wait_timeout(queue, std::time::Duration::from_millis(100))
+                        .wait_timeout(queue, web_time::Duration::from_millis(100))
                         .unwrap()
                         .0;
 
@@ -267,7 +267,7 @@ mod tests {
             let counter_clone = Arc::clone(&counter);
             pool.execute(move || {
                 // Simulate some work
-                thread::sleep(std::time::Duration::from_micros(100));
+                thread::sleep(web_time::Duration::from_micros(100));
                 counter_clone.fetch_add(1, Ordering::SeqCst);
             })
             .unwrap();

@@ -2,7 +2,7 @@ use crate::simulation::Clock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 /// Performance metrics for query execution
 #[derive(Debug, Clone, Serialize, Deserialize)]

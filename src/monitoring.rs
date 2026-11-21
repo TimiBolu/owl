@@ -6,7 +6,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use web_time::Instant;
 
 /// Query execution metrics
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -840,7 +840,7 @@ mod tests {
         span.log("info".to_string(), "Starting operation".to_string());
 
         // Simulate some work
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(web_time::Duration::from_millis(10));
 
         span.finish();
 

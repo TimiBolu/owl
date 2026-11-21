@@ -2,7 +2,7 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use web_time::Duration;
 
 /// Node identifier in the network
 pub type NodeId = u32;
@@ -67,7 +67,7 @@ impl std::error::Error for NetworkError {}
 #[allow(dead_code)]
 struct PendingMessage {
     message: Message,
-    delivery_time: std::time::Instant,
+    delivery_time: web_time::Instant,
     original_order: u64, // For reordering simulation
 }
 
@@ -114,7 +114,7 @@ pub struct SimulatedNetwork {
     /// Random number generator for deterministic behavior
     rng: Arc<Mutex<StdRng>>,
     /// Current simulated time
-    current_time: Arc<Mutex<std::time::Instant>>,
+    current_time: Arc<Mutex<web_time::Instant>>,
     /// Message ordering counter for reordering simulation
     message_counter: Arc<Mutex<u64>>,
     /// Registered nodes in the network
@@ -144,7 +144,7 @@ impl SimulatedNetwork {
             base_latency: Duration::from_millis(10),
             failure_config: Arc::new(Mutex::new(NetworkFailureConfig::default())),
             rng: Arc::new(Mutex::new(StdRng::seed_from_u64(seed))),
-            current_time: Arc::new(Mutex::new(std::time::Instant::now())),
+            current_time: Arc::new(Mutex::new(web_time::Instant::now())),
             message_counter: Arc::new(Mutex::new(0)),
             nodes: Arc::new(Mutex::new(HashSet::new())),
         }
@@ -505,7 +505,7 @@ use std::thread;
 #[derive(Debug)]
 struct Connection {
     stream: TcpStream,
-    last_used: std::time::Instant,
+    last_used: web_time::Instant,
 }
 
 /// Circuit breaker states
@@ -523,7 +523,7 @@ struct CircuitBreaker {
     failure_count: u32,
     failure_threshold: u32,
     timeout: Duration,
-    last_failure_time: Option<std::time::Instant>,
+    last_failure_time: Option<web_time::Instant>,
 }
 
 impl CircuitBreaker {
@@ -564,7 +564,7 @@ impl CircuitBreaker {
 
     fn on_failure(&mut self) {
         self.failure_count += 1;
-        self.last_failure_time = Some(std::time::Instant::now());
+        self.last_failure_time = Some(web_time::Instant::now());
 
         if self.failure_count >= self.failure_threshold {
             self.state = CircuitBreakerState::Open;
@@ -709,7 +709,7 @@ impl RealNetwork {
         if pool.len() < self.max_connections_per_node {
             let connection = Connection {
                 stream,
-                last_used: std::time::Instant::now(),
+                last_used: web_time::Instant::now(),
             };
             pool.insert(node_id, connection);
         }

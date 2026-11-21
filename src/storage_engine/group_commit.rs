@@ -4,7 +4,7 @@ use crate::error::{OQLError, OQLResult};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 enum Message {
     Commit(Request),

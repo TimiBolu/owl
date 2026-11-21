@@ -8,7 +8,7 @@ autoexamples = false
 autobenches = false
 
 [workspace]
-members = [".", "apps/loggr", "apps/storefront", "apps/owl-server", "apps/gauntlet"]
+members = [".", "apps/loggr", "apps/storefront", "apps/owl-server", "apps/gauntlet", "apps/owl-wasm"]
 resolver = "2"
 
 [features]
@@ -56,6 +56,10 @@ tempfile = "3.0"
 
 # Parsing
 nom = "7.1"
+
+# The clock. On every target but the browser's this is the standard library's
+# own; there it asks the browser, where the standard library's panics.
+web-time = "1"
 
 # Encoding
 base64 = "0.21"
@@ -143,3 +147,8 @@ harness = false
 name = "navigation_bench"
 path = "benches/navigation_bench.rs"
 harness = false
+
+# In a browser, randomness comes from the browser.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
+uuid = { version = "1.0", features = ["v4", "serde", "js"] }

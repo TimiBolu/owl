@@ -273,7 +273,7 @@ impl Scheduler for RealScheduler {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
-    use std::time::Duration;
+    use web_time::Duration;
 
     #[test]
     fn test_simulated_scheduler_basic() {

@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_uint, c_ulong};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 /// Cross-layer observability manager
 pub struct CrossLayerObservabilityManager {
@@ -1263,7 +1263,7 @@ extern "C" {
 #[macro_export]
 macro_rules! time_cross_layer_operation {
     ($observability:expr, $operation:expr, $layer:expr, $shard_id:expr, $code:block) => {{
-        let start_time = std::time::Instant::now();
+        let start_time = web_time::Instant::now();
         let trace_id = $observability.start_trace($operation)?;
         let span_id = $observability.start_span(&trace_id, $operation, $layer, $shard_id)?;
         

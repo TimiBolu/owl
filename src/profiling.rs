@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use web_time::Instant;
 
 /// Profile sample
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,8 +250,8 @@ impl<'a> ProfiledFunction<'a> {
             file: self.file.clone(),
             line: self.line,
             duration_ns: duration.as_nanos() as u64,
-            timestamp_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            timestamp_ms: web_time::SystemTime::now()
+                .duration_since(web_time::UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64,
             layer: self.layer.clone(),
@@ -270,8 +270,8 @@ impl<'a> Drop for ProfiledFunction<'a> {
             file: self.file.clone(),
             line: self.line,
             duration_ns: duration.as_nanos() as u64,
-            timestamp_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            timestamp_ms: web_time::SystemTime::now()
+                .duration_since(web_time::UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64,
             layer: self.layer.clone(),
@@ -402,8 +402,8 @@ pub extern "C" fn owl_profile_record_sample(
             file: file.to_string(),
             line: sample_ref.line,
             duration_ns: sample_ref.duration_ns,
-            timestamp_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
+            timestamp_ms: web_time::SystemTime::now()
+                .duration_since(web_time::UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64,
             layer: "zig".to_string(),

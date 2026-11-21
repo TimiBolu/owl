@@ -29,7 +29,7 @@ use crate::streaming::{
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 /// Query execution engine for OQL with dependency injection
 #[allow(dead_code)]
