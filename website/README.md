@@ -10,11 +10,13 @@ deployed on pubp. There is no backend.
 ../.pubpignore         keeps the database's build output and data out of pubp uploads
 Dockerfile             node:22-alpine, runs `node .output/server/index.mjs` on :3000
 middleware/            www → apex 308, noindex on every non-canonical host
-src/routes/            index, play, health-check, robots.txt, sitemap.xml (and the 404 in __root)
-src/components/        Hero (owl, draggable graph), Language (tabs), Sections (the rest), Playground (/play)
+src/routes/            index, try (and play, which sends on to it), health-check, robots.txt, sitemap.xml (and the 404 in __root)
+src/components/        Hero (owl, draggable graph), Language (tabs), Sections (the rest), Playground with PlayData and PlayLoad (/try)
 src/lib/usePlay.ts     everything that moves after load; the page is complete without it
-src/lib/owl.ts         /play's side of the engine: sends OQL to the worker, gets rows back
-src/lib/playShop.ts    the shop /play starts with, and its samples
+src/lib/owl.ts         /try's side of the engine: sends OQL to the worker, gets rows and a description of the database back
+src/lib/playShop.ts    the shop /try starts with, and the tour's questions
+src/lib/questions.ts   questions worth asking of any collection, worked out from its schema
+src/lib/readRows.ts    reads pasted JSON or CSV, guesses a schema for it, and writes the inserts
 public/owl/            the engine, built for the browser, and the worker it runs in
 src/lib/seo.ts         titles, descriptions, share text, JSON-LD and CANONICAL_HOST
 scripts/og/            renders public/og-image.png and the icons
@@ -28,11 +30,16 @@ npm run dev                          # http://localhost:5181
 npm run build && PORT=3000 npm start
 ```
 
-## The playground
+## Try online
 
-`/play` runs the real engine in the visitor's tab. The engine is the Rust code in the repository,
+`/try` runs the real engine in the visitor's tab. The engine is the Rust code in the repository,
 compiled to WebAssembly by `apps/owl-wasm`, and it keeps its database in the browser's own file
 system, so what a visitor writes is there when they come back.
+
+The page shows what is in the database (collections, fields, what refers to what), offers
+questions worked out from the schema, remembers what was asked, and takes a visitor's own rows:
+pasted JSON or CSV is read, given a schema the visitor can change, checked by the engine, and
+loaded in one transaction, all rows or none.
 
 The site is built in a container with no Rust in it, so the built engine is committed in
 `public/owl/`. When the engine changes, build it again and commit the result:
@@ -42,7 +49,7 @@ npm run wasm        # needs a Rust toolchain with wasm32-unknown-unknown, and wa
 ```
 
 `public/owl/build.json` says which commit it was built from. The file is 6.7 MB and is served
-compressed at 1.2 MB; only `/play` loads it.
+compressed at 1.2 MB; only `/try` loads it.
 
 ## pubp
 

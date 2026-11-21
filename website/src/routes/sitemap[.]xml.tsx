@@ -18,7 +18,7 @@ export const Route = createFileRoute("/sitemap.xml")({
     <image:image><image:loc>${OG_IMAGE.url}</image:loc></image:image>
   </url>
   <url>
-    <loc>${SITE_URL}/play</loc>
+    <loc>${SITE_URL}/try</loc>
     <lastmod>${__BUILD_DATE__}</lastmod>
     <changefreq>weekly</changefreq>
     <priority>0.8</priority>

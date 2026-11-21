@@ -29,8 +29,8 @@ export function Hud() {
         <a className="key" href="#language">
           <kbd>L</kbd> the language
         </a>
-        <a className="key" href="/play">
-          <kbd>P</kbd> play
+        <a className="key" href="/try">
+          <kbd>T</kbd> try online
         </a>
       </span>
       <a className="brand" href="#top" aria-label="Owl, back to top">
@@ -250,8 +250,8 @@ export function Start() {
           </pre>
         </div>
         <div className="cta">
-          <a className="btn solid" href="/play">
-            Try it in your browser
+          <a className="btn solid" href="/try">
+            Try it online
           </a>
           <a className="btn" href={GITHUB_URL} target="_blank" rel="noopener noreferrer">
             Get Owl on GitHub
@@ -332,7 +332,7 @@ export function Footer({ home = "" }: { home?: string }) {
             {name}
           </a>
         ))}
-        <a href="/play">Play</a>
+        <a href="/try">Try online</a>
         <a href={GITHUB_URL} target="_blank" rel="noopener noreferrer">
           GitHub
         </a>

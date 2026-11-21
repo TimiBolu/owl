@@ -281,6 +281,26 @@ export class Owl {
         }
     }
     /**
+     * What is in the database, as JSON: each collection with how many
+     * rows it has, its fields (the id, then the rest by name) with their
+     * types as OQL writes them, the collection each reference points at,
+     * the names by which other collections' references reach it, and the
+     * rules its schema states.
+     * @returns {string}
+     */
+    describe() {
+        let deferred1_0;
+        let deferred1_1;
+        try {
+            const ret = wasm.owl_describe(this.__wbg_ptr);
+            deferred1_0 = ret[0];
+            deferred1_1 = ret[1];
+            return getStringFromWasm0(ret[0], ret[1]);
+        } finally {
+            wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
+        }
+    }
+    /**
      * Add files to the pool of a database that is kept.
      * @param {Array<any>} handles
      */
