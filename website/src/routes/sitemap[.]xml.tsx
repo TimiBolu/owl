@@ -17,6 +17,12 @@ export const Route = createFileRoute("/sitemap.xml")({
     <priority>1.0</priority>
     <image:image><image:loc>${OG_IMAGE.url}</image:loc></image:image>
   </url>
+  <url>
+    <loc>${SITE_URL}/play</loc>
+    <lastmod>${__BUILD_DATE__}</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>0.8</priority>
+  </url>
 </urlset>
 `,
           { headers: { "content-type": "application/xml; charset=utf-8", "cache-control": "public, max-age=3600" } },

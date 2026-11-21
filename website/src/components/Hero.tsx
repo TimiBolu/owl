@@ -68,7 +68,7 @@ function HeroGraph({ say }: { say: Say }) {
   );
 }
 
-function Owl({ hoot }: { hoot: () => void }) {
+export function Owl({ hoot }: { hoot: () => void }) {
   return (
     <svg className="owl" id="owl" viewBox="0 0 240 300" role="img" aria-label="An owl whose eyes follow your cursor">
       <g filter="url(#rough-fine)">
