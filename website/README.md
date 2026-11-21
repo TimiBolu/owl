@@ -10,9 +10,12 @@ deployed on pubp. There is no backend.
 ../.pubpignore         keeps the database's build output and data out of pubp uploads
 Dockerfile             node:22-alpine, runs `node .output/server/index.mjs` on :3000
 middleware/            www → apex 308, noindex on every non-canonical host
-src/routes/            index, health-check, robots.txt, sitemap.xml (and the 404 in __root)
-src/components/        Hero (owl, draggable graph), Language (tabs), Sections (the rest)
+src/routes/            index, play, health-check, robots.txt, sitemap.xml (and the 404 in __root)
+src/components/        Hero (owl, draggable graph), Language (tabs), Sections (the rest), Playground (/play)
 src/lib/usePlay.ts     everything that moves after load; the page is complete without it
+src/lib/owl.ts         /play's side of the engine: sends OQL to the worker, gets rows back
+src/lib/playShop.ts    the shop /play starts with, and its samples
+public/owl/            the engine, built for the browser, and the worker it runs in
 src/lib/seo.ts         titles, descriptions, share text, JSON-LD and CANONICAL_HOST
 scripts/og/            renders public/og-image.png and the icons
 ```
@@ -24,6 +27,22 @@ npm install
 npm run dev                          # http://localhost:5181
 npm run build && PORT=3000 npm start
 ```
+
+## The playground
+
+`/play` runs the real engine in the visitor's tab. The engine is the Rust code in the repository,
+compiled to WebAssembly by `apps/owl-wasm`, and it keeps its database in the browser's own file
+system, so what a visitor writes is there when they come back.
+
+The site is built in a container with no Rust in it, so the built engine is committed in
+`public/owl/`. When the engine changes, build it again and commit the result:
+
+```bash
+npm run wasm        # needs a Rust toolchain with wasm32-unknown-unknown, and wasm-pack
+```
+
+`public/owl/build.json` says which commit it was built from. The file is 6.7 MB and is served
+compressed at 1.2 MB; only `/play` loads it.
 
 ## pubp
 

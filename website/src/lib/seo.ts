@@ -23,6 +23,10 @@ export const OG_IMAGE = {
 };
 
 /** The sections of the page, in order: used by the footer links and the structured data. */
+export const PLAY_TITLE = "Play with Owl: the database running in your browser";
+export const PLAY_DESCRIPTION =
+  "Write OQL and run it against a real Owl database, compiled to WebAssembly and running in your browser tab. No server, no sign-up, and what you write is still there when you come back.";
+
 export const SECTIONS = [
   ["language", "The language", "A seven-chapter tour of OQL, from a schema to recursion and row positions."],
   ["forms", "Chain and block forms", "The two equivalent ways to write any OQL query, and what a block adds."],

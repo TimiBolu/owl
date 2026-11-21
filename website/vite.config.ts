@@ -18,6 +18,8 @@ export default defineConfig({
   plugins: [
     nitro({
       serverDir: ".",
+      // The engine is 6.7 MB as built and under 2 MB compressed.
+      compressPublicAssets: true,
       routeRules: {
         // Pages: always revalidate, so a deploy shows up at once.
         "/**": { headers: { ...SECURITY_HEADERS, "cache-control": "no-cache" } },
@@ -28,6 +30,8 @@ export default defineConfig({
           ),
         ),
         "/assets/**": { headers: { ...SECURITY_HEADERS, "cache-control": "public, max-age=31536000, immutable" } },
+        // The engine for /play: large and unhashed, so it is kept for an hour and checked after.
+        "/owl/**": { headers: { ...SECURITY_HEADERS, "cache-control": "public, max-age=3600, must-revalidate" } },
         "/health-check": { headers: { "cache-control": "no-store", "x-robots-tag": "noindex, nofollow, noarchive" } },
       },
     }),

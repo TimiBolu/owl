@@ -25,9 +25,14 @@ export function InkFilters() {
 export function Hud() {
   return (
     <header className="hud">
-      <a className="key" href="#language">
-        <kbd>L</kbd> the language
-      </a>
+      <span className="hud-keys">
+        <a className="key" href="#language">
+          <kbd>L</kbd> the language
+        </a>
+        <a className="key" href="/play">
+          <kbd>P</kbd> play
+        </a>
+      </span>
       <a className="brand" href="#top" aria-label="Owl, back to top">
         <span className="o-eye look" data-reach="4">
           <b />
@@ -245,7 +250,10 @@ export function Start() {
           </pre>
         </div>
         <div className="cta">
-          <a className="btn solid" href={GITHUB_URL} target="_blank" rel="noopener noreferrer">
+          <a className="btn solid" href="/play">
+            Try it in your browser
+          </a>
+          <a className="btn" href={GITHUB_URL} target="_blank" rel="noopener noreferrer">
             Get Owl on GitHub
           </a>
         </div>
@@ -314,15 +322,17 @@ export function Join() {
   );
 }
 
-export function Footer() {
+/** `home` is where the sections are: nothing on the home page itself, "/" from any other. */
+export function Footer({ home = "" }: { home?: string }) {
   return (
     <footer className="foot">
-      <nav className="foot-nav" aria-label="Sections of this page">
+      <nav className="foot-nav" aria-label={home ? "Sections of the home page" : "Sections of this page"}>
         {SECTIONS.map(([id, name]) => (
-          <a key={id} href={`#${id}`}>
+          <a key={id} href={`${home}#${id}`}>
             {name}
           </a>
         ))}
+        <a href="/play">Play</a>
         <a href={GITHUB_URL} target="_blank" rel="noopener noreferrer">
           GitHub
         </a>

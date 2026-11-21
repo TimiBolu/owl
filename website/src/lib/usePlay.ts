@@ -4,7 +4,7 @@ import { GITHUB_URL } from "./seo";
 const LINES = ["who?", "who: .customer.name", "no joins.", "I read your schema.", "ask me at night.", "a star would be nice.", "you again?"];
 
 /** How far a pupil moves toward a point, capped at `reach`. */
-function pull(box: DOMRect, x: number, y: number, reach: number) {
+export function pull(box: DOMRect, x: number, y: number, reach: number) {
   const dx = x - (box.left + box.width / 2);
   const dy = y - (box.top + box.height / 2);
   const far = Math.hypot(dx, dy) || 1;
@@ -117,6 +117,7 @@ export function usePlay() {
       const k = e.key.toLowerCase();
       if (k === "l") document.getElementById("language")?.scrollIntoView();
       if (k === "g") window.open(GITHUB_URL, "_blank", "noopener,noreferrer");
+      if (k === "p") location.assign("/play");
       if (k === "h") {
         scrollTo({ top: 0 });
         hoot();
