@@ -7687,9 +7687,13 @@ fn restore_checkpoint(
         // With a budget, only as many rows as it has room for are decoded.
         // The rest are known by the schema and id their records state, and
         // decoded if they are ever asked for.
-        let room = match state
-            .rows_bytes()
-            .is_some_and(|bytes| state.object_directory.bytes() >= bytes)
+        // When the records can be read from their file later, none is
+        // decoded now: opening a database should not cost in proportion to
+        // rows nobody has asked for yet, in time or in memory.
+        let room = match records_on_file
+            || state
+                .rows_bytes()
+                .is_some_and(|bytes| state.object_directory.bytes() >= bytes)
         {
             true => 0,
             false => state
@@ -12946,7 +12950,9 @@ mod tests {
         let scalar_layout = reopened.storage_layout_stats("logs").unwrap();
         assert_eq!(scalar_layout.typed_authoritative_rows, 1);
         assert_eq!(scalar_layout.row_overflow_rows, 0);
-        assert_eq!(scalar_layout.resident_documents, 1);
+        // Opening decodes nothing: the nested row is read from its record
+        // when it is first asked for, as the scalar one is from its segment.
+        assert_eq!(scalar_layout.resident_documents, 0);
         assert_eq!(scalar_layout.lazy_typed_rows, 1);
         let nested_layout = reopened.storage_layout_stats("payloads").unwrap();
         assert_eq!(nested_layout.typed_authoritative_rows, 0);
@@ -12958,7 +12964,7 @@ mod tests {
             Some(scalar)
         );
         let materialized_layout = reopened.storage_layout_stats("logs").unwrap();
-        assert_eq!(materialized_layout.resident_documents, 2);
+        assert_eq!(materialized_layout.resident_documents, 1);
         assert_eq!(materialized_layout.lazy_typed_rows, 0);
         assert_eq!(
             reopened
@@ -12966,6 +12972,8 @@ mod tests {
                 .unwrap(),
             Some(nested)
         );
+        let both = reopened.storage_layout_stats("logs").unwrap();
+        assert_eq!(both.resident_documents, 2);
     }
 
     #[test]

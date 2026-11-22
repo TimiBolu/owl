@@ -12,6 +12,7 @@ mod data;
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use data::{Cell, Row, Table};
+use owl_db::storage::DocumentStore;
 use owl_db::Value;
 use serde_json::Value as Json;
 use std::path::PathBuf;
@@ -64,6 +65,20 @@ enum Command {
         /// Only run queries whose name contains this text.
         #[arg(long)]
         only: Option<String>,
+    },
+    /// How one database behaves as it grows: how fast it loads, checkpoints,
+    /// compacts, reopens, commits one row at a time and reads one row, and
+    /// what it holds in memory and on disk. Owl alone.
+    Scale {
+        #[arg(long, default_value_t = 2000)]
+        people: usize,
+        /// Keep the database in this directory instead of a temporary
+        /// one. When one is already there, only reopen it, `--reopens`
+        /// times, which is the way to look closely at opening.
+        #[arg(long)]
+        at: Option<PathBuf>,
+        #[arg(long, default_value_t = 5)]
+        reopens: usize,
     },
     /// An experiment: time two slow questions over rows, over the store's
     /// column segments and over plain arrays.
@@ -368,6 +383,159 @@ fn memory(people: usize, only: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Rows held back from the load, to be committed one at a time.
+const SINGLE_COMMITS: usize = 2000;
+/// Rows looked up by id.
+const LOOKUPS: usize = 20_000;
+
+fn scale(people: usize, at: Option<PathBuf>, reopens: usize) -> Result<()> {
+    let megabytes = |bytes: u64| bytes as f64 / 1e6;
+    let size_of = |directory: &std::path::Path| -> u64 {
+        std::fs::read_dir(directory)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| Some(entry.ok()?.metadata().ok()?.len()))
+            .sum()
+    };
+    let base = resident_megabytes();
+    let held = || {
+        let peak = PEAK_BYTES.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / (1024.0 * 1024.0);
+        (resident_megabytes() - base, peak - base)
+    };
+    let line = |what: &str, seconds: f64, note: String| {
+        let (now, peak) = held();
+        println!("{what:<34} {seconds:>8.2} s {now:>7.0} MB held {peak:>7.0} MB at most   {note}");
+    };
+
+    let temporary = tempfile::TempDir::new()?;
+    let directory = at.unwrap_or_else(|| temporary.path().to_path_buf());
+    std::fs::create_dir_all(&directory)?;
+    let path = directory.join("gauntlet.owl");
+    if path.exists() {
+        for _ in 0..reopens {
+            held();
+            let started = Instant::now();
+            let owl = Owl::open_with(&path, include_str!("../schema.oql"))?;
+            line("reopen", started.elapsed().as_secs_f64(), String::new());
+            drop(owl);
+        }
+        return Ok(());
+    }
+    let owl = Owl::open_with(&path, include_str!("../schema.oql"))?;
+
+    let started = Instant::now();
+    let mut tables = data::generate(people);
+    let generated = started.elapsed().as_secs_f64();
+    // The generator's rows are not Owl's doing; count from here.
+    let generator = resident_megabytes() - base;
+    let mut kept_back: Vec<Row> = Vec::new();
+    let mut ids: Vec<String> = Vec::new();
+    for table in &mut tables {
+        if table.name == "events" && table.rows.len() > 2 * SINGLE_COMMITS {
+            kept_back = table.rows.split_off(table.rows.len() - SINGLE_COMMITS);
+        }
+        if table.name == "people" {
+            ids = table
+                .rows
+                .iter()
+                .filter_map(|row| match &row[0].1 {
+                    Cell::Text(id) => Some(id.clone()),
+                    _ => None,
+                })
+                .collect();
+        }
+    }
+    let rows: usize = tables.iter().map(|table| table.rows.len()).sum();
+    println!(
+        "{rows} rows ({people} people); generating them took {generated:.1} s and holds {generator:.0} MB of its own\n"
+    );
+
+    let started = Instant::now();
+    for table in tables {
+        for batch in table.rows.chunks(BATCH) {
+            owl.insert_rows(table.name, batch.iter().map(owl_row).collect())?;
+        }
+        // Each table is let go once it is in, so the generator's rows do
+        // not sit beside Owl's for the whole load.
+    }
+    let seconds = started.elapsed().as_secs_f64();
+    line("load", seconds, format!("{:.0} rows a second", rows as f64 / seconds));
+
+    let started = Instant::now();
+    owl.checkpoint()?;
+    line(
+        "checkpoint",
+        started.elapsed().as_secs_f64(),
+        format!("{:.0} MB on disk", megabytes(size_of(&directory))),
+    );
+
+    let started = Instant::now();
+    owl.compact()?;
+    line(
+        "compaction",
+        started.elapsed().as_secs_f64(),
+        format!("{:.0} MB on disk", megabytes(size_of(&directory))),
+    );
+
+    let started = Instant::now();
+    owl.compact_and_reclaim()?;
+    line(
+        "compaction again, old copy removed",
+        started.elapsed().as_secs_f64(),
+        format!("{:.0} MB on disk", megabytes(size_of(&directory))),
+    );
+
+    let started = Instant::now();
+    let commits = kept_back.len();
+    for row in &kept_back {
+        owl.insert_rows("events", vec![owl_row(row)])?;
+    }
+    let seconds = started.elapsed().as_secs_f64();
+    line(
+        "commits of one row each",
+        seconds,
+        format!("{commits} commits, {:.0} a second", commits as f64 / seconds.max(1e-9)),
+    );
+
+    drop(owl);
+    held();
+    let started = Instant::now();
+    let owl = Owl::open_with(&path, include_str!("../schema.oql"))?;
+    line("reopen", started.elapsed().as_secs_f64(), String::new());
+
+    // Every so-manyth id, so the lookups are spread over the collection.
+    let step = (ids.len() / LOOKUPS.min(ids.len()).max(1)).max(1);
+    let wanted: Vec<&String> = ids.iter().step_by(step).collect();
+    let started = Instant::now();
+    let mut found = 0usize;
+    for id in &wanted {
+        if owl
+            .store()
+            .get_document("people", id)
+            .map_err(|error| anyhow!("{error}"))?
+            .is_some()
+        {
+            found += 1;
+        }
+    }
+    let seconds = started.elapsed().as_secs_f64();
+    line(
+        "lookups by id",
+        seconds,
+        format!(
+            "{found} found, {:.1} microseconds each",
+            seconds * 1e6 / wanted.len().max(1) as f64
+        ),
+    );
+
+    for round in ["first", "second"] {
+        let started = Instant::now();
+        owl.query("events.count()")?;
+        line(&format!("count every event, {round} time"), started.elapsed().as_secs_f64(), String::new());
+    }
+    Ok(())
+}
+
 fn load(people: usize) -> Result<Loaded> {
     let tables = data::generate(people);
     let directory = tempfile::TempDir::new()?;
@@ -527,5 +695,6 @@ fn main() -> Result<()> {
         Command::Show { people, rows, queries } => show(people, rows, &queries),
         Command::Columns { people, samples } => columns::run(&load(people)?.owl, samples),
         Command::Memory { people, only } => memory(people, only.as_deref()),
+        Command::Scale { people, at, reopens } => scale(people, at, reopens),
     }
 }
