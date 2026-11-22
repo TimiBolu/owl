@@ -2043,9 +2043,23 @@ pub(crate) fn cleanup_typed_locator_spools(
         OQLError::storage_error(&format!("inspect locator build journal: {error}"), None)
     })?)
     .map_err(|_| OQLError::storage_error("locator build journal is too large", None))?;
+    if len < LOCATOR_BUILD_JOURNAL_LEN {
+        // The build died while writing its journal. The journal is made
+        // durable before the first run is written, so a journal that is
+        // not all there has no runs to name: it is all that was left.
+        filesystem.remove(&journal).map_err(|error| {
+            OQLError::storage_error(&format!("remove locator build journal: {error}"), None)
+        })?;
+        return filesystem.sync_all().map_err(|error| {
+            OQLError::storage_error(
+                &format!("sync reclaimed locator build artifacts: {error}"),
+                None,
+            )
+        });
+    }
     if len != LOCATOR_BUILD_JOURNAL_LEN {
         return Err(OQLError::storage_error(
-            "locator build journal is truncated",
+            "locator build journal has an invalid length",
             None,
         ));
     }

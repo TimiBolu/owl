@@ -3564,12 +3564,15 @@ impl StoreCore {
     }
 
     fn checkpoint_concurrent(&self) -> OQLResult<CheckpointInfo> {
-        if let Some(pending) = self
+        // Taken in a statement of its own, so the lock is let go before
+        // the checkpoint is finished: finishing puts the checkpoint back
+        // under the same lock when it fails again.
+        let unfinished = self
             .pending_incremental_checkpoint
             .lock()
             .map_err(|_| OQLError::generic("pending incremental checkpoint lock poisoned"))?
-            .take()
-        {
+            .take();
+        if let Some(pending) = unfinished {
             return self.finish_incremental_checkpoint(pending);
         }
         let pending = self
@@ -3608,12 +3611,12 @@ impl StoreCore {
     }
 
     fn compact_concurrent(&self) -> OQLResult<CheckpointInfo> {
-        if let Some(pending) = self
+        let unfinished = self
             .pending_incremental_checkpoint
             .lock()
             .map_err(|_| OQLError::generic("pending incremental checkpoint lock poisoned"))?
-            .take()
-        {
+            .take();
+        if let Some(pending) = unfinished {
             self.finish_incremental_checkpoint(pending)?;
         }
         let pending = self
@@ -4135,11 +4138,20 @@ impl StoreCore {
             has_record_root: true,
             has_index_root: true,
         };
-        write_synced_file(
+        if let Err(error) = write_synced_file(
             self.filesystem.as_ref(),
             &self.manifest_paths[slot],
             &manifest.encode(),
-        )?;
+        ) {
+            // The manifest may be on disk though writing it failed, and
+            // nothing here can tell. Publishing again would choose a base
+            // segment to write over by reading the manifests, and could
+            // choose the one a manifest that did reach the disk depends
+            // on. Both logs are still whole, so stop writing and let the
+            // next open settle which checkpoint stands.
+            self.poisoned.store(true, Ordering::Release);
+            return Err(error);
+        }
         self.install_record_root_handle(manifest)?;
         self.install_index_bases(segment.indexes)?;
         self.checkpoint_sequence.store(sequence, Ordering::Release);
@@ -4486,36 +4498,16 @@ impl StoreCore {
             if typed_row_remains_checkpoint_authoritative(state, object_ref)? {
                 continue;
             }
+            // What memory holds is newest. Failing that, the checkpoint
+            // files hold it, and the newest of those is a generation
+            // before it is the base: a row last written just before an
+            // incremental checkpoint has its current record only there.
             let record = if let Some(record) = state.object_records.get(&object_ref) {
                 record.clone()
+            } else if let Some(record) = handles.record(object_ref)? {
+                record
             } else {
-                match handles
-                    .record_root
-                    .as_ref()
-                    .map(|root| root.lookup(object_ref))
-                    .transpose()?
-                {
-                    Some(RecordDeltaLookup::Put(record)) => record,
-                    Some(RecordDeltaLookup::Delete) => {
-                        return Err(OQLError::storage_error(
-                            "live checkpoint object is deleted by its record root",
-                            None,
-                        ));
-                    }
-                    Some(RecordDeltaLookup::Missing) | None => {
-                        if let Some(record) = handles
-                            .base_segment
-                            .as_ref()
-                            .map(|base| base.lookup(object_ref))
-                            .transpose()?
-                            .flatten()
-                        {
-                            record
-                        } else {
-                            encode_authoritative_row(state, object_ref)?
-                        }
-                    }
-                }
+                encode_authoritative_row(state, object_ref)?
             };
             let header = RecordCodec::header(&record)?;
             if header.object_ref != object_ref {
@@ -4700,7 +4692,8 @@ impl StoreCore {
                 logical_live_count(&state),
             )
         };
-        let checkpoint = self.publish_image(&image, live_objects)?.info;
+        let published = self.publish_image(&image, live_objects)?;
+        let checkpoint = published.info.clone();
         {
             let mut wal = self
                 .wal
@@ -4724,6 +4717,16 @@ impl StoreCore {
                     storage_io("reclaim recovered sealed WAL", &self.sealed_wal_path, error)
                 })?;
         }
+        // The checkpoint just published holds the typed rows in its base
+        // segment. The open state must hold them the same way, as it does
+        // after any other full checkpoint; otherwise it keeps a second
+        // copy of each row and no longer matches what is on disk.
+        self.install_live_typed_checkpoint(
+            checkpoint.checkpoint_lsn,
+            published.segment_slot,
+            published.typed_locator,
+            published.typed_segments,
+        )?;
         Ok(checkpoint)
     }
 
@@ -8455,6 +8458,21 @@ fn cleanup_unpublished_flush_generation(
     let candidate = flush_generation_path(prefix, candidate_sequence);
     let record_candidate = flush_generation_record_path(prefix, candidate_sequence);
     let index_candidate = flush_generation_index_path(prefix, candidate_sequence);
+    // A checkpoint that wrote its list of generations and died before its
+    // manifest leaves that list in the slot the next checkpoint will use.
+    // The next checkpoint takes the same sequence, so the list would pass
+    // for its own and name generation files that are gone.
+    let unpublished_root = &root_paths[1 - (manifest.slot as usize & 1)];
+    if filesystem.exists(unpublished_root) {
+        let bytes = read_exact_file(filesystem, unpublished_root)?;
+        let names_unpublished = bytes.len() < 16
+            || u64::from_le_bytes(bytes[8..16].try_into().unwrap()) > manifest.sequence;
+        if names_unpublished {
+            filesystem.remove(unpublished_root).map_err(|error| {
+                storage_io("remove unpublished generation root", unpublished_root, error)
+            })?;
+        }
+    }
     if !filesystem.exists(&candidate)
         && !filesystem.exists(&record_candidate)
         && !filesystem.exists(&index_candidate)
@@ -8546,6 +8564,32 @@ fn truncate_recovered_wal(
 }
 
 fn write_synced_file(filesystem: &dyn FileSystem, path: &Path, bytes: &[u8]) -> OQLResult<()> {
+    // A checkpoint that failed part of the way is tried again, and writes
+    // the same files under the same names. One that already holds these
+    // bytes is left as it is and only synced: a manifest written by the
+    // first attempt may have reached the disk though the attempt failed,
+    // and emptying a file it names, to fill it again, would leave the
+    // database unreadable if power went in between.
+    if filesystem.exists(path)
+        && filesystem
+            .file_size(path)
+            .is_ok_and(|length| length == bytes.len() as u64)
+        && read_exact_file(filesystem, path).is_ok_and(|held| held == bytes)
+    {
+        return filesystem
+            .open_with_options(
+                path,
+                &FileOptions {
+                    read: true,
+                    write: true,
+                    create: false,
+                    truncate: false,
+                    append: false,
+                },
+            )
+            .and_then(|mut file| file.sync())
+            .map_err(|error| storage_io("sync checkpoint file", path, error));
+    }
     let mut file = filesystem
         .create(path)
         .map_err(|error| storage_io("create checkpoint file", path, error))?;

@@ -115,6 +115,13 @@ impl Default for FileOptions {
     }
 }
 
+/// A write that has not been synced. A crash may keep it, lose it, or keep
+/// only the front of it.
+enum Pending {
+    Write { offset: usize, bytes: Vec<u8> },
+    SetLen(usize),
+}
+
 /// In-memory file for simulation
 struct SimulatedFile {
     data: Vec<u8>,
@@ -122,6 +129,11 @@ struct SimulatedFile {
     synced_data: Vec<u8>, // Data that survives crashes
     is_synced: bool,
     has_been_synced: bool, // Track if file has ever been synced
+    /// The directory knows the file durably: it was made with `create`,
+    /// which syncs the directory on a real disk, or renamed into place.
+    entry_durable: bool,
+    /// What was written since the last sync, in the order it was written.
+    pending: Vec<Pending>,
 }
 
 impl SimulatedFile {
@@ -132,6 +144,8 @@ impl SimulatedFile {
             synced_data: Vec::new(),
             is_synced: true,
             has_been_synced: false, // New files haven't been synced yet
+            entry_durable: false,
+            pending: Vec::new(),
         }
     }
 
@@ -140,19 +154,189 @@ impl SimulatedFile {
         self.data = self.synced_data.clone();
         self.position = 0; // Reset position to beginning
         self.is_synced = true;
+        self.pending.clear();
+    }
+
+    /// What a real disk may hold after power is lost: the synced bytes,
+    /// and over them some of the unsynced writes, one of them possibly cut
+    /// short at a sector boundary.
+    fn crash_torn(&mut self, rng: &mut rand::rngs::StdRng, out_of_order: bool) {
+        use rand::Rng;
+
+        const SECTOR: usize = 512;
+        let pending = std::mem::take(&mut self.pending);
+        let mut image = self.synced_data.clone();
+        if !pending.is_empty() {
+            // Either the writes reached the disk in order and stopped
+            // somewhere, or each made it or did not on its own.
+            let in_order = !out_of_order || rng.gen_bool(0.5);
+            let stop = rng.gen_range(0..=pending.len());
+            let kept: Vec<bool> = (0..pending.len())
+                .map(|at| if in_order { at < stop } else { rng.gen_bool(0.5) })
+                .collect();
+            let last = kept.iter().rposition(|kept| *kept);
+            let tear = rng.gen_bool(0.5);
+            for (at, write) in pending.iter().enumerate() {
+                if !kept[at] {
+                    continue;
+                }
+                match write {
+                    Pending::SetLen(len) => image.resize(*len, 0),
+                    Pending::Write { offset, bytes } => {
+                        let mut len = bytes.len();
+                        if tear && Some(at) == last && len > 0 {
+                            let sectors = len / SECTOR;
+                            len = if sectors == 0 {
+                                rng.gen_range(0..len)
+                            } else {
+                                rng.gen_range(0..=sectors) * SECTOR
+                            }
+                            .min(len);
+                        }
+                        if len == 0 {
+                            continue;
+                        }
+                        if offset + len > image.len() {
+                            image.resize(offset + len, 0);
+                        }
+                        image[*offset..offset + len].copy_from_slice(&bytes[..len]);
+                    }
+                }
+            }
+        }
+        self.synced_data = image.clone();
+        self.data = image;
+        self.position = 0;
+        self.is_synced = true;
+    }
+
+    fn synced(&mut self) {
+        self.synced_data = self.data.clone();
+        self.is_synced = true;
+        self.has_been_synced = true;
+        self.pending.clear();
+    }
+}
+
+/// Faults the simulated disk has been asked to produce.
+#[derive(Default)]
+struct Faults {
+    /// Crash in the middle of this operation, counted from the start.
+    crash_at: Option<u64>,
+    /// Whether that crash may keep part of what was not synced.
+    crash_torn: bool,
+    /// Chance that a write, a sync or a change of length fails.
+    io_failure_rate: f64,
+    /// Whether a torn crash keeps only writes up to some point, in the
+    /// order they were made, rather than any of them.
+    in_order_only: bool,
+}
+
+struct Shared {
+    /// In-memory files
+    files: Mutex<HashMap<PathBuf, Arc<Mutex<SimulatedFile>>>>,
+    /// Whether the system has crashed
+    crashed: Mutex<bool>,
+    /// Counts crashes. A handle opened before a crash belongs to a process
+    /// that died in it, and must not touch the files afterwards.
+    epoch: std::sync::atomic::AtomicU64,
+    /// Operations that change the disk, counted since the start.
+    operations: std::sync::atomic::AtomicU64,
+    /// Failure injection probability (0.0 to 1.0)
+    failure_rate: Mutex<f64>,
+    faults: Mutex<Faults>,
+    /// Random number generator for failures
+    rng: Mutex<rand::rngs::StdRng>,
+}
+
+/// What an operation that changes the disk is to do.
+enum Turn {
+    Proceed,
+    /// The machine dies during this operation.
+    Crash { torn: bool },
+}
+
+impl Shared {
+    fn is_crashed(&self) -> bool {
+        *self.crashed.lock().unwrap()
+    }
+
+    fn epoch(&self) -> u64 {
+        self.epoch.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn coin(&self) -> bool {
+        use rand::Rng;
+        self.rng.lock().unwrap().gen_bool(0.5)
+    }
+
+    fn crashed_error() -> io::Error {
+        io::Error::new(io::ErrorKind::Other, "File system crashed")
+    }
+
+    /// Count an operation that changes the disk and say what becomes of it.
+    fn turn(&self, may_fail: bool) -> io::Result<Turn> {
+        use rand::Rng;
+
+        if self.is_crashed() {
+            return Err(Self::crashed_error());
+        }
+        let count = self
+            .operations
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+            + 1;
+        let faults = self.faults.lock().unwrap();
+        if faults.crash_at == Some(count) {
+            return Ok(Turn::Crash {
+                torn: faults.crash_torn,
+            });
+        }
+        if may_fail
+            && faults.io_failure_rate > 0.0
+            && self.rng.lock().unwrap().gen::<f64>() < faults.io_failure_rate
+        {
+            return Err(io::Error::new(io::ErrorKind::Other, "Injected failure"));
+        }
+        Ok(Turn::Proceed)
+    }
+
+    fn crash(&self, torn: bool) {
+        *self.crashed.lock().unwrap() = true;
+        self.epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.faults.lock().unwrap().crash_at = None;
+
+        let mut files = self.files.lock().unwrap();
+        // In the order of their names, so that one seed gives one outcome.
+        let mut paths: Vec<PathBuf> = files.keys().cloned().collect();
+        paths.sort();
+        let out_of_order = !self.faults.lock().unwrap().in_order_only;
+        let mut rng = self.rng.lock().unwrap();
+        for path in paths {
+            let keep = {
+                use rand::Rng;
+                let mut file = files[&path].lock().unwrap();
+                if torn {
+                    file.crash_torn(&mut rng, out_of_order);
+                    // A file the directory was never made to remember may
+                    // or may not be there.
+                    file.has_been_synced || file.entry_durable || rng.gen_bool(0.5)
+                } else {
+                    file.crash_recover();
+                    // If file has never been synced, it should be removed (never existed on disk)
+                    file.has_been_synced
+                }
+            };
+            if !keep {
+                files.remove(&path);
+            }
+        }
     }
 }
 
 /// Simulated file system for crash testing
 pub struct SimulatedFileSystem {
-    /// In-memory files
-    files: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<SimulatedFile>>>>>,
-    /// Whether the system has crashed
-    crashed: Arc<Mutex<bool>>,
-    /// Failure injection probability (0.0 to 1.0)
-    failure_rate: Arc<Mutex<f64>>,
-    /// Random number generator for failures
-    rng: Arc<Mutex<rand::rngs::StdRng>>,
+    shared: Arc<Shared>,
 }
 
 impl SimulatedFileSystem {
@@ -161,62 +345,151 @@ impl SimulatedFileSystem {
         use rand::SeedableRng;
 
         Self {
-            files: Arc::new(Mutex::new(HashMap::new())),
-            crashed: Arc::new(Mutex::new(false)),
-            failure_rate: Arc::new(Mutex::new(0.0)),
-            rng: Arc::new(Mutex::new(rand::rngs::StdRng::seed_from_u64(seed))),
+            shared: Arc::new(Shared {
+                files: Mutex::new(HashMap::new()),
+                crashed: Mutex::new(false),
+                epoch: std::sync::atomic::AtomicU64::new(0),
+                operations: std::sync::atomic::AtomicU64::new(0),
+                failure_rate: Mutex::new(0.0),
+                faults: Mutex::new(Faults::default()),
+                rng: Mutex::new(rand::rngs::StdRng::seed_from_u64(seed)),
+            }),
         }
     }
 
     /// Simulate a crash - lose all unsynced writes
     pub fn crash(&self) {
-        *self.crashed.lock().unwrap() = true;
+        self.shared.crash(false);
+    }
 
-        let mut files = self.files.lock().unwrap();
-        let mut files_to_remove = Vec::new();
+    /// Simulate losing power the way a real disk does: of what was not
+    /// synced, some writes are kept and some lost, and one may be cut
+    /// short. Which ones follows from the seed.
+    pub fn crash_torn(&self) {
+        self.shared.crash(true);
+    }
 
-        for (path, file) in files.iter() {
-            let mut file_guard = file.lock().unwrap();
-            file_guard.crash_recover();
+    /// Crash in the middle of an operation that changes the disk: the
+    /// `after`-th one from now, counting writes, syncs, changes of length,
+    /// creations, renames and removals. That operation and every one after
+    /// it fail until `recover`. With `torn`, the crash is a `crash_torn`.
+    pub fn crash_after(&self, after: u64, torn: bool) {
+        let now = self.operations();
+        let mut faults = self.shared.faults.lock().unwrap();
+        faults.crash_at = Some(now + after.max(1));
+        faults.crash_torn = torn;
+    }
 
-            // If file has never been synced, it should be removed (never existed on disk)
-            if !file_guard.has_been_synced {
-                files_to_remove.push(path.clone());
-            }
-        }
+    /// Say how a torn crash treats what was not synced. By default any
+    /// of those writes may be kept or lost on its own, so a later one can
+    /// survive an earlier one, as on a disk that reorders them. With
+    /// `in_order_only`, what survives is the writes up to some point, the
+    /// last of them possibly cut short: a file is only ever a prefix of
+    /// what was written to it.
+    pub fn set_in_order_only(&self, in_order_only: bool) {
+        self.shared.faults.lock().unwrap().in_order_only = in_order_only;
+    }
 
-        // Remove files that were never synced
-        for path in files_to_remove {
-            files.remove(&path);
-        }
+    /// Call off a crash asked for with `crash_after` that has not happened.
+    pub fn disarm(&self) {
+        self.shared.faults.lock().unwrap().crash_at = None;
+    }
+
+    /// How many operations have changed the disk so far.
+    pub fn operations(&self) -> u64 {
+        self.shared
+            .operations
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Every file there is, with its length, in the order of the names.
+    pub fn files(&self) -> Vec<(PathBuf, usize)> {
+        let files = self.shared.files.lock().unwrap();
+        let mut listed: Vec<(PathBuf, usize)> = files
+            .iter()
+            .map(|(path, file)| (path.clone(), file.lock().unwrap().data.len()))
+            .collect();
+        listed.sort();
+        listed
+    }
+
+    /// Whether the system is down after a crash.
+    pub fn is_down(&self) -> bool {
+        self.shared.is_crashed()
     }
 
     /// Recover from crash
     pub fn recover(&self) {
-        *self.crashed.lock().unwrap() = false;
+        *self.shared.crashed.lock().unwrap() = false;
     }
 
     /// Set failure injection rate (0.0 = no failures, 1.0 = always fail)
     pub fn set_failure_rate(&self, rate: f64) {
-        *self.failure_rate.lock().unwrap() = rate.clamp(0.0, 1.0);
+        *self.shared.failure_rate.lock().unwrap() = rate.clamp(0.0, 1.0);
+    }
+
+    /// Set the chance that a write, a sync or a change of length on an
+    /// open file fails. A failed write changes nothing; a failed sync
+    /// leaves what was written unsynced.
+    pub fn set_io_failure_rate(&self, rate: f64) {
+        self.shared.faults.lock().unwrap().io_failure_rate = rate.clamp(0.0, 1.0);
     }
 
     /// Check if operation should fail
     fn should_fail(&self) -> bool {
         use rand::Rng;
 
-        let rate = *self.failure_rate.lock().unwrap();
+        let rate = *self.shared.failure_rate.lock().unwrap();
         if rate <= 0.0 {
             return false;
         }
 
-        let mut rng = self.rng.lock().unwrap();
+        let mut rng = self.shared.rng.lock().unwrap();
         rng.gen::<f64>() < rate
     }
 
     /// Check if system is crashed
     fn is_crashed(&self) -> bool {
-        *self.crashed.lock().unwrap()
+        self.shared.is_crashed()
+    }
+
+    fn handle(&self, file: Arc<Mutex<SimulatedFile>>, path: &Path) -> Box<dyn FileHandle> {
+        Box::new(SimulatedFileHandle {
+            file,
+            path: path.to_path_buf(),
+            shared: self.shared.clone(),
+            epoch: self.shared.epoch(),
+        })
+    }
+
+    /// Start an operation that changes the directory. `Ok(false)` means
+    /// the machine died before it took effect.
+    fn directory_turn(&self) -> io::Result<bool> {
+        if self.should_fail() {
+            return Err(io::Error::new(io::ErrorKind::Other, "Injected failure"));
+        }
+        match self.shared.turn(false)? {
+            Turn::Proceed => Ok(true),
+            Turn::Crash { torn } => {
+                // The crash falls before the operation or after it.
+                if self.shared.coin() {
+                    self.shared.crash(torn);
+                    Err(Shared::crashed_error())
+                } else {
+                    self.shared.faults.lock().unwrap().crash_at = Some(u64::MAX);
+                    self.shared.faults.lock().unwrap().crash_torn = torn;
+                    Ok(false)
+                }
+            }
+        }
+    }
+
+    /// Finish an operation that `directory_turn` said the machine dies
+    /// right after.
+    fn crash_after_effect(&self) -> io::Error {
+        let torn = self.shared.faults.lock().unwrap().crash_torn;
+        self.shared.crash(torn);
+        Shared::crashed_error()
     }
 }
 
@@ -225,19 +498,20 @@ impl FileSystem for SimulatedFileSystem {
         if self.is_crashed() {
             return Err(io::Error::new(io::ErrorKind::Other, "File system crashed"));
         }
+        let lives = self.directory_turn()?;
 
-        if self.should_fail() {
-            return Err(io::Error::new(io::ErrorKind::Other, "Injected failure"));
+        let file = Arc::new(Mutex::new(SimulatedFile::new()));
+        file.lock().unwrap().entry_durable = true;
+        self.shared
+            .files
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), file.clone());
+        if !lives {
+            return Err(self.crash_after_effect());
         }
 
-        let mut files = self.files.lock().unwrap();
-        let file = Arc::new(Mutex::new(SimulatedFile::new()));
-        files.insert(path.to_path_buf(), file.clone());
-
-        Ok(Box::new(SimulatedFileHandle {
-            file,
-            path: path.to_path_buf(),
-        }))
+        Ok(self.handle(file, path))
     }
 
     fn open(&self, path: &Path) -> io::Result<Box<dyn FileHandle>> {
@@ -249,14 +523,11 @@ impl FileSystem for SimulatedFileSystem {
             return Err(io::Error::new(io::ErrorKind::Other, "Injected failure"));
         }
 
-        let files = self.files.lock().unwrap();
+        let files = self.shared.files.lock().unwrap();
         if let Some(file) = files.get(path) {
             // Reset position to 0 for reading
             file.lock().unwrap().position = 0;
-            Ok(Box::new(SimulatedFileHandle {
-                file: file.clone(),
-                path: path.to_path_buf(),
-            }))
+            Ok(self.handle(file.clone(), path))
         } else {
             Err(io::Error::new(io::ErrorKind::NotFound, "File not found"))
         }
@@ -275,21 +546,15 @@ impl FileSystem for SimulatedFileSystem {
             return Err(io::Error::new(io::ErrorKind::Other, "Injected failure"));
         }
 
-        let mut files = self.files.lock().unwrap();
+        let mut files = self.shared.files.lock().unwrap();
 
         if options.create {
             let file = Arc::new(Mutex::new(SimulatedFile::new()));
             files.insert(path.to_path_buf(), file.clone());
 
-            Ok(Box::new(SimulatedFileHandle {
-                file,
-                path: path.to_path_buf(),
-            }))
+            Ok(self.handle(file, path))
         } else if let Some(file) = files.get(path) {
-            Ok(Box::new(SimulatedFileHandle {
-                file: file.clone(),
-                path: path.to_path_buf(),
-            }))
+            Ok(self.handle(file.clone(), path))
         } else {
             Err(io::Error::new(io::ErrorKind::NotFound, "File not found"))
         }
@@ -299,13 +564,12 @@ impl FileSystem for SimulatedFileSystem {
         if self.is_crashed() {
             return Err(io::Error::new(io::ErrorKind::Other, "File system crashed"));
         }
+        let lives = self.directory_turn()?;
 
-        if self.should_fail() {
-            return Err(io::Error::new(io::ErrorKind::Other, "Injected failure"));
+        self.shared.files.lock().unwrap().remove(path);
+        if !lives {
+            return Err(self.crash_after_effect());
         }
-
-        let mut files = self.files.lock().unwrap();
-        files.remove(path);
         Ok(())
     }
 
@@ -313,14 +577,18 @@ impl FileSystem for SimulatedFileSystem {
         if self.is_crashed() {
             return Err(io::Error::new(io::ErrorKind::Other, "File system crashed"));
         }
-        if self.should_fail() {
-            return Err(io::Error::new(io::ErrorKind::Other, "Injected failure"));
+        let lives = self.directory_turn()?;
+        {
+            let mut files = self.shared.files.lock().unwrap();
+            let file = files
+                .remove(from)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "File not found"))?;
+            file.lock().unwrap().entry_durable = true;
+            files.insert(to.to_path_buf(), file);
         }
-        let mut files = self.files.lock().unwrap();
-        let file = files
-            .remove(from)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "File not found"))?;
-        files.insert(to.to_path_buf(), file);
+        if !lives {
+            return Err(self.crash_after_effect());
+        }
         Ok(())
     }
 
@@ -329,7 +597,7 @@ impl FileSystem for SimulatedFileSystem {
             return false;
         }
 
-        let files = self.files.lock().unwrap();
+        let files = self.shared.files.lock().unwrap();
         files.contains_key(path)
     }
 
@@ -338,7 +606,7 @@ impl FileSystem for SimulatedFileSystem {
             return Err(io::Error::new(io::ErrorKind::Other, "File system crashed"));
         }
 
-        let files = self.files.lock().unwrap();
+        let files = self.shared.files.lock().unwrap();
         if let Some(file) = files.get(path) {
             let file = file.lock().unwrap();
             Ok(file.data.len() as u64)
@@ -356,11 +624,12 @@ impl FileSystem for SimulatedFileSystem {
             return Err(io::Error::new(io::ErrorKind::Other, "Injected failure"));
         }
 
-        let files = self.files.lock().unwrap();
+        let files = self.shared.files.lock().unwrap();
         for file in files.values() {
             let mut file = file.lock().unwrap();
             file.synced_data = file.data.clone();
             file.is_synced = true;
+            file.pending.clear();
         }
 
         Ok(())
@@ -375,7 +644,7 @@ impl FileSystem for SimulatedFileSystem {
             return Err(io::Error::new(io::ErrorKind::Other, "Injected failure"));
         }
 
-        let files = self.files.lock().unwrap();
+        let files = self.shared.files.lock().unwrap();
         if let Some(file) = files.get(path) {
             Ok(Box::new(SimulatedMemoryMap {
                 file: file.clone(),
@@ -392,12 +661,38 @@ impl FileSystem for SimulatedFileSystem {
 struct SimulatedFileHandle {
     file: Arc<Mutex<SimulatedFile>>,
     path: PathBuf,
+    shared: Arc<Shared>,
+    /// The crash count when this handle was opened.
+    epoch: u64,
+}
+
+impl SimulatedFileHandle {
+    /// A handle from before a crash belongs to a process that is gone.
+    fn alive(&self) -> io::Result<()> {
+        if self.epoch != self.shared.epoch() || self.shared.is_crashed() {
+            return Err(Shared::crashed_error());
+        }
+        Ok(())
+    }
+
+    fn put(file: &mut SimulatedFile, start: usize, buf: &[u8]) {
+        if start + buf.len() > file.data.len() {
+            file.data.resize(start + buf.len(), 0);
+        }
+        file.data[start..start + buf.len()].copy_from_slice(buf);
+        file.is_synced = false;
+        file.pending.push(Pending::Write {
+            offset: start,
+            bytes: buf.to_vec(),
+        });
+    }
 }
 
 impl FileHandle for SimulatedFileHandle {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.alive()?;
         let mut file = self.file.lock().unwrap();
-        let start = file.position as usize;
+        let start = (file.position as usize).min(file.data.len());
         let end = std::cmp::min(start + buf.len(), file.data.len());
         let bytes_to_read = end - start;
 
@@ -410,6 +705,7 @@ impl FileHandle for SimulatedFileHandle {
     }
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize> {
+        self.alive()?;
         let file = self.file.lock().unwrap();
         let start = usize::try_from(offset)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset exceeds usize"))?;
@@ -422,48 +718,63 @@ impl FileHandle for SimulatedFileHandle {
     }
 
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let mut file = self.file.lock().unwrap();
-        let start = file.position as usize;
-
-        // Extend file if necessary
-        if start + buf.len() > file.data.len() {
-            file.data.resize(start + buf.len(), 0);
+        self.alive()?;
+        let turn = self.shared.turn(true)?;
+        {
+            let mut file = self.file.lock().unwrap();
+            let start = file.position as usize;
+            Self::put(&mut file, start, buf);
+            file.position += buf.len() as u64;
         }
-
-        // Write data
-        file.data[start..start + buf.len()].copy_from_slice(buf);
-        file.position += buf.len() as u64;
-        file.is_synced = false;
-
+        if let Turn::Crash { torn } = turn {
+            // The write was on its way when the machine died.
+            self.shared.crash(torn);
+            return Err(Shared::crashed_error());
+        }
         Ok(buf.len())
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize> {
-        let mut file = self.file.lock().unwrap();
+        self.alive()?;
         let start = usize::try_from(offset)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "offset exceeds usize"))?;
-        let end = start
+        start
             .checked_add(buf.len())
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "write range overflows"))?;
-        if end > file.data.len() {
-            file.data.resize(end, 0);
+        let turn = self.shared.turn(true)?;
+        {
+            let mut file = self.file.lock().unwrap();
+            Self::put(&mut file, start, buf);
         }
-        file.data[start..end].copy_from_slice(buf);
-        file.is_synced = false;
+        if let Turn::Crash { torn } = turn {
+            self.shared.crash(torn);
+            return Err(Shared::crashed_error());
+        }
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> io::Result<()> {
         // Flush is a no-op in simulation (data is already in memory)
-        Ok(())
+        self.alive()
     }
 
     fn sync(&mut self) -> io::Result<()> {
-        let mut file = self.file.lock().unwrap();
-        file.synced_data = file.data.clone();
-        file.is_synced = true;
-        file.has_been_synced = true; // Mark that this file has been synced
-        Ok(())
+        self.alive()?;
+        match self.shared.turn(true)? {
+            Turn::Proceed => {
+                self.file.lock().unwrap().synced();
+                Ok(())
+            }
+            Turn::Crash { torn } => {
+                // The machine died during the sync: either it had finished
+                // and nobody was told, or it had not.
+                if self.shared.coin() {
+                    self.file.lock().unwrap().synced();
+                }
+                self.shared.crash(torn);
+                Err(Shared::crashed_error())
+            }
+        }
     }
 
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
@@ -490,14 +801,24 @@ impl FileHandle for SimulatedFileHandle {
     }
 
     fn size(&self) -> io::Result<u64> {
+        self.alive()?;
         Ok(self.file.lock().unwrap().data.len() as u64)
     }
 
     fn set_len(&mut self, len: u64) -> io::Result<()> {
-        let mut file = self.file.lock().unwrap();
-        file.data.resize(len as usize, 0);
-        file.position = file.position.min(len);
-        file.is_synced = false;
+        self.alive()?;
+        let turn = self.shared.turn(true)?;
+        {
+            let mut file = self.file.lock().unwrap();
+            file.data.resize(len as usize, 0);
+            file.position = file.position.min(len);
+            file.is_synced = false;
+            file.pending.push(Pending::SetLen(len as usize));
+        }
+        if let Turn::Crash { torn } = turn {
+            self.shared.crash(torn);
+            return Err(Shared::crashed_error());
+        }
         Ok(())
     }
 }

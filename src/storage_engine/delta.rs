@@ -107,7 +107,10 @@ impl RecordRootHandle {
 
     pub(crate) fn open(filesystem: Arc<dyn FileSystem>, path: &Path) -> OQLResult<Self> {
         let file_len = usize::try_from(filesystem.file_size(path).map_err(|error| {
-            OQLError::storage_error(&format!("inspect record root: {error}"), None)
+            OQLError::storage_error(
+                &format!("inspect record root '{}': {error}", path.display()),
+                None,
+            )
         })?)
         .map_err(|_| OQLError::storage_error("record root is too large to address", None))?;
         if file_len < DELTA_HEADER_LEN {
