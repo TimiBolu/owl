@@ -570,18 +570,16 @@ fn acknowledged_writes_survive_failing_writes_and_syncs() {
     sweep(100_000, seeds(300), 60, faults);
 }
 
-/// Not yet true, and left out of the usual run for that reason. The sweep
-/// above passes over its three hundred seeds; over four thousand, eleven
-/// end with a database that cannot be opened. These are two of them.
+/// Two seeds the larger sweep found, kept for what they show.
 ///
-/// An incremental checkpoint writes its generation files, then its
-/// manifest. When writing the manifest fails without a crash, the bytes
-/// may still have reached the disk. The checkpoint is kept and tried
-/// again, and trying again writes the generation files afresh under the
-/// same names, emptying them first. Power lost at that moment leaves a
-/// manifest that is whole beside generation files that are not.
+/// A checkpoint writes its files, then its manifest. When writing the
+/// manifest fails without a crash, the bytes may still have reached the
+/// disk. The checkpoint used to be tried again in place: an incremental
+/// one emptied its generation files to write them afresh, and a full one
+/// could pick the standing base segment to write over. Power lost at that
+/// moment left a manifest that was whole beside files that were not, and
+/// the database would not open.
 #[test]
-#[ignore = "retrying a checkpoint rewrites files its manifest may already name"]
 fn the_database_opens_after_a_checkpoint_is_retried_and_power_is_lost() {
     let faults = Faults {
         io_faults: true,

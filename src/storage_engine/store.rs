@@ -4138,11 +4138,20 @@ impl StoreCore {
             has_record_root: true,
             has_index_root: true,
         };
-        write_synced_file(
+        if let Err(error) = write_synced_file(
             self.filesystem.as_ref(),
             &self.manifest_paths[slot],
             &manifest.encode(),
-        )?;
+        ) {
+            // The manifest may be on disk though writing it failed, and
+            // nothing here can tell. Publishing again would choose a base
+            // segment to write over by reading the manifests, and could
+            // choose the one a manifest that did reach the disk depends
+            // on. Both logs are still whole, so stop writing and let the
+            // next open settle which checkpoint stands.
+            self.poisoned.store(true, Ordering::Release);
+            return Err(error);
+        }
         self.install_record_root_handle(manifest)?;
         self.install_index_bases(segment.indexes)?;
         self.checkpoint_sequence.store(sequence, Ordering::Release);
@@ -8555,6 +8564,32 @@ fn truncate_recovered_wal(
 }
 
 fn write_synced_file(filesystem: &dyn FileSystem, path: &Path, bytes: &[u8]) -> OQLResult<()> {
+    // A checkpoint that failed part of the way is tried again, and writes
+    // the same files under the same names. One that already holds these
+    // bytes is left as it is and only synced: a manifest written by the
+    // first attempt may have reached the disk though the attempt failed,
+    // and emptying a file it names, to fill it again, would leave the
+    // database unreadable if power went in between.
+    if filesystem.exists(path)
+        && filesystem
+            .file_size(path)
+            .is_ok_and(|length| length == bytes.len() as u64)
+        && read_exact_file(filesystem, path).is_ok_and(|held| held == bytes)
+    {
+        return filesystem
+            .open_with_options(
+                path,
+                &FileOptions {
+                    read: true,
+                    write: true,
+                    create: false,
+                    truncate: false,
+                    append: false,
+                },
+            )
+            .and_then(|mut file| file.sync())
+            .map_err(|error| storage_io("sync checkpoint file", path, error));
+    }
     let mut file = filesystem
         .create(path)
         .map_err(|error| storage_io("create checkpoint file", path, error))?;
