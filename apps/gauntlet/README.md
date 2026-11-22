@@ -57,6 +57,16 @@ cargo build --release -p gauntlet
 ./target/release/gauntlet show h04
 ```
 
+```bash
+./target/release/gauntlet scale --people 20000
+```
+
+`scale` times one database as it grows: loading, checkpointing, compacting,
+committing one row at a time, reopening and looking rows up by id, with what
+it holds in memory and on disk at each step. `--at <directory>` keeps the
+database there; run again with the same directory and it is only reopened,
+`--reopens` times.
+
 `check` fails if any query differs. `bench` adds the median time on each
 engine. `show` prints both answers for a named query, or runs an OQL statement
 given in full on Owl alone, which is the quick way to try a new one. All three
