@@ -21,6 +21,7 @@ use crate::storage::{
     ScalarIndexDefinition, ScalarIndexDirection, ScalarIndexRange, ScalarIndexScanPage,
     ScanPredicate, VectorIndexDefinition,
 };
+use crate::storage_engine::btree::OrderedIndexBase;
 use crate::storage_engine::{
     BTreeIndex, BorrowedRecordValue, CompiledSchema, RecordCodec, RecordView, TypedKey,
     ColumnBuilder, TypedColumn, TypedSegment,
@@ -176,6 +177,29 @@ const LEGACY_GENERATION_ROOT_ENTRY_LEN: usize = 56;
 const MAX_FLUSH_GENERATIONS: usize = 32;
 const REVERSE_INDEX_SCHEMA: &str = "\0owl";
 const REVERSE_INDEX_NAME: &str = "\0reverse_refs";
+/// The index a checkpoint keeps of the rows outside its column segments:
+/// collection and id to the row. It is what finds such a row by its id and
+/// lists a collection in id order without holding every id in memory.
+const ID_INDEX_NAME: &str = "\0ids";
+
+/// The key a row goes under in the id index: its collection, then its id,
+/// so that one collection's rows lie together in the order of their ids.
+fn id_index_key(collection: u16, id: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(2 + id.len());
+    key.extend_from_slice(&collection.to_be_bytes());
+    key.extend_from_slice(id.as_bytes());
+    key
+}
+
+/// The range of the id index that holds one collection.
+fn id_index_range(collection: u16) -> (Bound<Vec<u8>>, Bound<Vec<u8>>) {
+    let start = Bound::Included(collection.to_be_bytes().to_vec());
+    let end = match collection.checked_add(1) {
+        Some(next) => Bound::Excluded(next.to_be_bytes().to_vec()),
+        None => Bound::Unbounded,
+    };
+    (start, end)
+}
 
 /// Thresholds for automatic checkpoint maintenance.
 ///
@@ -458,6 +482,15 @@ struct State {
     /// Stable collection scan order, derived from live document identities.
     /// This is rebuilt during recovery and maintained atomically with writes.
     collection_rows: HashMap<String, BTreeMap<DocumentId, ObjRef>>,
+    /// The ids of the rows the checkpoint holds outside its column
+    /// segments, read from its file a page at a time. With it,
+    /// `collection_rows` holds only rows written since that checkpoint,
+    /// and `typed_delta_rows` says which of the checkpoint's rows have
+    /// changed or gone. Without it, as in a database written before the
+    /// index existed, `collection_rows` holds every such row.
+    overflow_ids: Option<Arc<dyn OrderedIndexBase>>,
+    /// How many rows of each collection `overflow_ids` holds.
+    overflow_id_counts: HashMap<String, usize>,
     object_directory: DecodedRows,
     /// Authoritative checkpoint rows that have not needed a general
     /// `Document` representation. Locations remain valid for the immutable
@@ -560,6 +593,13 @@ impl State {
     /// held now may be let go later.
     fn bounded(&self) -> bool {
         self.decoded_budget.is_some() || self.decoded_bytes_budget.is_some()
+    }
+
+    /// Whether the checkpoint holds rows that are found through its files
+    /// and not through `collection_rows`, so that a change to one must be
+    /// noted in `typed_delta_rows`.
+    fn has_rows_on_file(&self) -> bool {
+        !self.typed_segments.is_empty() || self.overflow_ids.is_some()
     }
 
     /// Whether memory is short: a count of rows was set, which says so, or
@@ -895,6 +935,8 @@ struct PublishedCheckpoint {
     segment_slot: u8,
     typed_locator: TypedLocatorLeaf,
     typed_segments: Vec<TypedSegmentFileDescriptor>,
+    /// The pages of the index of rows by id, when the image carried one.
+    id_pages: Option<PublishedIndexPages>,
 }
 
 #[derive(Debug)]
@@ -2844,7 +2886,7 @@ impl RustStore {
             .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
         validate_state_integrity(&state)?;
         if state.committed_lsn != recovered.committed_lsn
-            || state.collection_rows != recovered.collection_rows
+            || !same_identities(&state, &recovered)?
             || logical_document_map(&state)? != logical_document_map(&recovered)?
             || state.scalar_indexes != recovered.scalar_indexes
         {
@@ -3655,6 +3697,7 @@ impl StoreCore {
                     published.segment_slot,
                     published.typed_locator,
                     published.typed_segments,
+                    published.id_pages,
                 )?;
                 self.evict_clean_record_bytes()?;
                 tracing::debug!(
@@ -3686,6 +3729,7 @@ impl StoreCore {
         segment_slot: u8,
         typed_locator: TypedLocatorLeaf,
         descriptors: Vec<TypedSegmentFileDescriptor>,
+        id_pages: Option<PublishedIndexPages>,
     ) -> OQLResult<()> {
         let open_started = Instant::now();
         let segment_path = self
@@ -3712,6 +3756,11 @@ impl StoreCore {
         // base-plus-delta view; reopen can install this checkpoint and replay
         // those newer WAL records exactly.
         if state.committed_lsn != checkpoint_lsn {
+            // The index of rows by id that this store reads belongs to the
+            // checkpoint just replaced, whose file may now be removed.
+            // Take what it lists into memory; the next checkpoint that is
+            // installed puts it back on file.
+            list_overflow_ids_in_memory(&mut state)?;
             return Ok(());
         }
         // The image builder validated logical rows and the publisher
@@ -3790,6 +3839,24 @@ impl StoreCore {
         };
         state.typed_row_locations.install_base(typed_locator);
         state.typed_delta_rows.clear();
+        // Every row is now in a column segment or listed in the id index
+        // of the checkpoint just published, so none need be listed here.
+        match id_pages {
+            Some(index) => {
+                let ids: Arc<dyn OrderedIndexBase> = Arc::new(FileIndexBase::new(
+                    self.filesystem.clone(),
+                    index.schema,
+                    index.name,
+                    true,
+                    index.pages,
+                    state.index_pages(),
+                ));
+                state.overflow_id_counts = count_overflow_ids(&state, ids.as_ref())?;
+                state.overflow_ids = Some(ids);
+                state.collection_rows.clear();
+            }
+            None => list_overflow_ids_in_memory(&mut state)?,
+        }
         drop(state);
         tracing::debug!(
             target: "owl_db::storage_engine::checkpoint",
@@ -4153,7 +4220,12 @@ impl StoreCore {
             return Err(error);
         }
         self.install_record_root_handle(manifest)?;
-        self.install_index_bases(segment.indexes)?;
+        let mut published_indexes = segment.indexes;
+        let id_pages = published_indexes
+            .iter()
+            .position(|index| index.schema == REVERSE_INDEX_SCHEMA && index.name == ID_INDEX_NAME)
+            .map(|at| published_indexes.remove(at));
+        self.install_index_bases(published_indexes)?;
         self.checkpoint_sequence.store(sequence, Ordering::Release);
 
         Ok(PublishedCheckpoint {
@@ -4167,6 +4239,7 @@ impl StoreCore {
             segment_slot: segment_slot as u8,
             typed_locator: segment.typed_locator,
             typed_segments: segment.typed_segments,
+            id_pages,
         })
     }
 
@@ -4726,6 +4799,7 @@ impl StoreCore {
             published.segment_slot,
             published.typed_locator,
             published.typed_segments,
+            published.id_pages,
         )?;
         Ok(checkpoint)
     }
@@ -5829,7 +5903,7 @@ impl RustStore {
                         .object_schema_versions
                         .insert(object_ref, header.schema_version);
                     state.object_records.insert(object_ref, record);
-                    if !state.typed_segments.is_empty() {
+                    if state.has_rows_on_file() {
                         state
                             .typed_delta_rows
                             .entry(delta_schema)
@@ -5866,7 +5940,7 @@ impl RustStore {
                     state.typed_row_locations.remove(&object_ref)?;
                     state.object_schema_versions.remove(&object_ref);
                     state.object_records.remove_known(&object_ref);
-                    if !state.typed_segments.is_empty() {
+                    if state.has_rows_on_file() {
                         state
                             .typed_delta_rows
                             .entry(schema)
@@ -6484,6 +6558,27 @@ fn checkpoint_image_with_records(
         "built typed checkpoint segments"
     );
     records.retain(|(object_ref, _)| !authoritative_rows.contains(object_ref));
+    // The rows left outside the column segments, by collection and id.
+    let mut id_entries = Vec::with_capacity(records.len());
+    for (object_ref, record) in &records {
+        let header = RecordCodec::trusted_header(record)?;
+        let compiled = state
+            .compiled_schemas
+            .get(&(object_ref.collection_id(), header.schema_version))
+            .ok_or_else(|| {
+                OQLError::storage_error("checkpoint record has no compiled schema", None)
+            })?;
+        let id = RecordCodec::trusted_view(record, compiled)?.external_id()?;
+        id_entries.push((id_index_key(object_ref.collection_id(), id), vec![*object_ref]));
+    }
+    id_entries.sort_by(|left, right| left.0.cmp(&right.0));
+    indexes.push(CheckpointIndex {
+        spooled: None,
+        schema: REVERSE_INDEX_SCHEMA.into(),
+        name: ID_INDEX_NAME.into(),
+        unique: true,
+        entries: id_entries,
+    });
     Ok(CheckpointImage {
         segment_spool: None,
         record_spool: None,
@@ -6519,6 +6614,10 @@ struct LogicalIdentityCursor<'a> {
     fence_index: usize,
     row: usize,
     typed: Option<(DocumentId, ObjRef)>,
+    /// The checkpoint's rows outside its column segments, and the next of
+    /// them that has not changed since.
+    overflow: Option<OverflowIds>,
+    on_file: Option<(DocumentId, ObjRef)>,
     resident:
         Option<std::iter::Peekable<std::collections::btree_map::Iter<'a, DocumentId, ObjRef>>>,
 }
@@ -6536,6 +6635,8 @@ impl<'a> LogicalIdentityCursor<'a> {
             fence_index: 0,
             row: 0,
             typed: None,
+            overflow: OverflowIds::new(state, schema),
+            on_file: None,
             resident: state
                 .collection_rows
                 .get(schema)
@@ -6543,9 +6644,50 @@ impl<'a> LogicalIdentityCursor<'a> {
         }
     }
 
+    /// The next row in id order from the three places a row can be: a
+    /// column segment, the checkpoint's other rows, and memory. A row is
+    /// in a segment or among the other rows, never both; one also in
+    /// memory has changed, and memory has it as it is now.
     fn next(&mut self) -> OQLResult<Option<(DocumentId, ObjRef)>> {
         if self.typed.is_none() {
             self.typed = self.next_typed()?;
+        }
+        if self.on_file.is_none() {
+            self.on_file = self.next_on_file()?;
+        }
+        // Whichever of the two file sources comes first stands for both.
+        let file_first = match (&self.typed, &self.on_file) {
+            (Some((typed, _)), Some((other, _))) => other < typed,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        // A row is not in both file sources; should one ever be, the
+        // column segment has it.
+        if let (Some((typed, _)), Some((other, _))) = (&self.typed, &self.on_file) {
+            if typed == other {
+                self.on_file = None;
+            }
+        }
+        if file_first {
+            let resident_id = self
+                .resident
+                .as_mut()
+                .and_then(|rows| rows.peek())
+                .map(|(id, _)| (*id).clone());
+            let on_file_id = self.on_file.as_ref().map(|(id, _)| id.clone());
+            return match (on_file_id, resident_id) {
+                (Some(on_file), Some(resident)) if resident <= on_file => {
+                    if resident == on_file {
+                        self.on_file = None;
+                    }
+                    Ok(self
+                        .resident
+                        .as_mut()
+                        .and_then(|rows| rows.next())
+                        .map(|(id, object_ref)| (id.clone(), *object_ref)))
+                }
+                _ => Ok(self.on_file.take()),
+            };
         }
         let resident = self
             .resident
@@ -6577,6 +6719,20 @@ impl<'a> LogicalIdentityCursor<'a> {
                 .and_then(|rows| rows.next())
                 .map(|(id, object_ref)| (id.clone(), *object_ref))),
         }
+    }
+
+    fn next_on_file(&mut self) -> OQLResult<Option<(DocumentId, ObjRef)>> {
+        let Some(overflow) = self.overflow.as_mut() else {
+            return Ok(None);
+        };
+        let changed = self.state.typed_delta_rows.get(self.schema);
+        while let Some((id, object_ref)) = overflow.next()? {
+            if changed.is_some_and(|rows| rows.contains_key(&id)) {
+                continue;
+            }
+            return Ok(Some((id, object_ref)));
+        }
+        Ok(None)
     }
 
     fn next_typed(&mut self) -> OQLResult<Option<(DocumentId, ObjRef)>> {
@@ -6649,6 +6805,8 @@ fn checkpoint_image_from_compaction(
         .collect::<HashMap<_, _>>();
     let reverse_number = index_identities.len();
     index_identities.push((REVERSE_INDEX_SCHEMA.into(), REVERSE_INDEX_NAME.into(), false));
+    let ids_number = index_identities.len();
+    index_identities.push((REVERSE_INDEX_SCHEMA.into(), ID_INDEX_NAME.into(), true));
     let mut index_entries = IndexSorter::new(
         plan.filesystem.clone(),
         sidecar_path(&plan.manifest_path, "index-run"),
@@ -6754,6 +6912,7 @@ fn checkpoint_image_from_compaction(
                         &mut typed_chunk,
                         &mut typed_segments,
                         &mut records,
+                        (&mut index_entries, ids_number),
                     )?;
                 }
             } else {
@@ -6763,6 +6922,12 @@ fn checkpoint_image_from_compaction(
                     &mut typed_chunk,
                     &mut typed_segments,
                     &mut records,
+                    (&mut index_entries, ids_number),
+                )?;
+                index_entries.push(
+                    ids_number,
+                    &id_index_key(row.object_ref.collection_id(), &row.document.id),
+                    row.object_ref,
                 )?;
                 records.push(
                     row.object_ref,
@@ -6788,6 +6953,7 @@ fn checkpoint_image_from_compaction(
             &mut typed_chunk,
             &mut typed_segments,
             &mut records,
+            (&mut index_entries, ids_number),
         )?;
     }
     if changed.is_some() {
@@ -6841,6 +7007,7 @@ fn flush_compaction_typed_chunk(
     chunk: &mut Vec<CompactionRow>,
     typed_segments: &mut SegmentSpool,
     records: &mut RecordSpool,
+    (ids, ids_number): (&mut IndexSorter, usize),
 ) -> OQLResult<()> {
     if chunk.is_empty() {
         return Ok(());
@@ -6859,6 +7026,11 @@ fn flush_compaction_typed_chunk(
         .ok_or_else(|| OQLError::storage_error("compaction compiled schema is missing", None))?;
     let Some(schema) = state.schemas.get(schema_name) else {
         for row in chunk.iter() {
+            ids.push(
+                ids_number,
+                &id_index_key(row.object_ref.collection_id(), &row.document.id),
+                row.object_ref,
+            )?;
             records.push(
                 row.object_ref,
                 &row.record.clone().unwrap_or(Arc::from(RecordCodec::encode(
@@ -6880,6 +7052,11 @@ fn flush_compaction_typed_chunk(
         typed_segments.push(&segment.encode()?)?;
     } else {
         for row in chunk.iter() {
+            ids.push(
+                ids_number,
+                &id_index_key(row.object_ref.collection_id(), &row.document.id),
+                row.object_ref,
+            )?;
             records.push(
                 row.object_ref,
                 &row.record.clone().unwrap_or(Arc::from(RecordCodec::encode(
@@ -7136,7 +7313,130 @@ fn lookup_object_ref(state: &State, schema: &str, id: &DocumentId) -> OQLResult<
     {
         return Ok(Some(object_ref));
     }
-    Ok(base_location_by_id(state, schema, id)?.map(|(_, _, object_ref)| object_ref))
+    if let Some((_, _, object_ref)) = base_location_by_id(state, schema, id)? {
+        return Ok(Some(object_ref));
+    }
+    overflow_base_by_id(state, schema, id)
+}
+
+/// How many rows of each collection the id index lists.
+fn count_overflow_ids(
+    state: &State,
+    ids: &dyn OrderedIndexBase,
+) -> OQLResult<HashMap<String, usize>> {
+    let names = state
+        .collection_ids
+        .iter()
+        .map(|(name, collection)| (*collection, name))
+        .collect::<HashMap<_, _>>();
+    let mut counts = HashMap::<String, usize>::new();
+    ids.visit_entries(&mut |key, rows| {
+        let collection = key
+            .get(..2)
+            .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]]))
+            .ok_or_else(|| "a key of the id index is too short".to_string())?;
+        let name = names
+            .get(&collection)
+            .ok_or_else(|| "the id index lists a row of an unknown collection".to_string())?;
+        *counts.entry((*name).clone()).or_default() += rows.len();
+        Ok(())
+    })
+    .map_err(|error| OQLError::storage_error(&error, None))?;
+    Ok(counts)
+}
+
+/// Stop reading the checkpoint's index of rows by id: list in memory the
+/// rows it holds that have not changed since, beside those that have.
+fn list_overflow_ids_in_memory(state: &mut State) -> OQLResult<()> {
+    if state.overflow_ids.is_none() {
+        return Ok(());
+    }
+    let names = state.collection_ids.keys().cloned().collect::<Vec<_>>();
+    for name in names {
+        let mut unchanged = Vec::new();
+        if let Some(mut on_file) = OverflowIds::new(state, &name) {
+            let changed = state.typed_delta_rows.get(&name);
+            while let Some((id, object_ref)) = on_file.next()? {
+                if !changed.is_some_and(|rows| rows.contains_key(&id)) {
+                    unchanged.push((id, object_ref));
+                }
+            }
+        }
+        if !unchanged.is_empty() {
+            state.collection_rows.entry(name).or_default().extend(unchanged);
+        }
+    }
+    state.overflow_ids = None;
+    state.overflow_id_counts.clear();
+    Ok(())
+}
+
+/// The row the checkpoint holds outside its column segments under this
+/// id, whether or not it has changed since.
+fn overflow_base_by_id(state: &State, schema: &str, id: &str) -> OQLResult<Option<ObjRef>> {
+    let (Some(ids), Some(collection)) = (&state.overflow_ids, state.collection_ids.get(schema))
+    else {
+        return Ok(None);
+    };
+    Ok(ids
+        .search_key(&id_index_key(*collection, id))
+        .map_err(|error| OQLError::storage_error(&error, None))?
+        .first()
+        .copied())
+}
+
+/// The rows the checkpoint holds outside its column segments, a
+/// collection at a time in id order, read a stretch at a time.
+struct OverflowIds {
+    ids: Arc<dyn OrderedIndexBase>,
+    end: Bound<Vec<u8>>,
+    /// Where the next stretch starts.
+    from: Bound<Vec<u8>>,
+    held: std::collections::VecDeque<(DocumentId, ObjRef)>,
+    finished: bool,
+}
+
+impl OverflowIds {
+    /// How many ids one read takes in.
+    const STRETCH: usize = 1_024;
+
+    fn new(state: &State, schema: &str) -> Option<Self> {
+        let ids = state.overflow_ids.clone()?;
+        let collection = *state.collection_ids.get(schema)?;
+        let (from, end) = id_index_range(collection);
+        Some(Self {
+            ids,
+            end,
+            from,
+            held: std::collections::VecDeque::new(),
+            finished: false,
+        })
+    }
+
+    fn next(&mut self) -> OQLResult<Option<(DocumentId, ObjRef)>> {
+        if self.held.is_empty() && !self.finished {
+            let stretch = self
+                .ids
+                .range_entries(self.from.clone(), self.end.clone(), Some(Self::STRETCH), false)
+                .map_err(|error| OQLError::storage_error(&error, None))?;
+            if stretch.len() < Self::STRETCH {
+                self.finished = true;
+            }
+            if let Some((last, _)) = stretch.last() {
+                self.from = Bound::Excluded(last.clone());
+            }
+            for (key, rows) in stretch {
+                let id = std::str::from_utf8(key.get(2..).unwrap_or_default())
+                    .map_err(|_| OQLError::storage_error("an id in the id index is not text", None))?
+                    .to_string();
+                let object_ref = rows.first().copied().ok_or_else(|| {
+                    OQLError::storage_error("an id in the id index names no row", None)
+                })?;
+                self.held.push_back((id, object_ref));
+            }
+        }
+        Ok(self.held.pop_front())
+    }
 }
 
 fn base_location_by_id(
@@ -7164,6 +7464,21 @@ fn base_location_by_id(
     Ok(Some((fence.segment_index, row, segment.object_ref(row)?)))
 }
 
+/// Whether two states list the same rows under the same ids, however each
+/// keeps the list.
+fn same_identities(left: &State, right: &State) -> OQLResult<bool> {
+    let mut names = left.collection_ids.keys().collect::<Vec<_>>();
+    names.extend(right.collection_ids.keys());
+    names.sort();
+    names.dedup();
+    for name in names {
+        if logical_collection_identities(left, name)? != logical_collection_identities(right, name)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn logical_live_count(state: &State) -> usize {
     state
         .collection_ids
@@ -7182,10 +7497,14 @@ fn logical_collection_count(state: &State, schema: &str) -> usize {
         .sum::<usize>();
     let overridden_base_rows = state.typed_delta_rows.get(schema).map_or(0, |rows| {
         rows.keys()
-            .filter(|id| base_location_by_id(state, schema, id).is_ok_and(|row| row.is_some()))
+            .filter(|id| {
+                base_location_by_id(state, schema, id).is_ok_and(|row| row.is_some())
+                    || overflow_base_by_id(state, schema, id).is_ok_and(|row| row.is_some())
+            })
             .count()
     });
     base_rows
+        .saturating_add(state.overflow_id_counts.get(schema).copied().unwrap_or(0))
         .saturating_sub(overridden_base_rows)
         .saturating_add(state.collection_rows.get(schema).map_or(0, BTreeMap::len))
 }
@@ -7217,6 +7536,14 @@ fn logical_collection_identities(
             identities.push((id, segment.object_ref(row)?));
         }
     }
+    if let Some(mut on_file) = OverflowIds::new(state, schema) {
+        while let Some((id, object_ref)) = on_file.next()? {
+            if delta.is_some_and(|rows| rows.contains_key(&id)) {
+                continue;
+            }
+            identities.push((id, object_ref));
+        }
+    }
     if let Some(rows) = state.collection_rows.get(schema) {
         identities.extend(
             rows.iter()
@@ -7231,7 +7558,9 @@ fn logical_collection_identities(
 /// yields them. Rows held in memory are already kept in that order, so only
 /// a collection with rows in typed segments needs the ids to merge by.
 fn logical_collection_object_refs(state: &State, schema: &str) -> OQLResult<Vec<ObjRef>> {
-    if !state.typed_id_fences.contains_key(schema) {
+    if !state.typed_id_fences.contains_key(schema)
+        && state.overflow_id_counts.get(schema).copied().unwrap_or(0) == 0
+    {
         return Ok(state
             .collection_rows
             .get(schema)
@@ -7239,6 +7568,47 @@ fn logical_collection_object_refs(state: &State, schema: &str) -> OQLResult<Vec<
             .flat_map(BTreeMap::values)
             .copied()
             .collect());
+    }
+    if !state.typed_id_fences.contains_key(schema) {
+        // No row is in a column segment: the checkpoint's index of rows by
+        // id has them in order already. Read through it without making
+        // text of each id, slipping in the rows held in memory where their
+        // ids fall and leaving out the ones that have changed.
+        if let (Some(ids), Some(collection)) =
+            (&state.overflow_ids, state.collection_ids.get(schema))
+        {
+            let changed = state.typed_delta_rows.get(schema);
+            let mut resident = state
+                .collection_rows
+                .get(schema)
+                .map(|rows| rows.iter().peekable());
+            let mut listed = Vec::with_capacity(logical_collection_count(state, schema));
+            let mut not_text = false;
+            let (start, end) = id_index_range(*collection);
+            ids.visit_range(start, end, &mut |key, rows| {
+                let Ok(id) = std::str::from_utf8(key.get(2..).unwrap_or_default()) else {
+                    not_text = true;
+                    return;
+                };
+                while let Some((held, object_ref)) = resident.as_mut().and_then(|rows| rows.peek()) {
+                    if held.as_str() > id {
+                        break;
+                    }
+                    listed.push(**object_ref);
+                    resident.as_mut().and_then(|rows| rows.next());
+                }
+                if changed.is_some_and(|rows| rows.contains_key(id)) {
+                    return;
+                }
+                listed.extend(rows.first().copied());
+            })
+            .map_err(|error| OQLError::storage_error(&error, None))?;
+            if not_text {
+                return Err(OQLError::storage_error("an id in the id index is not text", None));
+            }
+            listed.extend(resident.into_iter().flatten().map(|(_, object_ref)| *object_ref));
+            return Ok(listed);
+        }
     }
     Ok(logical_collection_identities(state, schema)?
         .into_iter()
@@ -7683,6 +8053,13 @@ fn restore_checkpoint(
     }
     state.decoded_budget = decoded_budget;
     state.decoded_bytes_budget = default_decoded_bytes();
+    // A checkpoint that carries the index of its rows by id needs none of
+    // them listed in memory.
+    let mut ids_on_file = false;
+    checkpoint_indexes.again().for_each(filesystem.as_ref(), |page| {
+        ids_on_file |= page.schema == REVERSE_INDEX_SCHEMA && page.name == ID_INDEX_NAME;
+        Ok(())
+    })?;
     records.for_each_chunk(filesystem.as_ref(), 4_096, |records| {
         // With a budget, only as many rows as it has room for are decoded.
         // The rest are known by the schema and id their records state, and
@@ -7759,13 +8136,19 @@ fn restore_checkpoint(
             }
         };
         for (object_ref, record, schema, id, document, schema_version) in hydrated {
-            if lookup_object_ref(&state, &schema, &id)?.is_some()
-                || state
-                    .collection_rows
-                    .entry(schema)
-                    .or_default()
-                    .insert(id, object_ref)
-                    .is_some()
+            let listed_twice = if ids_on_file {
+                *state.overflow_id_counts.entry(schema).or_default() += 1;
+                false
+            } else {
+                lookup_object_ref(&state, &schema, &id)?.is_some()
+                    || state
+                        .collection_rows
+                        .entry(schema)
+                        .or_default()
+                        .insert(id, object_ref)
+                        .is_some()
+            };
+            if listed_twice
                 || {
                     // Past the budget the row is left as its record, which
                     // is held below, and decoded when it is asked for.
@@ -8230,6 +8613,7 @@ fn restore_scalar_indexes(
         REVERSE_INDEX_SCHEMA.to_string(),
         REVERSE_INDEX_NAME.to_string(),
     );
+    let ids_identity = (REVERSE_INDEX_SCHEMA.to_string(), ID_INDEX_NAME.to_string());
     let mut page_descriptors = HashMap::<(String, String), Vec<IndexPageDescriptor>>::new();
     let mut previous_keys = HashMap::<(String, String), Vec<u8>>::new();
     let mut posting_counts = HashMap::<(String, String), usize>::new();
@@ -8243,6 +8627,8 @@ fn restore_scalar_indexes(
         let identity = (page.schema.clone(), page.name.clone());
         let expected_unique = if identity == reverse_identity {
             false
+        } else if identity == ids_identity {
+            true
         } else {
             definitions
                 .get(&identity)
@@ -8301,9 +8687,14 @@ fn restore_scalar_indexes(
         .any(|identity| !page_descriptors.contains_key(identity) || !completed.contains(identity))
         || page_descriptors
             .keys()
-            .any(|identity| !definitions.contains_key(identity) && identity != &reverse_identity)
+            .any(|identity| {
+                !definitions.contains_key(identity)
+                    && identity != &reverse_identity
+                    && identity != &ids_identity
+            })
         || (page_descriptors.contains_key(&reverse_identity)
             && !completed.contains(&reverse_identity))
+        || (page_descriptors.contains_key(&ids_identity) && !completed.contains(&ids_identity))
     {
         return Err(OQLError::storage_error(
             "checkpoint index blocks do not match the scalar index catalog",
@@ -8338,6 +8729,23 @@ fn restore_scalar_indexes(
                 None,
             ));
         }
+    }
+    if let Some(pages) = page_descriptors.remove(&ids_identity) {
+        let listed = posting_counts.get(&ids_identity).copied().unwrap_or(0);
+        if listed != state.overflow_id_counts.values().sum::<usize>() {
+            return Err(OQLError::storage_error(
+                "checkpoint id index does not list every row outside the column segments once",
+                None,
+            ));
+        }
+        state.overflow_ids = Some(Arc::new(FileIndexBase::new(
+            filesystem.clone(),
+            ids_identity.0,
+            ids_identity.1,
+            true,
+            pages,
+            state.index_pages(),
+        )));
     }
     state.reverse_reference_index = if let Some(pages) = page_descriptors.remove(&reverse_identity)
     {
@@ -8807,12 +9215,7 @@ fn validate_state_integrity(state: &State) -> OQLResult<()> {
         if state.typed_row_locations.contains_key(object_ref)? {
             continue;
         }
-        if state
-            .collection_rows
-            .get(&document.schema)
-            .and_then(|rows| rows.get(&document.id))
-            != Some(object_ref)
-        {
+        if lookup_object_ref(state, &document.schema, &document.id)?.as_ref() != Some(object_ref) {
             return Err(OQLError::storage_error(
                 "object directory entry has no matching document identity",
                 None,
@@ -10218,11 +10621,8 @@ impl DocumentStore for RustStore {
                 .state
                 .read()
                 .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
-            state
-                .collection_rows
-                .get(schema)
-                .into_iter()
-                .flat_map(BTreeMap::values)
+            logical_collection_object_refs(&state, schema)?
+                .iter()
                 .map(|object_ref| {
                     logical_document(&state, *object_ref).and_then(|document| {
                         document
@@ -10309,11 +10709,8 @@ impl DocumentStore for RustStore {
                 .state
                 .read()
                 .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
-            state
-                .collection_rows
-                .get(schema)
-                .into_iter()
-                .flat_map(BTreeMap::values)
+            logical_collection_object_refs(&state, schema)?
+                .iter()
                 .map(|object_ref| {
                     logical_document(&state, *object_ref).and_then(|document| {
                         document
@@ -12671,12 +13068,10 @@ mod tests {
             store.checkpoint().unwrap();
             assert_eq!(scan(&store).len(), 2);
             let state = store.state.read().unwrap();
-            let object_ref = state
-                .collection_rows
-                .get("events")
-                .and_then(|rows| rows.get("old"))
+            let object_ref = lookup_object_ref(&state, "events", &"old".to_string())
+                .unwrap()
                 .unwrap();
-            assert!(state.object_records.get(object_ref).is_none());
+            assert!(state.object_records.get(&object_ref).is_none());
         }
 
         fs.crash();

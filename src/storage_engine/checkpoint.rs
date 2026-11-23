@@ -914,6 +914,16 @@ pub(crate) struct SegmentIndexReader {
 }
 
 impl SegmentIndexReader {
+    /// A second reader over the same pages.
+    pub(crate) fn again(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            start: self.start,
+            len: self.len,
+            count: self.count,
+        }
+    }
+
     pub(crate) fn for_each(
         self,
         filesystem: &dyn FileSystem,
