@@ -53,6 +53,9 @@ pub(crate) struct RecordRootHandle {
     /// read one after another are mostly on the same page, and reading a
     /// page is opening the file, reading it and checking its sum.
     pages: std::sync::Mutex<PagesRead>,
+    /// The file, opened when a page is first read from it and kept open:
+    /// opening it for every page cost more than reading the page.
+    file: std::sync::Mutex<Option<Box<dyn crate::simulation::filesystem::FileHandle>>>,
 }
 
 /// The pages a [`RecordRootHandle`] has read lately.
@@ -79,12 +82,33 @@ impl RecordRootHandle {
         {
             return Ok(known);
         }
-        let page = read_file_range(
-            self.filesystem.as_ref(),
-            &self.path,
-            page_offset,
-            page_end - page_offset,
-        )?;
+        let page = {
+            let mut file = self
+                .file
+                .lock()
+                .map_err(|_| OQLError::storage_error("record root file lock poisoned", None))?;
+            if file.is_none() {
+                *file = Some(self.filesystem.open(&self.path).map_err(|error| {
+                    OQLError::storage_error(&format!("open record root: {error}"), None)
+                })?);
+            }
+            let file = file.as_mut().expect("the file was opened just above");
+            file.seek(SeekFrom::Start(page_offset as u64)).map_err(|error| {
+                OQLError::storage_error(&format!("seek record root: {error}"), None)
+            })?;
+            let mut bytes = vec![0; page_end - page_offset];
+            let mut read = 0;
+            while read < bytes.len() {
+                let count = file.read(&mut bytes[read..]).map_err(|error| {
+                    OQLError::storage_error(&format!("read record root: {error}"), None)
+                })?;
+                if count == 0 {
+                    return Err(OQLError::storage_error("record root is truncated", None));
+                }
+                read += count;
+            }
+            bytes
+        };
         if crc32fast::hash(&page) != get_u32(&self.prefix, page_cursor + 28)? {
             return Err(OQLError::storage_error(
                 "record root page checksum is invalid",
@@ -141,6 +165,7 @@ impl RecordRootHandle {
                 authority_checksum: crc32fast::hash(&bytes),
                 legacy: Some(legacy),
                 pages: std::sync::Mutex::new(PagesRead::default()),
+                file: std::sync::Mutex::new(None),
             });
         }
         let directory_len = usize::try_from(get_u64(&header, 32)?)
@@ -182,6 +207,7 @@ impl RecordRootHandle {
             authority_checksum,
             legacy: None,
             pages: std::sync::Mutex::new(PagesRead::default()),
+            file: std::sync::Mutex::new(None),
         })
     }
 

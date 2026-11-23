@@ -79,6 +79,16 @@ enum Command {
         at: Option<PathBuf>,
         #[arg(long, default_value_t = 5)]
         reopens: usize,
+        /// Load the generated rows this many times over, each copy under
+        /// ids of its own. The generator holds every row it makes, so
+        /// this is the way to a database larger than memory.
+        #[arg(long, default_value_t = 1)]
+        copies: usize,
+        /// With a database already at `--at`: compact it this many
+        /// times once it is open, timing each, which is the way to look
+        /// closely at a compaction without loading again.
+        #[arg(long, default_value_t = 0)]
+        compactions: usize,
     },
     /// An experiment: time two slow questions over rows, over the store's
     /// column segments and over plain arrays.
@@ -388,7 +398,45 @@ const SINGLE_COMMITS: usize = 2000;
 /// Rows looked up by id.
 const LOOKUPS: usize = 20_000;
 
-fn scale(people: usize, at: Option<PathBuf>, reopens: usize) -> Result<()> {
+/// The id as one copy of the rows has it. The first copy keeps the ids
+/// as they were generated.
+fn id_in_copy(id: &str, copy: usize) -> String {
+    match copy {
+        0 => id.to_string(),
+        copy => format!("{id}-{copy}"),
+    }
+}
+
+/// A row as one copy has it: every text that is the id of a generated
+/// row, whether the row's own or a reference to another, names that
+/// copy's row.
+fn row_in_copy(row: &Row, copy: usize, ids: &std::collections::HashSet<String>) -> Row {
+    let text = |value: &String| match ids.contains(value) {
+        true => id_in_copy(value, copy),
+        false => value.clone(),
+    };
+    row.iter()
+        .map(|(name, cell)| {
+            let cell = match cell {
+                Cell::Text(value) => Cell::Text(text(value)),
+                Cell::Texts(values) => Cell::Texts(values.iter().map(text).collect()),
+                Cell::Rows(rows) => Cell::Rows(rows.iter().map(|row| row_in_copy(row, copy, ids)).collect()),
+                Cell::Int(value) => Cell::Int(*value),
+                Cell::Float(value) => Cell::Float(*value),
+                Cell::Absent => Cell::Absent,
+            };
+            (*name, cell)
+        })
+        .collect()
+}
+
+fn scale(
+    people: usize,
+    at: Option<PathBuf>,
+    reopens: usize,
+    copies: usize,
+    compactions: usize,
+) -> Result<()> {
     let megabytes = |bytes: u64| bytes as f64 / 1e6;
     let size_of = |directory: &std::path::Path| -> u64 {
         std::fs::read_dir(directory)
@@ -425,6 +473,16 @@ fn scale(people: usize, at: Option<PathBuf>, reopens: usize) -> Result<()> {
         for (name, entries, bytes) in owl.store().memory_breakdown().map_err(|error| anyhow!("{error}"))? {
             println!("  {name:<46} {entries:>9} entries {:>7.1} MB", bytes as f64 / 1e6);
         }
+        for _ in 0..compactions {
+            held();
+            let started = Instant::now();
+            owl.compact()?;
+            line(
+                "compaction",
+                started.elapsed().as_secs_f64(),
+                format!("{:.0} MB on disk", megabytes(size_of(&directory))),
+            );
+        }
         // Left open for a while when asked, so a tool can look at it.
         if let Some(seconds) = std::env::var("OWL_HOLD_OPEN").ok().and_then(|value| value.parse().ok()) {
             std::thread::sleep(std::time::Duration::from_secs(seconds));
@@ -456,18 +514,51 @@ fn scale(people: usize, at: Option<PathBuf>, reopens: usize) -> Result<()> {
                 .collect();
         }
     }
-    let rows: usize = tables.iter().map(|table| table.rows.len()).sum();
+    let rows: usize = tables.iter().map(|table| table.rows.len()).sum::<usize>() * copies;
     println!(
-        "{rows} rows ({people} people); generating them took {generated:.1} s and holds {generator:.0} MB of its own\n"
+        "{rows} rows ({people} people, {copies} time(s) over); generating them took {generated:.1} s and holds {generator:.0} MB of its own\n"
     );
 
     let started = Instant::now();
-    for table in tables {
-        for batch in table.rows.chunks(BATCH) {
-            owl.insert_rows(table.name, batch.iter().map(owl_row).collect())?;
+    if copies == 1 {
+        for table in tables {
+            for batch in table.rows.chunks(BATCH) {
+                owl.insert_rows(table.name, batch.iter().map(owl_row).collect())?;
+            }
+            // Each table is let go once it is in, so the generator's rows
+            // do not sit beside Owl's for the whole load.
         }
-        // Each table is let go once it is in, so the generator's rows do
-        // not sit beside Owl's for the whole load.
+    } else {
+        let generated_ids: std::collections::HashSet<String> = tables
+            .iter()
+            .flat_map(|table| &table.rows)
+            .filter_map(|row| match row.first() {
+                Some(("id", Cell::Text(id))) => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        for copy in 0..copies {
+            let copy_started = Instant::now();
+            for table in &tables {
+                for batch in table.rows.chunks(BATCH) {
+                    owl.insert_rows(
+                        table.name,
+                        batch
+                            .iter()
+                            .map(|row| owl_row(&row_in_copy(row, copy, &generated_ids)))
+                            .collect(),
+                    )?;
+                }
+            }
+            let each = rows / copies;
+            eprintln!(
+                "  copy {} of {copies}: {:.0} rows a second, {:.0} MB held",
+                copy + 1,
+                each as f64 / copy_started.elapsed().as_secs_f64(),
+                resident_megabytes() - base
+            );
+        }
+        drop(tables);
     }
     let seconds = started.elapsed().as_secs_f64();
     line("load", seconds, format!("{:.0} rows a second", rows as f64 / seconds));
@@ -516,7 +607,12 @@ fn scale(people: usize, at: Option<PathBuf>, reopens: usize) -> Result<()> {
 
     // Every so-manyth id, so the lookups are spread over the collection.
     let step = (ids.len() / LOOKUPS.min(ids.len()).max(1)).max(1);
-    let wanted: Vec<&String> = ids.iter().step_by(step).collect();
+    let wanted: Vec<String> = ids
+        .iter()
+        .step_by(step)
+        .enumerate()
+        .map(|(position, id)| id_in_copy(id, position % copies))
+        .collect();
     let started = Instant::now();
     let mut found = 0usize;
     for id in &wanted {
@@ -706,6 +802,8 @@ fn main() -> Result<()> {
         Command::Show { people, rows, queries } => show(people, rows, &queries),
         Command::Columns { people, samples } => columns::run(&load(people)?.owl, samples),
         Command::Memory { people, only } => memory(people, only.as_deref()),
-        Command::Scale { people, at, reopens } => scale(people, at, reopens),
+        Command::Scale { people, at, reopens, copies, compactions } => {
+            scale(people, at, reopens, copies.max(1), compactions)
+        }
     }
 }

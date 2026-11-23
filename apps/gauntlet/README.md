@@ -65,7 +65,9 @@ cargo build --release -p gauntlet
 committing one row at a time, reopening and looking rows up by id, with what
 it holds in memory and on disk at each step. `--at <directory>` keeps the
 database there; run again with the same directory and it is only reopened,
-`--reopens` times.
+`--reopens` times. `--copies <n>` loads the generated rows n times over,
+each copy under ids of its own, for a database larger than the generator
+could hold in memory: `scale --people 5000 --copies 20` is 3.7 million rows.
 
 `check` fails if any query differs. `bench` adds the median time on each
 engine. `show` prints both answers for a named query, or runs an OQL statement
