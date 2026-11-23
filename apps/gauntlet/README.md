@@ -67,7 +67,10 @@ it holds in memory and on disk at each step. `--at <directory>` keeps the
 database there; run again with the same directory and it is only reopened,
 `--reopens` times. `--copies <n>` loads the generated rows n times over,
 each copy under ids of its own, for a database larger than the generator
-could hold in memory: `scale --people 5000 --copies 20` is 3.7 million rows.
+could hold in memory: `scale --people 5000 --copies 20` is 3.7 million rows. Each
+copy's ids come after the ones already loaded, as ids that grow with time do;
+`--scattered` puts them in between, as random ids would, which is the harder
+case.
 
 `check` fails if any query differs. `bench` adds the median time on each
 engine. `show` prints both answers for a named query, or runs an OQL statement

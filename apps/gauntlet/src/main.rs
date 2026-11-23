@@ -84,6 +84,13 @@ enum Command {
         /// this is the way to a database larger than memory.
         #[arg(long, default_value_t = 1)]
         copies: usize,
+        /// Give each copy ids that fall in between the ids already
+        /// loaded, as random ids would, where the default gives each copy
+        /// ids that come after them, as ids that grow with time do. Rows
+        /// arriving in between existing ones are the harder case: no
+        /// stretch of the database is left untouched by them.
+        #[arg(long)]
+        scattered: bool,
         /// With a database already at `--at`: compact it this many
         /// times once it is open, timing each, which is the way to look
         /// closely at a compaction without loading again.
@@ -398,12 +405,19 @@ const SINGLE_COMMITS: usize = 2000;
 /// Rows looked up by id.
 const LOOKUPS: usize = 20_000;
 
+/// Whether each copy's ids fall in between those already loaded.
+static SCATTERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The id as one copy of the rows has it. The first copy keeps the ids
-/// as they were generated.
+/// as they were generated. A later copy's ids sort after every earlier
+/// copy's, or, when scattered, in between them.
 fn id_in_copy(id: &str, copy: usize) -> String {
-    match copy {
-        0 => id.to_string(),
-        copy => format!("{id}-{copy}"),
+    match (copy, SCATTERED.load(std::sync::atomic::Ordering::Relaxed)) {
+        (0, _) => id.to_string(),
+        (copy, true) => format!("{id}-{copy}"),
+        // Past any generated id, which starts with a lower-case letter,
+        // and in the order of the copies.
+        (copy, false) => format!("z{copy:04}-{id}"),
     }
 }
 
@@ -802,7 +816,8 @@ fn main() -> Result<()> {
         Command::Show { people, rows, queries } => show(people, rows, &queries),
         Command::Columns { people, samples } => columns::run(&load(people)?.owl, samples),
         Command::Memory { people, only } => memory(people, only.as_deref()),
-        Command::Scale { people, at, reopens, copies, compactions } => {
+        Command::Scale { people, at, reopens, copies, compactions, scattered } => {
+            SCATTERED.store(scattered, std::sync::atomic::Ordering::Relaxed);
             scale(people, at, reopens, copies.max(1), compactions)
         }
     }
