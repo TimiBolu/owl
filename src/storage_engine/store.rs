@@ -5810,7 +5810,10 @@ impl RustStore {
                             .generation_record_roots
                             .insert(0, record_root);
                         state.object_records.mark_clean();
-                        evict_clean_records(&mut state);
+                        // Every record held clean at this point was read
+                        // from this generation's file a moment ago, so
+                        // none needs looking up there before it is let go.
+                        state.object_records.evict_clean();
                     }
                 }
             }
@@ -6620,15 +6623,17 @@ fn validate_runtime_scalar_indexes_structural(state: &State) -> OQLResult<()> {
             OQLError::storage_error("recovered scalar index has no runtime handle", None)
         })?;
         let mut referenced = HashSet::new();
+        // A row's reference names its collection, so the row need not be
+        // read to know it is one of this index's.
+        let collection = state.collection_ids.get(&definition.schema).copied();
         index
             .visit_entries(&mut |_key, postings| {
                 if definition.unique && postings.len() > 1 {
                     return Err("recovered unique index has multiple postings".into());
                 }
                 for object_ref in postings {
-                    if !logical_document(state, *object_ref)
-                        .map_err(|error| error.to_string())?
-                        .is_some_and(|document| document.schema == definition.schema)
+                    if Some(object_ref.collection_id()) != collection
+                        || !object_is_live(state, *object_ref).map_err(|error| error.to_string())?
                     {
                         return Err(
                             "recovered index references an object in the wrong collection".into(),
@@ -6814,6 +6819,13 @@ struct LogicalIdentityCursor<'a> {
     fence_index: usize,
     row: usize,
     typed: Option<(DocumentId, ObjRef)>,
+    /// Which segment, by its place among the fences, and which row of it
+    /// `typed` is.
+    typed_at: (usize, usize),
+    /// The same for the row `next` gave last, when a segment had it.
+    gave: Option<(usize, usize)>,
+    /// The row `typed` held when `next` was last asked.
+    gave_typed: Option<ObjRef>,
     /// The checkpoint's rows outside its column segments, and the next of
     /// them that has not changed since.
     overflow: Option<OverflowIds>,
@@ -6835,6 +6847,9 @@ impl<'a> LogicalIdentityCursor<'a> {
             fence_index: 0,
             row: 0,
             typed: None,
+            typed_at: (0, 0),
+            gave: None,
+            gave_typed: None,
             overflow: OverflowIds::new(state, schema),
             on_file: None,
             resident: state
@@ -6849,9 +6864,32 @@ impl<'a> LogicalIdentityCursor<'a> {
     /// in a segment or among the other rows, never both; one also in
     /// memory has changed, and memory has it as it is now.
     fn next(&mut self) -> OQLResult<Option<(DocumentId, ObjRef)>> {
+        let row = self.next_row()?;
+        // Only a row taken from `typed` leaves it empty with nothing
+        // else having been read from the segments since.
+        self.gave = match (&row, &self.typed) {
+            (Some((_, object_ref)), None) if self.gave_typed == Some(*object_ref) => Some(self.typed_at),
+            _ => None,
+        };
+        Ok(row)
+    }
+
+    /// The first row of a column segment was just given, and nothing has
+    /// been read past it: leave the rest of that segment out.
+    fn skip_rest_of_segment(&mut self) {
+        if let Some((fence_index, 0)) = self.gave {
+            self.fence_index = fence_index + 1;
+            self.row = 0;
+            self.typed = None;
+            self.gave = None;
+        }
+    }
+
+    fn next_row(&mut self) -> OQLResult<Option<(DocumentId, ObjRef)>> {
         if self.typed.is_none() {
             self.typed = self.next_typed()?;
         }
+        self.gave_typed = self.typed.as_ref().map(|(_, object_ref)| *object_ref);
         if self.on_file.is_none() {
             self.on_file = self.next_on_file()?;
         }
@@ -6963,6 +7001,7 @@ impl<'a> LogicalIdentityCursor<'a> {
             {
                 continue;
             }
+            self.typed_at = (self.fence_index, row);
             return Ok(Some((id, segment.object_ref(row)?)));
         }
     }
@@ -7051,6 +7090,40 @@ fn checkpoint_image_from_compaction(
                 (Some(_), None) => false,
                 (Some((base_id, _)), Some(row)) => &row.id <= base_id,
             };
+            // A column segment none of whose rows has changed, and into
+            // whose span of ids nothing else falls, goes into the new
+            // checkpoint as it is. Its rows are not decoded and built
+            // into a segment again; only the fields its indexes are made
+            // from are read.
+            if !take_changed {
+                if let Some((fence_index, 0)) = base_rows.gave {
+                    let next_change = collection_change.map(|row| row.id.as_str());
+                    if let Some(encoded) =
+                        segment_carried_over(state, plan, &schema_name, fence_index, next_change)?
+                    {
+                        flush_compaction_typed_chunk(
+                            state,
+                            &schema_name,
+                            &mut typed_chunk,
+                            &mut typed_segments,
+                            &mut records,
+                            (&mut index_entries, ids_number),
+                        )?;
+                        add_carried_segment_indexes(
+                            state,
+                            &schema_name,
+                            fence_index,
+                            &index_numbers,
+                            reverse_number,
+                            &mut index_entries,
+                        )?;
+                        typed_segments.push(&encoded)?;
+                        base_rows.skip_rest_of_segment();
+                        base = base_rows.next()?;
+                        continue;
+                    }
+                }
+            }
             let row = if take_changed {
                 let change = changed.take().ok_or_else(|| {
                     OQLError::storage_error("compaction change cursor is empty", None)
@@ -7084,22 +7157,24 @@ fn checkpoint_image_from_compaction(
                     .take()
                     .ok_or_else(|| OQLError::storage_error("compaction cursor is empty", None))?;
                 base = base_rows.next()?;
-                let document = logical_document(state, object_ref)?.ok_or_else(|| {
+                let (document, source) = sourced_document(state, object_ref)?.ok_or_else(|| {
                     OQLError::storage_error("compaction base row is missing", None)
                 })?;
-                CompactionRow {
-                    object_ref,
-                    document,
-                    record: state.object_records.get(&object_ref).cloned(),
-                    schema_version: logical_schema_version(state, object_ref)?.ok_or_else(
-                        || {
-                            OQLError::storage_error(
-                                "compaction base row has no schema version",
-                                None,
-                            )
-                        },
-                    )?,
-                }
+                // A row read from its record has the record to hand: it
+                // goes into the new checkpoint as it is, not encoded again.
+                let read = match source {
+                    DocumentSource::Record(record) => Some(record),
+                    _ => None,
+                };
+                let record = state.object_records.get(&object_ref).cloned().or(read);
+                // Its record names the schema version it was written under.
+                let schema_version = match &record {
+                    Some(record) => RecordCodec::trusted_header(record)?.schema_version,
+                    None => logical_schema_version(state, object_ref)?.ok_or_else(|| {
+                        OQLError::storage_error("compaction base row has no schema version", None)
+                    })?,
+                };
+                CompactionRow { object_ref, document, record, schema_version }
             };
             add_compaction_indexes(state, &row, &index_numbers, reverse_number, &mut index_entries)?;
             let current_version = state.current_schema_versions.get(&schema_name).copied();
@@ -7175,6 +7250,145 @@ fn checkpoint_image_from_compaction(
         indexes,
         typed_segments: Vec::new(),
     })
+}
+
+/// A column segment of the base may go into the new checkpoint as it is
+/// when it is written the way segments are now, under the collection's
+/// current schema, is not small, and holds exactly the rows the new
+/// checkpoint would put in its place: none of its rows has been written
+/// again or deleted, and no other row has an id within its span. Gives
+/// the segment as encoded when so.
+fn segment_carried_over(
+    state: &State,
+    plan: &CompactionPlan,
+    schema: &str,
+    fence_index: usize,
+    next_change: Option<&str>,
+) -> OQLResult<Option<Vec<u8>>> {
+    let Some(fence) = state
+        .typed_id_fences
+        .get(schema)
+        .and_then(|fences| fences.get(fence_index))
+    else {
+        return Ok(None);
+    };
+    let segment = state
+        .typed_segments
+        .get(fence.segment_index)
+        .ok_or_else(|| OQLError::storage_error("typed ID fence has no segment", None))?;
+    // A segment far below the usual size is built again with its
+    // neighbours, or the segments would only ever get smaller.
+    const SMALLEST_CARRIED: usize = 2_048;
+    if !segment.authoritative()
+        || segment.row_count() < SMALLEST_CARRIED
+        || state.current_schema_versions.get(schema).copied() != Some(segment.schema_version())
+        || !state.schemas.contains_key(schema)
+    {
+        return Ok(None);
+    }
+    let span = (
+        Bound::Included(fence.first.as_str()),
+        Bound::Included(fence.last.as_str()),
+    );
+    // A row written since the frozen commit.
+    if next_change.is_some_and(|id| id <= fence.last.as_str()) {
+        return Ok(None);
+    }
+    // A row the base holds in memory, or has noted as changed.
+    if state
+        .collection_rows
+        .get(schema)
+        .is_some_and(|rows| rows.range::<str, _>(span).next().is_some())
+        || state
+            .typed_delta_rows
+            .get(schema)
+            .is_some_and(|rows| rows.range::<str, _>(span).next().is_some())
+    {
+        return Ok(None);
+    }
+    // A row the base keeps as a record.
+    if state.overflow_id_counts.get(schema).copied().unwrap_or(0) != 0 {
+        let (Some(ids), Some(collection)) = (&state.overflow_ids, state.collection_ids.get(schema))
+        else {
+            return Ok(None);
+        };
+        let between = ids
+            .range_entries(
+                Bound::Included(id_index_key(*collection, &fence.first)),
+                Bound::Included(id_index_key(*collection, &fence.last)),
+                Some(1),
+                false,
+            )
+            .map_err(|error| OQLError::storage_error(&error, None))?;
+        if !between.is_empty() {
+            return Ok(None);
+        }
+    }
+    for row in 0..segment.row_count() {
+        let object_ref = segment.object_ref(row)?;
+        if plan.overridden.contains(&object_ref)
+            || !state
+                .typed_row_locations
+                .still_at(&object_ref, (fence.segment_index, row))?
+        {
+            return Ok(None);
+        }
+    }
+    segment.encoded()
+}
+
+/// The index entries of every row of a column segment that is carried
+/// over, made as [`add_compaction_indexes`] makes them, from rows with
+/// only the fields those entries are made from.
+fn add_carried_segment_indexes(
+    state: &State,
+    schema: &str,
+    fence_index: usize,
+    index_numbers: &HashMap<(String, String), usize>,
+    reverse_number: usize,
+    entries: &mut IndexSorter,
+) -> OQLResult<()> {
+    let fence = state
+        .typed_id_fences
+        .get(schema)
+        .and_then(|fences| fences.get(fence_index))
+        .ok_or_else(|| OQLError::storage_error("carried segment has no ID fence", None))?;
+    let handle = state
+        .typed_segments
+        .get(fence.segment_index)
+        .ok_or_else(|| OQLError::storage_error("typed ID fence has no segment", None))?;
+    let compiled = state
+        .compiled_schemas
+        .get(&(handle.collection_id(), handle.schema_version()))
+        .ok_or_else(|| OQLError::storage_error("compiled schema is missing", None))?;
+    let segment = handle.load()?;
+    // The fields an index is declared on, and the fields that refer to
+    // another row.
+    let mut wanted = HashSet::new();
+    for definition in state.scalar_indexes.get(schema).into_iter().flatten() {
+        for path in &definition.fields {
+            let field = path.trim_start_matches('.');
+            wanted.insert(field.split('.').next().unwrap_or(field).to_string());
+        }
+    }
+    for field in &compiled.fields {
+        if segment.column(field.id).is_some_and(|column| column.is_reference()) {
+            wanted.insert(field.name.clone());
+        }
+    }
+    if wanted.is_empty() && state.scalar_indexes.get(schema).is_none_or(|indexes| indexes.is_empty()) {
+        return Ok(());
+    }
+    for row in 0..segment.row_count() {
+        let row = CompactionRow {
+            object_ref: handle.object_ref(row)?,
+            document: Arc::new(segment.decode_document_reading(row, compiled, Some(&wanted))?),
+            record: None,
+            schema_version: handle.schema_version(),
+        };
+        add_compaction_indexes(state, &row, index_numbers, reverse_number, entries)?;
+    }
+    Ok(())
 }
 
 fn add_compaction_indexes(
@@ -12719,18 +12933,38 @@ fn reverse_reference_key(target: ObjRef, field_path: &str) -> Vec<u8> {
 }
 
 fn document_reverse_keys(document: &Document) -> HashSet<Vec<u8>> {
-    let mut targets = HashMap::new();
-    for (field, value) in &document.fields {
-        collect_reference_targets(value, field, document, &mut targets);
+    // The same rows and field paths [`collect_reference_targets`] finds,
+    // as keys, without a copy of the row's collection and id for each.
+    fn keys(value: &Value, path: &mut String, output: &mut HashSet<Vec<u8>>) {
+        match value {
+            Value::Reference(object_ref) => {
+                output.insert(reverse_reference_key(*object_ref, path));
+            }
+            Value::List(values) => {
+                for value in values {
+                    keys(value, path, output);
+                }
+            }
+            Value::Object(fields) => {
+                let length = path.len();
+                for (name, value) in fields {
+                    path.push('.');
+                    path.push_str(name);
+                    keys(value, path, output);
+                    path.truncate(length);
+                }
+            }
+            _ => {}
+        }
     }
-    targets
-        .into_iter()
-        .flat_map(|(target, edges)| {
-            edges
-                .into_iter()
-                .map(move |edge| reverse_reference_key(target, &edge.field_path))
-        })
-        .collect()
+    let mut output = HashSet::new();
+    let mut path = String::new();
+    for (field, value) in &document.fields {
+        path.clear();
+        path.push_str(field);
+        keys(value, &mut path, &mut output);
+    }
+    output
 }
 
 fn update_reverse_reference_index(

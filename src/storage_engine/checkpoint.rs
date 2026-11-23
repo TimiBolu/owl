@@ -610,6 +610,19 @@ impl TypedSegmentHandle {
         self.descriptor.authoritative
     }
 
+    /// The segment exactly as its file holds it, when it is encoded the
+    /// way segments are written now. `None` for one held only in memory
+    /// or written in an older form.
+    pub(crate) fn encoded(&self) -> OQLResult<Option<Vec<u8>>> {
+        let Some(file) = self.file.as_ref() else {
+            return Ok(None);
+        };
+        if !TypedSegment::written_as_now(&self.descriptor) {
+            return Ok(None);
+        }
+        Ok(Some(read_exact_at(file.as_ref(), self.offset, self.descriptor.encoded_len)?))
+    }
+
     pub(crate) fn collection_id(&self) -> u16 {
         self.descriptor.collection_id
     }

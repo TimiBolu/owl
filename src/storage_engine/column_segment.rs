@@ -471,6 +471,12 @@ impl TypedSegment {
         self.decode_document_reading(row, compiled, None)
     }
 
+    /// Whether a segment with this header is encoded the way segments are
+    /// written now, and so can be copied into a new checkpoint as it is.
+    pub(crate) fn written_as_now(descriptor: &TypedSegmentDescriptor) -> bool {
+        descriptor.format_version == VERSION
+    }
+
     /// [`Self::decode_document`], building only the fields in `wanted`.
     pub(crate) fn decode_document_reading(
         &self,
