@@ -29,6 +29,11 @@ pub(crate) trait OrderedIndexBase: Send + Sync {
         }
         Ok(())
     }
+
+    /// This base as the pages of a checkpoint, when that is what it is.
+    fn file_base(&self) -> Option<&crate::storage_engine::checkpoint::FileIndexBase> {
+        None
+    }
 }
 
 /// The objects filed under one key, in order.
@@ -247,6 +252,11 @@ impl std::fmt::Debug for BTreeIndex {
 impl BTreeIndex {
     pub fn create(_order: usize, _flags: u32) -> Result<Self, String> {
         Ok(Self::default())
+    }
+
+    /// What this index is laid over, if anything.
+    pub(crate) fn base(&self) -> Option<Arc<dyn OrderedIndexBase>> {
+        self.inner.read().ok().and_then(|inner| inner.base.clone())
     }
 
     pub(crate) fn with_base(base: Arc<dyn OrderedIndexBase>) -> Self {

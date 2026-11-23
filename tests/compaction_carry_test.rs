@@ -267,4 +267,9 @@ fn a_compaction_writes_what_changed_and_the_database_stays_its_size() {
     let store = open(&path);
     check(&store, "once reopened");
     store.verify_integrity().unwrap();
+    // The compactions here built their indexes over the pages they
+    // replaced, and none had to give that up.
+    let (over_pages, refused) = RustStore::index_page_carries();
+    assert!(over_pages >= 20, "{over_pages} compactions built their indexes over pages");
+    assert_eq!(refused, 0, "compactions that could not build their indexes over pages");
 }

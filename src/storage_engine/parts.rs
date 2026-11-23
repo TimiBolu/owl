@@ -498,6 +498,8 @@ pub(crate) struct PartWriter {
     current: (u64, u64, crc32fast::Hasher),
     /// Whether the last extent noted is of an earlier part.
     last_listed: bool,
+    /// Whether that extent may have the next stretch joined to it.
+    last_joined: bool,
 }
 
 impl PartWriter {
@@ -511,6 +513,7 @@ impl PartWriter {
             extents: Vec::new(),
             current: (0, 0, crc32fast::Hasher::new()),
             last_listed: false,
+            last_joined: false,
         })
     }
 
@@ -532,16 +535,20 @@ impl PartWriter {
     }
 
     /// Take the next `len` bytes of the checkpoint from an earlier part,
-    /// where they are at `offset`, without writing them. Stretches that
-    /// follow one another in the same part are noted as one extent.
-    pub(crate) fn list(&mut self, part: u64, offset: u64, len: u64, checksum: u32) {
+    /// where they are at `offset`, without writing them. With `joined`,
+    /// stretches that follow one another in the same part are noted as
+    /// one extent; without, each keeps an extent and a checksum of its
+    /// own, and can be listed again later without being read.
+    pub(crate) fn list(&mut self, part: u64, offset: u64, len: u64, checksum: u32, joined: bool) {
         if len == 0 {
             return;
         }
         self.cut();
         match self.extents.last_mut() {
             Some(last)
-                if self.last_listed
+                if joined
+                    && self.last_joined
+                    && self.last_listed
                     && last.part == part
                     && last.offset + last.len == offset
                     && last.start + last.len == self.at =>
@@ -552,6 +559,7 @@ impl PartWriter {
             _ => self.extents.push(Extent { start: self.at, len, part, offset, checksum }),
         }
         self.last_listed = true;
+        self.last_joined = joined;
         self.at += len;
         self.current = (self.at, self.written, crc32fast::Hasher::new());
     }
