@@ -3179,12 +3179,19 @@ impl RustStore {
     /// Whether a memory budget is set and the log has grown to several
     /// times the size at which a checkpoint is due.
     fn checkpoints_are_behind(&self) -> OQLResult<bool> {
-        const TIMES_OVERDUE: u64 = 1;
-        let bounded = self
-            .state
-            .read()
-            .map_err(|_| OQLError::generic("storage state lock poisoned"))?
-            .tight();
+        let (bounded, budget) = {
+            let state = self
+                .state
+                .read()
+                .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+            // A store told how many rows it may hold was told to be
+            // frugal: it keeps to the policy's size.
+            let bytes = match state.decoded_budget {
+                Some(_) => None,
+                None => state.decoded_bytes_budget,
+            };
+            (state.tight(), bytes)
+        };
         if !bounded {
             return Ok(false);
         }
@@ -3199,7 +3206,16 @@ impl RustStore {
             .filesystem
             .file_size(&self.wal_path)
             .map_err(|error| storage_io("inspect WAL", &self.wal_path, error))?;
-        Ok(wal_bytes >= policy.wal_bytes.saturating_mul(TIMES_OVERDUE))
+        // A checkpoint is due at the policy's size, and one that is a
+        // compaction can take a while. The writer goes on meanwhile, up
+        // to a sixteenth of the memory budget in log: what that log holds
+        // is in memory until the checkpoint is done, and comes to a few
+        // times its size there. A small budget leaves the policy's size
+        // as the bound, as it was.
+        let allowed = policy
+            .wal_bytes
+            .max(budget.map_or(0, |budget| (budget / 16) as u64));
+        Ok(wal_bytes >= allowed)
     }
 
     /// Check, plan, log and apply one batch, without waiting for the log
@@ -3635,7 +3651,7 @@ impl StoreCore {
         let live_is_tight = self.state.read().map(|state| state.tight()).unwrap_or(false);
         let reconstructed = (|| {
             let recovery_started = Instant::now();
-            let (mut base, _) = RustStore::recover_checkpoint(
+            let (mut base, _) = RustStore::recover_checkpoint_auditing(
                 self.filesystem.clone(),
                 &self.manifest_paths,
                 &self.segment_paths,
@@ -3648,6 +3664,7 @@ impl StoreCore {
                 // The base holds no rows decoded: each is read once, as
                 // it is compacted.
                 Some(0),
+                false,
             )?;
             base.decoded_budget = None;
             // The base is the published checkpoint, which the store's own
@@ -5599,6 +5616,42 @@ impl RustStore {
         verification: SegmentVerification,
         decoded_budget: Option<usize>,
     ) -> OQLResult<(State, u64)> {
+        Self::recover_checkpoint_auditing(
+            filesystem,
+            manifest_paths,
+            segment_paths,
+            generation_root_paths,
+            generation_prefix,
+            wal_delta_paths,
+            record_delta_paths,
+            index_delta_paths,
+            verification,
+            decoded_budget,
+            true,
+        )
+    }
+
+    /// [`Self::recover_checkpoint`], with the choice of whether the
+    /// indexes, as the generations left them, are audited against the
+    /// rows. A database being opened is; the starting state of a
+    /// compaction is not, since a compaction builds its indexes from the
+    /// checkpoint's own pages and from rows, and reads nothing through
+    /// the indexes as the generations left them. The audit looks at every
+    /// entry of every index, which a compaction cannot afford each time.
+    #[allow(clippy::too_many_arguments)]
+    fn recover_checkpoint_auditing(
+        filesystem: Arc<dyn FileSystem>,
+        manifest_paths: &[PathBuf; 2],
+        segment_paths: &[PathBuf; 2],
+        generation_root_paths: &[PathBuf; 2],
+        generation_prefix: &Path,
+        wal_delta_paths: &[PathBuf; 2],
+        record_delta_paths: &[PathBuf; 2],
+        index_delta_paths: &[PathBuf; 2],
+        verification: SegmentVerification,
+        decoded_budget: Option<usize>,
+        audit_indexes: bool,
+    ) -> OQLResult<(State, u64)> {
         let mut manifests = Vec::new();
         for (slot, path) in manifest_paths.iter().enumerate() {
             if !filesystem.exists(path) {
@@ -5931,9 +5984,10 @@ impl RustStore {
                 true,
             )?;
         }
-        if generation_root.is_some()
-            || (generation_root.is_none() && !manifest.has_index_root)
-            || index_root_changed
+        if audit_indexes
+            && (generation_root.is_some()
+                || (generation_root.is_none() && !manifest.has_index_root)
+                || index_root_changed)
         {
             let audit_started = Instant::now();
             validate_runtime_scalar_indexes_structural(&state)?;
