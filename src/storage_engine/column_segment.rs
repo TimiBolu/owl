@@ -468,6 +468,16 @@ impl TypedSegment {
         row: usize,
         compiled: &CompiledSchema,
     ) -> OQLResult<Document> {
+        self.decode_document_reading(row, compiled, None)
+    }
+
+    /// [`Self::decode_document`], building only the fields in `wanted`.
+    pub(crate) fn decode_document_reading(
+        &self,
+        row: usize,
+        compiled: &CompiledSchema,
+        wanted: Option<&std::collections::HashSet<String>>,
+    ) -> OQLResult<Document> {
         if !self.authoritative
             || row >= self.row_count()
             || compiled.collection_id != self.collection_id
@@ -480,6 +490,9 @@ impl TypedSegment {
         }
         let mut fields = crate::document::Fields::with_capacity_and_hasher(compiled.fields.len(), Default::default());
         for field in &compiled.fields {
+            if wanted.is_some_and(|wanted| !wanted.contains(&field.name)) {
+                continue;
+            }
             let column = self
                 .column(field.id)
                 .ok_or_else(|| storage_error("authoritative typed segment is missing a field"))?;
