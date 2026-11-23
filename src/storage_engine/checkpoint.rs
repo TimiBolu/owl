@@ -3570,7 +3570,12 @@ fn discover_typed_segments(
 
 pub(crate) struct BaseSegmentHandle {
     file: Mutex<Box<dyn FileHandle>>,
-    prefix: Vec<u8>,
+    /// The reference of the first entry of each block of the directory.
+    /// The directory stays in the file: it has an entry for every record,
+    /// and held whole it would cost memory for every row.
+    fences: Vec<ObjRef>,
+    /// Blocks of the directory read lately, and the order they came in.
+    blocks: Mutex<(HashMap<usize, Arc<[u8]>>, VecDeque<usize>)>,
     entry_count: usize,
     directory_start: usize,
     records_start: usize,
@@ -3587,6 +3592,20 @@ pub(crate) struct BaseSegmentHandle {
 
 /// How much of the record region one read takes in.
 const RECORD_WINDOW: usize = 32 * 1024;
+
+/// How many directory entries are read from the file at a time: 4 KB.
+const DIRECTORY_BLOCK: usize = 128;
+
+/// How many directory blocks are kept once read: 1 MB.
+const DIRECTORY_BLOCKS_KEPT: usize = 256;
+
+/// Where a record lies in the record region, and its checksum.
+#[derive(Clone, Copy)]
+struct Located {
+    offset: usize,
+    length: usize,
+    checksum: u32,
+}
 
 impl BaseSegmentHandle {
     pub(crate) fn open(
@@ -3656,33 +3675,49 @@ impl BaseSegmentHandle {
             .checked_add(records_len)
             .filter(|end| *end <= file_len)
             .ok_or_else(|| OQLError::storage_error("base record region is truncated", None))?;
-        let prefix = read_file_range(filesystem.as_ref(), path, 0, records_start)?;
+        // The directory is read through once, a stretch at a time, to
+        // check it and to note where each of its blocks begins.
+        let mut fences = Vec::with_capacity(entry_count.div_ceil(DIRECTORY_BLOCK));
         let mut previous = None;
-        for index in 0..entry_count {
-            let entry = directory_start + index * DIRECTORY_ENTRY_LEN;
-            let object_ref = ObjRef::new(get_u64(&prefix, entry)?);
-            let offset = usize::try_from(get_u64(&prefix, entry + 8)?)
-                .map_err(|_| OQLError::storage_error("base record offset overflow", None))?;
-            let length = get_u32(&prefix, entry + 16)? as usize;
-            if object_ref.is_null()
-                || previous.is_some_and(|candidate| candidate >= object_ref)
-                || offset
-                    .checked_add(length)
-                    .is_none_or(|end| end > records_len)
-            {
-                return Err(OQLError::storage_error(
-                    "base segment object directory is invalid",
-                    None,
-                ));
+        const BLOCKS_A_READ: usize = 64;
+        for first in (0..entry_count).step_by(DIRECTORY_BLOCK * BLOCKS_A_READ) {
+            let count = (entry_count - first).min(DIRECTORY_BLOCK * BLOCKS_A_READ);
+            let stretch = read_file_range(
+                filesystem.as_ref(),
+                path,
+                directory_start + first * DIRECTORY_ENTRY_LEN,
+                count * DIRECTORY_ENTRY_LEN,
+            )?;
+            for index in 0..count {
+                let entry = index * DIRECTORY_ENTRY_LEN;
+                let object_ref = ObjRef::new(get_u64(&stretch, entry)?);
+                let offset = usize::try_from(get_u64(&stretch, entry + 8)?)
+                    .map_err(|_| OQLError::storage_error("base record offset overflow", None))?;
+                let length = get_u32(&stretch, entry + 16)? as usize;
+                if object_ref.is_null()
+                    || previous.is_some_and(|candidate| candidate >= object_ref)
+                    || offset
+                        .checked_add(length)
+                        .is_none_or(|end| end > records_len)
+                {
+                    return Err(OQLError::storage_error(
+                        "base segment object directory is invalid",
+                        None,
+                    ));
+                }
+                if (first + index) % DIRECTORY_BLOCK == 0 {
+                    fences.push(object_ref);
+                }
+                previous = Some(object_ref);
             }
-            previous = Some(object_ref);
         }
         let file = filesystem.open(path).map_err(|error| {
             OQLError::storage_error(&format!("open base segment records: {error}"), None)
         })?;
         Ok(Self {
             file: Mutex::new(file),
-            prefix,
+            fences,
+            blocks: Mutex::new((HashMap::new(), VecDeque::new())),
             entry_count,
             directory_start,
             records_start,
@@ -3692,126 +3727,125 @@ impl BaseSegmentHandle {
         })
     }
 
-    /// Whether this segment holds a record for the object, from its
-    /// directory alone.
-    pub(crate) fn contains(&self, object_ref: ObjRef) -> OQLResult<bool> {
-        let mut low = 0usize;
-        let mut high = self.entry_count;
-        while low < high {
-            let middle = low + (high - low) / 2;
-            let entry = self.directory_start + middle * DIRECTORY_ENTRY_LEN;
-            match ObjRef::new(get_u64(&self.prefix, entry)?).cmp(&object_ref) {
-                std::cmp::Ordering::Less => low = middle + 1,
-                std::cmp::Ordering::Greater => high = middle,
-                std::cmp::Ordering::Equal => return Ok(true),
+    /// The block of the directory that would hold this reference.
+    fn directory_block(&self, block: usize) -> OQLResult<Arc<[u8]>> {
+        let mut blocks = self
+            .blocks
+            .lock()
+            .map_err(|_| OQLError::storage_error("base segment directory lock poisoned", None))?;
+        if let Some(held) = blocks.0.get(&block) {
+            return Ok(held.clone());
+        }
+        let first = block * DIRECTORY_BLOCK;
+        let count = (self.entry_count - first).min(DIRECTORY_BLOCK);
+        let read: Arc<[u8]> = {
+            let mut file = self.file.lock().map_err(|_| {
+                OQLError::storage_error("base segment read handle lock poisoned", None)
+            })?;
+            file.seek(SeekFrom::Start(
+                (self.directory_start + first * DIRECTORY_ENTRY_LEN) as u64,
+            ))
+            .map_err(|error| {
+                OQLError::storage_error(&format!("seek base object directory: {error}"), None)
+            })?;
+            Arc::from(read_exact_handle(file.as_mut(), count * DIRECTORY_ENTRY_LEN)?)
+        };
+        if blocks.1.len() >= DIRECTORY_BLOCKS_KEPT {
+            if let Some(oldest) = blocks.1.pop_front() {
+                blocks.0.remove(&oldest);
             }
         }
-        Ok(false)
+        blocks.0.insert(block, read.clone());
+        blocks.1.push_back(block);
+        Ok(read)
     }
 
-    pub(crate) fn lookup(&self, object_ref: ObjRef) -> OQLResult<Option<Arc<[u8]>>> {
+    /// Where the record of this object lies, from the directory.
+    fn locate(&self, object_ref: ObjRef) -> OQLResult<Option<Located>> {
+        // The last block that begins at or before the reference.
+        let Some(block) = self
+            .fences
+            .partition_point(|first| *first <= object_ref)
+            .checked_sub(1)
+        else {
+            return Ok(None);
+        };
+        let entries = self.directory_block(block)?;
         let mut low = 0usize;
-        let mut high = self.entry_count;
+        let mut high = entries.len() / DIRECTORY_ENTRY_LEN;
         while low < high {
             let middle = low + (high - low) / 2;
-            let entry = self.directory_start + middle * DIRECTORY_ENTRY_LEN;
-            match ObjRef::new(get_u64(&self.prefix, entry)?).cmp(&object_ref) {
+            let entry = middle * DIRECTORY_ENTRY_LEN;
+            match ObjRef::new(get_u64(&entries, entry)?).cmp(&object_ref) {
                 std::cmp::Ordering::Less => low = middle + 1,
                 std::cmp::Ordering::Greater => high = middle,
                 std::cmp::Ordering::Equal => {
-                    let offset =
-                        usize::try_from(get_u64(&self.prefix, entry + 8)?).map_err(|_| {
-                            OQLError::storage_error("base record offset overflow", None)
-                        })?;
-                    let length = get_u32(&self.prefix, entry + 16)? as usize;
-                    let checksum = get_u32(&self.prefix, entry + 20)?;
-                    let end = offset
+                    let offset = usize::try_from(get_u64(&entries, entry + 8)?)
+                        .map_err(|_| OQLError::storage_error("base record offset overflow", None))?;
+                    let length = get_u32(&entries, entry + 16)? as usize;
+                    let checksum = get_u32(&entries, entry + 20)?;
+                    offset
                         .checked_add(length)
                         .filter(|end| *end <= self.records_len)
                         .ok_or_else(|| {
                             OQLError::storage_error("base record lies outside its region", None)
                         })?;
-                    let mut window = self.window.lock().map_err(|_| {
-                        OQLError::storage_error("base segment read window lock poisoned", None)
-                    })?;
-                    // One record read on its own is read alone. The next
-                    // after it, or one close behind, is part of a run, and
-                    // a stretch is read for the records that will follow.
-                    let last_end = self.last_end.swap(end, std::sync::atomic::Ordering::Relaxed);
-                    let in_a_run = offset >= last_end && offset - last_end <= RECORD_WINDOW / 8;
-                    if offset < window.0 || end > window.0 + window.1.len() {
-                        let ahead = if in_a_run { RECORD_WINDOW } else { 0 };
-                        let length = (end - offset).max(ahead).min(self.records_len - offset);
-                        let mut file = self.file.lock().map_err(|_| {
-                            OQLError::storage_error("base segment read handle lock poisoned", None)
-                        })?;
-                        file.seek(SeekFrom::Start((self.records_start + offset) as u64))
-                            .map_err(|error| {
-                                OQLError::storage_error(
-                                    &format!("seek base object record: {error}"),
-                                    None,
-                                )
-                            })?;
-                        *window = (offset, read_exact_handle(file.as_mut(), length)?);
-                    }
-                    let record = &window.1[offset - window.0..end - window.0];
-                    if crc32fast::hash(record) != checksum {
-                        return Err(OQLError::storage_error(
-                            "base object record checksum mismatch",
-                            None,
-                        ));
-                    }
-                    return Ok(Some(Arc::from(record)));
+                    return Ok(Some(Located { offset, length, checksum }));
                 }
             }
         }
         Ok(None)
     }
 
+    /// Whether this segment holds a record for the object, from its
+    /// directory alone.
+    pub(crate) fn contains(&self, object_ref: ObjRef) -> OQLResult<bool> {
+        Ok(self.locate(object_ref)?.is_some())
+    }
+
+    pub(crate) fn lookup(&self, object_ref: ObjRef) -> OQLResult<Option<Arc<[u8]>>> {
+        let Some(Located { offset, length, checksum }) = self.locate(object_ref)? else {
+            return Ok(None);
+        };
+        let end = offset + length;
+        let mut window = self.window.lock().map_err(|_| {
+            OQLError::storage_error("base segment read window lock poisoned", None)
+        })?;
+        // One record read on its own is read alone. The next
+        // after it, or one close behind, is part of a run, and
+        // a stretch is read for the records that will follow.
+        let last_end = self.last_end.swap(end, std::sync::atomic::Ordering::Relaxed);
+        let in_a_run = offset >= last_end && offset - last_end <= RECORD_WINDOW / 8;
+        if offset < window.0 || end > window.0 + window.1.len() {
+            let ahead = if in_a_run { RECORD_WINDOW } else { 0 };
+            let length = (end - offset).max(ahead).min(self.records_len - offset);
+            let mut file = self.file.lock().map_err(|_| {
+                OQLError::storage_error("base segment read handle lock poisoned", None)
+            })?;
+            file.seek(SeekFrom::Start((self.records_start + offset) as u64))
+                .map_err(|error| {
+                    OQLError::storage_error(
+                        &format!("seek base object record: {error}"),
+                        None,
+                    )
+                })?;
+            *window = (offset, read_exact_handle(file.as_mut(), length)?);
+        }
+        let record = &window.1[offset - window.0..end - window.0];
+        if crc32fast::hash(record) != checksum {
+            return Err(OQLError::storage_error(
+                "base object record checksum mismatch",
+                None,
+            ));
+        }
+        Ok(Some(Arc::from(record)))
+    }
+
     /// Resolve a scan batch with one contiguous base-segment read. Object
     /// records are physically ordered by `ObjRef`, so rows from one collection
     /// normally occupy one compact span even when logical scan order differs.
     pub(crate) fn lookup_many(&self, object_refs: &[ObjRef]) -> OQLResult<Vec<Option<Arc<[u8]>>>> {
-        #[derive(Clone, Copy)]
-        struct Located {
-            offset: usize,
-            length: usize,
-            checksum: u32,
-        }
-
-        let locate = |object_ref: ObjRef| -> OQLResult<Option<Located>> {
-            let mut low = 0usize;
-            let mut high = self.entry_count;
-            while low < high {
-                let middle = low + (high - low) / 2;
-                let entry = self.directory_start + middle * DIRECTORY_ENTRY_LEN;
-                match ObjRef::new(get_u64(&self.prefix, entry)?).cmp(&object_ref) {
-                    std::cmp::Ordering::Less => low = middle + 1,
-                    std::cmp::Ordering::Greater => high = middle,
-                    std::cmp::Ordering::Equal => {
-                        let offset =
-                            usize::try_from(get_u64(&self.prefix, entry + 8)?).map_err(|_| {
-                                OQLError::storage_error("base record offset overflow", None)
-                            })?;
-                        let length = get_u32(&self.prefix, entry + 16)? as usize;
-                        let checksum = get_u32(&self.prefix, entry + 20)?;
-                        offset
-                            .checked_add(length)
-                            .filter(|end| *end <= self.records_len)
-                            .ok_or_else(|| {
-                                OQLError::storage_error("base record lies outside its region", None)
-                            })?;
-                        return Ok(Some(Located {
-                            offset,
-                            length,
-                            checksum,
-                        }));
-                    }
-                }
-            }
-            Ok(None)
-        };
-
+        let locate = |object_ref: ObjRef| self.locate(object_ref);
         let located = object_refs
             .iter()
             .copied()
