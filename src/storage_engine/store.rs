@@ -2753,6 +2753,9 @@ impl RustStore {
                 .ok()
                 .and_then(|value| value.trim().parse().ok())
         });
+        // A checkpoint kept as a root over part files reads as one file
+        // from here on.
+        let filesystem = crate::storage_engine::parts::PartedFileSystem::over(filesystem);
         let wal_path = path.as_ref().to_path_buf();
         let sealed_wal_path = sidecar_path(path.as_ref(), "wal.sealed");
         let manifest_paths = [
@@ -2796,6 +2799,10 @@ impl RustStore {
             &generation_root_paths,
             &generation_prefix,
         )?;
+        // A part a crash left behind, written for a checkpoint whose root
+        // never was, is listed by nothing.
+        crate::storage_engine::parts::remove_unlisted_parts(filesystem.as_ref(), &segment_paths)
+            .map_err(|error| storage_io("remove unlisted checkpoint parts", &wal_path, error))?;
         let mut wal = if filesystem.exists(&wal_path) {
             filesystem
                 .open_with_options(
@@ -4356,6 +4363,13 @@ impl StoreCore {
             image,
             self.max_size_bytes,
         )?;
+        // The root just written took the place of an older one, whose
+        // parts nothing lists any more. Failing to remove them costs
+        // space until the next attempt, and nothing else.
+        let _ = crate::storage_engine::parts::remove_unlisted_parts(
+            self.filesystem.as_ref(),
+            &self.segment_paths,
+        );
         let record_root = RecordPageDelta {
             base_lsn: checkpoint_lsn,
             target_lsn: checkpoint_lsn,
@@ -4848,6 +4862,14 @@ impl StoreCore {
                 remove_reclaimed_file(self.filesystem.as_ref(), path, &mut report)?;
             }
         }
+        // The parts only the removed checkpoint listed go with it. Its
+        // size, counted above, was theirs.
+        let (parts, _) = crate::storage_engine::parts::remove_unlisted_parts(
+            self.filesystem.as_ref(),
+            &self.segment_paths,
+        )
+        .map_err(|error| storage_io("remove unlisted checkpoint parts", &self.wal_path, error))?;
+        report.files_removed += parts;
         for (slot, path) in self.record_delta_paths.iter().enumerate() {
             if !manifest.has_record_root || slot != manifest.slot as usize {
                 remove_reclaimed_file(self.filesystem.as_ref(), path, &mut report)?;
@@ -6810,6 +6832,52 @@ struct CompactionRow {
     document: Arc<Document>,
     record: Option<Arc<[u8]>>,
     schema_version: u32,
+    /// Where the checkpoint being replaced holds this very record, its
+    /// length and its checksum, when it does.
+    carried: Option<(u64, u32, u32)>,
+}
+
+/// Put a row's record in the new checkpoint. One the checkpoint being
+/// replaced holds as it is wanted is carried over from there; any other
+/// is written, encoded first if the row was not read from a record.
+fn push_row_record(
+    records: &mut RecordSpool,
+    row: &CompactionRow,
+    compiled: &CompiledSchema,
+) -> OQLResult<()> {
+    if let Some((offset, length, checksum)) = row.carried {
+        return records.push_carried(row.object_ref, offset, length, checksum);
+    }
+    match &row.record {
+        Some(record) => records.push(row.object_ref, record),
+        None => records.push(
+            row.object_ref,
+            &RecordCodec::encode(&row.document, row.object_ref, compiled)?,
+        ),
+    }
+}
+
+/// Where the checkpoint being replaced holds exactly this record, when it
+/// does: the directory's entry for the row has this length and checksum.
+fn record_carried(
+    state: &State,
+    object_ref: ObjRef,
+    record: &[u8],
+) -> OQLResult<Option<(u64, u32, u32)>> {
+    let Some(files) = &state.checkpoint_records else {
+        return Ok(None);
+    };
+    let files = files
+        .lock()
+        .map_err(|_| OQLError::generic("checkpoint read handle lock poisoned"))?;
+    let Some(base) = &files.base_segment else {
+        return Ok(None);
+    };
+    Ok(base
+        .place(object_ref)?
+        .filter(|(_, length, checksum)| {
+            *length as usize == record.len() && *checksum == crc32fast::hash(record)
+        }))
 }
 
 struct LogicalIdentityCursor<'a> {
@@ -7059,6 +7127,22 @@ fn checkpoint_image_from_compaction(
     }
     collection_names.sort();
     collection_names.dedup();
+    // Records and column segments the checkpoint being replaced holds
+    // as they are wanted are carried over from it.
+    let base_path = match &state.checkpoint_records {
+        Some(files) => files
+            .lock()
+            .map_err(|_| OQLError::generic("checkpoint read handle lock poisoned"))?
+            .base_segment
+            .as_ref()
+            .map(|base| base.path().to_path_buf()),
+        None => None,
+    };
+    let carries = base_path.is_some();
+    if let Some(base_path) = base_path {
+        records.carry_from(base_path.clone());
+        typed_segments.carry_from(base_path);
+    }
     let mut changed_rows = CompactionChangeCursor::new(plan.filesystem.as_ref(), &plan.runs)?;
     let mut changed = changed_rows.next()?;
 
@@ -7098,9 +7182,14 @@ fn checkpoint_image_from_compaction(
             if !take_changed {
                 if let Some((fence_index, 0)) = base_rows.gave {
                     let next_change = collection_change.map(|row| row.id.as_str());
-                    if let Some(encoded) =
-                        segment_carried_over(state, plan, &schema_name, fence_index, next_change)?
-                    {
+                    if let Some(encoded) = segment_carried_over(
+                        state,
+                        plan,
+                        &schema_name,
+                        fence_index,
+                        next_change,
+                        typed_segments.carries(),
+                    )? {
                         flush_compaction_typed_chunk(
                             state,
                             &schema_name,
@@ -7117,7 +7206,12 @@ fn checkpoint_image_from_compaction(
                             reverse_number,
                             &mut index_entries,
                         )?;
-                        typed_segments.push(&encoded)?;
+                        match encoded {
+                            CarriedSegment::Listed(offset, descriptor) => {
+                                typed_segments.push_carried(offset, descriptor)?
+                            }
+                            CarriedSegment::Bytes(encoded) => typed_segments.push(&encoded)?,
+                        }
                         base_rows.skip_rest_of_segment();
                         base = base_rows.next()?;
                         continue;
@@ -7151,6 +7245,7 @@ fn checkpoint_image_from_compaction(
                     document: Arc::new(RecordCodec::decode(&record, compiled)?),
                     record: Some(record),
                     schema_version: header.schema_version,
+                    carried: None,
                 }
             } else {
                 let (_, object_ref) = base
@@ -7174,7 +7269,13 @@ fn checkpoint_image_from_compaction(
                         OQLError::storage_error("compaction base row has no schema version", None)
                     })?,
                 };
-                CompactionRow { object_ref, document, record, schema_version }
+                // A record the checkpoint being replaced holds as it is
+                // goes into the new one by being listed, not written.
+                let carried = match (&record, carries) {
+                    (Some(record), true) => record_carried(state, object_ref, record)?,
+                    _ => None,
+                };
+                CompactionRow { object_ref, document, record, schema_version, carried }
             };
             add_compaction_indexes(state, &row, &index_numbers, reverse_number, &mut index_entries)?;
             let current_version = state.current_schema_versions.get(&schema_name).copied();
@@ -7204,22 +7305,13 @@ fn checkpoint_image_from_compaction(
                     &id_index_key(row.object_ref.collection_id(), &row.document.id),
                     row.object_ref,
                 )?;
-                records.push(
-                    row.object_ref,
-                    &row.record.unwrap_or(Arc::from(RecordCodec::encode(
-                        &row.document,
-                        row.object_ref,
-                        state
-                            .compiled_schemas
-                            .get(&(row.object_ref.collection_id(), row.schema_version))
-                            .ok_or_else(|| {
-                                OQLError::storage_error(
-                                    "compaction row has no compiled schema",
-                                    None,
-                                )
-                            })?,
-                    )?)),
-                )?;
+let compiled = state
+                    .compiled_schemas
+                    .get(&(row.object_ref.collection_id(), row.schema_version))
+                    .ok_or_else(|| {
+                        OQLError::storage_error("compaction row has no compiled schema", None)
+                    })?;
+                push_row_record(&mut records, &row, compiled)?;
             }
         }
         flush_compaction_typed_chunk(
@@ -7264,7 +7356,8 @@ fn segment_carried_over(
     schema: &str,
     fence_index: usize,
     next_change: Option<&str>,
-) -> OQLResult<Option<Vec<u8>>> {
+    listed: bool,
+) -> OQLResult<Option<CarriedSegment>> {
     let Some(fence) = state
         .typed_id_fences
         .get(schema)
@@ -7334,7 +7427,21 @@ fn segment_carried_over(
             return Ok(None);
         }
     }
-    segment.encoded()
+    if listed {
+        if let Some((offset, descriptor)) = segment.place() {
+            return Ok(Some(CarriedSegment::Listed(offset, descriptor)));
+        }
+    }
+    Ok(segment.encoded()?.map(CarriedSegment::Bytes))
+}
+
+/// A column segment that goes into the new checkpoint as it is.
+enum CarriedSegment {
+    /// Where the checkpoint being replaced holds it, and what its header
+    /// says of it: it is listed from there, not written again.
+    Listed(u64, crate::storage_engine::column_segment::TypedSegmentDescriptor),
+    /// Its bytes, to be written.
+    Bytes(Vec<u8>),
 }
 
 /// The index entries of every row of a column segment that is carried
@@ -7385,6 +7492,7 @@ fn add_carried_segment_indexes(
             document: Arc::new(segment.decode_document_reading(row, compiled, Some(&wanted))?),
             record: None,
             schema_version: handle.schema_version(),
+            carried: None,
         };
         add_compaction_indexes(state, &row, index_numbers, reverse_number, entries)?;
     }
@@ -7445,14 +7553,7 @@ fn flush_compaction_typed_chunk(
                 &id_index_key(row.object_ref.collection_id(), &row.document.id),
                 row.object_ref,
             )?;
-            records.push(
-                row.object_ref,
-                &row.record.clone().unwrap_or(Arc::from(RecordCodec::encode(
-                    &row.document,
-                    row.object_ref,
-                    compiled,
-                )?)),
-            )?;
+            push_row_record(records, row, compiled)?;
         }
         chunk.clear();
         return Ok(());
@@ -7471,14 +7572,7 @@ fn flush_compaction_typed_chunk(
                 &id_index_key(row.object_ref.collection_id(), &row.document.id),
                 row.object_ref,
             )?;
-            records.push(
-                row.object_ref,
-                &row.record.clone().unwrap_or(Arc::from(RecordCodec::encode(
-                    &row.document,
-                    row.object_ref,
-                    compiled,
-                )?)),
-            )?;
+            push_row_record(records, row, compiled)?;
         }
     }
     chunk.clear();
@@ -9738,6 +9832,9 @@ fn inspect_integrity(
     database_path: &Path,
     filesystem: Arc<dyn FileSystem>,
 ) -> OQLResult<(IntegrityReport, State)> {
+    // The files are read as a store reads them: a checkpoint kept as a
+    // root over parts as one file.
+    let filesystem = crate::storage_engine::parts::PartedFileSystem::over(filesystem);
     let sealed_wal_path = sidecar_path(database_path, "wal.sealed");
     let manifest_paths = [
         sidecar_path(database_path, "manifest.0"),
@@ -13422,10 +13519,82 @@ mod tests {
         ) -> std::io::Result<Box<dyn crate::simulation::filesystem::MemoryMap>> {
             self.inner.mmap(path, size)
         }
+
+        fn list_dir(&self, directory: &Path) -> std::io::Result<Vec<PathBuf>> {
+            self.inner.list_dir(directory)
+        }
     }
 
     fn document(id: &str) -> Document {
         Document::with_id(id.to_string(), "events".to_string(), crate::document::Fields::default())
+    }
+
+    /// A checkpoint used to be one file. A database kept that way opens
+    /// as it is, and its next compaction writes a root over a part.
+    #[test]
+    fn a_checkpoint_kept_as_one_file_opens_and_becomes_a_root_when_next_compacted() {
+        use crate::storage_engine::parts::{part_path, parts_of, PartedFileSystem, PartsOf};
+        let fs = Arc::new(SimulatedFileSystem::new(71));
+        let path = Path::new("one-file.owl");
+        let store = RustStore::new_with_fs(path, 1024 * 1024, fs.clone()).unwrap();
+        for number in 0..200 {
+            let mut event = document(&format!("event-{number:04}"));
+            event.fields.insert("code".into(), Value::Integer(number));
+            store.put_document(&event).unwrap();
+        }
+        store.checkpoint().unwrap();
+        drop(store);
+
+        // Put each checkpoint back the way it used to be kept: its bytes
+        // in one file at its path, and no parts.
+        let segments = [sidecar_path(path, "segment.0"), sidecar_path(path, "segment.1")];
+        let parted = PartedFileSystem::over(fs.clone());
+        let mut rewritten = 0;
+        for segment in &segments {
+            let PartsOf::Root(parts) = parts_of(fs.as_ref(), segment) else {
+                continue;
+            };
+            let mut bytes = vec![0u8; parted.file_size(segment).unwrap() as usize];
+            let mut whole = parted.open(segment).unwrap();
+            let mut read = 0;
+            while read < bytes.len() {
+                read += whole.read(&mut bytes[read..]).unwrap();
+            }
+            let mut file = fs.create(segment).unwrap();
+            write_all(file.as_mut(), &bytes).unwrap();
+            file.sync().unwrap();
+            for part in parts {
+                fs.remove(&part_path(segment, part)).unwrap();
+            }
+            rewritten += 1;
+        }
+        fs.sync_all().unwrap();
+        assert!(rewritten >= 1);
+        assert!(segments
+            .iter()
+            .all(|segment| !matches!(parts_of(fs.as_ref(), segment), PartsOf::Root(_))));
+
+        let store = RustStore::new_with_fs(path, 1024 * 1024, fs.clone()).unwrap();
+        assert_eq!(store.scan_documents("events").unwrap().len(), 200);
+        store.verify_integrity().unwrap();
+        let mut event = document("event-0200");
+        event.fields.insert("code".into(), Value::Integer(200));
+        store.put_document(&event).unwrap();
+        store.compact().unwrap();
+        assert!(segments
+            .iter()
+            .any(|segment| matches!(parts_of(fs.as_ref(), segment), PartsOf::Root(_))));
+        assert_eq!(store.scan_documents("events").unwrap().len(), 201);
+        store.verify_integrity().unwrap();
+        drop(store);
+
+        let store = RustStore::new_with_fs(path, 1024 * 1024, fs).unwrap();
+        assert_eq!(store.scan_documents("events").unwrap().len(), 201);
+        assert_eq!(
+            store.get_document("events", &"event-0200".to_string()).unwrap().unwrap().fields.get("code"),
+            Some(&Value::Integer(200))
+        );
+        store.verify_integrity().unwrap();
     }
 
     #[test]

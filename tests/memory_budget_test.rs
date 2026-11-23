@@ -474,10 +474,10 @@ fn a_row_read_from_a_checkpoint_file_is_held_within_the_budget() {
     assert!(store.decoded_documents() <= 10);
 }
 
-/// A compaction leaves the copy it replaced on disk, as something to fall
-/// back to. Asked to, it removes that copy once the new one has been read
-/// back and checked. The database is then about half the size on disk, and
-/// answers and reopens exactly as before.
+/// A compaction leaves the checkpoint it replaced on disk. Asked to, it
+/// removes it, and the parts only it listed, once the new one has been
+/// read back and checked. The database takes no more room than before,
+/// and answers and reopens exactly as before.
 #[test]
 fn a_compaction_can_remove_the_copy_it_replaced() {
     let home = TempDir::new().unwrap();
@@ -507,7 +507,9 @@ fn a_compaction_can_remove_the_copy_it_replaced() {
     let (_, reclaimed) = store.compact_and_reclaim().unwrap();
     assert!(reclaimed.files_removed >= 1, "{reclaimed:?}");
     let light = size_on_disk();
-    assert!(light * 10 < kept * 7, "{light} bytes after reclaiming, {kept} before");
+    // What the two checkpoints have in common is held once, in parts both
+    // list, so the older one takes little room of its own by now.
+    assert!(light <= kept, "{light} bytes after reclaiming, {kept} before");
     same(&answers(&store), &expected, "after reclaiming");
     assert!(store.verify_integrity().is_ok());
 

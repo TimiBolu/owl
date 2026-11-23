@@ -326,6 +326,18 @@ impl FileSystem for PoolFileSystem {
         self.locked()?.remove(path)
     }
 
+    fn list_dir(&self, directory: &Path) -> io::Result<Vec<PathBuf>> {
+        let pool = self.locked()?;
+        let mut listed: Vec<PathBuf> = pool
+            .by_path
+            .keys()
+            .filter(|path| path.parent() == Some(directory))
+            .cloned()
+            .collect();
+        listed.sort();
+        Ok(listed)
+    }
+
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
         let mut pool = self.locked()?;
         let Some(at) = pool.by_path.get(from).copied() else {
