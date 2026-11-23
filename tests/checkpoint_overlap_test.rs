@@ -275,4 +275,7 @@ fn a_store_agrees_with_what_was_written_while_checkpoints_overlap_writes() {
     let store = open(&path);
     agrees(&store, &model, &deleted, "once reopened");
     store.verify_integrity().unwrap();
+    // No compaction here found the index pages it built over to be other
+    // than it expected.
+    assert_eq!(RustStore::index_page_carries().1, 0);
 }

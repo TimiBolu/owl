@@ -1223,10 +1223,13 @@ pub(crate) struct SpooledIndexPages {
 
 #[derive(Debug, Clone)]
 struct SpooledIndexPage {
+    /// Where the page is in the working file; or, for a page carried
+    /// over, where it is in the checkpoint being replaced.
     offset: u64,
     len: usize,
     first_key: Option<Vec<u8>>,
     last_key: Option<Vec<u8>>,
+    carried: bool,
 }
 
 /// The working file encoded index pages wait in. Removed when dropped.
@@ -1386,42 +1389,36 @@ impl IndexSorter {
 
     /// Merge everything taken into the pages of each index, in the order
     /// the indexes were named.
-    pub(crate) fn finish(mut self) -> OQLResult<Vec<CheckpointIndex>> {
+    pub(crate) fn finish(self) -> OQLResult<Vec<CheckpointIndex>> {
+        let bases = self.identities.iter().map(|_| None).collect();
+        self.finish_over(bases, None, &[])
+    }
+
+    /// [`Self::finish`], over the pages each index has in the checkpoint
+    /// being replaced. What was taken here is added to those pages, and
+    /// what `removed` was given is taken out of them. A page that neither
+    /// touches is carried over as it is, unread; a page either touches is
+    /// read, changed and written again.
+    ///
+    /// An entry to be taken out that the pages do not hold means the
+    /// pages are not what they were thought to be. That is refused, with
+    /// an error [`index_carry_refused`] knows, unless the index is one of
+    /// the `lenient`, where such an entry is passed over.
+    pub(crate) fn finish_over(
+        mut self,
+        bases: Vec<Option<Arc<dyn OrderedIndexBase>>>,
+        mut removed: Option<IndexSorter>,
+        lenient: &[usize],
+    ) -> OQLResult<Vec<CheckpointIndex>> {
         self.sort();
-        let mut runs = Vec::with_capacity(self.runs.len());
-        for path in &self.runs {
-            let end = self.filesystem.file_size(path).map_err(|error| {
-                OQLError::storage_error(&format!("inspect index run: {error}"), None)
-            })? as usize;
-            let file = self.filesystem.open(path).map_err(|error| {
-                OQLError::storage_error(&format!("open index run: {error}"), None)
-            })?;
-            runs.push(IndexRun { file, offset: 0, end, buffer: Vec::new(), position: 0 });
+        let mut adds = SortedEntries::open(&self)?;
+        if let Some(removed) = &mut removed {
+            removed.sort();
         }
-        // The smallest entry of each source, the entries still in memory
-        // being the last source.
-        let held = runs.len();
-        let mut heads = std::collections::BinaryHeap::new();
-        for (source, run) in runs.iter_mut().enumerate() {
-            if let Some((index, key, object_ref)) = run.next()? {
-                heads.push(std::cmp::Reverse((index, key, object_ref.packed(), source)));
-            }
-        }
-        let mut next_held = 0usize;
-        let held_entry = |sorter: &Self, at: usize| {
-            sorter.items.get(at).map(|(index, offset, length, object_ref)| {
-                (
-                    *index,
-                    sorter.keys[*offset as usize..(*offset + *length) as usize].to_vec(),
-                    object_ref.packed(),
-                    held,
-                )
-            })
+        let mut gone = match &removed {
+            Some(removed) => Some(SortedEntries::open(removed)?),
+            None => None,
         };
-        if let Some(entry) = held_entry(&self, next_held) {
-            heads.push(std::cmp::Reverse(entry));
-            next_held += 1;
-        }
 
         let pages_path = PathBuf::from(format!("{}.pages", self.prefix.display()));
         let mut pages_file = IndexPagesFile {
@@ -1432,112 +1429,134 @@ impl IndexSorter {
             })?),
         };
         let mut written = 0u64;
-        let mut spooled: Vec<Vec<SpooledIndexPage>> = vec![Vec::new(); self.identities.len()];
-        // The page being filled, and the key and rows being gathered.
-        let mut page: Vec<(Vec<u8>, Vec<ObjRef>)> = Vec::new();
-        let mut page_len = 0usize;
-        let mut group: Option<(Vec<u8>, Vec<ObjRef>)> = None;
+        let mut spooled: Vec<Vec<SpooledIndexPage>> = Vec::with_capacity(self.identities.len());
 
         for number in 0..self.identities.len() {
             let (schema, name, unique) = self.identities[number].clone();
             let fixed = INDEX_BLOCK_HEADER_LEN + schema.len() + name.len() + INDEX_ROUTING_HEADER_LEN;
-            page_len = fixed;
-            let mut emit = |page: &mut Vec<(Vec<u8>, Vec<ObjRef>)>,
-                            spooled: &mut Vec<SpooledIndexPage>,
-                            last: bool|
-             -> OQLResult<()> {
-                let first = spooled.is_empty();
-                let entries = std::mem::take(page);
-                let count = entries.len();
-                let first_key = entries.first().map(|entry| entry.0.clone());
-                let last_key = entries.last().map(|entry| entry.0.clone());
-                let block = encode_index_page(
-                    &CheckpointIndex {
-                        schema: schema.clone(),
-                        name: name.clone(),
-                        unique,
-                        entries,
-                        spooled: None,
-                    },
-                    0..count,
-                    first,
-                    last,
-                )?;
-                let file = pages_file
-                    .file
-                    .as_mut()
-                    .ok_or_else(|| OQLError::storage_error("index pages file is closed", None))?;
-                write_all_handle(file.as_mut(), &block)?;
-                spooled.push(SpooledIndexPage { offset: written, len: block.len(), first_key, last_key });
-                written += block.len() as u64;
-                Ok(())
+            let passes_over = lenient.contains(&number);
+            let mut out = IndexPagesOut {
+                file: &mut pages_file,
+                written: &mut written,
+                schema,
+                name,
+                unique,
+                fixed,
+                page: Vec::new(),
+                page_len: fixed,
+                pages: Vec::new(),
+                carried_from: Vec::new(),
             };
-            let mut close_group = |group: &mut Option<(Vec<u8>, Vec<ObjRef>)>,
-                                   page: &mut Vec<(Vec<u8>, Vec<ObjRef>)>,
-                                   page_len: &mut usize,
-                                   spooled: &mut Vec<SpooledIndexPage>|
-             -> OQLResult<()> {
-                let Some((key, mut postings)) = group.take() else {
-                    return Ok(());
-                };
-                postings.sort_unstable();
-                postings.dedup();
-                if postings.is_empty() || (unique && postings.len() != 1) {
-                    return Err(OQLError::storage_error(
-                        "compaction index violates posting constraints",
-                        None,
-                    ));
-                }
-                // The rule a page of entries held in memory is cut by.
-                let entry_len = index_entry_len(&key, &postings)?;
-                let first_key_len = page.first().map_or(key.len(), |entry| entry.0.len());
-                if !page.is_empty()
-                    && *page_len + entry_len + first_key_len + key.len() > INDEX_PAGE_TARGET_BYTES
-                {
-                    emit(page, spooled, false)?;
-                    *page_len = fixed;
-                }
-                *page_len += entry_len;
-                page.push((key, postings));
-                Ok(())
-            };
-            while heads
-                .peek()
-                .is_some_and(|std::cmp::Reverse(head)| head.0 as usize == number)
-            {
-                let Some(std::cmp::Reverse((_, key, packed, source))) = heads.pop() else {
-                    break;
-                };
-                let refill = if source == held {
-                    let entry = held_entry(&self, next_held);
-                    next_held += 1;
-                    entry
-                } else {
-                    runs[source]
-                        .next()?
-                        .map(|(index, key, object_ref)| (index, key, object_ref.packed(), source))
-                };
-                if let Some(entry) = refill {
-                    heads.push(std::cmp::Reverse(entry));
-                }
-                match &mut group {
-                    Some((current, postings)) if *current == key => postings.push(ObjRef::new(packed)),
-                    _ => {
-                        close_group(&mut group, &mut page, &mut page_len, &mut spooled[number])?;
-                        group = Some((key, vec![ObjRef::new(packed)]));
+            let base = bases
+                .get(number)
+                .and_then(|base| base.as_ref())
+                .and_then(|base| base.file_base());
+            if let Some(base) = base {
+                let count = base.pages.len();
+                for (at, descriptor) in base.pages.iter().enumerate() {
+                    let Some(last) = descriptor.last_key.as_deref() else {
+                        // A page with no entries has nothing to carry.
+                        continue;
+                    };
+                    let added = adds.key_in(number).is_some_and(|key| key <= last);
+                    let taken = gone
+                        .as_ref()
+                        .and_then(|gone| gone.key_in(number))
+                        .is_some_and(|key| key <= last);
+                    // A page says of itself whether it is its index's
+                    // first, and whether it is the last. It can be carried
+                    // only where it would say the same again; the last
+                    // page of the base is always written again, since
+                    // what follows it is not yet known.
+                    let would_be_first = out.pages.is_empty() && out.page.is_empty();
+                    if !added && !taken && (at == 0) == would_be_first && at + 1 != count {
+                        out.flush()?;
+                        out.carry(descriptor, at);
+                        continue;
+                    }
+                    let entries = base
+                        .read_page(at)
+                        .map_err(|error| OQLError::storage_error(&error, None))?;
+                    for (key, postings) in entries.iter() {
+                        while adds.key_in(number).is_some_and(|added| added < key.as_slice()) {
+                            let (added, rows) = adds.take_key(number)?;
+                            out.add(added, rows)?;
+                        }
+                        let mut postings = postings.clone();
+                        if let Some(gone) = gone.as_mut() {
+                            while gone.key_in(number).is_some_and(|taken| taken < key.as_slice()) {
+                                if !passes_over {
+                                    return Err(refuse_index_carry("an entry to take out is not in its page"));
+                                }
+                                gone.take_key(number)?;
+                            }
+                            if gone.key_in(number) == Some(key.as_slice()) {
+                                let (_, rows) = gone.take_key(number)?;
+                                for row in rows {
+                                    match postings.iter().position(|held| *held == row) {
+                                        Some(held) => {
+                                            postings.remove(held);
+                                        }
+                                        None if passes_over => {}
+                                        None => {
+                                            return Err(refuse_index_carry(
+                                                "a row to take out is not under its key",
+                                            ))
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if adds.key_in(number) == Some(key.as_slice()) {
+                            let (_, rows) = adds.take_key(number)?;
+                            postings.extend(rows);
+                        }
+                        if !postings.is_empty() {
+                            out.add(key.clone(), postings)?;
+                        }
                     }
                 }
             }
-            close_group(&mut group, &mut page, &mut page_len, &mut spooled[number])?;
+            // What is left to add comes after every page of the base.
+            while adds.key_in(number).is_some() {
+                let (added, rows) = adds.take_key(number)?;
+                out.add(added, rows)?;
+            }
+            if let Some(gone) = gone.as_mut() {
+                while gone.key_in(number).is_some() {
+                    if !passes_over {
+                        return Err(refuse_index_carry("an entry to take out is past every page"));
+                    }
+                    gone.take_key(number)?;
+                }
+            }
+            // The index's last page says that it is. When everything
+            // after a carried page came to nothing, that page is the last
+            // after all, and is written again to say so.
+            if out.page.is_empty() {
+                if let (Some(base), Some(Some(at))) = (base, out.carried_from.last().copied()) {
+                    out.pages.pop();
+                    out.carried_from.pop();
+                    let entries = base
+                        .read_page(at)
+                        .map_err(|error| OQLError::storage_error(&error, None))?;
+                    for (key, postings) in entries.iter() {
+                        out.add(key.clone(), postings.clone())?;
+                    }
+                } else if !out.pages.is_empty() {
+                    return Err(refuse_index_carry("an index would end on a page that is not its last"));
+                }
+            }
             // The last page of the index, which is its only page, and an
             // empty one, when the index has no entries.
-            emit(&mut page, &mut spooled[number], true)?;
+            out.emit(true)?;
+            spooled.push(out.pages);
         }
-        let _ = page_len;
-        if heads.pop().is_some() {
+        if adds.any_left() || gone.as_ref().is_some_and(|gone| gone.any_left()) {
             return Err(OQLError::storage_error("an index entry names no index", None));
         }
-        drop(runs);
+        drop(adds);
+        drop(gone);
         if let Some(mut file) = pages_file.file.take() {
             file.flush().map_err(|error| {
                 OQLError::storage_error(&format!("flush index pages: {error}"), None)
@@ -1559,6 +1578,211 @@ impl IndexSorter {
                 spooled: Some(SpooledIndexPages { file: pages_file.clone(), pages }),
             })
             .collect())
+    }
+}
+
+/// What marks the error given when an index cannot be built over the
+/// pages of the checkpoint being replaced.
+const INDEX_CARRY_REFUSED: &str = "index pages cannot be carried over: ";
+
+fn refuse_index_carry(why: &str) -> OQLError {
+    OQLError::storage_error(&format!("{INDEX_CARRY_REFUSED}{why}"), None)
+}
+
+/// Whether an error says that an index could not be built over the pages
+/// of the checkpoint being replaced. Building it from every row instead
+/// is always possible.
+pub(crate) fn index_carry_refused(error: &OQLError) -> bool {
+    error.to_string().contains(INDEX_CARRY_REFUSED)
+}
+
+/// The entries an [`IndexSorter`] was given, in order: by index, then
+/// key, then row.
+struct SortedEntries<'a> {
+    sorter: &'a IndexSorter,
+    runs: Vec<IndexRun>,
+    /// The smallest entry of each source not yet given, the entries still
+    /// in memory being the last source.
+    heads: std::collections::BinaryHeap<std::cmp::Reverse<(u16, Vec<u8>, u64, usize)>>,
+    next_held: usize,
+}
+
+impl<'a> SortedEntries<'a> {
+    /// `sorter` must have sorted what it holds in memory.
+    fn open(sorter: &'a IndexSorter) -> OQLResult<Self> {
+        let mut runs = Vec::with_capacity(sorter.runs.len());
+        for path in &sorter.runs {
+            let end = sorter.filesystem.file_size(path).map_err(|error| {
+                OQLError::storage_error(&format!("inspect index run: {error}"), None)
+            })? as usize;
+            let file = sorter.filesystem.open(path).map_err(|error| {
+                OQLError::storage_error(&format!("open index run: {error}"), None)
+            })?;
+            runs.push(IndexRun { file, offset: 0, end, buffer: Vec::new(), position: 0 });
+        }
+        let mut entries = Self { sorter, runs, heads: std::collections::BinaryHeap::new(), next_held: 0 };
+        for source in 0..entries.runs.len() {
+            if let Some((index, key, object_ref)) = entries.runs[source].next()? {
+                entries.heads.push(std::cmp::Reverse((index, key, object_ref.packed(), source)));
+            }
+        }
+        entries.refill_held();
+        Ok(entries)
+    }
+
+    fn refill_held(&mut self) {
+        let held = self.runs.len();
+        if let Some((index, offset, length, object_ref)) = self.sorter.items.get(self.next_held) {
+            self.heads.push(std::cmp::Reverse((
+                *index,
+                self.sorter.keys[*offset as usize..(*offset + *length) as usize].to_vec(),
+                object_ref.packed(),
+                held,
+            )));
+            self.next_held += 1;
+        }
+    }
+
+    fn any_left(&self) -> bool {
+        !self.heads.is_empty()
+    }
+
+    /// The key of the next entry, when it is an entry of this index.
+    fn key_in(&self, number: usize) -> Option<&[u8]> {
+        self.heads
+            .peek()
+            .filter(|std::cmp::Reverse(head)| head.0 as usize == number)
+            .map(|std::cmp::Reverse(head)| head.1.as_slice())
+    }
+
+    fn next(&mut self) -> OQLResult<Option<(u16, Vec<u8>, ObjRef)>> {
+        let Some(std::cmp::Reverse((index, key, packed, source))) = self.heads.pop() else {
+            return Ok(None);
+        };
+        if source == self.runs.len() {
+            self.refill_held();
+        } else if let Some((index, key, object_ref)) = self.runs[source].next()? {
+            self.heads.push(std::cmp::Reverse((index, key, object_ref.packed(), source)));
+        }
+        Ok(Some((index, key, ObjRef::new(packed))))
+    }
+
+    /// The next key of this index and every row given under it, each once.
+    fn take_key(&mut self, number: usize) -> OQLResult<(Vec<u8>, Vec<ObjRef>)> {
+        let Some((_, key, first)) = self.next()? else {
+            return Err(OQLError::storage_error("an index has no entry left to take", None));
+        };
+        let mut rows = vec![first];
+        while self.key_in(number) == Some(key.as_slice()) {
+            if let Some((_, _, row)) = self.next()? {
+                rows.push(row);
+            }
+        }
+        rows.sort_unstable();
+        rows.dedup();
+        Ok((key, rows))
+    }
+}
+
+/// The pages of one index as they are made: written to the working file,
+/// or carried over from the checkpoint being replaced.
+struct IndexPagesOut<'a> {
+    file: &'a mut IndexPagesFile,
+    written: &'a mut u64,
+    schema: String,
+    name: String,
+    unique: bool,
+    /// What a page takes before it has any entry.
+    fixed: usize,
+    /// The page being filled.
+    page: Vec<(Vec<u8>, Vec<ObjRef>)>,
+    page_len: usize,
+    pages: Vec<SpooledIndexPage>,
+    /// For each of `pages`, which page of the base it is, when carried.
+    carried_from: Vec<Option<usize>>,
+}
+
+impl IndexPagesOut<'_> {
+    /// Write the page being filled, as the index's last or not.
+    fn emit(&mut self, last: bool) -> OQLResult<()> {
+        let first = self.pages.is_empty();
+        let entries = std::mem::take(&mut self.page);
+        let count = entries.len();
+        let first_key = entries.first().map(|entry| entry.0.clone());
+        let last_key = entries.last().map(|entry| entry.0.clone());
+        let block = encode_index_page(
+            &CheckpointIndex {
+                schema: self.schema.clone(),
+                name: self.name.clone(),
+                unique: self.unique,
+                entries,
+                spooled: None,
+            },
+            0..count,
+            first,
+            last,
+        )?;
+        let file = self
+            .file
+            .file
+            .as_mut()
+            .ok_or_else(|| OQLError::storage_error("index pages file is closed", None))?;
+        write_all_handle(file.as_mut(), &block)?;
+        self.pages.push(SpooledIndexPage {
+            offset: *self.written,
+            len: block.len(),
+            first_key,
+            last_key,
+            carried: false,
+        });
+        self.carried_from.push(None);
+        *self.written += block.len() as u64;
+        self.page_len = self.fixed;
+        Ok(())
+    }
+
+    /// Write the page being filled, if it holds anything, so that a
+    /// carried page can follow it.
+    fn flush(&mut self) -> OQLResult<()> {
+        if self.page.is_empty() {
+            return Ok(());
+        }
+        self.emit(false)
+    }
+
+    /// Take a page of the base as it is.
+    fn carry(&mut self, descriptor: &IndexPageDescriptor, at: usize) {
+        self.pages.push(SpooledIndexPage {
+            offset: descriptor.location.offset as u64,
+            len: descriptor.location.len,
+            first_key: descriptor.first_key.clone(),
+            last_key: descriptor.last_key.clone(),
+            carried: true,
+        });
+        self.carried_from.push(Some(at));
+    }
+
+    /// Add a key and its rows, which come after every key added so far.
+    fn add(&mut self, key: Vec<u8>, mut postings: Vec<ObjRef>) -> OQLResult<()> {
+        postings.sort_unstable();
+        postings.dedup();
+        if postings.is_empty() || (self.unique && postings.len() != 1) {
+            return Err(OQLError::storage_error(
+                "compaction index violates posting constraints",
+                None,
+            ));
+        }
+        // The rule a page of entries held in memory is cut by.
+        let entry_len = index_entry_len(&key, &postings)?;
+        let first_key_len = self.page.first().map_or(key.len(), |entry| entry.0.len());
+        if !self.page.is_empty()
+            && self.page_len + entry_len + first_key_len + key.len() > INDEX_PAGE_TARGET_BYTES
+        {
+            self.emit(false)?;
+        }
+        self.page_len += entry_len;
+        self.page.push((key, postings));
+        Ok(())
     }
 }
 
@@ -1743,7 +1967,18 @@ impl FileIndexBase {
     }
 }
 
+impl FileIndexBase {
+    /// Whether every page of this index is in the checkpoint at `path`.
+    pub(crate) fn is_in(&self, path: &Path) -> bool {
+        self.pages.iter().all(|page| page.location.path == path)
+    }
+}
+
 impl OrderedIndexBase for FileIndexBase {
+    fn file_base(&self) -> Option<&FileIndexBase> {
+        Some(self)
+    }
+
     fn search_key(&self, key: &[u8]) -> Result<Vec<ObjRef>, String> {
         if self.is_ordered() {
             let page_index = self
@@ -3413,6 +3648,18 @@ pub(crate) fn write_segment_file(
                     }
                 }
             }
+            for (index, range, _, _) in &index_pages {
+                let carried = index
+                    .spooled
+                    .as_ref()
+                    .map(|spooled| &spooled.pages[range.start])
+                    .filter(|page| page.carried);
+                if let Some(page) = carried {
+                    if let Some((part, _, _)) = base.place(page.offset, page.len as u64) {
+                        *wanted.entry(part).or_default() += page.len as u64;
+                    }
+                }
+            }
         }
         wanted
             .into_iter()
@@ -3440,7 +3687,7 @@ pub(crate) fn write_segment_file(
             ImageRecord::Carried { offset, length, checksum } => {
                 match placed(offset, length as u64) {
                     Some((part, part_offset, _)) => {
-                        file.list(part, part_offset, length as u64, checksum);
+                        file.list(part, part_offset, length as u64, checksum, true);
                         internal.combine(&crc32fast::Hasher::new_with_initial_len(checksum, length as u64));
                     }
                     None => {
@@ -3480,26 +3727,57 @@ pub(crate) fn write_segment_file(
     let mut published_indexes = Vec::<PublishedIndexPages>::new();
     let mut index_offset = SEGMENT_HEADER_LEN + metadata.len() + directory_len + records_len;
     for (index, range, first, last) in index_pages {
-        let (first_key, last_key, block) = match &index.spooled {
-            Some(spooled) => {
+        // A page carried over from the checkpoint being replaced is
+        // listed from the part that holds it there; any other is written.
+        let carried = index
+            .spooled
+            .as_ref()
+            .map(|spooled| &spooled.pages[range.start])
+            .filter(|page| page.carried);
+        let listed = match carried {
+            Some(page) => placed(page.offset, page.len as u64).map(|place| (page, place)),
+            None => None,
+        };
+        let (first_key, last_key, block_len) = match (listed, &index.spooled) {
+            (Some((page, (part, part_offset, whole))), _) => {
+                // The checksum of a stretch that is exactly an extent is
+                // on record; any other is read to be known.
+                let checksum = match whole {
+                    Some(checksum) => checksum,
+                    None => crc32fast::hash(&from_base(page.offset, page.len)?),
+                };
+                file.list(part, part_offset, page.len as u64, checksum, false);
+                internal.combine(&crc32fast::Hasher::new_with_initial_len(checksum, page.len as u64));
+                (page.first_key.clone(), page.last_key.clone(), page.len)
+            }
+            (None, Some(spooled)) => {
                 let described = &spooled.pages[range.start];
-                let file = spooled.file.file.as_ref().ok_or_else(|| {
-                    OQLError::storage_error("index pages file is closed", None)
-                })?;
+                let block = match described.carried {
+                    true => from_base(described.offset, described.len)?,
+                    false => {
+                        let pages = spooled.file.file.as_ref().ok_or_else(|| {
+                            OQLError::storage_error("index pages file is closed", None)
+                        })?;
+                        read_exact_at(pages.as_ref(), described.offset as usize, described.len)?
+                    }
+                };
+                write_all_handle(file.as_mut(), &block)?;
+                internal.update(&block);
+                file.cut();
+                (described.first_key.clone(), described.last_key.clone(), block.len())
+            }
+            (None, None) => {
+                let block = encode_index_page(index, range.clone(), first, last)?;
+                write_all_handle(file.as_mut(), &block)?;
+                internal.update(&block);
+                file.cut();
                 (
-                    described.first_key.clone(),
-                    described.last_key.clone(),
-                    read_exact_at(file.as_ref(), described.offset as usize, described.len)?,
+                    index.entries[range.clone()].first().map(|entry| entry.0.clone()),
+                    index.entries[range.clone()].last().map(|entry| entry.0.clone()),
+                    block.len(),
                 )
             }
-            None => (
-                index.entries[range.clone()].first().map(|entry| entry.0.clone()),
-                index.entries[range.clone()].last().map(|entry| entry.0.clone()),
-                encode_index_page(index, range, first, last)?,
-            ),
         };
-        write_all_handle(file.as_mut(), &block)?;
-        internal.update(&block);
         if first {
             published_indexes.push(PublishedIndexPages {
                 schema: index.schema.clone(),
@@ -3516,7 +3794,7 @@ pub(crate) fn write_segment_file(
                 location: IndexPageLocation {
                     path: path.to_path_buf(),
                     offset: index_offset,
-                    len: block.len(),
+                    len: block_len,
                 },
                 first_key,
                 last_key,
@@ -3525,7 +3803,7 @@ pub(crate) fn write_segment_file(
                 // by the writer's in-memory source entries.
                 cached_entries: None,
             });
-        index_offset += block.len();
+        index_offset += block_len;
     }
     file.cut();
     typed_locator.write_to(file.as_mut(), &mut internal)?;
@@ -3540,7 +3818,7 @@ pub(crate) fn write_segment_file(
                     Some(checksum) => checksum,
                     None => crc32fast::hash(&from_base(offset, length)?),
                 };
-                file.list(part, part_offset, length as u64, checksum);
+                file.list(part, part_offset, length as u64, checksum, false);
                 internal.combine(&crc32fast::Hasher::new_with_initial_len(checksum, length as u64));
                 continue;
             }

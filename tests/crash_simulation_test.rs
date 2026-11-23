@@ -523,6 +523,12 @@ fn sweep(first: u64, count: u64, steps: usize, faults: Faults) {
         crashes += run.crashes;
     }
     println!("{count} seeds, {crashes} crashes, {} failures", failures.len());
+    // A compaction that finds the index pages it builds over to be other
+    // than it expected falls back to building from every row, which
+    // hides nothing but should not happen.
+    let (over_pages, refused) = RustStore::index_page_carries();
+    println!("{over_pages} compactions built their indexes over pages, {refused} could not");
+    assert_eq!(refused, 0, "compactions that could not build their indexes over pages");
     // Failures by what went wrong, most common first.
     let mut kinds: BTreeMap<String, (usize, u64)> = BTreeMap::new();
     for failure in &failures {

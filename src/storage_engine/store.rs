@@ -6880,6 +6880,25 @@ fn record_carried(
         }))
 }
 
+/// Where a row a [`LogicalIdentityCursor`] gives is held.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowFrom {
+    /// A column segment of the checkpoint.
+    Segment,
+    /// A record of the checkpoint.
+    Record,
+    /// Memory: it was written after the checkpoint.
+    Memory,
+}
+
+/// A row of the checkpoint's files that is no longer the row.
+enum PassedOver {
+    /// Row `row` of the segment at this place among the store's segments.
+    Segment { segment_index: usize, row: usize },
+    /// The record of this row in the checkpoint.
+    Record(ObjRef),
+}
+
 struct LogicalIdentityCursor<'a> {
     state: &'a State,
     schema: &'a str,
@@ -6894,6 +6913,16 @@ struct LogicalIdentityCursor<'a> {
     gave: Option<(usize, usize)>,
     /// The row `typed` held when `next` was last asked.
     gave_typed: Option<ObjRef>,
+    /// Where the row `next` gave last came from.
+    gave_from: RowFrom,
+    /// The record `on_file` held once `next` had filled it.
+    gave_record: Option<ObjRef>,
+    records_noted: Vec<ObjRef>,
+    /// Rows of the checkpoint's files this cursor passed over because the
+    /// row has changed since: noted only when asked for, for whoever
+    /// needs to know what the files hold that is no longer so.
+    note_passed_over: bool,
+    passed_over: Vec<PassedOver>,
     /// The checkpoint's rows outside its column segments, and the next of
     /// them that has not changed since.
     overflow: Option<OverflowIds>,
@@ -6918,6 +6947,11 @@ impl<'a> LogicalIdentityCursor<'a> {
             typed_at: (0, 0),
             gave: None,
             gave_typed: None,
+            gave_from: RowFrom::Memory,
+            gave_record: None,
+            records_noted: Vec::new(),
+            note_passed_over: false,
+            passed_over: Vec::new(),
             overflow: OverflowIds::new(state, schema),
             on_file: None,
             resident: state
@@ -6932,6 +6966,7 @@ impl<'a> LogicalIdentityCursor<'a> {
     /// in a segment or among the other rows, never both; one also in
     /// memory has changed, and memory has it as it is now.
     fn next(&mut self) -> OQLResult<Option<(DocumentId, ObjRef)>> {
+        let had_record = self.on_file.as_ref().map(|(_, object_ref)| *object_ref);
         let row = self.next_row()?;
         // Only a row taken from `typed` leaves it empty with nothing
         // else having been read from the segments since.
@@ -6939,6 +6974,36 @@ impl<'a> LogicalIdentityCursor<'a> {
             (Some((_, object_ref)), None) if self.gave_typed == Some(*object_ref) => Some(self.typed_at),
             _ => None,
         };
+        let given = row.as_ref().map(|(_, object_ref)| *object_ref);
+        self.gave_from = match given {
+            _ if self.gave.is_some() => RowFrom::Segment,
+            Some(given)
+                if self.on_file.is_none()
+                    && (self.gave_record == Some(given) || had_record == Some(given)) =>
+            {
+                RowFrom::Record
+            }
+            _ => RowFrom::Memory,
+        };
+        // A row of the files that was held ready and has gone without
+        // being given was hidden by one in memory under the same id.
+        if self.note_passed_over {
+            if let Some(typed) = self.gave_typed {
+                if self.typed.is_none() && given != Some(typed) {
+                    self.passed_over.push(PassedOver::Segment {
+                        segment_index: self.fences[self.typed_at.0].segment_index,
+                        row: self.typed_at.1,
+                    });
+                }
+            }
+            for record in [had_record, self.gave_record].into_iter().flatten() {
+                if self.on_file.is_none() && given != Some(record) && !self.records_noted.contains(&record) {
+                    self.records_noted.push(record);
+                    self.passed_over.push(PassedOver::Record(record));
+                }
+            }
+            self.records_noted.clear();
+        }
         Ok(row)
     }
 
@@ -6961,6 +7026,7 @@ impl<'a> LogicalIdentityCursor<'a> {
         if self.on_file.is_none() {
             self.on_file = self.next_on_file()?;
         }
+        self.gave_record = self.on_file.as_ref().map(|(_, object_ref)| *object_ref);
         // Whichever of the two file sources comes first stands for both.
         let file_first = match (&self.typed, &self.on_file) {
             (Some((typed, _)), Some((other, _))) => other < typed,
@@ -7034,6 +7100,9 @@ impl<'a> LogicalIdentityCursor<'a> {
         let changed = self.state.typed_delta_rows.get(self.schema);
         while let Some((id, object_ref)) = overflow.next()? {
             if changed.is_some_and(|rows| rows.contains_key(&id)) {
+                if self.note_passed_over {
+                    self.passed_over.push(PassedOver::Record(object_ref));
+                }
                 continue;
             }
             return Ok(Some((id, object_ref)));
@@ -7067,6 +7136,12 @@ impl<'a> LogicalIdentityCursor<'a> {
                 .get(self.schema)
                 .is_some_and(|rows| rows.contains_key(&id))
             {
+                if self.note_passed_over {
+                    self.passed_over.push(PassedOver::Segment {
+                        segment_index: fence.segment_index,
+                        row,
+                    });
+                }
                 continue;
             }
             self.typed_at = (self.fence_index, row);
@@ -7075,10 +7150,114 @@ impl<'a> LogicalIdentityCursor<'a> {
     }
 }
 
+/// How many compactions in this process built their indexes over the
+/// pages of the checkpoint they replaced, and how many set out to and
+/// had to build them from every row instead.
+static INDEX_CARRIES: AtomicU64 = AtomicU64::new(0);
+static INDEX_CARRIES_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+impl RustStore {
+    /// See [`INDEX_CARRIES`]: compactions that built their indexes over
+    /// the pages they replaced, and those that could not.
+    #[doc(hidden)]
+    pub fn index_page_carries() -> (u64, u64) {
+        (
+            INDEX_CARRIES.load(Ordering::Relaxed),
+            INDEX_CARRIES_REFUSED.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// The image of a compaction. Its indexes are built over the pages the
+/// checkpoint being replaced has, where that can be done; where it turns
+/// out it cannot, they are built from every row, as they always could be.
 fn checkpoint_image_from_compaction(
     state: &State,
     plan: &CompactionPlan,
     sequence: u64,
+) -> OQLResult<CheckpointImage> {
+    match compaction_image(state, plan, sequence, true) {
+        Err(error) if crate::storage_engine::checkpoint::index_carry_refused(&error) => {
+            INDEX_CARRIES_REFUSED.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                target: "owl_db::storage_engine::checkpoint",
+                %error,
+                "building every index from its rows"
+            );
+            compaction_image(state, plan, sequence, false)
+        }
+        image => image,
+    }
+}
+
+/// Take out of the indexes what a row of the checkpoint being replaced
+/// put in them: the row is not carried over as it is, so whatever it
+/// becomes is added afresh. `document` is the row as that checkpoint's
+/// files hold it.
+fn take_out_base_entries(
+    state: &State,
+    document: &Document,
+    object_ref: ObjRef,
+    was_record: bool,
+    index_numbers: &HashMap<(String, String), usize>,
+    reverse_number: usize,
+    ids_number: usize,
+    gone: &mut IndexSorter,
+) -> OQLResult<()> {
+    for definition in state.scalar_indexes.get(&document.schema).into_iter().flatten() {
+        let number = *index_numbers
+            .get(&(definition.schema.clone(), definition.name.clone()))
+            .ok_or_else(|| OQLError::storage_error("compaction index builder is missing", None))?;
+        gone.push(number, &document_index_key(document, definition)?, object_ref)?;
+    }
+    for key in document_reverse_keys(document) {
+        gone.push(reverse_number, &key, object_ref)?;
+    }
+    if was_record {
+        gone.push(ids_number, &id_index_key(object_ref.collection_id(), &document.id), object_ref)?;
+    }
+    Ok(())
+}
+
+/// A row as the files of the checkpoint being replaced hold it, whatever
+/// has become of it since.
+fn passed_over_document(state: &State, passed: &PassedOver) -> OQLResult<(ObjRef, Document)> {
+    match passed {
+        PassedOver::Segment { segment_index, row } => {
+            let handle = state.typed_segments.get(*segment_index).ok_or_else(|| {
+                OQLError::storage_error("a passed-over row names a missing segment", None)
+            })?;
+            let compiled = state
+                .compiled_schemas
+                .get(&(handle.collection_id(), handle.schema_version()))
+                .ok_or_else(|| OQLError::storage_error("compiled schema is missing", None))?;
+            Ok((handle.object_ref(*row)?, handle.load()?.decode_document(*row, compiled)?))
+        }
+        PassedOver::Record(object_ref) => {
+            let record = match &state.checkpoint_records {
+                Some(files) => {
+                    let files = files
+                        .lock()
+                        .map_err(|_| OQLError::generic("checkpoint read handle lock poisoned"))?;
+                    match &files.base_segment {
+                        Some(base) => base.lookup(*object_ref)?,
+                        None => None,
+                    }
+                }
+                None => None,
+            }
+            .ok_or_else(|| OQLError::storage_error("a passed-over row has no record in its checkpoint", None))?;
+            let compiled = schema_of_record(state, *object_ref, &record)?;
+            Ok((*object_ref, RecordCodec::decode(&record, compiled)?))
+        }
+    }
+}
+
+fn compaction_image(
+    state: &State,
+    plan: &CompactionPlan,
+    sequence: u64,
+    carry_index_pages: bool,
 ) -> OQLResult<CheckpointImage> {
     // The rows of a segment are held decoded while it is built. A database
     // short of memory builds smaller segments, which also lets it hold a
@@ -7110,10 +7289,15 @@ fn checkpoint_image_from_compaction(
         .enumerate()
         .map(|(number, (schema, name, _))| ((schema.clone(), name.clone()), number))
         .collect::<HashMap<_, _>>();
+    let declared_indexes = index_identities
+        .iter()
+        .map(|(schema, name, _)| (schema.clone(), name.clone()))
+        .collect::<Vec<_>>();
     let reverse_number = index_identities.len();
     index_identities.push((REVERSE_INDEX_SCHEMA.into(), REVERSE_INDEX_NAME.into(), false));
     let ids_number = index_identities.len();
     index_identities.push((REVERSE_INDEX_SCHEMA.into(), ID_INDEX_NAME.into(), true));
+    let index_identities_again = index_identities.clone();
     let mut index_entries = IndexSorter::new(
         plan.filesystem.clone(),
         sidecar_path(&plan.manifest_path, "index-run"),
@@ -7139,6 +7323,34 @@ fn checkpoint_image_from_compaction(
         None => None,
     };
     let carries = base_path.is_some();
+    // Each index's pages in that checkpoint, when every index has them
+    // there: the declared ones, what refers to what, and rows by id. The
+    // indexes are then built over those pages, and a row that is carried
+    // over is not read at all.
+    let index_bases = base_path.as_ref().filter(|_| carry_index_pages).and_then(|base_path| {
+        let in_base = |base: Arc<dyn OrderedIndexBase>| {
+            base.file_base()
+                .is_some_and(|pages| pages.is_in(base_path))
+                .then_some(base)
+        };
+        let mut bases = Vec::with_capacity(ids_number + 1);
+        for (schema, name) in declared_indexes.iter() {
+            bases.push(in_base(
+                state.scalar_index_data.get(&(schema.clone(), name.clone()))?.base()?,
+            )?);
+        }
+        bases.push(in_base(state.reverse_reference_index.base()?)?);
+        bases.push(in_base(state.overflow_ids.clone()?)?);
+        Some(bases)
+    });
+    let over_pages = index_bases.is_some();
+    // What the rows that are not carried over as they are had put in
+    // those pages.
+    let mut gone = IndexSorter::new(
+        plan.filesystem.clone(),
+        sidecar_path(&plan.manifest_path, "index-gone"),
+        index_identities_again,
+    )?;
     if let Some(base_path) = base_path {
         records.carry_from(base_path.clone());
         typed_segments.carry_from(base_path);
@@ -7148,15 +7360,54 @@ fn checkpoint_image_from_compaction(
 
     for schema_name in collection_names {
         let mut base_rows = LogicalIdentityCursor::new(state, &schema_name);
+        base_rows.note_passed_over = over_pages;
         let mut base = base_rows.next()?;
         let mut typed_chunk = Vec::<CompactionRow>::with_capacity(TARGET_ROWS);
+        // A row of the checkpoint's files that will not be carried over
+        // as it is has its entries taken out of the pages.
+        let take_out = |gone: &mut IndexSorter, object_ref: ObjRef, from: RowFrom| -> OQLResult<()> {
+            if from == RowFrom::Memory {
+                return Ok(());
+            }
+            let document = logical_document(state, object_ref)?.ok_or_else(|| {
+                OQLError::storage_error("compaction base row is missing", None)
+            })?;
+            take_out_base_entries(
+                state,
+                &document,
+                object_ref,
+                from == RowFrom::Record,
+                &index_numbers,
+                reverse_number,
+                ids_number,
+                gone,
+            )
+        };
 
         loop {
             while base
                 .as_ref()
                 .is_some_and(|(_, object_ref)| plan.overridden.contains(object_ref))
             {
+                if over_pages {
+                    if let Some((_, object_ref)) = &base {
+                        take_out(&mut gone, *object_ref, base_rows.gave_from)?;
+                    }
+                }
                 base = base_rows.next()?;
+            }
+            for passed in std::mem::take(&mut base_rows.passed_over) {
+                let (object_ref, document) = passed_over_document(state, &passed)?;
+                take_out_base_entries(
+                    state,
+                    &document,
+                    object_ref,
+                    matches!(passed, PassedOver::Record(_)),
+                    &index_numbers,
+                    reverse_number,
+                    ids_number,
+                    &mut gone,
+                )?;
             }
             if changed
                 .as_ref()
@@ -7198,14 +7449,18 @@ fn checkpoint_image_from_compaction(
                             &mut records,
                             (&mut index_entries, ids_number),
                         )?;
-                        add_carried_segment_indexes(
-                            state,
-                            &schema_name,
-                            fence_index,
-                            &index_numbers,
-                            reverse_number,
-                            &mut index_entries,
-                        )?;
+                        // Its rows' entries are in the pages already when
+                        // the indexes are built over those.
+                        if !over_pages {
+                            add_carried_segment_indexes(
+                                state,
+                                &schema_name,
+                                fence_index,
+                                &index_numbers,
+                                reverse_number,
+                                &mut index_entries,
+                            )?;
+                        }
                         match encoded {
                             CarriedSegment::Listed(offset, descriptor) => {
                                 typed_segments.push_carried(offset, descriptor)?
@@ -7213,6 +7468,30 @@ fn checkpoint_image_from_compaction(
                             CarriedSegment::Bytes(encoded) => typed_segments.push(&encoded)?,
                         }
                         base_rows.skip_rest_of_segment();
+                        base = base_rows.next()?;
+                        continue;
+                    }
+                }
+            }
+            // A row the checkpoint keeps as a record, unchanged, stays
+            // one: it is listed where it is, with its entries in the
+            // pages as they are, and is not read.
+            if !take_changed && over_pages && base_rows.gave_from == RowFrom::Record {
+                if let Some((_, object_ref)) = &base {
+                    let place = match &state.checkpoint_records {
+                        Some(files) => {
+                            let files = files.lock().map_err(|_| {
+                                OQLError::generic("checkpoint read handle lock poisoned")
+                            })?;
+                            match &files.base_segment {
+                                Some(base) => base.place(*object_ref)?,
+                                None => None,
+                            }
+                        }
+                        None => None,
+                    };
+                    if let Some((offset, length, checksum)) = place {
+                        records.push_carried(*object_ref, offset, length, checksum)?;
                         base = base_rows.next()?;
                         continue;
                     }
@@ -7226,6 +7505,11 @@ fn checkpoint_image_from_compaction(
                     .as_ref()
                     .is_some_and(|(base_id, _)| base_id == &change.id)
                 {
+                    if over_pages {
+                        if let Some((_, object_ref)) = &base {
+                            take_out(&mut gone, *object_ref, base_rows.gave_from)?;
+                        }
+                    }
                     base = base_rows.next()?;
                 }
                 changed = changed_rows.next()?;
@@ -7251,10 +7535,25 @@ fn checkpoint_image_from_compaction(
                 let (_, object_ref) = base
                     .take()
                     .ok_or_else(|| OQLError::storage_error("compaction cursor is empty", None))?;
+                let from = base_rows.gave_from;
                 base = base_rows.next()?;
                 let (document, source) = sourced_document(state, object_ref)?.ok_or_else(|| {
                     OQLError::storage_error("compaction base row is missing", None)
                 })?;
+                // It is built into the new checkpoint afresh, so what the
+                // old one's pages say of it goes.
+                if over_pages && from != RowFrom::Memory {
+                    take_out_base_entries(
+                        state,
+                        &document,
+                        object_ref,
+                        from == RowFrom::Record,
+                        &index_numbers,
+                        reverse_number,
+                        ids_number,
+                        &mut gone,
+                    )?;
+                }
                 // A row read from its record has the record to hand: it
                 // goes into the new checkpoint as it is, not encoded again.
                 let read = match source {
@@ -7330,7 +7629,20 @@ let compiled = state
         ));
     }
 
-    let indexes = index_entries.finish()?;
+    let indexes = match index_bases {
+        Some(bases) => {
+            let indexes = index_entries.finish_over(
+                bases.into_iter().map(Some).collect(),
+                Some(gone),
+                // What refers to what may have had entries dropped while
+                // the database ran, for rows that no longer exist.
+                &[reverse_number],
+            )?;
+            INDEX_CARRIES.fetch_add(1, Ordering::Relaxed);
+            indexes
+        }
+        None => index_entries.finish()?,
+    };
 
     Ok(CheckpointImage {
         segment_spool: Some(Arc::new(typed_segments.finish()?)),
