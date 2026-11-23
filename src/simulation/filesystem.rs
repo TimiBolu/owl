@@ -42,6 +42,13 @@ pub trait FileSystem: Send + Sync {
 
     /// Memory map a file (for high-performance access)
     fn mmap(&self, path: &Path, size: usize) -> io::Result<Box<dyn MemoryMap>>;
+
+    /// The files directly inside a directory. A file system that cannot
+    /// say gives none, and whatever depends on the list, such as removing
+    /// files nothing refers to any more, then finds nothing to do.
+    fn list_dir(&self, _directory: &Path) -> io::Result<Vec<PathBuf>> {
+        Ok(Vec::new())
+    }
 }
 
 /// File handle abstraction
@@ -601,6 +608,21 @@ impl FileSystem for SimulatedFileSystem {
         files.contains_key(path)
     }
 
+    fn list_dir(&self, directory: &Path) -> io::Result<Vec<PathBuf>> {
+        if self.is_crashed() {
+            return Err(io::Error::new(io::ErrorKind::Other, "File system crashed"));
+        }
+        let files = self.shared.files.lock().unwrap();
+        // In path order, so that a run is the same run every time.
+        let mut listed: Vec<PathBuf> = files
+            .keys()
+            .filter(|path| path.parent() == Some(directory))
+            .cloned()
+            .collect();
+        listed.sort();
+        Ok(listed)
+    }
+
     fn file_size(&self, path: &Path) -> io::Result<u64> {
         if self.is_crashed() {
             return Err(io::Error::new(io::ErrorKind::Other, "File system crashed"));
@@ -926,6 +948,23 @@ impl FileSystem for RealFileSystem {
 
     fn exists(&self, path: &Path) -> bool {
         path.exists()
+    }
+
+    fn list_dir(&self, directory: &Path) -> io::Result<Vec<PathBuf>> {
+        // A path with no directory in it is in the current one.
+        let directory = match directory.as_os_str().is_empty() {
+            true => Path::new("."),
+            false => directory,
+        };
+        let mut listed = Vec::new();
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                listed.push(entry.path());
+            }
+        }
+        listed.sort();
+        Ok(listed)
     }
 
     fn file_size(&self, path: &Path) -> io::Result<u64> {

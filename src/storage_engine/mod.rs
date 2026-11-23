@@ -15,6 +15,7 @@ mod group_commit;
 mod index_delta;
 mod key;
 mod object_ref;
+mod parts;
 mod record;
 mod store;
 pub mod vector;

@@ -105,7 +105,14 @@ pub(crate) struct SegmentSpool {
     path: PathBuf,
     file: Option<Box<dyn FileHandle>>,
     /// Where each segment is in the file, and what its header says of it.
+    /// One carried over from the checkpoint being replaced is not in the
+    /// file: its place is where it is in that checkpoint.
     entries: Vec<(u64, TypedSegmentDescriptor)>,
+    /// For each entry, whether its place is in the checkpoint being
+    /// replaced.
+    carried: Vec<bool>,
+    /// The checkpoint being replaced, when segments are carried from it.
+    base: Option<PathBuf>,
     written: u64,
 }
 
@@ -125,7 +132,38 @@ impl SegmentSpool {
         let file = filesystem.create(&path).map_err(|error| {
             OQLError::storage_error(&format!("create segment spool: {error}"), None)
         })?;
-        Ok(Self { filesystem, path, file: Some(file), entries: Vec::new(), written: 0 })
+        Ok(Self {
+            filesystem,
+            path,
+            file: Some(file),
+            entries: Vec::new(),
+            carried: Vec::new(),
+            base: None,
+            written: 0,
+        })
+    }
+
+    /// Segments may be carried over from the checkpoint at `base`.
+    pub(crate) fn carry_from(&mut self, base: PathBuf) {
+        self.base = Some(base);
+    }
+
+    pub(crate) fn carries(&self) -> bool {
+        self.base.is_some()
+    }
+
+    /// A segment that the checkpoint being replaced holds at `offset`,
+    /// exactly as it is wanted. It is not written here.
+    pub(crate) fn push_carried(&mut self, offset: u64, descriptor: TypedSegmentDescriptor) -> OQLResult<()> {
+        if self.base.is_none() {
+            return Err(OQLError::storage_error(
+                "a segment is carried from no checkpoint",
+                None,
+            ));
+        }
+        self.entries.push((offset, descriptor));
+        self.carried.push(true);
+        Ok(())
     }
 
     pub(crate) fn push(&mut self, segment: &[u8]) -> OQLResult<()> {
@@ -142,6 +180,7 @@ impl SegmentSpool {
             .ok_or_else(|| OQLError::storage_error("segment spool is closed", None))?;
         write_all_handle(file.as_mut(), segment)?;
         self.entries.push((self.written, descriptor));
+        self.carried.push(false);
         self.written += segment.len() as u64;
         Ok(())
     }
@@ -169,6 +208,18 @@ impl SegmentSpool {
             .entries
             .get(number)
             .ok_or_else(|| OQLError::storage_error("segment spool has no such segment", None))?;
+        if self.carried.get(number).copied().unwrap_or(false) {
+            let base = self
+                .base
+                .as_ref()
+                .ok_or_else(|| OQLError::storage_error("a segment is carried from no checkpoint", None))?;
+            return Ok(Arc::from(read_file_range(
+                self.filesystem.as_ref(),
+                base,
+                *offset as usize,
+                descriptor.encoded_len,
+            )?));
+        }
         let file = self
             .file
             .as_ref()
@@ -211,6 +262,19 @@ impl<'a> ImageSegments<'a> {
         }
     }
 
+    /// Where the checkpoint being replaced holds the segment, when the
+    /// segment is carried over from it.
+    fn carried(&self, number: usize) -> Option<u64> {
+        let spool = self.spooled?;
+        let at = number.checked_sub(self.held.len())?;
+        spool
+            .carried
+            .get(at)
+            .copied()
+            .unwrap_or(false)
+            .then(|| spool.entries[at].0)
+    }
+
     /// The segment's bytes, read from the spool if that is where it is.
     fn bytes(&self, number: usize) -> OQLResult<Arc<[u8]>> {
         match self.held.get(number) {
@@ -233,6 +297,12 @@ pub(crate) struct RecordSpool {
     file: Option<Box<dyn FileHandle>>,
     /// Each record's reference, offset in the file, length and checksum.
     entries: Vec<(ObjRef, u64, u32, u32)>,
+    /// The same for each record carried over from the checkpoint being
+    /// replaced, where the offset is its place in that checkpoint. These
+    /// are not in the file.
+    carried: Vec<(ObjRef, u64, u32, u32)>,
+    /// The checkpoint being replaced, when records are carried from it.
+    base: Option<PathBuf>,
     written: u64,
     /// Bytes not yet handed to the file.
     pending: Vec<u8>,
@@ -261,9 +331,26 @@ impl RecordSpool {
             path,
             file: Some(file),
             entries: Vec::new(),
+            carried: Vec::new(),
+            base: None,
             written: 0,
             pending: Vec::with_capacity(Self::PENDING_BYTES),
         })
+    }
+
+    /// Records may be carried over from the checkpoint at `base`.
+    pub(crate) fn carry_from(&mut self, base: PathBuf) {
+        self.base = Some(base);
+    }
+
+    /// A record that the checkpoint being replaced holds at `offset`,
+    /// exactly as it is wanted. It is not written here.
+    pub(crate) fn push_carried(&mut self, object_ref: ObjRef, offset: u64, length: u32, checksum: u32) -> OQLResult<()> {
+        if self.base.is_none() {
+            return Err(OQLError::storage_error("a record is carried from no checkpoint", None));
+        }
+        self.carried.push((object_ref, offset, length, checksum));
+        Ok(())
     }
 
     pub(crate) fn push(&mut self, object_ref: ObjRef, record: &[u8]) -> OQLResult<()> {
@@ -312,7 +399,7 @@ impl RecordSpool {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.entries.len()
+        self.entries.len() + self.carried.len()
     }
 
     fn read(&self, offset: u64, length: u32) -> OQLResult<Vec<u8>> {
@@ -331,24 +418,26 @@ impl Drop for RecordSpool {
     }
 }
 
-/// A record of an image being written: held in memory, or in the spool.
+/// A record of an image being written: held in memory, in the spool, or
+/// in the checkpoint being replaced.
 enum ImageRecord<'a> {
     Held(&'a [u8]),
     Spooled { offset: u64, length: u32, checksum: u32 },
+    Carried { offset: u64, length: u32, checksum: u32 },
 }
 
 impl ImageRecord<'_> {
     fn len(&self) -> usize {
         match self {
             ImageRecord::Held(record) => record.len(),
-            ImageRecord::Spooled { length, .. } => *length as usize,
+            ImageRecord::Spooled { length, .. } | ImageRecord::Carried { length, .. } => *length as usize,
         }
     }
 
     fn checksum(&self) -> u32 {
         match self {
             ImageRecord::Held(record) => crc32fast::hash(record),
-            ImageRecord::Spooled { checksum, .. } => *checksum,
+            ImageRecord::Spooled { checksum, .. } | ImageRecord::Carried { checksum, .. } => *checksum,
         }
     }
 }
@@ -608,6 +697,14 @@ impl TypedSegmentHandle {
 
     pub(crate) fn authoritative(&self) -> bool {
         self.descriptor.authoritative
+    }
+
+    /// Where the segment is in its checkpoint, and what its header says
+    /// of it, when it is encoded the way segments are written now. `None`
+    /// for one held only in memory or written in an older form.
+    pub(crate) fn place(&self) -> Option<(u64, TypedSegmentDescriptor)> {
+        self.file.as_ref()?;
+        TypedSegment::written_as_now(&self.descriptor).then_some((self.offset as u64, self.descriptor))
     }
 
     /// The segment exactly as its file holds it, when it is encoded the
@@ -3127,6 +3224,16 @@ pub(crate) fn write_segment_file(
                 },
             )
         }));
+        records.extend(spool.carried.iter().map(|(object_ref, offset, length, checksum)| {
+            (
+                *object_ref,
+                ImageRecord::Carried {
+                    offset: *offset,
+                    length: *length,
+                    checksum: *checksum,
+                },
+            )
+        }));
     }
     records.sort_by_key(|(object_ref, _)| object_ref.packed());
     let records_len = records.iter().try_fold(0usize, |total, (_, record)| {
@@ -3258,16 +3365,97 @@ pub(crate) fn write_segment_file(
     let root_checksum = checkpoint_root_checksum(&header, &[&metadata, &directory]);
     put_u32(&mut header, 68, root_checksum);
 
-    let mut file = filesystem.create(path).map_err(|error| {
-        OQLError::storage_error(&format!("create checkpoint segment: {error}"), None)
-    })?;
+    // The checkpoint's bytes go to a part of their own, and the file at
+    // the checkpoint's path becomes a root that says where they are. Each
+    // region is an extent of its own, and so is each column segment.
+    let mut file = Box::new(
+        super::parts::PartWriter::create(filesystem, path, image.sequence).map_err(|error| {
+            OQLError::storage_error(&format!("create checkpoint part: {error}"), None)
+        })?,
+    );
     let mut internal = crc32fast::Hasher::new();
     for bytes in [&header[..], &metadata, &directory] {
         write_all_handle(file.as_mut(), bytes)?;
         internal.update(bytes);
+        file.cut();
     }
+    // What is carried over from the checkpoint being replaced is listed
+    // from the parts that hold it there, and not written again. A part of
+    // which less than half would still be listed is not listed from at
+    // all: what is wanted of it is copied, so that the part can go, and
+    // what is not wanted of it does not stay on disk for good.
+    let base_path = image
+        .record_spool
+        .as_ref()
+        .and_then(|spool| spool.base.clone())
+        .or_else(|| image.segment_spool.as_ref().and_then(|spool| spool.base.clone()));
+    let base = match &base_path {
+        Some(base_path) => super::parts::root_tables(filesystem, base_path).map_err(|error| {
+            OQLError::storage_error(&format!("read the root of the checkpoint being replaced: {error}"), None)
+        })?,
+        None => None,
+    };
+    let listed_from = {
+        let mut wanted = HashMap::<u64, u64>::new();
+        if let Some(base) = &base {
+            for (_, record) in &records {
+                if let ImageRecord::Carried { offset, length, .. } = record {
+                    if let Some((part, _, _)) = base.place(*offset, *length as u64) {
+                        *wanted.entry(part).or_default() += *length as u64;
+                    }
+                }
+            }
+            for number in 0..segments.len() {
+                if let Some(offset) = segments.carried(number) {
+                    let length = segment_descriptors[number].encoded_len as u64;
+                    if let Some((part, _, _)) = base.place(offset, length) {
+                        *wanted.entry(part).or_default() += length;
+                    }
+                }
+            }
+        }
+        wanted
+            .into_iter()
+            .filter(|(part, bytes)| {
+                base.as_ref()
+                    .and_then(|base| base.part_len(*part))
+                    .is_some_and(|part_len| bytes.saturating_mul(2) >= part_len)
+            })
+            .map(|(part, _)| part)
+            .collect::<HashSet<u64>>()
+    };
+    let placed = |offset: u64, length: u64| {
+        base.as_ref()
+            .and_then(|base| base.place(offset, length))
+            .filter(|(part, _, _)| listed_from.contains(part))
+    };
+    let from_base = |offset: u64, length: usize| -> OQLResult<Vec<u8>> {
+        let base_path = base_path
+            .as_ref()
+            .ok_or_else(|| OQLError::storage_error("carried from no checkpoint", None))?;
+        read_file_range(filesystem, base_path, offset as usize, length)
+    };
     for (_, record) in records {
         match record {
+            ImageRecord::Carried { offset, length, checksum } => {
+                match placed(offset, length as u64) {
+                    Some((part, part_offset, _)) => {
+                        file.list(part, part_offset, length as u64, checksum);
+                        internal.combine(&crc32fast::Hasher::new_with_initial_len(checksum, length as u64));
+                    }
+                    None => {
+                        let record = from_base(offset, length as usize)?;
+                        if crc32fast::hash(&record) != checksum {
+                            return Err(OQLError::storage_error(
+                                "a carried record does not read back as it was",
+                                None,
+                            ));
+                        }
+                        write_all_handle(file.as_mut(), &record)?;
+                        internal.update(&record);
+                    }
+                }
+            }
             ImageRecord::Held(record) => {
                 write_all_handle(file.as_mut(), record)?;
                 internal.update(record);
@@ -3288,6 +3476,7 @@ pub(crate) fn write_segment_file(
             }
         }
     }
+    file.cut();
     let mut published_indexes = Vec::<PublishedIndexPages>::new();
     let mut index_offset = SEGMENT_HEADER_LEN + metadata.len() + directory_len + records_len;
     for (index, range, first, last) in index_pages {
@@ -3338,8 +3527,24 @@ pub(crate) fn write_segment_file(
             });
         index_offset += block.len();
     }
+    file.cut();
     typed_locator.write_to(file.as_mut(), &mut internal)?;
+    file.cut();
     for number in 0..segments.len() {
+        if let Some(offset) = segments.carried(number) {
+            let length = segment_descriptors[number].encoded_len;
+            if let Some((part, part_offset, whole)) = placed(offset, length as u64) {
+                // The checksum of a stretch that is exactly an extent is
+                // on record; any other is read to be known.
+                let checksum = match whole {
+                    Some(checksum) => checksum,
+                    None => crc32fast::hash(&from_base(offset, length)?),
+                };
+                file.list(part, part_offset, length as u64, checksum);
+                internal.combine(&crc32fast::Hasher::new_with_initial_len(checksum, length as u64));
+                continue;
+            }
+        }
         let segment = segments.bytes(number)?;
         if segment.len() != segment_descriptors[number].encoded_len {
             return Err(OQLError::storage_error(
@@ -3349,15 +3554,35 @@ pub(crate) fn write_segment_file(
         }
         write_all_handle(file.as_mut(), &segment)?;
         internal.update(&segment);
+        file.cut();
     }
     let internal_checksum = internal.finalize();
-    file.seek(SeekFrom::Start(56)).map_err(|error| {
-        OQLError::storage_error(&format!("seek checkpoint checksum: {error}"), None)
+    // The header goes in again with the checksum of everything in it.
+    put_u32(&mut header, 56, internal_checksum);
+    if file.checkpoint_len() != total_len as u64 {
+        return Err(OQLError::storage_error(
+            "a checkpoint was not written at the length it was planned",
+            None,
+        ));
+    }
+    let (part_len, extents) = file.finish(&header).map_err(|error| {
+        OQLError::storage_error(&format!("sync checkpoint part: {error}"), None)
     })?;
-    write_all_handle(file.as_mut(), &internal_checksum.to_le_bytes())?;
-    file.flush().and_then(|_| file.sync()).map_err(|error| {
-        OQLError::storage_error(&format!("sync checkpoint segment: {error}"), None)
-    })?;
+    // The new part, and each earlier part an extent is listed from.
+    let mut part_lens = vec![(image.sequence, part_len)];
+    for extent in &extents {
+        if part_lens.iter().any(|(part, _)| *part == extent.part) {
+            continue;
+        }
+        let known = base
+            .as_ref()
+            .and_then(|base| base.part_len(extent.part))
+            .ok_or_else(|| OQLError::storage_error("a checkpoint lists a part of unknown length", None))?;
+        part_lens.push((extent.part, known));
+    }
+    // The part is durable before the root that names it is written.
+    super::parts::write_root(filesystem, path, total_len as u64, &part_lens, &extents)
+    .map_err(|error| OQLError::storage_error(&format!("write checkpoint root: {error}"), None))?;
     filesystem.sync_all().map_err(|error| {
         OQLError::storage_error(&format!("sync checkpoint directory: {error}"), None)
     })?;
@@ -3582,6 +3807,8 @@ fn discover_typed_segments(
 }
 
 pub(crate) struct BaseSegmentHandle {
+    /// The checkpoint this reads the records of.
+    path: PathBuf,
     file: Mutex<Box<dyn FileHandle>>,
     /// The reference of the first entry of each block of the directory.
     /// The directory stays in the file: it has an entry for every record,
@@ -3728,6 +3955,7 @@ impl BaseSegmentHandle {
             OQLError::storage_error(&format!("open base segment records: {error}"), None)
         })?;
         Ok(Self {
+            path: path.to_path_buf(),
             file: Mutex::new(file),
             fences,
             blocks: Mutex::new((HashMap::new(), VecDeque::new())),
@@ -3808,6 +4036,23 @@ impl BaseSegmentHandle {
             }
         }
         Ok(None)
+    }
+
+    /// The checkpoint whose records these are.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Where in the checkpoint the record of this object is, its length
+    /// and its checksum, from the directory alone.
+    pub(crate) fn place(&self, object_ref: ObjRef) -> OQLResult<Option<(u64, u32, u32)>> {
+        Ok(self.locate(object_ref)?.map(|located| {
+            (
+                (self.records_start + located.offset) as u64,
+                located.length as u32,
+                located.checksum,
+            )
+        }))
     }
 
     /// Whether this segment holds a record for the object, from its
@@ -5074,8 +5319,11 @@ mod tests {
                     <= INDEX_PAGE_TARGET_BYTES
             );
         }
-        let filesystem = Arc::new(SimulatedFileSystem::new(44));
-        let path = Path::new("streamed-segment.owl");
+        // Read through the layer that shows a root over parts as one file.
+        let filesystem = crate::storage_engine::parts::PartedFileSystem::over(Arc::new(
+            SimulatedFileSystem::new(44),
+        ));
+        let path = Path::new("streamed.owl.segment.0");
         let info = write_segment_file(filesystem.as_ref(), path, &image, usize::MAX).unwrap();
         assert_eq!(info.len, expected.len() as u64);
         assert_eq!(info.checksum, get_u32(&expected, 56).unwrap());
@@ -5139,7 +5387,19 @@ mod tests {
         let damaged_offset = damaged_page.location.offset + damaged_page.location.len - 1;
         let damaged_byte =
             read_file_range(filesystem.as_ref(), path, damaged_offset, 1).unwrap()[0];
-        let mut file = filesystem.open(path).unwrap();
+        // The checkpoint's bytes are in its one part, at the same offsets.
+        let mut file = filesystem
+            .open_with_options(
+                &crate::storage_engine::parts::part_path(path, 7),
+                &crate::simulation::filesystem::FileOptions {
+                    read: true,
+                    write: true,
+                    create: false,
+                    truncate: false,
+                    append: false,
+                },
+            )
+            .unwrap();
         file.seek(SeekFrom::Start(damaged_offset as u64)).unwrap();
         write_all_handle(file.as_mut(), &[damaged_byte ^ 0xff]).unwrap();
         file.sync().unwrap();
