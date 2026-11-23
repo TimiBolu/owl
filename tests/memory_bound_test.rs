@@ -52,8 +52,8 @@ static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 /// The budget every database here is opened under.
 const BUDGET: usize = 4 * 1024 * 1024;
 
-/// A row with a list in it stays out of the column segments, which is the
-/// kind of row the store keeps track of one by one.
+/// A row with a list in it stays out of the column segments, and is kept
+/// as a record of its own.
 fn listed(number: usize) -> Document {
     Document::with_id(
         format!("row-{number:08}"),
@@ -148,29 +148,10 @@ fn rows_in_column_segments_cost_nothing_each_once_open() {
     );
 }
 
-/// A ceiling on today's cost, so that it can only come down. A row with a
-/// list in it is still kept track of in memory: which version of its
-/// schema it was written under.
+/// Nor does a row with a list in it, which stays out of the column
+/// segments: it is found through the index of rows by id and the record
+/// directory, both of which stay in the checkpoint's files.
 #[test]
-fn rows_outside_column_segments_do_not_cost_more_each_than_they_did() {
-    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    let each = bytes_a_row(listed);
-    assert!(
-        each < CEILING,
-        "an open database holds {each:.1} bytes for each row outside its column segments; \
-         the ceiling is {CEILING}"
-    );
-}
-
-/// What each row outside the column segments may cost, in bytes. The map
-/// from id to row is on disk; what is left is the note of which version
-/// of its schema each row was written under.
-const CEILING: f64 = 75.0;
-
-/// Not yet true. An open database should hold no more for a row with a
-/// list in it than for any other: nothing.
-#[test]
-#[ignore = "the schema version of every row outside the column segments is held in memory"]
 fn rows_outside_column_segments_cost_nothing_each_once_open() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let each = bytes_a_row(listed);
