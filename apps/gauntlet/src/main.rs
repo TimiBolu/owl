@@ -419,6 +419,17 @@ fn scale(people: usize, at: Option<PathBuf>, reopens: usize) -> Result<()> {
             line("reopen", started.elapsed().as_secs_f64(), String::new());
             drop(owl);
         }
+        // What an open database holds before anything is asked of it.
+        let owl = Owl::open_with(&path, include_str!("../schema.oql"))?;
+        println!("\nwhat the store holds once open, part by part (estimated):");
+        for (name, entries, bytes) in owl.store().memory_breakdown().map_err(|error| anyhow!("{error}"))? {
+            println!("  {name:<46} {entries:>9} entries {:>7.1} MB", bytes as f64 / 1e6);
+        }
+        // Left open for a while when asked, so a tool can look at it.
+        if let Some(seconds) = std::env::var("OWL_HOLD_OPEN").ok().and_then(|value| value.parse().ok()) {
+            std::thread::sleep(std::time::Duration::from_secs(seconds));
+        }
+        drop(owl);
         return Ok(());
     }
     let owl = Owl::open_with(&path, include_str!("../schema.oql"))?;
