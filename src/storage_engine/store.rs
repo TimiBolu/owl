@@ -567,7 +567,15 @@ struct State {
     /// is next written or deleted. Counting checks each row changed since
     /// the checkpoint against the checkpoint's files.
     collection_counts: Mutex<HashMap<String, usize>>,
+    /// Ids looked up in the checkpoint lately, by collection, and the row
+    /// the checkpoint holds under each, if any. The checkpoint does not
+    /// change, so an answer stays good until another is installed. Kept
+    /// to a fixed number of ids.
+    ids_found_on_file: RwLock<(HashMap<String, HashMap<DocumentId, Option<ObjRef>>>, usize)>,
 }
+
+/// How many ids looked up in the checkpoint are remembered at once.
+const IDS_REMEMBERED: usize = 65_536;
 
 /// A row written after the commit a checkpoint froze, as it stands when
 /// the checkpoint is installed.
@@ -687,6 +695,11 @@ impl State {
             Ok(counts) => counts.clear(),
             Err(poisoned) => poisoned.into_inner().clear(),
         }
+        // The checkpoint read may be another one now.
+        *match self.ids_found_on_file.get_mut() {
+            Ok(found) => found,
+            Err(poisoned) => poisoned.into_inner(),
+        } = Default::default();
     }
 
     fn has_rows_on_file(&self) -> bool {
@@ -7502,10 +7515,31 @@ fn lookup_object_ref(state: &State, schema: &str, id: &DocumentId) -> OQLResult<
     {
         return Ok(Some(object_ref));
     }
-    if let Some((_, _, object_ref)) = base_location_by_id(state, schema, id)? {
-        return Ok(Some(object_ref));
+    if !state.has_rows_on_file() {
+        return Ok(None);
     }
-    overflow_base_by_id(state, schema, id)
+    if let Ok(found) = state.ids_found_on_file.read() {
+        if let Some(known) = found.0.get(schema).and_then(|ids| ids.get(id)) {
+            return Ok(*known);
+        }
+    }
+    let on_file = match base_location_by_id(state, schema, id)? {
+        Some((_, _, object_ref)) => Some(object_ref),
+        None => overflow_base_by_id(state, schema, id)?,
+    };
+    if let Ok(mut found) = state.ids_found_on_file.write() {
+        if found.1 >= IDS_REMEMBERED {
+            *found = Default::default();
+        }
+        let ids = match found.0.get_mut(schema) {
+            Some(ids) => ids,
+            None => found.0.entry(schema.to_string()).or_default(),
+        };
+        if ids.insert(id.clone(), on_file).is_none() {
+            found.1 += 1;
+        }
+    }
+    Ok(on_file)
 }
 
 /// How many rows of each collection the id index lists.
@@ -7949,7 +7983,7 @@ fn segment_rows_with_a_few_newer(state: &State, schema: &str) -> OQLResult<Optio
         }
         let rows = segment.row_count();
         let mut from = 0usize;
-        let mut take = |listed: &mut Vec<ObjRef>, rows: std::ops::Range<usize>| -> OQLResult<()> {
+        let take = |listed: &mut Vec<ObjRef>, rows: std::ops::Range<usize>| -> OQLResult<()> {
             for row in rows {
                 let object_ref = segment.object_ref(row)?;
                 if state
@@ -8055,6 +8089,48 @@ fn sourced_document_reading(
     };
     let compiled = schema_of_record(state, object_ref, &record)?;
     Ok(Some(Arc::new(RecordCodec::decode_projection(&record, compiled, Some(wanted))?)))
+}
+
+/// The fields a scan's filter reads.
+fn filter_fields(predicate: &ScanPredicate, fields: &mut HashSet<String>) {
+    match predicate {
+        ScanPredicate::Comparison { field, .. } => {
+            fields.insert(field.clone());
+        }
+        ScanPredicate::And(left, right) | ScanPredicate::Or(left, right) => {
+            filter_fields(left, fields);
+            filter_fields(right, fields);
+        }
+    }
+}
+
+/// A row of a column segment that is not held decoded, with only the
+/// fields in `wanted` built. `None` for any other row.
+fn segment_row_reading(
+    state: &State,
+    object_ref: ObjRef,
+    wanted: &HashSet<String>,
+) -> OQLResult<Option<Document>> {
+    if state.object_directory.contains_key(&object_ref) {
+        return Ok(None);
+    }
+    let Some((segment_index, row)) = state.typed_row_locations.get(&object_ref)? else {
+        return Ok(None);
+    };
+    let segment = state.typed_segments.get(segment_index).ok_or_else(|| {
+        OQLError::storage_error("typed row location references a missing segment", None)
+    })?;
+    if segment.object_ref(row)? != object_ref {
+        return Err(OQLError::storage_error(
+            "typed row location conflicts with segment identity",
+            None,
+        ));
+    }
+    let compiled = state
+        .compiled_schemas
+        .get(&(segment.collection_id(), segment.schema_version()))
+        .ok_or_else(|| OQLError::storage_error("compiled schema is missing", None))?;
+    Ok(Some(segment.load()?.decode_document_reading(row, compiled, Some(wanted))?))
 }
 
 fn sourced_document(
@@ -11404,9 +11480,37 @@ impl DocumentStore for RustStore {
                 .read()
                 .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
             let mut documents = Vec::with_capacity(object_refs.len());
+            // A row read from a column segment for this scan alone has
+            // only the fields the scan filters on or returns built.
+            let wanted = fields.map(|fields| {
+                let mut wanted: HashSet<String> = fields.iter().cloned().collect();
+                for filter in filters {
+                    filter_fields(filter, &mut wanted);
+                }
+                wanted
+            });
+            // While memory is not short a row decoded here is kept, so
+            // the next scan finds it held, as it would in a database that
+            // had never been checkpointed.
+            let hold = !state.tight();
+            let mut decoded = Vec::new();
             for object_ref in &object_refs {
-                let Some(document) = logical_document(&state, *object_ref)? else {
-                    continue;
+                let from_segment = match &wanted {
+                    Some(wanted) if !hold => segment_row_reading(&state, *object_ref, wanted)?,
+                    _ => None,
+                };
+                let document = match from_segment {
+                    Some(document) => Arc::new(document),
+                    None => {
+                        let read = match hold {
+                            true => shared_document(&state, *object_ref, &mut decoded)?,
+                            false => logical_document(&state, *object_ref)?,
+                        };
+                        match read {
+                            Some(document) => document,
+                            None => continue,
+                        }
+                    }
                 };
                 if !filters
                     .iter()
@@ -11431,6 +11535,8 @@ impl DocumentStore for RustStore {
                     None => document.as_ref().clone(),
                 });
             }
+            drop(state);
+            self.keep_decoded(decoded)?;
             return Ok(Some(documents));
         }
         if !records_resident {
@@ -11785,17 +11891,6 @@ impl DocumentStore for RustStore {
         // A row held only as its record is decoded for this scan alone,
         // and only the fields the scan filters on or returns: a count
         // decodes none of a row's lists or text.
-        fn filter_fields(predicate: &ScanPredicate, fields: &mut HashSet<String>) {
-            match predicate {
-                ScanPredicate::Comparison { field, .. } => {
-                    fields.insert(field.clone());
-                }
-                ScanPredicate::And(left, right) | ScanPredicate::Or(left, right) => {
-                    filter_fields(left, fields);
-                    filter_fields(right, fields);
-                }
-            }
-        }
         let mut wanted: HashSet<String> = fields.iter().cloned().collect();
         for filter in filters {
             filter_fields(filter, &mut wanted);
