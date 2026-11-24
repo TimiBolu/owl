@@ -470,6 +470,22 @@ impl DenseTypedRowDirectory {
     }
 }
 
+/// What is kept, while the generations written since a compaction are
+/// applied to it, to check the indexes afterwards against the compaction's
+/// own pages instead of entry by entry.
+#[derive(Default)]
+struct OpenAudit {
+    /// How many rows each indexed collection had in the compaction.
+    base_counts: HashMap<String, usize>,
+    /// The indexes that answered from the compaction's pages alone.
+    from_pages: HashSet<(String, String)>,
+    /// The indexes a generation made or dropped: their pages are no guide.
+    remade: HashSet<(String, String)>,
+    /// Every row a generation wrote or deleted, and whether the
+    /// compaction held it.
+    touched: HashMap<ObjRef, bool>,
+}
+
 #[derive(Default)]
 struct State {
     /// For each collection, the commit that last wrote one of its rows.
@@ -527,6 +543,9 @@ struct State {
     scalar_index_data: HashMap<(String, String), Arc<BTreeIndex>>,
     scalar_index_resets: BTreeSet<(String, String)>,
     scalar_index_deletes: BTreeSet<(String, String)>,
+    /// Set while a database being opened has its generations applied:
+    /// what is needed to check the indexes afterwards.
+    open_audit: Option<OpenAudit>,
     vector_indexes: HashMap<String, Vec<VectorIndexDefinition>>,
     reverse_reference_index: Arc<BTreeIndex>,
     /// What open transactions need in order to tell, at commit, whether
@@ -5770,6 +5789,20 @@ impl RustStore {
             .records()
             .into_iter()
             .collect::<BTreeMap<_, _>>();
+        if audit_indexes && generation_root.is_some() {
+            // The state is the compaction's at this point.
+            let mut audit = OpenAudit::default();
+            for (identity, index) in &state.scalar_index_data {
+                if index.is_base_alone() {
+                    audit.from_pages.insert(identity.clone());
+                    if !audit.base_counts.contains_key(&identity.0) {
+                        let count = logical_collection_count(&state, &identity.0);
+                        audit.base_counts.insert(identity.0.clone(), count);
+                    }
+                }
+            }
+            state.open_audit = Some(audit);
+        }
         if let Some(root) = &generation_root {
             if root.base_sequence != base_sequence || root.base_lsn != base_checkpoint_lsn {
                 return Err(OQLError::storage_error(
@@ -5990,7 +6023,25 @@ impl RustStore {
                 || index_root_changed)
         {
             let audit_started = Instant::now();
-            validate_runtime_scalar_indexes_structural(&state)?;
+            match state.open_audit.take() {
+                Some(audit) => {
+                    OPENS_AUDITED_AGAINST_PAGES.fetch_add(1, Ordering::Relaxed);
+                    let against_pages = validate_scalar_indexes_against_pages(&state, &audit);
+                    if AUDIT_OPENS_BOTH_WAYS.load(Ordering::Relaxed) {
+                        let entry_by_entry = validate_runtime_scalar_indexes_structural(&state);
+                        if against_pages.is_ok() != entry_by_entry.is_ok() {
+                            return Err(OQLError::storage_error(
+                                &format!(
+                                    "the two audits of recovered indexes disagree: against pages {against_pages:?}, entry by entry {entry_by_entry:?}"
+                                ),
+                                None,
+                            ));
+                        }
+                    }
+                    against_pages?
+                }
+                None => validate_runtime_scalar_indexes_structural(&state)?,
+            }
             tracing::debug!(
                 target: "owl_db::storage_engine::recovery",
                 elapsed_ms = audit_started.elapsed().as_secs_f64() * 1_000.0,
@@ -5998,6 +6049,7 @@ impl RustStore {
                 "audited recovered scalar-index coverage"
             );
         }
+        state.open_audit = None;
         state.object_records.mark_clean();
         evict_clean_records(&mut state);
         mark_indexes_clean(&mut state)?;
@@ -6139,6 +6191,9 @@ impl RustStore {
                         .and_modify(|next| *next = (*next).max(next_object_id))
                         .or_insert(next_object_id);
                     let previous = logical_document(state, object_ref)?;
+                    if let Some(audit) = &mut state.open_audit {
+                        audit.touched.entry(object_ref).or_insert(previous.is_some());
+                    }
                     if index_mode == IndexReplayMode::Maintain {
                         update_document_indexes(
                             state,
@@ -6191,6 +6246,9 @@ impl RustStore {
                     object_ref,
                 } => {
                     let previous = logical_document(state, object_ref)?;
+                    if let Some(audit) = &mut state.open_audit {
+                        audit.touched.entry(object_ref).or_insert(previous.is_some());
+                    }
                     if index_mode == IndexReplayMode::Maintain {
                         update_document_indexes(state, previous.as_deref(), None, object_ref)?;
                     }
@@ -6248,6 +6306,9 @@ impl RustStore {
                         .scalar_index_data
                         .insert(identity.clone(), Arc::new(data));
                     state.scalar_index_deletes.remove(&identity);
+                    if let Some(audit) = &mut state.open_audit {
+                        audit.remade.insert(identity.clone());
+                    }
                     state.scalar_index_resets.insert(identity);
                     upsert(&mut state.scalar_indexes, index);
                 }
@@ -6256,6 +6317,9 @@ impl RustStore {
                     remove_named(&mut state.scalar_indexes, &schema, &name);
                     state.scalar_index_data.remove(&identity);
                     state.scalar_index_resets.remove(&identity);
+                    if let Some(audit) = &mut state.open_audit {
+                        audit.remade.insert(identity.clone());
+                    }
                     state.scalar_index_deletes.insert(identity);
                 }
                 Mutation::PutVectorIndex(index) => upsert(&mut state.vector_indexes, index),
@@ -6676,38 +6740,155 @@ fn validate_runtime_scalar_indexes(state: &State) -> OQLResult<()> {
     Ok(())
 }
 
-fn validate_runtime_scalar_indexes_structural(state: &State) -> OQLResult<()> {
-    let definitions = state
-        .scalar_indexes
-        .values()
-        .flatten()
-        .map(|definition| {
-            (
-                (definition.schema.clone(), definition.name.clone()),
-                definition,
-            )
-        })
-        .collect::<HashMap<_, _>>();
+/// The declared indexes with what holds each, having checked that the
+/// two lists agree.
+fn recovered_scalar_indexes(
+    state: &State,
+) -> OQLResult<Vec<(&ScalarIndexDefinition, &Arc<BTreeIndex>)>> {
+    let definitions = state.scalar_indexes.values().flatten().collect::<Vec<_>>();
     if definitions.len() != state.scalar_index_data.len() {
         return Err(OQLError::storage_error(
             "runtime scalar indexes do not match their recovered catalog",
             None,
         ));
     }
-    for (identity, definition) in definitions {
-        let index = state.scalar_index_data.get(&identity).ok_or_else(|| {
-            OQLError::storage_error("recovered scalar index has no runtime handle", None)
-        })?;
-        let mut referenced = HashSet::new();
-        // A row's reference names its collection, so the row need not be
-        // read to know it is one of this index's.
+    definitions
+        .into_iter()
+        .map(|definition| {
+            let index = state
+                .scalar_index_data
+                .get(&(definition.schema.clone(), definition.name.clone()))
+                .ok_or_else(|| {
+                    OQLError::storage_error("recovered scalar index has no runtime handle", None)
+                })?;
+            Ok((definition, index))
+        })
+        .collect()
+}
+
+fn validate_runtime_scalar_indexes_structural(state: &State) -> OQLResult<()> {
+    for (definition, index) in recovered_scalar_indexes(state)? {
+        validate_scalar_index_structural(state, definition, index)?;
+    }
+    Ok(())
+}
+
+/// Check, entry by entry, that an index names every row of its collection
+/// once and nothing else.
+fn validate_scalar_index_structural(
+    state: &State,
+    definition: &ScalarIndexDefinition,
+    index: &BTreeIndex,
+) -> OQLResult<()> {
+    let mut referenced = HashSet::new();
+    // A row's reference names its collection, so the row need not be
+    // read to know it is one of this index's.
+    let collection = state.collection_ids.get(&definition.schema).copied();
+    index
+        .visit_entries(&mut |_key, postings| {
+            if definition.unique && postings.len() > 1 {
+                return Err("recovered unique index has multiple postings".into());
+            }
+            for object_ref in postings {
+                if Some(object_ref.collection_id()) != collection
+                    || !object_is_live(state, *object_ref).map_err(|error| error.to_string())?
+                {
+                    return Err(
+                        "recovered index references an object in the wrong collection".into(),
+                    );
+                }
+                if !referenced.insert(*object_ref) {
+                    return Err("recovered index references one object more than once".into());
+                }
+            }
+            Ok(())
+        })
+        .map_err(|error| OQLError::storage_error(&error, None))?;
+    let expected = logical_collection_count(state, &definition.schema);
+    if referenced.len() != expected {
+        return Err(OQLError::storage_error(
+            "recovered scalar index does not cover every live object exactly once",
+            None,
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a database being opened also audits its indexes entry by
+/// entry where it would audit them against their pages, and refuses to
+/// open if the two disagree.
+static AUDIT_OPENS_BOTH_WAYS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How many openings in this process audited their indexes against pages.
+static OPENS_AUDITED_AGAINST_PAGES: AtomicU64 = AtomicU64::new(0);
+
+impl RustStore {
+    /// See [`OPENS_AUDITED_AGAINST_PAGES`].
+    #[doc(hidden)]
+    pub fn opens_audited_against_pages() -> u64 {
+        OPENS_AUDITED_AGAINST_PAGES.load(Ordering::Relaxed)
+    }
+
+    /// See [`AUDIT_OPENS_BOTH_WAYS`]. For tests.
+    #[doc(hidden)]
+    pub fn audit_opens_both_ways(both: bool) {
+        AUDIT_OPENS_BOTH_WAYS.store(both, Ordering::Relaxed);
+    }
+}
+
+/// Check that each index names every row of its collection once and
+/// nothing else, without looking at every entry.
+///
+/// A compaction's pages name each of its rows once: that is taken as
+/// given, as it is when a compacted database is opened. What the
+/// generations since laid over those pages is then all there is to
+/// check, and the checks below cost in proportion to it.
+///
+/// Call the rows of the compaction B and the rows now N. Under each key
+/// laid over the pages, a reference the pages hold and the index no
+/// longer answers is taken out, and one the index answers and the pages
+/// do not is put in. The index then holds B's references less those taken
+/// out, and those put in. It is checked that
+///
+/// 1. those put in are rows of N, each put in once;
+/// 2. each taken out is no longer a row, or is put in again;
+/// 3. B less those taken out, with those put in, is as many as N;
+/// 4. every row of N a generation wrote that is not in B is put in.
+///
+/// By 2 no row of both B and N is lost, and by 4 no row of N alone is, so
+/// every row of N is named. By 3 the index names as many as N holds, so
+/// it names nothing twice and nothing else.
+///
+/// An index a generation made or dropped, or one that did not answer
+/// from pages alone, is checked entry by entry.
+fn validate_scalar_indexes_against_pages(state: &State, audit: &OpenAudit) -> OQLResult<()> {
+    for (definition, index) in recovered_scalar_indexes(state)? {
+        let identity = (definition.schema.clone(), definition.name.clone());
+        let base_count = audit.base_counts.get(&definition.schema).copied();
+        let (true, false, Some(base_count)) = (
+            audit.from_pages.contains(&identity),
+            audit.remade.contains(&identity),
+            base_count,
+        ) else {
+            validate_scalar_index_structural(state, definition, index)?;
+            continue;
+        };
         let collection = state.collection_ids.get(&definition.schema).copied();
+        let mut put_in = HashSet::new();
+        let mut taken_out = Vec::new();
         index
-            .visit_entries(&mut |_key, postings| {
-                if definition.unique && postings.len() > 1 {
+            .visit_changes_to_base(&mut |before, now| {
+                if definition.unique && now.len() > 1 {
                     return Err("recovered unique index has multiple postings".into());
                 }
-                for object_ref in postings {
+                // A key can hold a great many rows, so neither list is
+                // searched once for each row of the other.
+                let before_held = before.iter().copied().collect::<HashSet<_>>();
+                let now_held = now.iter().copied().collect::<HashSet<_>>();
+                for object_ref in now {
+                    if before_held.contains(object_ref) {
+                        continue;
+                    }
                     if Some(object_ref.collection_id()) != collection
                         || !object_is_live(state, *object_ref).map_err(|error| error.to_string())?
                     {
@@ -6715,19 +6896,42 @@ fn validate_runtime_scalar_indexes_structural(state: &State) -> OQLResult<()> {
                             "recovered index references an object in the wrong collection".into(),
                         );
                     }
-                    if !referenced.insert(*object_ref) {
+                    if !put_in.insert(*object_ref) {
                         return Err("recovered index references one object more than once".into());
                     }
                 }
+                taken_out.extend(before.iter().filter(|object_ref| !now_held.contains(object_ref)).copied());
                 Ok(())
             })
             .map_err(|error| OQLError::storage_error(&error, None))?;
+        for object_ref in &taken_out {
+            if !put_in.contains(object_ref) && object_is_live(state, *object_ref)? {
+                return Err(OQLError::storage_error(
+                    "recovered scalar index no longer names a live object",
+                    None,
+                ));
+            }
+        }
         let expected = logical_collection_count(state, &definition.schema);
-        if referenced.len() != expected {
+        if base_count + put_in.len() != expected + taken_out.len() {
             return Err(OQLError::storage_error(
                 "recovered scalar index does not cover every live object exactly once",
                 None,
             ));
+        }
+        for (object_ref, in_base) in &audit.touched {
+            if *in_base
+                || Some(object_ref.collection_id()) != collection
+                || put_in.contains(object_ref)
+            {
+                continue;
+            }
+            if object_is_live(state, *object_ref)? {
+                return Err(OQLError::storage_error(
+                    "recovered scalar index does not name a row written since the compaction",
+                    None,
+                ));
+            }
         }
     }
     Ok(())
@@ -7263,6 +7467,13 @@ impl RustStore {
     #[doc(hidden)]
     pub fn index_pages_carried_and_written() -> (u64, u64) {
         crate::storage_engine::checkpoint::index_pages_carried_and_written()
+    }
+
+    /// How many index pages this process has read from files to answer
+    /// for an index.
+    #[doc(hidden)]
+    pub fn index_pages_read() -> u64 {
+        crate::storage_engine::checkpoint::index_pages_read()
     }
 
     #[doc(hidden)]
