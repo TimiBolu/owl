@@ -1731,6 +1731,15 @@ impl<'a> SortedEntries<'a> {
 static INDEX_PAGES_CARRIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static INDEX_PAGES_WRITTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// How many index pages this process has read from files to answer for
+/// an index: lookups, scans and audits, not compactions building over
+/// them.
+static INDEX_PAGES_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn index_pages_read() -> u64 {
+    INDEX_PAGES_READ.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// See [`INDEX_PAGES_CARRIED`].
 pub(crate) fn index_pages_carried_and_written() -> (u64, u64) {
     (
@@ -1965,6 +1974,7 @@ impl FileIndexBase {
             .pages
             .get(page_index)
             .ok_or_else(|| "checkpoint index page number is invalid".to_string())?;
+        INDEX_PAGES_READ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let bytes = read_file_range(
             self.filesystem.as_ref(),
             &descriptor.location.path,

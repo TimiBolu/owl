@@ -389,6 +389,45 @@ impl BTreeIndex {
         Ok(())
     }
 
+    /// Whether the index answers from pages with nothing laid over them.
+    pub(crate) fn is_base_alone(&self) -> bool {
+        self.inner.read().is_ok_and(|inner| {
+            inner.base.is_some() && inner.entries.is_empty() && inner.tombstones.is_empty()
+        })
+    }
+
+    /// For each key laid over the pages: what the pages hold under it and
+    /// what the index now answers. Only the pages those keys fall on are
+    /// read.
+    pub(crate) fn visit_changes_to_base(
+        &self,
+        visitor: &mut dyn FnMut(&[ObjRef], &[ObjRef]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let (base, overlays) = {
+            let inner = self
+                .inner
+                .read()
+                .map_err(|_| "B-tree read lock poisoned".to_string())?;
+            let mut overlays = inner
+                .entries
+                .iter()
+                .map(|(key, postings)| (key.clone(), postings.iter().copied().collect::<Vec<_>>()))
+                .collect::<BTreeMap<_, _>>();
+            for key in &inner.tombstones {
+                overlays.insert(key.clone(), Vec::new());
+            }
+            (inner.base.clone(), overlays)
+        };
+        for (key, now) in overlays {
+            let before = match &base {
+                Some(base) => base.search_key(&key)?,
+                None => Vec::new(),
+            };
+            visitor(&before, &now)?;
+        }
+        Ok(())
+    }
+
     pub fn insert_key(&self, key: Vec<u8>, value: ObjRef, unique: bool) -> Result<(), String> {
         let mut inner = self
             .inner

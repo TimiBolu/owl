@@ -499,6 +499,9 @@ fn seeds(default: u64) -> u64 {
 }
 
 fn sweep(first: u64, count: u64, steps: usize, faults: Faults) {
+    // Every opening audits its indexes both against their pages and
+    // entry by entry, and fails if the two disagree.
+    RustStore::audit_opens_both_ways(true);
     if let Some(seed) = std::env::var("OWL_CRASH_SEED")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
@@ -528,6 +531,10 @@ fn sweep(first: u64, count: u64, steps: usize, faults: Faults) {
     // hides nothing but should not happen.
     let (over_pages, refused) = RustStore::index_page_carries();
     println!("{over_pages} compactions built their indexes over pages, {refused} could not");
+    println!(
+        "{} openings audited their indexes against pages and entry by entry, and the two agreed",
+        RustStore::opens_audited_against_pages()
+    );
     assert_eq!(refused, 0, "compactions that could not build their indexes over pages");
     // Failures by what went wrong, most common first.
     let mut kinds: BTreeMap<String, (usize, u64)> = BTreeMap::new();
