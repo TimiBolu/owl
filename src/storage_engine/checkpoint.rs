@@ -203,6 +203,29 @@ impl SegmentSpool {
         self.entries.iter().map(|(_, descriptor)| descriptor.row_count).sum()
     }
 
+    /// A stretch of a segment: `len` bytes starting `at` bytes into it.
+    fn read_part(&self, number: usize, at: usize, len: usize) -> OQLResult<Vec<u8>> {
+        let (offset, descriptor) = self
+            .entries
+            .get(number)
+            .ok_or_else(|| OQLError::storage_error("segment spool has no such segment", None))?;
+        if at.checked_add(len).is_none_or(|end| end > descriptor.encoded_len) {
+            return Err(OQLError::storage_error("a stretch lies outside its segment", None));
+        }
+        if self.carried.get(number).copied().unwrap_or(false) {
+            let base = self
+                .base
+                .as_ref()
+                .ok_or_else(|| OQLError::storage_error("a segment is carried from no checkpoint", None))?;
+            return read_file_range(self.filesystem.as_ref(), base, *offset as usize + at, len);
+        }
+        let file = self
+            .file
+            .as_ref()
+            .ok_or_else(|| OQLError::storage_error("segment spool is closed", None))?;
+        read_exact_at(file.as_ref(), *offset as usize + at, len)
+    }
+
     fn read(&self, number: usize) -> OQLResult<Arc<[u8]>> {
         let (offset, descriptor) = self
             .entries
@@ -273,6 +296,25 @@ impl<'a> ImageSegments<'a> {
             .copied()
             .unwrap_or(false)
             .then(|| spool.entries[at].0)
+    }
+
+    /// Which rows the segment holds, by reference and by id, from the part
+    /// of it that says so: its columns are neither read nor decoded.
+    fn identity(&self, number: usize) -> OQLResult<TypedSegmentIdentity> {
+        // What a segment's header takes, before the part that names its rows.
+        const TYPED_HEADER_LEN: usize = 64;
+        let descriptor = self.descriptor(number)?;
+        let bytes = match self.held.get(number) {
+            Some(segment) => segment
+                .get(TYPED_HEADER_LEN..TYPED_HEADER_LEN + descriptor.lookup_len)
+                .ok_or_else(|| OQLError::storage_error("a held segment is shorter than its header states", None))?
+                .to_vec(),
+            None => self
+                .spooled
+                .ok_or_else(|| OQLError::storage_error("an image has no such segment", None))?
+                .read_part(number - self.held.len(), TYPED_HEADER_LEN, descriptor.lookup_len)?,
+        };
+        TypedSegment::open_identity(descriptor, Arc::from(bytes))
     }
 
     /// The segment's bytes, read from the spool if that is where it is.
@@ -2257,6 +2299,9 @@ struct LocatorSortEntry {
 struct LocatorRunReader {
     file: Box<dyn FileHandle>,
     remaining: usize,
+    /// Entries read from the file and not yet given.
+    buffer: Vec<u8>,
+    position: usize,
 }
 
 impl LocatorRunReader {
@@ -2277,6 +2322,8 @@ impl LocatorRunReader {
         Ok(Self {
             file,
             remaining: len / LOCATOR_RUN_ENTRY_LEN,
+            buffer: Vec::new(),
+            position: 0,
         })
     }
 
@@ -2284,12 +2331,21 @@ impl LocatorRunReader {
         if self.remaining == 0 {
             return Ok(None);
         }
-        let bytes = read_exact_handle(self.file.as_mut(), LOCATOR_RUN_ENTRY_LEN)?;
+        // Entries are read many at a time: one read for each was most of
+        // what building a locator cost.
+        if self.position == self.buffer.len() {
+            const ENTRIES_A_READ: usize = 8_192;
+            let entries = self.remaining.min(ENTRIES_A_READ);
+            self.buffer = read_exact_handle(self.file.as_mut(), entries * LOCATOR_RUN_ENTRY_LEN)?;
+            self.position = 0;
+        }
+        let bytes = &self.buffer[self.position..self.position + LOCATOR_RUN_ENTRY_LEN];
+        self.position += LOCATOR_RUN_ENTRY_LEN;
         self.remaining -= 1;
         Ok(Some(LocatorSortEntry {
-            collection_id: get_u16(&bytes, 0)?,
-            object_id: get_u32(&bytes, 2)?,
-            packed: get_u32(&bytes, 6)?,
+            collection_id: get_u16(bytes, 0)?,
+            object_id: get_u32(bytes, 2)?,
+            packed: get_u32(bytes, 6)?,
         }))
     }
 }
@@ -2779,23 +2835,34 @@ fn prepare_typed_locator<'a>(
     let mut collection_slots = BTreeMap::<u16, usize>::new();
     let mut fences = Vec::<(usize, String, String)>::new();
     let mut live_count = 0usize;
+    // Only the part of a segment that names its rows is read, once, and
+    // kept for the second pass: a segment carried over from the checkpoint
+    // being replaced has no column of it read here at all.
+    let mut identities = Vec::with_capacity(segments.len());
     for segment_index in 0..segments.len() {
-        let segment = TypedSegment::decode(&segments.bytes(segment_index)?)?;
-        if !segment.authoritative {
+        let descriptor = segments.descriptor(segment_index)?;
+        if !descriptor.authoritative {
+            identities.push(None);
             continue;
         }
-        if let (Some(first), Some(last)) =
-            (segment.document_ids.first(), segment.document_ids.last())
-        {
-            fences.push((segment_index, first.clone(), last.clone()));
+        let identity = segments.identity(segment_index)?;
+        let rows = descriptor.row_count;
+        if rows > 0 {
+            fences.push((
+                segment_index,
+                identity.document_id(0)?.to_string(),
+                identity.document_id(rows - 1)?.to_string(),
+            ));
         }
-        for object_ref in segment.object_refs.iter().copied() {
-            let slots = collection_slots.entry(segment.collection_id).or_default();
+        for row in 0..rows {
+            let object_ref = identity.object_ref(row)?;
+            let slots = collection_slots.entry(descriptor.collection_id).or_default();
             *slots = (*slots).max(object_ref.object_id() as usize + 1);
             live_count = live_count
                 .checked_add(1)
                 .ok_or_else(|| OQLError::storage_error("typed locator live rows overflow", None))?;
         }
+        identities.push(Some(identity));
     }
     let initial_run_count = live_count.div_ceil(LOCATOR_SORT_CHUNK_ENTRIES);
     write_locator_build_journal(filesystem, path, sequence, initial_run_count)?;
@@ -2807,14 +2874,14 @@ fn prepare_typed_locator<'a>(
     };
     let mut chunk = Vec::<LocatorSortEntry>::with_capacity(LOCATOR_SORT_CHUNK_ENTRIES);
     let mut runs = Vec::<PathBuf>::with_capacity(initial_run_count);
-    for segment_index in 0..segments.len() {
-        let segment = TypedSegment::decode(&segments.bytes(segment_index)?)?;
-        if !segment.authoritative {
+    for (segment_index, identity) in identities.iter().enumerate() {
+        let Some(identity) = identity else {
             continue;
-        }
-        for (row, object_ref) in segment.object_refs.iter().copied().enumerate() {
+        };
+        for row in 0..identity.descriptor.row_count {
+            let object_ref = identity.object_ref(row)?;
             chunk.push(LocatorSortEntry {
-                collection_id: segment.collection_id,
+                collection_id: identity.descriptor.collection_id,
                 object_id: object_ref.object_id(),
                 packed: pack_typed_location(segment_index, row)?,
             });

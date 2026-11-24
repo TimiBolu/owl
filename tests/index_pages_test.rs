@@ -50,7 +50,12 @@ fn rows_arriving_between_others_do_not_have_every_index_page_written_again() {
             }),
         ])
         .unwrap();
-    const LOADED: usize = 60_000;
+    const LOADED: usize = 60_000 * SCALE;
+    // Set to time a larger database by hand.
+    const SCALE: usize = match option_env!("OWL_INDEX_PAGES_SCALE") {
+        Some(_) => 5,
+        None => 1,
+    };
     for start in (0..LOADED).step_by(2_000) {
         let batch = (start..start + 2_000)
             .map(|number| WriteOperation::PutDocument(item(format!("item-{number:08}"), number as i64)))
@@ -72,7 +77,9 @@ fn rows_arriving_between_others_do_not_have_every_index_page_written_again() {
         })
         .collect();
     store.write_batch(batch).unwrap();
+    let started = std::time::Instant::now();
     store.compact().unwrap();
+    println!("that compaction took {:.0} ms", started.elapsed().as_secs_f64() * 1e3);
     let after = RustStore::index_pages_carried_and_written();
     let (carried, written) = (after.0 - before.0, after.1 - before.1);
     println!("that compaction carried {carried} index pages and wrote {written}");

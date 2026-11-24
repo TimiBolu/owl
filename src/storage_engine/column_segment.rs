@@ -175,6 +175,23 @@ impl TypedSegment {
         schema: &Schema,
         rows: &[(ObjRef, Arc<Document>)],
     ) -> OQLResult<Self> {
+        let rows = rows
+            .iter()
+            .map(|(object_ref, document)| SegmentRow::Document(*object_ref, document.as_ref()))
+            .collect::<Vec<_>>();
+        Self::build_from(compiled, schema, &rows)
+    }
+
+    /// Build a segment from rows, each given as a document or as a row of
+    /// a segment that holds it. A row of a segment has its cells copied
+    /// from that segment's columns, with no document made of it between.
+    /// The result is the segment [`Self::build`] makes of the same rows as
+    /// documents.
+    pub(crate) fn build_from(
+        compiled: &CompiledSchema,
+        schema: &Schema,
+        rows: &[SegmentRow<'_>],
+    ) -> OQLResult<Self> {
         if rows.len() > MAX_ROWS {
             return Err(storage_error("typed segment exceeds its row limit"));
         }
@@ -189,19 +206,42 @@ impl TypedSegment {
             updated_at: Vec::with_capacity(rows.len()),
             columns: Vec::new(),
         };
-        for (object_ref, document) in rows {
-            if object_ref.collection_id() != compiled.collection_id
-                || document.schema != compiled.name
-            {
-                return Err(storage_error(
-                    "typed segment row conflicts with its compiled schema",
-                ));
+        for row in rows {
+            match row {
+                SegmentRow::Document(object_ref, document) => {
+                    if object_ref.collection_id() != compiled.collection_id
+                        || document.schema != compiled.name
+                    {
+                        return Err(storage_error(
+                            "typed segment row conflicts with its compiled schema",
+                        ));
+                    }
+                    segment.object_refs.push(*object_ref);
+                    segment.document_ids.push(document.id.clone());
+                    segment.document_versions.push(document.version);
+                    segment.created_at.push(document.created_at);
+                    segment.updated_at.push(document.updated_at);
+                }
+                SegmentRow::Stored(stored, at) => {
+                    // Only a segment that holds every field of the same
+                    // version of the schema says all there is to say of
+                    // its rows.
+                    if !stored.authoritative
+                        || stored.collection_id != compiled.collection_id
+                        || stored.schema_version != compiled.version
+                        || *at >= stored.row_count()
+                    {
+                        return Err(storage_error(
+                            "typed segment row conflicts with its compiled schema",
+                        ));
+                    }
+                    segment.object_refs.push(stored.object_refs[*at]);
+                    segment.document_ids.push(stored.document_ids[*at].clone());
+                    segment.document_versions.push(stored.document_versions[*at]);
+                    segment.created_at.push(stored.created_at[*at]);
+                    segment.updated_at.push(stored.updated_at[*at]);
+                }
             }
-            segment.object_refs.push(*object_ref);
-            segment.document_ids.push(document.id.clone());
-            segment.document_versions.push(document.version);
-            segment.created_at.push(document.created_at);
-            segment.updated_at.push(document.updated_at);
         }
 
         for field in &compiled.fields {
@@ -216,11 +256,12 @@ impl TypedSegment {
             // accelerator, so omit this field instead of making checkpoint
             // publication fail or silently narrowing the reference.
             if kind == KIND_REFERENCE
-                && rows.iter().any(|(_, document)| {
-                    matches!(
+                && rows.iter().any(|row| match row {
+                    SegmentRow::Document(_, document) => matches!(
                         document.fields.get(&field.name),
                         Some(Value::GlobalReference(_))
-                    )
+                    ),
+                    SegmentRow::Stored(..) => false,
                 })
             {
                 continue;
@@ -853,11 +894,19 @@ impl ColumnValues {
     }
 }
 
+/// A row for [`TypedSegment::build_from`].
+pub(crate) enum SegmentRow<'a> {
+    /// The row as a document, under its reference.
+    Document(ObjRef, &'a Document),
+    /// The row at this place of a segment that holds it.
+    Stored(&'a TypedSegment, usize),
+}
+
 fn build_column(
     field_id: u16,
     field_name: &str,
     kind: u8,
-    rows: &[(ObjRef, Arc<Document>)],
+    rows: &[SegmentRow<'_>],
 ) -> OQLResult<TypedColumn> {
     let bitmap_len = rows.len().div_ceil(8);
     let mut presence = vec![0; bitmap_len];
@@ -865,7 +914,36 @@ fn build_column(
     let mut values = empty_values(kind, rows.len());
     let mut integer_min = None;
     let mut integer_max = None;
-    for (index, (_, document)) in rows.iter().enumerate() {
+    let mut widen = |value: i64| {
+        integer_min = Some(integer_min.map_or(value, |current: i64| current.min(value)));
+        integer_max = Some(integer_max.map_or(value, |current: i64| current.max(value)));
+    };
+    for (index, row) in rows.iter().enumerate() {
+        let document = match row {
+            SegmentRow::Document(_, document) => document,
+            SegmentRow::Stored(stored, at) => {
+                // The cell goes from one column to the other as it is.
+                let column = stored
+                    .column(field_id)
+                    .ok_or_else(|| storage_error("authoritative typed segment is missing a field"))?;
+                match column.cell(*at)? {
+                    TypedCell::Missing => push_default(&mut values)?,
+                    TypedCell::Null => {
+                        set_bit(&mut presence, index);
+                        set_bit(&mut nulls, index);
+                        push_default(&mut values)?;
+                    }
+                    cell => {
+                        set_bit(&mut presence, index);
+                        push_cell(&mut values, cell)?;
+                        if let TypedCell::Integer(value) = cell {
+                            widen(value);
+                        }
+                    }
+                }
+                continue;
+            }
+        };
         let Some(value) = document.fields.get(field_name) else {
             push_default(&mut values)?;
             continue;
@@ -878,8 +956,7 @@ fn build_column(
         }
         push_value(&mut values, value)?;
         if let Value::Integer(value) = value {
-            integer_min = Some(integer_min.map_or(*value, |current: i64| current.min(*value)));
-            integer_max = Some(integer_max.map_or(*value, |current: i64| current.max(*value)));
+            widen(*value);
         }
     }
     finish_strings(&mut values)?;
@@ -933,6 +1010,26 @@ fn push_value(values: &mut ColumnValues, value: &Value) -> OQLResult<()> {
         (ColumnValues::Booleans(values), Value::Boolean(value)) => values.push(u8::from(*value)),
         (ColumnValues::DateTimes(values), Value::DateTime(value)) => values.push(*value),
         (ColumnValues::References(values), Value::Reference(value)) => values.push(*value),
+        _ => {
+            return Err(storage_error(
+                "typed segment value disagrees with its schema field type",
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn push_cell(values: &mut ColumnValues, cell: TypedCell<'_>) -> OQLResult<()> {
+    match (values, cell) {
+        (ColumnValues::Strings { offsets, bytes }, TypedCell::String(value)) => {
+            offsets.push(as_u32(bytes.len(), "typed string column")?);
+            bytes.extend_from_slice(value.as_bytes());
+        }
+        (ColumnValues::Integers(values), TypedCell::Integer(value)) => values.push(value),
+        (ColumnValues::Floats(values), TypedCell::Float(value)) => values.push(value),
+        (ColumnValues::Booleans(values), TypedCell::Boolean(value)) => values.push(u8::from(value)),
+        (ColumnValues::DateTimes(values), TypedCell::DateTime(value)) => values.push(value),
+        (ColumnValues::References(values), TypedCell::Reference(value)) => values.push(value),
         _ => {
             return Err(storage_error(
                 "typed segment value disagrees with its schema field type",
@@ -1434,6 +1531,54 @@ mod tests {
                 (ObjRef::from_parts(7, 2, 1), Arc::new(second)),
             ],
         )
+    }
+
+    /// A segment made of rows taken from another segment's columns is
+    /// the segment made of the same rows as documents, in any mixture and
+    /// any order, down to its encoded bytes.
+    #[test]
+    fn a_segment_built_from_stored_rows_is_the_one_built_from_their_documents() {
+        let (compiled, schema, rows) = fixture();
+        let stored = TypedSegment::decode(
+            &TypedSegment::build(&compiled, &schema, &rows).unwrap().encode().unwrap(),
+        )
+        .unwrap();
+        // A third row, which no segment holds yet.
+        let mut third = Document::with_id(
+            "c".into(),
+            "events".into(),
+            crate::document::Fields::from_iter([
+                ("active".into(), Value::Boolean(true)),
+                ("message".into(), Value::String("gamma".into())),
+                ("sequence".into(), Value::Integer(40)),
+                ("optional".into(), Value::String("set".into())),
+            ]),
+        );
+        third.created_at = rows[0].1.created_at;
+        third.updated_at = rows[0].1.updated_at;
+        let third = (ObjRef::from_parts(7, 3, 1), Arc::new(third));
+
+        // The stored rows the other way round, with the new row between.
+        let as_documents = vec![rows[1].clone(), third.clone(), rows[0].clone()];
+        let from_documents = TypedSegment::build(&compiled, &schema, &as_documents).unwrap();
+        let mixed = [
+            SegmentRow::Stored(&stored, 1),
+            SegmentRow::Document(third.0, third.1.as_ref()),
+            SegmentRow::Stored(&stored, 0),
+        ];
+        let from_stored = TypedSegment::build_from(&compiled, &schema, &mixed).unwrap();
+        assert_eq!(from_stored, from_documents);
+        assert!(from_stored.authoritative);
+        assert_eq!(from_stored.encode().unwrap(), from_documents.encode().unwrap());
+        for (at, (_, document)) in as_documents.iter().enumerate() {
+            assert_eq!(from_stored.decode_document(at, &compiled).unwrap(), **document);
+        }
+
+        // A row of a segment made under another version of the schema is
+        // not taken as it is.
+        let mut other = stored.clone();
+        other.schema_version += 1;
+        assert!(TypedSegment::build_from(&compiled, &schema, &[SegmentRow::Stored(&other, 0)]).is_err());
     }
 
     #[test]
