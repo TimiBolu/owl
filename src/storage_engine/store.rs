@@ -6889,6 +6889,25 @@ struct CompactionRow {
     /// Where the checkpoint being replaced holds this very record, its
     /// length and its checksum, when it does.
     carried: Option<(u64, u32, u32)>,
+    /// Set when the index pages of the checkpoint being replaced are
+    /// built over and already hold this row's entries, because the row
+    /// has not changed: whether it is kept as a record there. Such a
+    /// row's entries are left as they are. Only the index of rows by id
+    /// has anything to say, when the row stops or starts being a record.
+    in_pages: Option<bool>,
+}
+
+/// Say in the index of rows by id that a row is kept as a record, unless
+/// the pages being built over say so already.
+fn note_row_is_record(ids: &mut IndexSorter, ids_number: usize, row: &CompactionRow) -> OQLResult<()> {
+    if row.in_pages == Some(true) {
+        return Ok(());
+    }
+    ids.push(
+        ids_number,
+        &id_index_key(row.object_ref.collection_id(), &row.document.id),
+        row.object_ref,
+    )
 }
 
 /// Put a row's record in the new checkpoint. One the checkpoint being
@@ -7213,6 +7232,13 @@ static INDEX_CARRIES_REFUSED: AtomicU64 = AtomicU64::new(0);
 impl RustStore {
     /// See [`INDEX_CARRIES`]: compactions that built their indexes over
     /// the pages they replaced, and those that could not.
+    /// How many index pages the compactions of this process carried over
+    /// as they were, and how many they wrote.
+    #[doc(hidden)]
+    pub fn index_pages_carried_and_written() -> (u64, u64) {
+        crate::storage_engine::checkpoint::index_pages_carried_and_written()
+    }
+
     #[doc(hidden)]
     pub fn index_page_carries() -> (u64, u64) {
         (
@@ -7501,7 +7527,7 @@ fn compaction_image(
                             &mut typed_chunk,
                             &mut typed_segments,
                             &mut records,
-                            (&mut index_entries, ids_number),
+                            (&mut index_entries, &mut gone, ids_number),
                         )?;
                         // Its rows' entries are in the pages already when
                         // the indexes are built over those.
@@ -7584,6 +7610,7 @@ fn compaction_image(
                     record: Some(record),
                     schema_version: header.schema_version,
                     carried: None,
+                    in_pages: None,
                 }
             } else {
                 let (_, object_ref) = base
@@ -7594,20 +7621,10 @@ fn compaction_image(
                 let (document, source) = sourced_document(state, object_ref)?.ok_or_else(|| {
                     OQLError::storage_error("compaction base row is missing", None)
                 })?;
-                // It is built into the new checkpoint afresh, so what the
-                // old one's pages say of it goes.
-                if over_pages && from != RowFrom::Memory {
-                    take_out_base_entries(
-                        state,
-                        &document,
-                        object_ref,
-                        from == RowFrom::Record,
-                        &index_numbers,
-                        reverse_number,
-                        ids_number,
-                        &mut gone,
-                    )?;
-                }
+                // The row has not changed, so what the old checkpoint's
+                // pages say of it still holds, wherever in the new one it
+                // ends up.
+                let in_pages = (over_pages && from != RowFrom::Memory).then_some(from == RowFrom::Record);
                 // A row read from its record has the record to hand: it
                 // goes into the new checkpoint as it is, not encoded again.
                 let read = match source {
@@ -7628,9 +7645,11 @@ fn compaction_image(
                     (Some(record), true) => record_carried(state, object_ref, record)?,
                     _ => None,
                 };
-                CompactionRow { object_ref, document, record, schema_version, carried }
+                CompactionRow { object_ref, document, record, schema_version, carried, in_pages }
             };
-            add_compaction_indexes(state, &row, &index_numbers, reverse_number, &mut index_entries)?;
+            if row.in_pages.is_none() {
+                add_compaction_indexes(state, &row, &index_numbers, reverse_number, &mut index_entries)?;
+            }
             let current_version = state.current_schema_versions.get(&schema_name).copied();
             if current_version == Some(row.schema_version) {
                 typed_chunk.push(row);
@@ -7641,7 +7660,7 @@ fn compaction_image(
                         &mut typed_chunk,
                         &mut typed_segments,
                         &mut records,
-                        (&mut index_entries, ids_number),
+                        (&mut index_entries, &mut gone, ids_number),
                     )?;
                 }
             } else {
@@ -7651,14 +7670,10 @@ fn compaction_image(
                     &mut typed_chunk,
                     &mut typed_segments,
                     &mut records,
-                    (&mut index_entries, ids_number),
+                    (&mut index_entries, &mut gone, ids_number),
                 )?;
-                index_entries.push(
-                    ids_number,
-                    &id_index_key(row.object_ref.collection_id(), &row.document.id),
-                    row.object_ref,
-                )?;
-let compiled = state
+                note_row_is_record(&mut index_entries, ids_number, &row)?;
+                let compiled = state
                     .compiled_schemas
                     .get(&(row.object_ref.collection_id(), row.schema_version))
                     .ok_or_else(|| {
@@ -7673,7 +7688,7 @@ let compiled = state
             &mut typed_chunk,
             &mut typed_segments,
             &mut records,
-            (&mut index_entries, ids_number),
+            (&mut index_entries, &mut gone, ids_number),
         )?;
     }
     if changed.is_some() {
@@ -7859,6 +7874,7 @@ fn add_carried_segment_indexes(
             record: None,
             schema_version: handle.schema_version(),
             carried: None,
+            in_pages: None,
         };
         add_compaction_indexes(state, &row, index_numbers, reverse_number, entries)?;
     }
@@ -7895,7 +7911,7 @@ fn flush_compaction_typed_chunk(
     chunk: &mut Vec<CompactionRow>,
     typed_segments: &mut SegmentSpool,
     records: &mut RecordSpool,
-    (ids, ids_number): (&mut IndexSorter, usize),
+    (ids, gone, ids_number): (&mut IndexSorter, &mut IndexSorter, usize),
 ) -> OQLResult<()> {
     if chunk.is_empty() {
         return Ok(());
@@ -7914,11 +7930,7 @@ fn flush_compaction_typed_chunk(
         .ok_or_else(|| OQLError::storage_error("compaction compiled schema is missing", None))?;
     let Some(schema) = state.schemas.get(schema_name) else {
         for row in chunk.iter() {
-            ids.push(
-                ids_number,
-                &id_index_key(row.object_ref.collection_id(), &row.document.id),
-                row.object_ref,
-            )?;
+            note_row_is_record(ids, ids_number, row)?;
             push_row_record(records, row, compiled)?;
         }
         chunk.clear();
@@ -7931,13 +7943,17 @@ fn flush_compaction_typed_chunk(
     let segment = TypedSegment::build(compiled, schema, &rows)?;
     if segment.authoritative {
         typed_segments.push(&segment.encode()?)?;
-    } else {
-        for row in chunk.iter() {
-            ids.push(
+        // A row the pages list as a record is one no longer.
+        for row in chunk.iter().filter(|row| row.in_pages == Some(true)) {
+            gone.push(
                 ids_number,
                 &id_index_key(row.object_ref.collection_id(), &row.document.id),
                 row.object_ref,
             )?;
+        }
+    } else {
+        for row in chunk.iter() {
+            note_row_is_record(ids, ids_number, row)?;
             push_row_record(records, row, compiled)?;
         }
     }

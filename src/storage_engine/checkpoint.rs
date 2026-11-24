@@ -1684,6 +1684,19 @@ impl<'a> SortedEntries<'a> {
     }
 }
 
+/// How many index pages the compactions of this process carried over as
+/// they were, and how many they wrote.
+static INDEX_PAGES_CARRIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static INDEX_PAGES_WRITTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`INDEX_PAGES_CARRIED`].
+pub(crate) fn index_pages_carried_and_written() -> (u64, u64) {
+    (
+        INDEX_PAGES_CARRIED.load(std::sync::atomic::Ordering::Relaxed),
+        INDEX_PAGES_WRITTEN.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 /// The pages of one index as they are made: written to the working file,
 /// or carried over from the checkpoint being replaced.
 struct IndexPagesOut<'a> {
@@ -1736,6 +1749,7 @@ impl IndexPagesOut<'_> {
             carried: false,
         });
         self.carried_from.push(None);
+        INDEX_PAGES_WRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         *self.written += block.len() as u64;
         self.page_len = self.fixed;
         Ok(())
@@ -1752,6 +1766,7 @@ impl IndexPagesOut<'_> {
 
     /// Take a page of the base as it is.
     fn carry(&mut self, descriptor: &IndexPageDescriptor, at: usize) {
+        INDEX_PAGES_CARRIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.pages.push(SpooledIndexPage {
             offset: descriptor.location.offset as u64,
             len: descriptor.location.len,
