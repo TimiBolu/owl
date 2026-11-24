@@ -6883,7 +6883,13 @@ fn checkpoint_image_with_records(
 
 struct CompactionRow {
     object_ref: ObjRef,
-    document: Arc<Document>,
+    /// The row as a document. Absent for a row that is `stored`, which is
+    /// made into a document only if one is needed.
+    document: Option<Arc<Document>>,
+    /// For an unchanged row of a column segment of the checkpoint being
+    /// replaced: that segment, decoded, and the row's place in it. Its
+    /// cells go into the new segment as they are.
+    stored: Option<(Arc<crate::storage_engine::column_segment::TypedSegment>, usize)>,
     record: Option<Arc<[u8]>>,
     schema_version: u32,
     /// Where the checkpoint being replaced holds this very record, its
@@ -6897,6 +6903,26 @@ struct CompactionRow {
     in_pages: Option<bool>,
 }
 
+impl CompactionRow {
+    fn id(&self) -> &str {
+        match (&self.document, &self.stored) {
+            (Some(document), _) => &document.id,
+            (None, Some((segment, row))) => &segment.document_ids[*row],
+            (None, None) => "",
+        }
+    }
+
+    /// The row as a document, made from its segment if that is how it is
+    /// held.
+    fn whole(&self, compiled: &CompiledSchema) -> OQLResult<Arc<Document>> {
+        match (&self.document, &self.stored) {
+            (Some(document), _) => Ok(document.clone()),
+            (None, Some((segment, row))) => Ok(Arc::new(segment.decode_document(*row, compiled)?)),
+            (None, None) => Err(OQLError::storage_error("a compaction row holds no row", None)),
+        }
+    }
+}
+
 /// Say in the index of rows by id that a row is kept as a record, unless
 /// the pages being built over say so already.
 fn note_row_is_record(ids: &mut IndexSorter, ids_number: usize, row: &CompactionRow) -> OQLResult<()> {
@@ -6905,7 +6931,7 @@ fn note_row_is_record(ids: &mut IndexSorter, ids_number: usize, row: &Compaction
     }
     ids.push(
         ids_number,
-        &id_index_key(row.object_ref.collection_id(), &row.document.id),
+        &id_index_key(row.object_ref.collection_id(), row.id()),
         row.object_ref,
     )
 }
@@ -6925,7 +6951,7 @@ fn push_row_record(
         Some(record) => records.push(row.object_ref, record),
         None => records.push(
             row.object_ref,
-            &RecordCodec::encode(&row.document, row.object_ref, compiled)?,
+            &RecordCodec::encode(row.whole(compiled)?.as_ref(), row.object_ref, compiled)?,
         ),
     }
 }
@@ -7443,6 +7469,8 @@ fn compaction_image(
         base_rows.note_passed_over = over_pages;
         let mut base = base_rows.next()?;
         let mut typed_chunk = Vec::<CompactionRow>::with_capacity(TARGET_ROWS);
+        // The column segment the last such row was read from, decoded.
+        let mut held_segment: Option<(usize, Arc<crate::storage_engine::column_segment::TypedSegment>)> = None;
         // A row of the checkpoint's files that will not be carried over
         // as it is has its entries taken out of the pages.
         let take_out = |gone: &mut IndexSorter, object_ref: ObjRef, from: RowFrom| -> OQLResult<()> {
@@ -7606,7 +7634,8 @@ fn compaction_image(
                     })?;
                 CompactionRow {
                     object_ref: change.object_ref,
-                    document: Arc::new(RecordCodec::decode(&record, compiled)?),
+                    document: Some(Arc::new(RecordCodec::decode(&record, compiled)?)),
+                    stored: None,
                     record: Some(record),
                     schema_version: header.schema_version,
                     carried: None,
@@ -7617,14 +7646,54 @@ fn compaction_image(
                     .take()
                     .ok_or_else(|| OQLError::storage_error("compaction cursor is empty", None))?;
                 let from = base_rows.gave_from;
+                let at = base_rows.gave;
                 base = base_rows.next()?;
-                let (document, source) = sourced_document(state, object_ref)?.ok_or_else(|| {
-                    OQLError::storage_error("compaction base row is missing", None)
-                })?;
                 // The row has not changed, so what the old checkpoint's
                 // pages say of it still holds, wherever in the new one it
                 // ends up.
                 let in_pages = (over_pages && from != RowFrom::Memory).then_some(from == RowFrom::Record);
+                // One in a column segment that says everything of its rows
+                // is not made a document: its cells go from that segment
+                // to the new one as they are.
+                let stored = match (in_pages, at) {
+                    (Some(false), Some((fence_index, row))) => {
+                        let handle = state
+                            .typed_id_fences
+                            .get(&schema_name)
+                            .and_then(|fences| fences.get(fence_index))
+                            .and_then(|fence| state.typed_segments.get(fence.segment_index));
+                        match handle {
+                            Some(handle) if handle.authoritative() => {
+                                let decoded = match &held_segment {
+                                    Some((held, decoded)) if *held == fence_index => decoded.clone(),
+                                    _ => {
+                                        let decoded = handle.load()?;
+                                        held_segment = Some((fence_index, decoded.clone()));
+                                        decoded
+                                    }
+                                };
+                                Some((decoded, row, handle.schema_version()))
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some((segment, row, schema_version)) = stored {
+                    CompactionRow {
+                        object_ref,
+                        document: None,
+                        stored: Some((segment, row)),
+                        record: None,
+                        schema_version,
+                        carried: None,
+                        in_pages,
+                    }
+                } else {
+                let (document, source) = sourced_document(state, object_ref)?.ok_or_else(|| {
+                    OQLError::storage_error("compaction base row is missing", None)
+                })?;
+
                 // A row read from its record has the record to hand: it
                 // goes into the new checkpoint as it is, not encoded again.
                 let read = match source {
@@ -7645,7 +7714,16 @@ fn compaction_image(
                     (Some(record), true) => record_carried(state, object_ref, record)?,
                     _ => None,
                 };
-                CompactionRow { object_ref, document, record, schema_version, carried, in_pages }
+                CompactionRow {
+                    object_ref,
+                    document: Some(document),
+                    stored: None,
+                    record,
+                    schema_version,
+                    carried,
+                    in_pages,
+                }
+                }
             };
             if row.in_pages.is_none() {
                 add_compaction_indexes(state, &row, &index_numbers, reverse_number, &mut index_entries)?;
@@ -7870,7 +7948,8 @@ fn add_carried_segment_indexes(
     for row in 0..segment.row_count() {
         let row = CompactionRow {
             object_ref: handle.object_ref(row)?,
-            document: Arc::new(segment.decode_document_reading(row, compiled, Some(&wanted))?),
+            document: Some(Arc::new(segment.decode_document_reading(row, compiled, Some(&wanted))?)),
+            stored: None,
             record: None,
             schema_version: handle.schema_version(),
             carried: None,
@@ -7888,18 +7967,22 @@ fn add_compaction_indexes(
     reverse_number: usize,
     entries: &mut IndexSorter,
 ) -> OQLResult<()> {
+    let document = row
+        .document
+        .as_ref()
+        .ok_or_else(|| OQLError::storage_error("a row to index was not made a document", None))?;
     for definition in state
         .scalar_indexes
-        .get(&row.document.schema)
+        .get(&document.schema)
         .into_iter()
         .flatten()
     {
         let number = *index_numbers
             .get(&(definition.schema.clone(), definition.name.clone()))
             .ok_or_else(|| OQLError::storage_error("compaction index builder is missing", None))?;
-        entries.push(number, &document_index_key(&row.document, definition)?, row.object_ref)?;
+        entries.push(number, &document_index_key(document, definition)?, row.object_ref)?;
     }
-    for key in document_reverse_keys(&row.document) {
+    for key in document_reverse_keys(document) {
         entries.push(reverse_number, &key, row.object_ref)?;
     }
     Ok(())
@@ -7936,18 +8019,24 @@ fn flush_compaction_typed_chunk(
         chunk.clear();
         return Ok(());
     };
+    use crate::storage_engine::column_segment::SegmentRow;
     let rows = chunk
         .iter()
-        .map(|row| (row.object_ref, row.document.clone()))
-        .collect::<Vec<_>>();
-    let segment = TypedSegment::build(compiled, schema, &rows)?;
+        .map(|row| match (&row.document, &row.stored) {
+            (Some(document), _) => Ok(SegmentRow::Document(row.object_ref, document.as_ref())),
+            (None, Some((segment, at))) => Ok(SegmentRow::Stored(segment.as_ref(), *at)),
+            (None, None) => Err(OQLError::storage_error("a compaction row holds no row", None)),
+        })
+        .collect::<OQLResult<Vec<_>>>()?;
+    let segment = TypedSegment::build_from(compiled, schema, &rows)?;
+    drop(rows);
     if segment.authoritative {
         typed_segments.push(&segment.encode()?)?;
         // A row the pages list as a record is one no longer.
         for row in chunk.iter().filter(|row| row.in_pages == Some(true)) {
             gone.push(
                 ids_number,
-                &id_index_key(row.object_ref.collection_id(), &row.document.id),
+                &id_index_key(row.object_ref.collection_id(), row.id()),
                 row.object_ref,
             )?;
         }
