@@ -16,11 +16,27 @@
 //!   more than its budget;
 //! - removing a part removes it from the object store too.
 //!
-//! Everything that is not a part (the log, the roots, the manifests) stays
-//! on the local file system. One process writes a database; this module
-//! does nothing to keep a second writer out.
+//! Everything that is not a part (the log, the roots, the manifests) lives
+//! on the local file system. For another machine to read the database,
+//! the writer *publishes* it: [`RustStore::publish`] puts a copy of those
+//! files, as they stand at one commit, in the object store under numbered
+//! names, and then moves a pointer object to the new number. A reader
+//! ([`ObjectFileSystem::reader`]) fetches the files the pointer names into
+//! a directory of its own and opens them there, reading parts from the
+//! object store. It holds nothing the writer needs and puts and deletes
+//! nothing, so any number of them can come and go.
+//!
+//! The publication before the newest is kept, and so are the parts it
+//! lists, so a reader that opened one publication goes on working through
+//! the next. After that it must open again.
+//!
+//! One process writes a database; this module does nothing to keep a
+//! second writer out.
 
+use super::RustStore;
+use crate::error::{OQLError, OQLResult};
 use crate::simulation::filesystem::{FileHandle, FileOptions, FileSystem, MemoryMap};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, Read, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -501,6 +517,14 @@ impl FileHandle for RemotePart {
     }
 }
 
+/// Open a file to read it by position, leaving alone any cursor another
+/// handle on it has. The log is read this way while it is being appended
+/// to. (The simulated file system keeps one cursor for a file, and its
+/// plain `open` sets that cursor back to the start.)
+fn open_to_read(filesystem: &dyn FileSystem, path: &Path) -> io::Result<Box<dyn FileHandle>> {
+    filesystem.open_with_options(path, &FileOptions::default())
+}
+
 /// A file's bytes from its start, for a put.
 struct FromStart<'a> {
     file: &'a dyn FileHandle,
@@ -551,7 +575,7 @@ impl FileHandle for PartUpload {
     fn sync(&mut self) -> io::Result<()> {
         self.file.sync()?;
         // The handle that wrote the part may not be one that reads.
-        let written = self.local.open(&self.path)?;
+        let written = open_to_read(self.local.as_ref(), &self.path)?;
         let len = written.size()?;
         self.objects.put(
             &self.key,
@@ -589,6 +613,14 @@ pub struct ObjectFileSystem {
     objects: Arc<dyn ObjectStore>,
     directory: PathBuf,
     cache: Arc<BlockCache>,
+    /// A reader's: nothing is put in the object store or deleted from it.
+    reads_only: bool,
+    /// The number of the newest publication this writer knows of.
+    published: AtomicU64,
+    /// Parts removed since a publication that may list them, each with
+    /// the number of the newest publication when it was removed. Their
+    /// objects are deleted once no kept publication can list them.
+    retired: Mutex<Vec<(String, u64)>>,
 }
 
 impl ObjectFileSystem {
@@ -602,6 +634,7 @@ impl ObjectFileSystem {
         cache_bytes: u64,
     ) -> io::Result<Arc<Self>> {
         let directory = directory.into();
+        let objects_for_number = objects.clone();
         local.create_dir_all(&directory)?;
         // Blocks kept by an earlier run are not known to this one. They
         // are dropped, so that the cache holds what it counts.
@@ -621,7 +654,54 @@ impl ObjectFileSystem {
             local,
             objects,
             directory,
+            reads_only: false,
+            published: AtomicU64::new(newest_publication(objects_for_number.as_ref())?),
+            retired: Mutex::new(Vec::new()),
         }))
+    }
+
+    /// Make ready to read the database called `database` as it was last
+    /// published to `objects`: fetch its files into `directory` on
+    /// `local`, in place of any files of that database already there, and
+    /// give the file system to open it with. The database is then opened
+    /// at `directory/database`.
+    ///
+    /// What is opened is the reader's own. It may write to its directory,
+    /// as any open database does, and nothing it does reaches the object
+    /// store. To see a later publication, call this again.
+    pub fn reader(
+        local: Arc<dyn FileSystem>,
+        objects: Arc<dyn ObjectStore>,
+        directory: impl Into<PathBuf>,
+        database: &str,
+        cache_bytes: u64,
+    ) -> io::Result<(Arc<Self>, Published)> {
+        let directory = directory.into();
+        local.create_dir_all(&directory)?;
+        // A publication can be replaced while it is being fetched. Its
+        // files are then gone, and the newer one is fetched instead.
+        let mut attempts = 0;
+        let published = loop {
+            let published = Published::newest(objects.as_ref(), database)?.ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("'{database}' has not been published"))
+            })?;
+            for path in local.list_dir(&directory)? {
+                let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+                if belongs_to(database, name) {
+                    local.remove(&path)?;
+                }
+            }
+            match published.fetch(local.as_ref(), objects.as_ref(), &directory) {
+                Ok(()) => break published,
+                Err(error) if error.kind() == io::ErrorKind::NotFound && attempts < 3 => attempts += 1,
+                Err(error) => return Err(error),
+            }
+        };
+        local.sync_all()?;
+        let filesystem = Self::new(local, objects, directory, cache_bytes)?;
+        let mut filesystem = Arc::try_unwrap(filesystem).unwrap_or_else(|_| unreachable!("just made"));
+        filesystem.reads_only = true;
+        Ok((Arc::new(filesystem), published))
     }
 
     /// Remove the local copy of every part that is in the object store,
@@ -651,6 +731,9 @@ impl ObjectFileSystem {
         if self.local.exists(path) {
             return Ok(None);
         }
+        if self.retired.lock().unwrap().iter().any(|(other, _)| *other == key) {
+            return Ok(None);
+        }
         Ok(self.objects.len(&key)?.map(|len| (key, len)))
     }
 
@@ -671,6 +754,10 @@ impl FileSystem for ObjectFileSystem {
         let Some(key) = part_key(&self.directory, path) else {
             return Ok(file);
         };
+        if self.reads_only {
+            // A reader's own part stays in its directory.
+            return Ok(file);
+        }
         // A part of this name made before, and never listed by a root,
         // may have left blocks behind.
         self.cache.forget(&key);
@@ -704,9 +791,25 @@ impl FileSystem for ObjectFileSystem {
         let Some(key) = part_key(&self.directory, path) else {
             return self.local.remove(path);
         };
-        // The object goes first. If that fails the part is still whole in
-        // both places, and the removal can be tried again.
-        self.objects.delete(&key)?;
+        if self.reads_only {
+            // A reader removes what is its own and leaves the rest.
+            return match self.local.exists(path) {
+                true => self.local.remove(path),
+                false => Ok(()),
+            };
+        }
+        let published = self.published.load(Ordering::Acquire);
+        if published == 0 {
+            // The object goes first. If that fails the part is still
+            // whole in both places, and the removal can be tried again.
+            self.objects.delete(&key)?;
+        } else {
+            // A publication may still list it. Its object waits.
+            let mut retired = self.retired.lock().unwrap();
+            if !retired.iter().any(|(other, _)| *other == key) {
+                retired.push((key.clone(), published));
+            }
+        }
         self.cache.forget(&key);
         if self.local.exists(path) {
             self.local.remove(path)?;
@@ -751,7 +854,15 @@ impl FileSystem for ObjectFileSystem {
         listed.retain(|path| {
             !path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.contains(CACHED))
         });
+        if self.reads_only {
+            return Ok(listed);
+        }
+        let retired = self.retired.lock().unwrap();
         for key in self.objects.list("")? {
+            // A part waiting to be deleted is, to the store, gone.
+            if retired.iter().any(|(other, _)| *other == key) {
+                continue;
+            }
             let path = directory.join(&key);
             if part_key(directory, &path).is_some() && !listed.contains(&path) {
                 listed.push(path);
@@ -759,6 +870,227 @@ impl FileSystem for ObjectFileSystem {
         }
         listed.sort();
         Ok(listed)
+    }
+}
+
+/// The number of the newest publication in an object store, or zero when
+/// nothing has been published there. A writer that starts again learns
+/// from it that readers may be about, and that removed parts must wait.
+fn newest_publication(objects: &dyn ObjectStore) -> io::Result<u64> {
+    let mut newest = 0;
+    for key in objects.list("")? {
+        if let Some(database) = key.strip_suffix(".published") {
+            if let Some(published) = Published::newest(objects, database)? {
+                newest = newest.max(published.number);
+            }
+        }
+    }
+    Ok(newest)
+}
+
+/// Whether a file of this name is one of the database called `database`:
+/// the file itself, or anything named `<database>.<something>`.
+fn belongs_to(database: &str, name: &str) -> bool {
+    name == database || name.strip_prefix(database).is_some_and(|rest| rest.starts_with('.'))
+}
+
+/// One file of a publication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublishedFile {
+    pub name: String,
+    pub bytes: u64,
+    pub crc32: u32,
+}
+
+/// A database as it stood at one commit, in the object store for readers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Published {
+    /// Which publication this is. Each is one more than the last.
+    pub number: u64,
+    /// The last commit it contains.
+    pub committed_lsn: u64,
+    /// Its files, other than parts. A part is an object under its own
+    /// name, shared by every publication that lists it.
+    pub files: Vec<PublishedFile>,
+}
+
+impl Published {
+    /// The object that says which publication is the newest.
+    fn pointer(database: &str) -> String {
+        format!("{database}.published")
+    }
+
+    /// The object a file of publication `number` is kept as.
+    fn key(name: &str, number: u64) -> String {
+        format!("{name}@{number}")
+    }
+
+    /// The publication a key is a file of, when it is one of `database`'s.
+    fn number_of(database: &str, key: &str) -> Option<u64> {
+        let (name, number) = key.rsplit_once('@')?;
+        belongs_to(database, name).then(|| number.parse().ok())?
+    }
+
+    /// The newest publication of `database`, if it has been published.
+    pub fn newest(objects: &dyn ObjectStore, database: &str) -> io::Result<Option<Self>> {
+        let key = Self::pointer(database);
+        let Some(len) = objects.len(&key)? else {
+            return Ok(None);
+        };
+        let mut encoded = vec![0u8; len as usize];
+        let read = objects.read_at(&key, 0, &mut encoded)?;
+        serde_json::from_slice(&encoded[..read])
+            .map(Some)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("'{key}' cannot be read: {error}")))
+    }
+
+    /// Bring the publication's files to `directory`, each checked against
+    /// its size and checksum.
+    fn fetch(&self, local: &dyn FileSystem, objects: &dyn ObjectStore, directory: &Path) -> io::Result<()> {
+        let mut buffer = vec![0u8; BLOCK as usize];
+        for file in &self.files {
+            let key = Self::key(&file.name, self.number);
+            let mut target = local.create(&directory.join(&file.name))?;
+            let mut checksum = crc32fast::Hasher::new();
+            let mut at = 0u64;
+            while at < file.bytes {
+                let wanted = (file.bytes - at).min(BLOCK) as usize;
+                let count = objects.read_at(&key, at, &mut buffer[..wanted])?;
+                if count == 0 {
+                    break;
+                }
+                checksum.update(&buffer[..count]);
+                let mut done = 0;
+                while done < count {
+                    done += match target.write(&buffer[done..count])? {
+                        0 => return Err(io::Error::new(io::ErrorKind::WriteZero, "a fetched file could not be written")),
+                        written => written,
+                    };
+                }
+                at += count as u64;
+            }
+            if at != file.bytes || checksum.finalize() != file.crc32 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("'{key}' is not the file that was published"),
+                ));
+            }
+            target.flush()?;
+            target.sync()?;
+        }
+        Ok(())
+    }
+}
+
+/// A reader over a file that keeps the checksum of what it has given.
+struct Summed<'a> {
+    file: &'a dyn FileHandle,
+    at: u64,
+    checksum: crc32fast::Hasher,
+}
+
+impl Read for Summed<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = self.file.read_at(buffer, self.at)?;
+        self.checksum.update(&buffer[..count]);
+        self.at += count as u64;
+        Ok(count)
+    }
+}
+
+impl RustStore {
+    /// Publish the database, as of its last commit, for readers.
+    ///
+    /// `filesystem` is the one this store was opened with. Every file of
+    /// the database other than its parts is put in the object store under
+    /// a name of this publication, and then the pointer readers follow is
+    /// moved to it. Commits wait while the files are put; reads carry on.
+    ///
+    /// The publication before this one is kept, with the parts it lists.
+    /// Older ones, and parts only they listed, are deleted.
+    pub fn publish(&self, filesystem: &ObjectFileSystem) -> OQLResult<Published> {
+        let failed = |what: &str, error: io::Error| {
+            OQLError::storage_error(&format!("publish: cannot {what}: {error}"), None)
+        };
+        if filesystem.reads_only {
+            return Err(OQLError::storage_error("publish: a reader does not publish", None));
+        }
+        let (local, objects) = (filesystem.local.as_ref(), filesystem.objects.as_ref());
+        let published = self.with_files_frozen(|database, committed_lsn| {
+            let name = database
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| OQLError::storage_error("publish: the database has no name", None))?;
+            let number = Published::newest(objects, name)
+                .map_err(|error| failed("read the last publication", error))?
+                .map_or(0, |newest| newest.number)
+                .max(filesystem.published.load(Ordering::Acquire))
+                + 1;
+            let mut files = Vec::new();
+            let listed = local
+                .list_dir(&filesystem.directory)
+                .map_err(|error| failed("list the database's files", error))?;
+            for path in listed {
+                let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if !belongs_to(name, file_name)
+                    || file_name.contains(CACHED)
+                    || part_key(&filesystem.directory, &path).is_some()
+                {
+                    continue;
+                }
+                let file = open_to_read(local, &path).map_err(|error| failed(&format!("read {file_name}"), error))?;
+                let bytes = file.size().map_err(|error| failed(&format!("measure {file_name}"), error))?;
+                let mut source = Summed {
+                    file: file.as_ref(),
+                    at: 0,
+                    checksum: crc32fast::Hasher::new(),
+                };
+                objects
+                    .put(&Published::key(file_name, number), &mut source, bytes)
+                    .map_err(|error| failed(&format!("put {file_name}"), error))?;
+                files.push(PublishedFile {
+                    name: file_name.to_string(),
+                    bytes,
+                    crc32: source.checksum.finalize(),
+                });
+            }
+            let published = Published {
+                number,
+                committed_lsn,
+                files,
+            };
+            // The pointer goes last. Until it moves, readers see the
+            // publication before, whole.
+            let encoded = serde_json::to_vec(&published)
+                .map_err(|error| OQLError::storage_error(&format!("publish: cannot encode: {error}"), None))?;
+            objects
+                .put(&Published::pointer(name), &mut &encoded[..], encoded.len() as u64)
+                .map_err(|error| failed("move the pointer", error))?;
+            filesystem.published.store(number, Ordering::Release);
+            Ok((name.to_string(), published))
+        });
+        let (name, published) = published?;
+
+        // What no kept publication can need is deleted. A failure here
+        // leaves objects behind and loses nothing; the next publication
+        // tries again.
+        let keep_from = published.number.saturating_sub(1);
+        if let Ok(keys) = objects.list(&name) {
+            for key in keys {
+                if Published::number_of(&name, &key).is_some_and(|number| number < keep_from) {
+                    let _ = objects.delete(&key);
+                }
+            }
+        }
+        let mut retired = filesystem.retired.lock().unwrap();
+        retired.retain(|(key, when)| {
+            // Removed after publication `when`, so `when` may list it and
+            // no later one does.
+            *when >= keep_from || objects.delete(key).is_err()
+        });
+        Ok(published)
     }
 }
 
@@ -945,5 +1277,145 @@ mod tests {
         filesystem.remove(Path::new("shop.owl.part.900")).unwrap();
         assert!(objects.list("").unwrap().is_empty());
         assert!(!filesystem.exists(Path::new("shop.owl.part.900")));
+    }
+
+    /// A writer's database with rows 0..300 checkpointed and 300 in the
+    /// log, and the file system it was opened with.
+    fn written(seed: u64, objects: &Arc<MemoryObjectStore>) -> (RustStore, Arc<ObjectFileSystem>) {
+        let local = Arc::new(SimulatedFileSystem::new(seed));
+        let filesystem = layered(&local, objects, 8 << 20);
+        let store = RustStore::new_with_fs(Path::new("shop.owl"), 64 << 20, filesystem.clone()).unwrap();
+        for number in 0..300 {
+            store.put_document(&event(number)).unwrap();
+        }
+        store.checkpoint().unwrap();
+        store.put_document(&event(300)).unwrap();
+        (store, filesystem)
+    }
+
+    /// Open the database as last published, on a machine of its own.
+    fn read(seed: u64, objects: &Arc<MemoryObjectStore>) -> (RustStore, Arc<SimulatedFileSystem>) {
+        let machine = Arc::new(SimulatedFileSystem::new(seed));
+        let (filesystem, _) =
+            ObjectFileSystem::reader(machine.clone(), objects.clone(), "", "shop.owl", 8 << 20).unwrap();
+        let store = RustStore::new_with_fs(Path::new("shop.owl"), 64 << 20, filesystem).unwrap();
+        (store, machine)
+    }
+
+    #[test]
+    fn a_reader_opens_from_the_object_store_alone() {
+        let objects = Arc::new(MemoryObjectStore::new());
+        let (writer, filesystem) = written(810, &objects);
+        let published = writer.publish(&filesystem).unwrap();
+        assert_eq!(published.number, 1);
+        assert_eq!(published.committed_lsn, writer.committed_lsn());
+
+        let before = objects.list("").unwrap();
+        let (reader, machine) = read(811, &objects);
+        // Checkpointed rows and the one that was only in the log.
+        assert_eq!(codes(&reader), (0..=300).collect::<Vec<_>>());
+        let fetched_parts = machine
+            .list_dir(Path::new(""))
+            .unwrap()
+            .iter()
+            .filter(|path| part_key(Path::new(""), path).is_some())
+            .count();
+        assert_eq!(fetched_parts, 0, "a reader fetches blocks of a part, not the part");
+
+        // Whatever the reader does stays with the reader.
+        reader.put_document(&event(999)).unwrap();
+        reader.checkpoint().unwrap();
+        drop(reader);
+        assert_eq!(objects.list("").unwrap(), before);
+        assert_eq!(codes(&writer), (0..=300).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_reader_sees_what_was_published_and_no_later() {
+        let objects = Arc::new(MemoryObjectStore::new());
+        let (writer, filesystem) = written(812, &objects);
+        writer.publish(&filesystem).unwrap();
+        let (first, _) = read(813, &objects);
+
+        for number in 301..400 {
+            writer.put_document(&event(number)).unwrap();
+        }
+        writer.checkpoint().unwrap();
+        assert_eq!(codes(&first), (0..=300).collect::<Vec<_>>(), "unpublished writes are not seen");
+
+        assert_eq!(writer.publish(&filesystem).unwrap().number, 2);
+        let (second, _) = read(814, &objects);
+        assert_eq!(codes(&second), (0..400).collect::<Vec<_>>());
+        // The reader of the publication before goes on working.
+        assert_eq!(codes(&first), (0..=300).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn publications_before_the_last_two_are_deleted_with_their_parts() {
+        let objects = Arc::new(MemoryObjectStore::new());
+        let (writer, filesystem) = written(815, &objects);
+        writer.publish(&filesystem).unwrap();
+        let first_parts: Vec<String> =
+            objects.list("").unwrap().into_iter().filter(|key| !key.contains('@') && key.contains(".part.")).collect();
+        assert!(!first_parts.is_empty());
+
+        // Rewrite every row twice over, so that the first part is listed
+        // by no root, and publish each time.
+        for round in 0..3 {
+            for number in 0..=300 {
+                let mut changed = event(number);
+                changed.fields.insert("round".into(), Value::Integer(round));
+                writer.put_document(&changed).unwrap();
+            }
+            writer.checkpoint().unwrap();
+            writer.wait_for_maintenance().unwrap();
+            writer.reclaim_obsolete_files().unwrap();
+            writer.publish(&filesystem).unwrap();
+        }
+
+        let keys = objects.list("").unwrap();
+        let numbers: std::collections::BTreeSet<u64> =
+            keys.iter().filter_map(|key| Published::number_of("shop.owl", key)).collect();
+        assert_eq!(numbers.into_iter().collect::<Vec<_>>(), [3, 4], "the last two publications are kept");
+        for part in &first_parts {
+            assert!(!keys.contains(part), "'{part}' is listed by no kept publication and is still there");
+        }
+        // And a reader of the newest has every part it needs.
+        let (reader, _) = read(816, &objects);
+        assert_eq!(codes(&reader), (0..=300).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_database_that_was_never_published_cannot_be_read() {
+        let objects = Arc::new(MemoryObjectStore::new());
+        let (_writer, _filesystem) = written(817, &objects);
+        let machine = Arc::new(SimulatedFileSystem::new(818));
+        let error = ObjectFileSystem::reader(machine, objects.clone(), "", "shop.owl", 8 << 20).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn a_writer_that_starts_again_keeps_parts_a_reader_may_need() {
+        let objects = Arc::new(MemoryObjectStore::new());
+        let local = Arc::new(SimulatedFileSystem::new(819));
+        {
+            let filesystem = layered(&local, &objects, 8 << 20);
+            let store = RustStore::new_with_fs(Path::new("shop.owl"), 64 << 20, filesystem.clone()).unwrap();
+            for number in 0..300 {
+                store.put_document(&event(number)).unwrap();
+            }
+            store.checkpoint().unwrap();
+            store.publish(&filesystem).unwrap();
+        }
+        let (reader, _) = read(820, &objects);
+
+        // A new process: it has published nothing itself.
+        let filesystem = layered(&local, &objects, 8 << 20);
+        let part = objects.list("").unwrap().into_iter().find(|key| key.ends_with(".part.1") || key.contains(".part.")).unwrap();
+        let part = part.split('@').next().unwrap().to_string();
+        filesystem.remove(Path::new(&part)).unwrap();
+        assert!(objects.len(&part).unwrap().is_some(), "the published part waits for a later publication");
+        assert!(!filesystem.exists(Path::new(&part)), "to the writer it is gone");
+        assert_eq!(codes(&reader), (0..300).collect::<Vec<_>>());
     }
 }
