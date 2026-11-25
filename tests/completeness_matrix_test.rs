@@ -28,6 +28,8 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 const DOCUMENT: &str = "docs/COMPLETENESS_MATRIX.md";
+/// The same rows as data, for the website's matrix page.
+const SITE_DATA: &str = "website/src/lib/matrix.json";
 
 /// The shop every row is run against.
 const SHOP: &str = r#"
@@ -354,16 +356,50 @@ fn every_answer_in_the_matrix_is_what_the_engine_does() {
 
 #[test]
 fn the_written_matrix_is_these_rows() {
-    let written = render();
+    let written = [(DOCUMENT, render()), (SITE_DATA, site_data())];
     if std::env::var("OWL_WRITE_MATRIX").is_ok() {
-        std::fs::write(DOCUMENT, &written).unwrap();
+        for (path, text) in &written {
+            std::fs::write(path, text).unwrap();
+        }
         return;
     }
-    let on_disk = std::fs::read_to_string(DOCUMENT).unwrap_or_default();
-    assert!(
-        on_disk == written,
-        "{DOCUMENT} is out of date. Run:\n  OWL_WRITE_MATRIX=1 cargo test --release --test completeness_matrix_test"
-    );
+    for (path, text) in &written {
+        let on_disk = std::fs::read_to_string(path).unwrap_or_default();
+        assert!(
+            on_disk == *text,
+            "{path} is out of date. Run:\n  OWL_WRITE_MATRIX=1 cargo test --release --test completeness_matrix_test"
+        );
+    }
+}
+
+/// The rows as JSON: what the website's matrix page shows.
+fn site_data() -> String {
+    let areas: Vec<_> = matrix()
+        .into_iter()
+        .map(|(area, rows)| {
+            let rows: Vec<_> = rows
+                .iter()
+                .map(|row| {
+                    serde_json::json!({
+                        "feature": row.feature,
+                        "sql": row.sql,
+                        "mongo": row.mongo,
+                        "answer": row.answer.word(),
+                        "oql": row.oql,
+                        "check": row.check,
+                        "gives": if row.holding { "" } else { row.expect },
+                        "refuses": row.refuses,
+                        "test": row.test.map(|(file, function)| format!("{function} in {file}")),
+                        "note": row.note,
+                    })
+                })
+                .collect();
+            serde_json::json!({ "area": area, "rows": rows })
+        })
+        .collect();
+    let mut text = serde_json::to_string_pretty(&areas).unwrap();
+    text.push('\n');
+    text
 }
 
 /// Code in a table cell: one code span a line, with the bar escaped.

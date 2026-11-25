@@ -23,6 +23,12 @@ export const Route = createFileRoute("/sitemap.xml")({
     <changefreq>weekly</changefreq>
     <priority>0.8</priority>
   </url>
+  <url>
+    <loc>${SITE_URL}/matrix</loc>
+    <lastmod>${__BUILD_DATE__}</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>0.7</priority>
+  </url>
 </urlset>
 `,
           { headers: { "content-type": "application/xml; charset=utf-8", "cache-control": "public, max-age=3600" } },

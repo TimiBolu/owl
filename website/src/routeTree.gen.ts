@@ -11,6 +11,7 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as HealthCheckRouteImport } from './routes/health-check'
+import { Route as MatrixRouteImport } from './routes/matrix'
 import { Route as PlayRouteImport } from './routes/play'
 import { Route as RobotsDottxtRouteImport } from './routes/robots[.]txt'
 import { Route as SitemapDotxmlRouteImport } from './routes/sitemap[.]xml'
@@ -24,6 +25,11 @@ const IndexRoute = IndexRouteImport.update({
 const HealthCheckRoute = HealthCheckRouteImport.update({
   id: '/health-check',
   path: '/health-check',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const MatrixRoute = MatrixRouteImport.update({
+  id: '/matrix',
+  path: '/matrix',
   getParentRoute: () => rootRouteImport,
 } as any)
 const PlayRoute = PlayRouteImport.update({
@@ -50,6 +56,7 @@ const TryRoute = TryRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/health-check': typeof HealthCheckRoute
+  '/matrix': typeof MatrixRoute
   '/play': typeof PlayRoute
   '/robots.txt': typeof RobotsDottxtRoute
   '/sitemap.xml': typeof SitemapDotxmlRoute
@@ -58,6 +65,7 @@ export interface FileRoutesByFullPath {
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/health-check': typeof HealthCheckRoute
+  '/matrix': typeof MatrixRoute
   '/play': typeof PlayRoute
   '/robots.txt': typeof RobotsDottxtRoute
   '/sitemap.xml': typeof SitemapDotxmlRoute
@@ -67,6 +75,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/health-check': typeof HealthCheckRoute
+  '/matrix': typeof MatrixRoute
   '/play': typeof PlayRoute
   '/robots.txt': typeof RobotsDottxtRoute
   '/sitemap.xml': typeof SitemapDotxmlRoute
@@ -75,13 +84,27 @@ export interface FileRoutesById {
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
-    '/' | '/health-check' | '/play' | '/robots.txt' | '/sitemap.xml' | '/try'
+    | '/'
+    | '/health-check'
+    | '/matrix'
+    | '/play'
+    | '/robots.txt'
+    | '/sitemap.xml'
+    | '/try'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/health-check' | '/play' | '/robots.txt' | '/sitemap.xml' | '/try'
+  to:
+    | '/'
+    | '/health-check'
+    | '/matrix'
+    | '/play'
+    | '/robots.txt'
+    | '/sitemap.xml'
+    | '/try'
   id:
     | '__root__'
     | '/'
     | '/health-check'
+    | '/matrix'
     | '/play'
     | '/robots.txt'
     | '/sitemap.xml'
@@ -91,6 +114,7 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   HealthCheckRoute: typeof HealthCheckRoute
+  MatrixRoute: typeof MatrixRoute
   PlayRoute: typeof PlayRoute
   RobotsDottxtRoute: typeof RobotsDottxtRoute
   SitemapDotxmlRoute: typeof SitemapDotxmlRoute
@@ -111,6 +135,13 @@ declare module '@tanstack/react-router' {
       path: '/health-check'
       fullPath: '/health-check'
       preLoaderRoute: typeof HealthCheckRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/matrix': {
+      id: '/matrix'
+      path: '/matrix'
+      fullPath: '/matrix'
+      preLoaderRoute: typeof MatrixRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/play': {
@@ -147,6 +178,7 @@ declare module '@tanstack/react-router' {
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   HealthCheckRoute: HealthCheckRoute,
+  MatrixRoute: MatrixRoute,
   PlayRoute: PlayRoute,
   RobotsDottxtRoute: RobotsDottxtRoute,
   SitemapDotxmlRoute: SitemapDotxmlRoute,

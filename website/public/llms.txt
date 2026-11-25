@@ -88,6 +88,7 @@ Owl is open source under the MIT license.
 ## Links
 
 - [Home](https://owldb.tech/)
+- [Owl against SQL and MongoDB, feature by feature](https://owldb.tech/matrix)
 - [Source code](https://github.com/TimiBolu/owl)
 - [How to contribute](https://github.com/TimiBolu/owl#help-owl-grow)
 - [Sitemap](https://owldb.tech/sitemap.xml)
