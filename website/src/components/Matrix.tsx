@@ -29,6 +29,118 @@ const STRIDE = (() => {
 })();
 
 /** Words in brackets in the matrix are a remark, not code. */
+/** For each character of a query, how deep in brackets it sits, or -1 inside a string. */
+function depths(text: string): number[] {
+  const out: number[] = [];
+  let depth = 0;
+  let quoted = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quoted) {
+      out.push(-1);
+      if (c === "\\") out.push(-1), i++;
+      else if (c === '"') quoted = false;
+      continue;
+    }
+    if (c === '"') quoted = true;
+    if (")}]".includes(c)) depth--;
+    out.push(c === '"' ? -1 : depth);
+    if ("({[".includes(c)) depth++;
+  }
+  return out;
+}
+
+/** Cut `text` before each index in `at`. */
+const cut = (text: string, at: number[]) =>
+  [0, ...at].map((from, i) => text.slice(from, at[i] ?? text.length).trim());
+
+/** Put `parts` on as few lines as hold them; one too long for a line is laid out on its own. */
+function pack(parts: string[], pad: string, width: number): string[] {
+  const lines: string[] = [];
+  let line = "";
+  for (const part of parts) {
+    if (line && pad.length + line.length + 1 + part.length <= width) {
+      line += " " + part;
+      continue;
+    }
+    if (line) lines.push(pad + line);
+    line = "";
+    if (pad.length + part.length <= width) line = part;
+    else lines.push(...layOut(part, pad, width));
+  }
+  if (line) lines.push(pad + line);
+  return lines;
+}
+
+/**
+ * Lay one OQL expression out over lines no wider than `width`, where it can
+ * be: a chain breaks before each step, a condition before `&&`, `||` and
+ * `else`, and a body too long for its line goes on lines of its own between
+ * its brackets, as many parts to a line as fit.
+ */
+function layOut(text: string, pad: string, width: number): string[] {
+  if (pad.length + text.length <= width) return [pad + text];
+  const depth = depths(text);
+  const top = (i: number) => depth[i] === 0;
+
+  const steps: number[] = [];
+  for (let i = 1; i < text.length - 1; i++) {
+    if (text[i] === "." && top(i) && "})".includes(text[i - 1]) && /[a-z_]/i.test(text[i + 1])) steps.push(i);
+  }
+  if (steps.length) {
+    const lines: string[] = [];
+    cut(text, steps).forEach((step, i) => {
+      // A step after one that closed on a line of its own carries on from
+      // the closing bracket: `}.select { id }`.
+      const last = lines[lines.length - 1];
+      if (i && /^\s*[)}\]]$/.test(last)) {
+        const [first, ...rest] = layOut(step, pad, width - 1);
+        lines[lines.length - 1] = last + first.trim();
+        lines.push(...rest);
+      } else {
+        lines.push(...layOut(step, i ? pad + "  " : pad, width));
+      }
+    });
+    return lines;
+  }
+
+  const turns = [...text].flatMap((_, i) =>
+    i > 0 && top(i) && text[i - 1] === " " && ["&& ", "|| ", "else "].some((word) => text.startsWith(word, i))
+      ? [i]
+      : [],
+  );
+  if (turns.length) {
+    const [first, ...rest] = cut(text, turns);
+    const deeper = rest.some((part) => part.startsWith("else ")) ? pad + "  " : pad;
+    return [...layOut(first, pad, width), ...pack(rest, deeper, width)];
+  }
+
+  const open = [...text].findIndex((c, i) => top(i) && "({[".includes(c));
+  if (open < 0) return [pad + text];
+  let close = open + 1;
+  while (close < text.length && !(top(close) && ")}]".includes(text[close]))) close++;
+  const body = text.slice(open + 1, close).trim();
+  if (!body) return [pad + text];
+  const inner = depths(body);
+  const commas = [...body].flatMap((c, i) => (c === "," && inner[i] === 0 ? [i + 1] : []));
+  return [
+    pad + text.slice(0, open + 1),
+    ...pack(cut(body, commas), pad + "  ", width),
+    pad + text.slice(close),
+  ];
+}
+
+/** A query or script as it is run, laid out to be read in a narrow column. */
+function laidOut(source: string, width = 45): string {
+  return source
+    .split("\n")
+    .flatMap((line) => {
+      const pad = /^\s*/.exec(line)![0];
+      return layOut(line.trim(), pad, width);
+    })
+    .join("\n");
+}
+
 function Spoken({ text, block }: { text: string; block?: boolean }) {
   const remark = /^\((.*)\)$/s.exec(text);
   if (remark) return <em className="mx-remark">{remark[1][0].toUpperCase() + remark[1].slice(1)}.</em>;
@@ -56,13 +168,13 @@ const rowsOf = (gives: string) => gives.replace(/\} \{/g, "}\n{");
 /** What Owl says for a feature: the query, what it gave, what it refuses, and anything to add. */
 function OwlSide({ feature }: { feature: Feature }) {
   const parts: ReactNode[] = [];
-  if (feature.oql) parts.push(<Spoken key="oql" text={feature.oql} block />);
+  if (feature.oql) parts.push(<Spoken key="oql" text={laidOut(feature.oql)} block />);
   if (feature.check) {
     parts.push(
       <p key="then" className="mx-then">
         then
       </p>,
-      <Spoken key="check" text={feature.check} block />,
+      <Spoken key="check" text={laidOut(feature.check)} block />,
     );
   }
   if (feature.gives) {
@@ -93,7 +205,7 @@ function OwlSide({ feature }: { feature: Feature }) {
         refused
       </p>,
       <pre key="refuses" className="mx-code mx-refused">
-        <code>{feature.refuses}</code>
+        <code>{laidOut(feature.refuses)}</code>
       </pre>,
     );
   }
@@ -495,6 +607,10 @@ export function Matrix() {
                 customers, five products and six orders, and has to give the answer shown. Each no with something to try
                 has to be refused, so a row that starts working fails the test until it is moved.
               </p>
+              <p className="sub">
+                Only the Owl column is run. The SQL and MongoDB beside it are written by hand to ask the same question
+                of the same shop, and are there to compare by eye.
+              </p>
               <a
                 className="btn solid"
                 href={`${GITHUB_URL}/blob/main/docs/COMPLETENESS_MATRIX.md`}
@@ -513,7 +629,13 @@ export function Matrix() {
                 <li>
                   The test: <code>tests/completeness_matrix_test.rs</code>
                 </li>
-                <li>SQL here means PostgreSQL. MongoDB means its query and aggregation language.</li>
+                <li>
+                  The SQL and MongoDB: <code>tests/completeness_matrix/elsewhere.rs</code>
+                </li>
+                <li>
+                  SQL here means PostgreSQL, with an order's items in a table of their own. MongoDB means mongosh over
+                  the same documents as Owl.
+                </li>
               </ul>
               <p>
                 <code>cargo test --release --test completeness_matrix_test</code>
