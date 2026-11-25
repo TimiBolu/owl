@@ -218,7 +218,9 @@ export function Evidence() {
           <ul>
             <li>It runs on one machine. The clustering code is experimental.</li>
             <li>Writes are applied one at a time.</li>
-            <li>It has no syntax yet for changing a schema.</li>
+            <li>
+              It does not cover all of SQL and MongoDB. <a href="/matrix">The matrix</a> lists what is missing.
+            </li>
           </ul>
           <p>Owl is under active development. Keep data you cannot lose somewhere else for now.</p>
         </aside>

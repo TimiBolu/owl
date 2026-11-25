@@ -72,7 +72,7 @@ A schema declares its rules: `unique`, `check(.price >= 0)`, `Ref(customers)` an
 
 - It runs on one machine. The clustering code is experimental.
 - Writes are applied one at a time.
-- It has no syntax yet for changing a schema.
+- It does not cover all of SQL and MongoDB. The matrix at https://owldb.tech/matrix lists what is missing.
 
 ## Running it
 
