@@ -158,6 +158,8 @@ struct Pool {
     by_path: HashMap<PathBuf, usize>,
     /// The stamp of the last header written; the next is one more.
     stamp: u64,
+    /// The most files held at once since this was last cleared.
+    most: usize,
 }
 
 impl Pool {
@@ -222,6 +224,7 @@ impl Pool {
         slot.storage.truncate(HEADER)?;
         slot.storage.flush()?;
         self.by_path.insert(path.to_path_buf(), at);
+        self.most = self.most.max(self.by_path.len());
         Ok(at)
     }
 
@@ -242,7 +245,7 @@ pub struct PoolFileSystem {
 impl PoolFileSystem {
     /// Take up what a pool holds: every file named by a whole header.
     pub fn open(slots: Vec<Box<dyn SlotStorage>>) -> io::Result<Self> {
-        let files = Self { pool: Arc::new(Mutex::new(Pool { slots: Vec::new(), by_path: HashMap::new(), stamp: 0 })) };
+        let files = Self { pool: Arc::new(Mutex::new(Pool { slots: Vec::new(), by_path: HashMap::new(), stamp: 0, most: 0 })) };
         files.add(slots)?;
         Ok(files)
     }
@@ -260,6 +263,18 @@ impl PoolFileSystem {
     /// How many files of the pool hold nothing.
     pub fn free(&self) -> usize {
         self.locked().map_or(0, |pool| pool.slots.iter().filter(|slot| slot.path.is_none()).count())
+    }
+
+    /// The most files the engine has held at once since this was last
+    /// asked, which starts the count again from the files held now. What
+    /// one call into the engine needs of the pool is this less the files
+    /// held before it.
+    pub fn most_held(&self) -> usize {
+        self.locked().map_or(0, |mut pool| {
+            let most = pool.most.max(pool.by_path.len());
+            pool.most = pool.by_path.len();
+            most
+        })
     }
 
     /// The engine's files and their sizes, by name.
