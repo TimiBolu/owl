@@ -203,9 +203,14 @@ export function Evidence() {
           <p className="ticks-note">
             The shop suite has sixteen queries. Its check fails unless both engines return the same rows for every one.
           </p>
-          <a className="btn" href={`${GITHUB_URL}/tree/main/apps`} target="_blank" rel="noopener noreferrer">
-            Read the suites
-          </a>
+          <div className="cta evidence-cta">
+            <a className="btn solid" href="/matrix">
+              Owl against SQL and MongoDB
+            </a>
+            <a className="btn" href={`${GITHUB_URL}/tree/main/apps`} target="_blank" rel="noopener noreferrer">
+              Read the suites
+            </a>
+          </div>
         </div>
         <aside className="slip">
           <span className="stamp">Not for production yet</span>
@@ -333,6 +338,7 @@ export function Footer({ home = "" }: { home?: string }) {
           </a>
         ))}
         <a href="/try">Try online</a>
+        <a href="/matrix">Against SQL and MongoDB</a>
         <a href={GITHUB_URL} target="_blank" rel="noopener noreferrer">
           GitHub
         </a>
