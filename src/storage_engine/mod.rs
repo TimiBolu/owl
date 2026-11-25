@@ -15,6 +15,7 @@ mod group_commit;
 mod index_delta;
 mod key;
 mod object_ref;
+mod object_store;
 mod parts;
 mod record;
 mod store;
@@ -30,6 +31,7 @@ pub(crate) use column_segment::{
 pub use group_commit::GroupCommitter;
 pub use key::TypedKey;
 pub use object_ref::ObjRef;
+pub use object_store::{DirectoryObjectStore, MemoryObjectStore, ObjectFileSystem, ObjectStore};
 pub(crate) use record::{BorrowedRecordValue, CompiledSchema, RecordCodec, RecordView};
 pub use backup::{BackupFile, BackupInfo};
 pub use store::{
