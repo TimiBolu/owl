@@ -567,10 +567,11 @@ struct State {
     /// Whether rows have been let go to keep within the bytes budget. From
     /// then on the store takes it that memory is short.
     let_go_for_bytes: bool,
-    /// How many pages each file-backed index keeps decoded: a bound while
-    /// there is a budget on decoded rows, and none (zero) otherwise. Shared
-    /// with the indexes, so that a budget set later reaches them.
-    index_page_limit: Arc<std::sync::atomic::AtomicUsize>,
+    /// How much the file-backed indexes keep decoded: a sixteenth of the
+    /// bytes budget between them whenever there is one, and a count of
+    /// pages each once memory is short. Shared with the indexes, so that
+    /// a budget set later reaches them.
+    index_page_limit: Arc<crate::storage_engine::checkpoint::IndexPageBound>,
     /// Decoded documents in the order they were taken in, kept only while
     /// there is a budget. It may name documents since removed.
     decoded_order: VecDeque<ObjRef>,
@@ -733,11 +734,18 @@ impl State {
     }
 
     /// The budget is one figure for everything the store keeps so as not
-    /// to read it again, shared out: half for the rows held decoded, a
-    /// quarter for the column segments held decoded, and a quarter for
-    /// the columns and row lists kept between queries.
+    /// to read it again, shared out: a sixteenth for the index pages held
+    /// decoded, the rest of a half for the rows held decoded, a quarter
+    /// for the column segments held decoded, and a quarter for the
+    /// columns and row lists kept between queries.
     fn rows_bytes(&self) -> Option<usize> {
-        self.decoded_bytes_budget.map(|bytes| bytes / 2)
+        self.decoded_bytes_budget.map(|bytes| bytes / 2 - bytes / 16)
+    }
+
+    /// The share of the budget for index pages held decoded; zero for
+    /// no limit.
+    fn index_page_bytes(&self) -> usize {
+        self.decoded_bytes_budget.map_or(0, |bytes| (bytes / 16).max(1))
     }
 
     /// The share of the budget for column segments held decoded.
@@ -752,10 +760,10 @@ impl State {
             .map_or(BUILT_COLUMNS_LIMIT, |bytes| bytes / 4)
     }
 
-    fn index_pages(&self) -> Arc<std::sync::atomic::AtomicUsize> {
-        self.index_page_limit.store(
+    fn index_pages(&self) -> Arc<crate::storage_engine::checkpoint::IndexPageBound> {
+        self.index_page_limit.set(
             if self.tight() { INDEX_PAGES_UNDER_A_BUDGET } else { 0 },
-            std::sync::atomic::Ordering::Relaxed,
+            self.index_page_bytes(),
         );
         // A database short of memory also bounds the column segments this
         // process holds decoded. One that is not leaves that as it finds it.
@@ -7474,6 +7482,17 @@ impl RustStore {
     #[doc(hidden)]
     pub fn index_pages_read() -> u64 {
         crate::storage_engine::checkpoint::index_pages_read()
+    }
+
+    /// About how many bytes this store's indexes hold in decoded pages
+    /// read from its files, and the most they may; zero for no limit.
+    #[doc(hidden)]
+    pub fn index_page_bytes_held(&self) -> OQLResult<(usize, usize)> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+        Ok((state.index_page_limit.held(), state.index_page_bytes()))
     }
 
     #[doc(hidden)]

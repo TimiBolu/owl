@@ -1903,6 +1903,57 @@ pub(crate) struct IndexPageDescriptor {
     cached_entries: Option<Arc<Vec<(Vec<u8>, Vec<ObjRef>)>>>,
 }
 
+/// How much the file-backed indexes of one store may keep decoded.
+/// Shared by the store and every index of it, so that a budget set later
+/// reaches them and the bytes are counted across them all.
+#[derive(Default)]
+pub(crate) struct IndexPageBound {
+    /// The most pages one index keeps; zero for no limit.
+    pages: std::sync::atomic::AtomicUsize,
+    /// The most bytes the indexes together keep; zero for no limit.
+    bytes: std::sync::atomic::AtomicUsize,
+    /// The bytes they keep now, of pages read while a limit was set.
+    held: std::sync::atomic::AtomicUsize,
+}
+
+impl IndexPageBound {
+    pub(crate) fn set(&self, pages: usize, bytes: usize) {
+        self.pages.store(pages, std::sync::atomic::Ordering::Relaxed);
+        self.bytes.store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn held(&self) -> usize {
+        self.held.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// About what a decoded page takes in memory.
+fn decoded_page_bytes(entries: &[(Vec<u8>, Vec<ObjRef>)]) -> usize {
+    entries
+        .iter()
+        .map(|(key, postings)| {
+            std::mem::size_of::<(Vec<u8>, Vec<ObjRef>)>()
+                + key.capacity()
+                + postings.capacity() * std::mem::size_of::<ObjRef>()
+        })
+        .sum::<usize>()
+        + std::mem::size_of::<Vec<(Vec<u8>, Vec<ObjRef>)>>()
+}
+
+impl Drop for FileIndexBase {
+    /// What this index kept is kept no longer.
+    fn drop(&mut self) {
+        let order = match self.read_order.get_mut() {
+            Ok(order) => order,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let bytes = order.iter().map(|(_, bytes)| *bytes).sum::<usize>();
+        self.page_limit
+            .held
+            .fetch_sub(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub(crate) struct FileIndexBase {
     filesystem: Arc<dyn FileSystem>,
     schema: String,
@@ -1915,13 +1966,14 @@ pub(crate) struct FileIndexBase {
     /// page says otherwise; every read then looks at each entry.
     ordered: std::sync::atomic::AtomicBool,
     page_cache: Mutex<HashMap<usize, Arc<Vec<(Vec<u8>, Vec<ObjRef>)>>>>,
-    /// The pages read from the file, oldest first. Pages handed over
-    /// already decoded when the index was made are not among them.
-    read_order: Mutex<std::collections::VecDeque<usize>>,
-    /// The most pages read from the file that are kept decoded, shared
-    /// with the store; zero for no limit. Without one every page ever read
-    /// stays, and in time the whole index is in memory.
-    page_limit: Arc<std::sync::atomic::AtomicUsize>,
+    /// The pages read from the file while a limit was set, oldest first,
+    /// each with about what it takes decoded. Pages handed over already
+    /// decoded when the index was made are not among them.
+    read_order: Mutex<std::collections::VecDeque<(usize, usize)>>,
+    /// How much may be kept decoded, shared with the store. Without a
+    /// limit every page ever read stays, and in time the whole index is
+    /// in memory.
+    page_limit: Arc<IndexPageBound>,
 }
 
 impl FileIndexBase {
@@ -1931,7 +1983,7 @@ impl FileIndexBase {
         name: String,
         unique: bool,
         mut pages: Vec<IndexPageDescriptor>,
-        page_limit: Arc<std::sync::atomic::AtomicUsize>,
+        page_limit: Arc<IndexPageBound>,
     ) -> Self {
         let page_cache = pages
             .iter_mut()
@@ -2002,21 +2054,30 @@ impl FileIndexBase {
             .page_cache
             .lock()
             .map_err(|_| "checkpoint index page cache lock poisoned".to_string())?;
-        let limit = self.page_limit.load(std::sync::atomic::Ordering::Relaxed);
-        if limit > 0 {
+        use std::sync::atomic::Ordering::Relaxed;
+        let most_pages = self.page_limit.pages.load(Relaxed);
+        let most_bytes = self.page_limit.bytes.load(Relaxed);
+        if most_pages > 0 || most_bytes > 0 {
+            let bytes = decoded_page_bytes(&entries);
             let mut order = self
                 .read_order
                 .lock()
                 .map_err(|_| "checkpoint index page order lock poisoned".to_string())?;
-            while order.len() >= limit {
-                match order.pop_front() {
-                    Some(oldest) => {
-                        cache.remove(&oldest);
-                    }
-                    None => break,
+            // This index lets go of its own oldest pages until there is
+            // room for the one read, by its own count and by the bytes
+            // all the store's indexes hold. Another index that holds
+            // much lets go in its turn, when it next reads a page.
+            while !order.is_empty()
+                && ((most_pages > 0 && order.len() >= most_pages)
+                    || (most_bytes > 0 && self.page_limit.held.load(Relaxed) + bytes > most_bytes))
+            {
+                if let Some((oldest, held)) = order.pop_front() {
+                    cache.remove(&oldest);
+                    self.page_limit.held.fetch_sub(held, Relaxed);
                 }
             }
-            order.push_back(page_index);
+            order.push_back((page_index, bytes));
+            self.page_limit.held.fetch_add(bytes, Relaxed);
         }
         cache.insert(page_index, entries.clone());
         Ok(entries)
@@ -5779,7 +5840,7 @@ mod tests {
             published.name,
             published.unique,
             published.pages,
-            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(IndexPageBound::default()),
         );
         assert_eq!(base.search_key(&target_key).unwrap().len(), 1);
         assert!(!base
