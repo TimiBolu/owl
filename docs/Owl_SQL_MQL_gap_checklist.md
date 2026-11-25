@@ -1,5 +1,8 @@
 # Owl Vs PostgreSQL Vs MongoDB Gap Checklist
 
+> Superseded by [COMPLETENESS_MATRIX.md](COMPLETENESS_MATRIX.md), which fills in
+> every row and is checked by a test. This file is the unfilled outline it grew from.
+
 This is a mechanical checklist for comparing Owl against PostgreSQL SQL and
 MongoDB MQL.
 
