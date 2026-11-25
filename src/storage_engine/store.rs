@@ -48,19 +48,27 @@ const WAL_MAGIC: [u8; 4] = *b"OWLW";
 /// 4..6   format version
 /// 6..8   CRC-16 over header bytes 0..6 and 8..20 (version 3 and later)
 /// 8..16  commit LSN
-/// 16..20 payload length
-/// 20..24 CRC-32 over header bytes 0..20 followed by the payload
+/// 16..20 length of what follows the header
+/// 20..24 CRC-32 over header bytes 0..20 followed by what follows the header
 /// ```
 ///
 /// The header check authenticates the length before it is trusted, so a
 /// damaged length in a complete frame is reported as corruption instead of
 /// being mistaken for a torn tail.
-const WAL_VERSION: u16 = 3;
+///
+/// In version 4 the header is followed by eight bytes, the synced point,
+/// and then the batch. The synced point is how many bytes of this file were
+/// known to be on disk when the frame was written. It is what lets recovery
+/// tell an unsynced tail from damage: see `damage_is_unsynced_tail`.
+const WAL_VERSION: u16 = 4;
+/// Version 3 frames have no synced point: the batch follows the header.
+const WAL_UNMARKED_VERSION: u16 = 3;
 /// Version 2 frames checksum the payload only and leave bytes 6..8 zero. They
 /// remain readable so existing databases open; new frames are never written in
 /// this format.
 const WAL_LEGACY_VERSION: u16 = 2;
 const WAL_HEADER_LEN: usize = 24;
+const WAL_SYNCED_POINT_LEN: usize = 8;
 const MAX_WAL_FRAME: usize = 64 * 1024 * 1024;
 
 /// CRC-16/CCITT-FALSE. Small enough to fit the two reserved header bytes
@@ -81,77 +89,228 @@ fn wal_header_check(header: &[u8; WAL_HEADER_LEN]) -> u16 {
     crc
 }
 
-fn encode_wal_header(lsn: u64, payload: &[u8]) -> [u8; WAL_HEADER_LEN] {
-    let mut header = [0u8; WAL_HEADER_LEN];
-    header[0..4].copy_from_slice(&WAL_MAGIC);
-    header[4..6].copy_from_slice(&WAL_VERSION.to_le_bytes());
-    header[8..16].copy_from_slice(&lsn.to_le_bytes());
-    header[16..20].copy_from_slice(&(payload.len() as u32).to_le_bytes());
-    let check = wal_header_check(&header);
-    header[6..8].copy_from_slice(&check.to_le_bytes());
+/// The header and synced point that go in front of `payload` in the file.
+fn encode_wal_frame_head(
+    lsn: u64,
+    synced_len: u64,
+    payload: &[u8],
+) -> [u8; WAL_HEADER_LEN + WAL_SYNCED_POINT_LEN] {
+    let mut head = [0u8; WAL_HEADER_LEN + WAL_SYNCED_POINT_LEN];
+    head[0..4].copy_from_slice(&WAL_MAGIC);
+    head[4..6].copy_from_slice(&WAL_VERSION.to_le_bytes());
+    head[8..16].copy_from_slice(&lsn.to_le_bytes());
+    head[16..20]
+        .copy_from_slice(&((WAL_SYNCED_POINT_LEN + payload.len()) as u32).to_le_bytes());
+    head[WAL_HEADER_LEN..].copy_from_slice(&synced_len.to_le_bytes());
+    let header: &[u8; WAL_HEADER_LEN] = head[..WAL_HEADER_LEN].try_into().unwrap();
+    let check = wal_header_check(header);
+    head[6..8].copy_from_slice(&check.to_le_bytes());
     let mut hasher = Hasher::new();
-    hasher.update(&header[0..20]);
+    hasher.update(&head[0..20]);
+    hasher.update(&head[WAL_HEADER_LEN..]);
     hasher.update(payload);
-    header[20..24].copy_from_slice(&hasher.finalize().to_le_bytes());
-    header
+    let checksum = hasher.finalize();
+    head[20..24].copy_from_slice(&checksum.to_le_bytes());
+    head
 }
 
-/// Read the next WAL frame, returning its header LSN and authenticated
-/// payload. `None` means the file ends inside a frame (or exactly between
-/// frames): the only state an interrupted append can leave behind. Any defect
-/// in a frame whose bytes are all present is an error.
-fn read_wal_frame(
-    file: &mut dyn FileHandle,
-    path: &Path,
-) -> OQLResult<Option<(u64, Vec<u8>)>> {
+/// One frame read back from a WAL file.
+struct WalFrame {
+    lsn: u64,
+    /// The encoded batch.
+    payload: Vec<u8>,
+    /// How much of the file was on disk when the frame was written, for the
+    /// versions that say.
+    synced_len: Option<u64>,
+    /// The bytes the whole frame takes in the file.
+    len: u64,
+}
+
+/// What the next bytes of a WAL file turned out to be.
+enum WalRead {
+    Frame(WalFrame),
+    /// The file ends inside a frame, or exactly between frames.
+    End,
+    /// Every byte of a frame is there and it is not a frame Owl wrote.
+    Damaged(&'static str),
+}
+
+fn read_wal_frame_or_damage(file: &mut dyn FileHandle, path: &Path) -> OQLResult<WalRead> {
     let mut header = [0u8; WAL_HEADER_LEN];
     let header_len =
         read_up_to(file, &mut header).map_err(|e| storage_io("read WAL header", path, e))?;
     if header_len < WAL_HEADER_LEN {
-        return Ok(None);
+        return Ok(WalRead::End);
     }
     if header[0..4] != WAL_MAGIC {
-        return Err(OQLError::storage_error("invalid WAL frame magic", None));
+        return Ok(WalRead::Damaged("invalid WAL frame magic"));
     }
     let version = u16::from_le_bytes([header[4], header[5]]);
-    if version != WAL_VERSION && version != WAL_LEGACY_VERSION {
+    if version != WAL_LEGACY_VERSION
+        && u16::from_le_bytes([header[6], header[7]]) != wal_header_check(&header)
+    {
+        return Ok(WalRead::Damaged("WAL frame header checksum mismatch"));
+    }
+    if !matches!(
+        version,
+        WAL_VERSION | WAL_UNMARKED_VERSION | WAL_LEGACY_VERSION
+    ) {
+        // A header that checks out and names a version this build does not
+        // know was written by a newer Owl. That is never an unsynced tail.
         return Err(OQLError::storage_error(
             "unsupported WAL format version",
             None,
         ));
     }
-    if version == WAL_VERSION
-        && u16::from_le_bytes([header[6], header[7]]) != wal_header_check(&header)
-    {
-        return Err(OQLError::storage_error(
-            "WAL frame header checksum mismatch",
-            None,
-        ));
-    }
-    let header_lsn = u64::from_le_bytes(header[8..16].try_into().unwrap());
-    let payload_len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+    let lsn = u64::from_le_bytes(header[8..16].try_into().unwrap());
+    let body_len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
     let expected_checksum = u32::from_le_bytes(header[20..24].try_into().unwrap());
-    if payload_len > MAX_WAL_FRAME {
-        return Err(OQLError::storage_error(
-            "WAL frame is unreasonably large",
-            None,
-        ));
+    let synced_point_len = if version == WAL_VERSION {
+        WAL_SYNCED_POINT_LEN
+    } else {
+        0
+    };
+    if body_len > MAX_WAL_FRAME + synced_point_len {
+        return Ok(WalRead::Damaged("WAL frame is unreasonably large"));
     }
-    let mut payload = vec![0u8; payload_len];
-    if read_up_to(file, &mut payload).map_err(|e| storage_io("read WAL payload", path, e))?
-        < payload_len
+    if body_len < synced_point_len {
+        return Ok(WalRead::Damaged("WAL frame is too short for its version"));
+    }
+    let mut body = vec![0u8; body_len];
+    if read_up_to(file, &mut body).map_err(|e| storage_io("read WAL payload", path, e))?
+        < body_len
     {
-        return Ok(None);
+        return Ok(WalRead::End);
     }
     let mut hasher = Hasher::new();
-    if version == WAL_VERSION {
+    if version != WAL_LEGACY_VERSION {
         hasher.update(&header[0..20]);
     }
-    hasher.update(&payload);
+    hasher.update(&body);
     if hasher.finalize() != expected_checksum {
-        return Err(OQLError::storage_error("WAL frame checksum mismatch", None));
+        return Ok(WalRead::Damaged("WAL frame checksum mismatch"));
     }
-    Ok(Some((header_lsn, payload)))
+    let synced_len = (synced_point_len > 0)
+        .then(|| u64::from_le_bytes(body[..WAL_SYNCED_POINT_LEN].try_into().unwrap()));
+    body.drain(..synced_point_len);
+    Ok(WalRead::Frame(WalFrame {
+        lsn,
+        payload: body,
+        synced_len,
+        len: (WAL_HEADER_LEN + body_len) as u64,
+    }))
+}
+
+/// How a WAL file is read when a frame in it is damaged.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WalTail {
+    /// Every byte of the file was synced before anything relied on it, so
+    /// damage anywhere is corruption.
+    Synced,
+    /// The file is the one being appended to. Its last frames may never
+    /// have been synced, and a crash may have kept some of them and lost
+    /// others.
+    MayBeUnsynced,
+}
+
+/// Read the next WAL frame at `offset`, where the file's cursor stands.
+/// `None` is the end of the log: the file ends inside a frame or between
+/// frames, or, in a file whose tail may be unsynced, the frame is damaged
+/// and was never synced. Any other defect is an error.
+fn read_wal_frame(
+    file: &mut dyn FileHandle,
+    path: &Path,
+    offset: u64,
+    tail: WalTail,
+) -> OQLResult<Option<WalFrame>> {
+    match read_wal_frame_or_damage(file, path)? {
+        WalRead::Frame(frame) => Ok(Some(frame)),
+        WalRead::End => Ok(None),
+        WalRead::Damaged(what) => {
+            if tail == WalTail::MayBeUnsynced && damage_is_unsynced_tail(file, path, offset)? {
+                tracing::warn!(
+                    target: "owl_db::storage_engine::recovery",
+                    path = %path.display(),
+                    offset,
+                    damage = what,
+                    "the log ends in writes that were never synced; reading them as its end"
+                );
+                return Ok(None);
+            }
+            Err(OQLError::storage_error(what, None))
+        }
+    }
+}
+
+/// Whether the damaged frame at `damage` lies in a part of the file that
+/// was never synced.
+///
+/// A commit is acknowledged only once a sync covers its frame, so nothing
+/// acknowledged lives past the last synced byte, and a crash may leave
+/// anything there: a frame cut short, or a later write kept and an earlier
+/// one lost. Each frame says how much of the file was on disk when it was
+/// written. The frames after the damage are the witnesses. If one of them
+/// was written when the damaged bytes were already on disk, the damage
+/// happened to synced data and is corruption. If none was, the damage and
+/// all that follows is the unsynced tail, and the log ends before it.
+///
+/// A frame after the damage that does not say (it was written by an older
+/// Owl) cannot rule corruption out, so it counts as corruption.
+///
+/// What this cannot see: damage to the last frames synced, when nothing
+/// was written after that sync. No later frame vouches for them, and they
+/// are read as the end of the log.
+fn damage_is_unsynced_tail(
+    file: &mut dyn FileHandle,
+    path: &Path,
+    damage: u64,
+) -> OQLResult<bool> {
+    const CHUNK: usize = 64 * 1024;
+    let size = file
+        .size()
+        .map_err(|e| storage_io("inspect damaged WAL", path, e))?;
+    let mut chunk = vec![0u8; CHUNK];
+    // Where the next frame could begin. Past a whole frame, it is the byte
+    // after that frame.
+    let mut from = damage + 1;
+    while from + WAL_HEADER_LEN as u64 <= size {
+        let wanted = CHUNK.min((size - from) as usize);
+        let mut read = 0;
+        while read < wanted {
+            match file.read_at(&mut chunk[read..wanted], from + read as u64) {
+                Ok(0) => break,
+                Ok(count) => read += count,
+                Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                Err(error) => return Err(storage_io("scan damaged WAL", path, error)),
+            }
+        }
+        if read < WAL_MAGIC.len() {
+            break;
+        }
+        let mut next = from + (read - (WAL_MAGIC.len() - 1)) as u64;
+        let found = chunk[..read]
+            .windows(WAL_MAGIC.len())
+            .position(|window| window == WAL_MAGIC);
+        if let Some(at) = found {
+            let candidate = from + at as u64;
+            next = candidate + 1;
+            file.seek(SeekFrom::Start(candidate))
+                .map_err(|e| storage_io("seek damaged WAL", path, e))?;
+            match read_wal_frame_or_damage(file, path) {
+                Ok(WalRead::Frame(frame)) => match frame.synced_len {
+                    Some(synced) if synced <= damage => next = candidate + frame.len,
+                    _ => return Ok(false),
+                },
+                // Bytes that only look like the start of a frame.
+                Ok(WalRead::End | WalRead::Damaged(_)) => {}
+                // A frame from a newer Owl, or a read that failed: neither
+                // rules corruption out.
+                Err(_) => return Ok(false),
+            }
+        }
+        from = next;
+    }
+    Ok(true)
 }
 const DEFAULT_AUTO_CHECKPOINT_WAL_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_AUTO_CHECKPOINT_COMMITS: u64 = 10_000;
@@ -2383,6 +2542,10 @@ pub struct StoreCore {
     durable: Condvar,
     /// The last frame written to the WAL, synced or not.
     written_lsn: AtomicU64,
+    /// How many bytes of the active WAL file are known to be on disk. Each
+    /// frame carries the value at the time it is written. It may run behind
+    /// the truth, never ahead, and is only changed while holding the WAL.
+    wal_synced_len: AtomicU64,
     /// Commits that have started and not yet written their frame.
     commits_in_flight: AtomicUsize,
     next_transaction_id: AtomicU64,
@@ -2867,20 +3030,34 @@ impl RustStore {
         let record_delta_base_lsn = checkpoint_state.committed_lsn;
         let sealed_wal_existed = filesystem.exists(&sealed_wal_path);
         let (checkpoint_state, valid_sealed_wal_len) =
-            Self::recover(filesystem.as_ref(), &sealed_wal_path, checkpoint_state)?;
+            // The log was synced whole before it was sealed.
+            Self::recover(
+                filesystem.as_ref(),
+                &sealed_wal_path,
+                checkpoint_state,
+                WalTail::Synced,
+            )?;
         if sealed_wal_existed {
             truncate_recovered_wal(filesystem.as_ref(), &sealed_wal_path, valid_sealed_wal_len)?;
         }
-        let (state, valid_wal_len) =
-            Self::recover(filesystem.as_ref(), &wal_path, checkpoint_state)?;
+        let (state, valid_wal_len) = Self::recover(
+            filesystem.as_ref(),
+            &wal_path,
+            checkpoint_state,
+            WalTail::MayBeUnsynced,
+        )?;
         let wal_len = wal
             .size()
             .map_err(|e| storage_io("inspect WAL after recovery", &wal_path, e))?;
         if wal_len != valid_wal_len {
             wal.set_len(valid_wal_len)
-                .and_then(|_| wal.sync())
                 .map_err(|e| storage_io("truncate torn WAL tail", &wal_path, e))?;
         }
+        // What was read back may have come from memory that a dead process
+        // left behind and no sync ever covered. The frames written from
+        // here on say the log is on disk up to this point, so make it so.
+        wal.sync()
+            .map_err(|e| storage_io("sync recovered WAL", &wal_path, e))?;
         wal.seek(SeekFrom::Start(valid_wal_len))
             .map_err(|e| storage_io("seek WAL", &wal_path, e))?;
 
@@ -2925,6 +3102,7 @@ impl RustStore {
             }),
             durable: Condvar::new(),
             written_lsn: AtomicU64::new(recovered_lsn),
+            wal_synced_len: AtomicU64::new(valid_wal_len),
             commits_in_flight: AtomicUsize::new(0),
             next_transaction_id: AtomicU64::new(1),
             checkpoint_sequence: AtomicU64::new(checkpoint_sequence),
@@ -3343,11 +3521,14 @@ impl RustStore {
                     // Every frame written so far is in the file by now, and
                     // none can be added while this holds the WAL.
                     let through = self.written_lsn.load(Ordering::Acquire);
-                    wal.as_mut()
-                        .ok_or_else(|| "active WAL handle is unavailable".to_string())?
-                        .sync()
-                        .map(|_| through)
-                        .map_err(|error| error.to_string())
+                    let wal = wal
+                        .as_mut()
+                        .ok_or_else(|| "active WAL handle is unavailable".to_string())?;
+                    wal.sync().map_err(|error| error.to_string())?;
+                    if let Ok(len) = wal.size() {
+                        self.wal_synced_len.fetch_max(len, Ordering::AcqRel);
+                    }
+                    Ok(through)
                 });
 
             durability = self.durability.lock().map_err(|_| lost())?;
@@ -4979,6 +5160,7 @@ impl StoreCore {
         match create_synced_wal(self.filesystem.as_ref(), &self.wal_path) {
             Ok(new_wal) => {
                 *wal_guard = Some(new_wal);
+                self.wal_synced_len.store(0, Ordering::Release);
                 if let Err(error) = self.filesystem.sync_all() {
                     self.poisoned.store(true, Ordering::Release);
                     return Err(storage_io("sync WAL rotation", &self.wal_path, error));
@@ -5031,6 +5213,7 @@ impl StoreCore {
             let wal = wal
                 .as_mut()
                 .ok_or_else(|| OQLError::storage_error("active WAL handle is unavailable", None))?;
+            self.wal_synced_len.store(0, Ordering::Release);
             wal.set_len(0)
                 .and_then(|_| wal.seek(SeekFrom::Start(0)).map(|_| ()))
                 .and_then(|_| wal.sync())
@@ -5604,7 +5787,7 @@ impl RustStore {
             self.filesystem
                 .file_size(&self.wal_path)
                 .map_err(|e| storage_io("inspect WAL", &self.wal_path, e))? as usize;
-        let frame_size = WAL_HEADER_LEN.saturating_add(payload.len());
+        let frame_size = (WAL_HEADER_LEN + WAL_SYNCED_POINT_LEN).saturating_add(payload.len());
         if self.max_size_bytes > 0 && current_size.saturating_add(frame_size) > self.max_size_bytes
         {
             return Err(OQLError::storage_error(
@@ -5613,12 +5796,16 @@ impl RustStore {
             ));
         }
 
-        let header = encode_wal_header(lsn, payload);
+        let head = encode_wal_frame_head(
+            lsn,
+            self.wal_synced_len.load(Ordering::Acquire).min(current_size as u64),
+            payload,
+        );
 
         let wal = wal
             .as_mut()
             .ok_or_else(|| OQLError::storage_error("active WAL handle is unavailable", None))?;
-        let result = write_all(wal.as_mut(), &header)
+        let result = write_all(wal.as_mut(), &head)
             .and_then(|_| write_all(wal.as_mut(), payload))
             .and_then(|_| wal.flush());
         if let Err(error) = result {
@@ -5895,6 +6082,7 @@ impl RustStore {
                     } else {
                         IndexReplayMode::Maintain
                     },
+                    WalTail::Synced,
                 )?;
                 if valid_length != generation.len || replayed.committed_lsn != generation.end_lsn {
                     return Err(OQLError::storage_error(
@@ -5959,6 +6147,7 @@ impl RustStore {
                 } else {
                     IndexReplayMode::Maintain
                 },
+                WalTail::Synced,
             )?;
             if valid_length != manifest.delta_len
                 || replayed.committed_lsn != manifest.checkpoint_lsn
@@ -6064,8 +6253,13 @@ impl RustStore {
         Ok((state, manifest.sequence))
     }
 
-    fn recover(filesystem: &dyn FileSystem, path: &Path, state: State) -> OQLResult<(State, u64)> {
-        Self::recover_with_index_mode(filesystem, path, state, IndexReplayMode::Maintain)
+    fn recover(
+        filesystem: &dyn FileSystem,
+        path: &Path,
+        state: State,
+        tail: WalTail,
+    ) -> OQLResult<(State, u64)> {
+        Self::recover_with_index_mode(filesystem, path, state, IndexReplayMode::Maintain, tail)
     }
 
     fn recover_with_index_mode(
@@ -6073,6 +6267,7 @@ impl RustStore {
         path: &Path,
         mut state: State,
         index_mode: IndexReplayMode,
+        tail: WalTail,
     ) -> OQLResult<(State, u64)> {
         state.next_collection_id = state.next_collection_id.max(1);
         if !filesystem.exists(path) || filesystem.file_size(path).unwrap_or(0) == 0 {
@@ -6085,11 +6280,11 @@ impl RustStore {
         let mut valid_len = 0u64;
         let mut previous_wal_lsn = None;
         loop {
-            let Some((header_lsn, payload)) = read_wal_frame(file.as_mut(), path)? else {
+            let Some(frame) = read_wal_frame(file.as_mut(), path, valid_len, tail)? else {
                 break;
             };
-            let payload_len = payload.len();
-            let batch: WalBatch = bincode::deserialize(&payload).map_err(|e| {
+            let (header_lsn, frame_len) = (frame.lsn, frame.len);
+            let batch: WalBatch = bincode::deserialize(&frame.payload).map_err(|e| {
                 OQLError::serialization_error(&format!("cannot decode WAL batch: {e}"), None)
             })?;
             if batch.lsn != header_lsn {
@@ -6116,7 +6311,7 @@ impl RustStore {
                 }
                 Self::apply_batch_with_index_mode(&mut state, batch, index_mode)?;
             }
-            valid_len = valid_len.saturating_add((WAL_HEADER_LEN + payload_len) as u64);
+            valid_len = valid_len.saturating_add(frame_len);
         }
         Ok((state, valid_len))
     }
@@ -6421,11 +6616,11 @@ fn replay_wal_for_compaction(
     let mut valid_len = 0u64;
     let mut previous_wal_lsn = None;
     loop {
-        let Some((header_lsn, payload)) = read_wal_frame(file.as_mut(), path)? else {
+        let Some(frame) = read_wal_frame(file.as_mut(), path, valid_len, WalTail::Synced)? else {
             break;
         };
-        let payload_len = payload.len();
-        let batch: WalBatch = bincode::deserialize(&payload).map_err(|error| {
+        let (header_lsn, frame_len) = (frame.lsn, frame.len);
+        let batch: WalBatch = bincode::deserialize(&frame.payload).map_err(|error| {
             OQLError::serialization_error(
                 &format!("cannot decode WAL batch for compaction: {error}"),
                 None,
@@ -6450,7 +6645,7 @@ fn replay_wal_for_compaction(
             }
             apply_compaction_batch(state, &mut overlay, batch)?;
         }
-        valid_len = valid_len.saturating_add((WAL_HEADER_LEN + payload_len) as u64);
+        valid_len = valid_len.saturating_add(frame_len);
     }
     Ok((overlay.finish()?, valid_len))
 }
@@ -10589,10 +10784,10 @@ fn inspect_integrity(
     )?;
     let checkpoint_lsn = checkpoint_state.committed_lsn;
     let (checkpoint_state, sealed_len) =
-        RustStore::recover(filesystem.as_ref(), &sealed_wal_path, checkpoint_state)?;
+        RustStore::recover(filesystem.as_ref(), &sealed_wal_path, checkpoint_state, WalTail::Synced)?;
     require_complete_wal(filesystem.as_ref(), &sealed_wal_path, sealed_len)?;
     let (state, active_len) =
-        RustStore::recover(filesystem.as_ref(), database_path, checkpoint_state)?;
+        RustStore::recover(filesystem.as_ref(), database_path, checkpoint_state, WalTail::Synced)?;
     require_complete_wal(filesystem.as_ref(), database_path, active_len)?;
     validate_state_integrity(&state)?;
 
@@ -14780,6 +14975,9 @@ mod tests {
         {
             let store = RustStore::new_with_fs(path, 1024 * 1024, fs.clone()).unwrap();
             store.put_document(&document("a")).unwrap();
+            // Written after the first frame was synced, and so a witness
+            // that damage to the first frame is damage to synced data.
+            store.put_document(&document("b")).unwrap();
         }
         let mut file = fs
             .open_with_options(
@@ -15897,6 +16095,190 @@ mod tests {
         file.sync().unwrap();
     }
 
+    fn replace_file(fs: &SimulatedFileSystem, path: &Path, bytes: &[u8]) {
+        let mut file = fs
+            .open_with_options(
+                path,
+                &FileOptions {
+                    read: true,
+                    write: true,
+                    create: false,
+                    truncate: false,
+                    append: false,
+                },
+            )
+            .unwrap();
+        file.set_len(0).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        write_all(file.as_mut(), bytes).unwrap();
+        file.sync().unwrap();
+    }
+
+    /// The frames of a log file, as the offset and length of each.
+    fn frame_spans(wal: &[u8]) -> Vec<(usize, usize)> {
+        let mut spans = Vec::new();
+        let mut offset = 0usize;
+        while offset < wal.len() {
+            let body_len =
+                u32::from_le_bytes(wal[offset + 16..offset + 20].try_into().unwrap()) as usize;
+            spans.push((offset, WAL_HEADER_LEN + body_len));
+            offset += WAL_HEADER_LEN + body_len;
+        }
+        spans
+    }
+
+    /// A log of three commits, each synced before the next was written,
+    /// with the frames of the last two taken off and handed back: the
+    /// state of a disk that synced the first and was sent the others.
+    fn one_synced_commit_and_two_frames(
+        fs: &Arc<SimulatedFileSystem>,
+        path: &Path,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        {
+            let store = RustStore::new_with_fs(path, 1024 * 1024, fs.clone()).unwrap();
+            for id in ["a", "b", "c"] {
+                store.put_document(&document(id)).unwrap();
+            }
+        }
+        let wal = read_file(fs.as_ref(), path);
+        let spans = frame_spans(&wal);
+        assert_eq!(spans.len(), 3);
+        let frame = |index: usize| wal[spans[index].0..spans[index].0 + spans[index].1].to_vec();
+        (frame(0), frame(1), frame(2))
+    }
+
+    /// Give a frame another synced point, as if it had been written when
+    /// that much of the file was on disk.
+    fn with_synced_point(frame: &[u8], synced_len: u64) -> Vec<u8> {
+        let lsn = u64::from_le_bytes(frame[8..16].try_into().unwrap());
+        let payload = &frame[WAL_HEADER_LEN + WAL_SYNCED_POINT_LEN..];
+        let mut rewritten = encode_wal_frame_head(lsn, synced_len, payload).to_vec();
+        rewritten.extend_from_slice(payload);
+        rewritten
+    }
+
+    #[test]
+    fn a_later_write_kept_and_an_earlier_one_lost_is_the_end_of_the_log() {
+        let fs = Arc::new(SimulatedFileSystem::new(66));
+        let path = Path::new("reordered.owl");
+        let (first, second, third) = one_synced_commit_and_two_frames(&fs, path);
+        // The second and third commits were written together after the
+        // first was synced, and never synced themselves. The crash lost
+        // the second frame's header and kept everything after it.
+        let synced = first.len() as u64;
+        let mut wal = first.clone();
+        let mut lost = with_synced_point(&second, synced);
+        lost[..WAL_HEADER_LEN].fill(0);
+        wal.extend_from_slice(&lost);
+        wal.extend_from_slice(&with_synced_point(&third, synced));
+        replace_file(fs.as_ref(), path, &wal);
+
+        let reopened = RustStore::new_with_fs(path, 1024 * 1024, fs.clone()).unwrap();
+        assert_eq!(reopened.committed_lsn(), 1);
+        assert_eq!(reopened.scan_documents("events").unwrap().len(), 1);
+        // The unsynced writes are gone from the file, and the log goes on.
+        assert_eq!(fs.file_size(path).unwrap(), synced);
+        reopened.put_document(&document("d")).unwrap();
+        drop(reopened);
+        let again = RustStore::new_with_fs(path, 1024 * 1024, fs).unwrap();
+        assert_eq!(again.scan_documents("events").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn damage_that_a_later_frame_saw_synced_is_corruption() {
+        let fs = Arc::new(SimulatedFileSystem::new(67));
+        let path = Path::new("rot.owl");
+        let (first, second, third) = one_synced_commit_and_two_frames(&fs, path);
+        // The same damage, but the third frame was written after the
+        // second was on disk. An acknowledged commit has been damaged.
+        let mut wal = first.clone();
+        let mut damaged = second.clone();
+        damaged[..WAL_HEADER_LEN].fill(0);
+        wal.extend_from_slice(&damaged);
+        wal.extend_from_slice(&third);
+        let wal_len = wal.len() as u64;
+        replace_file(fs.as_ref(), path, &wal);
+
+        let error = RustStore::new_with_fs(path, 1024 * 1024, fs.clone())
+            .err()
+            .expect("damage to synced frames must fail open");
+        assert!(error.to_string().contains("magic"));
+        assert_eq!(fs.file_size(path).unwrap(), wal_len);
+    }
+
+    #[test]
+    fn a_frame_after_the_damage_that_names_no_synced_point_is_no_witness() {
+        let fs = Arc::new(SimulatedFileSystem::new(68));
+        let path = Path::new("unmarked.owl");
+        let (first, second, third) = one_synced_commit_and_two_frames(&fs, path);
+        // The frame after the damage is in the version before synced
+        // points. It cannot say the damage was unsynced, so it is not.
+        let payload = &third[WAL_HEADER_LEN + WAL_SYNCED_POINT_LEN..];
+        let mut header = [0u8; WAL_HEADER_LEN];
+        header[0..4].copy_from_slice(&WAL_MAGIC);
+        header[4..6].copy_from_slice(&WAL_UNMARKED_VERSION.to_le_bytes());
+        header[8..16].copy_from_slice(&third[8..16]);
+        header[16..20].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        let check = wal_header_check(&header);
+        header[6..8].copy_from_slice(&check.to_le_bytes());
+        let mut hasher = Hasher::new();
+        hasher.update(&header[0..20]);
+        hasher.update(payload);
+        let checksum = hasher.finalize();
+        header[20..24].copy_from_slice(&checksum.to_le_bytes());
+
+        let mut wal = first.clone();
+        let mut damaged = with_synced_point(&second, first.len() as u64);
+        damaged[..WAL_HEADER_LEN].fill(0);
+        wal.extend_from_slice(&damaged);
+        wal.extend_from_slice(&header);
+        wal.extend_from_slice(payload);
+        replace_file(fs.as_ref(), path, &wal);
+
+        assert!(RustStore::new_with_fs(path, 1024 * 1024, fs).is_err());
+    }
+
+    /// The limit of the rule, written down so that it is not a surprise:
+    /// damage to the last frames synced, with nothing written after that
+    /// sync, has no witness and reads as the end of the log.
+    #[test]
+    fn damage_to_the_last_synced_frame_has_no_witness() {
+        let fs = Arc::new(SimulatedFileSystem::new(69));
+        let path = Path::new("last-frame.owl");
+        {
+            let store = RustStore::new_with_fs(path, 1024 * 1024, fs.clone()).unwrap();
+            store.put_document(&document("a")).unwrap();
+            store.put_document(&document("b")).unwrap();
+        }
+        let wal = read_file(fs.as_ref(), path);
+        let (last, _) = *frame_spans(&wal).last().unwrap();
+        overwrite_at(fs.as_ref(), path, (last + WAL_HEADER_LEN + 12) as u64, &[0xff]);
+
+        let reopened = RustStore::new_with_fs(path, 1024 * 1024, fs).unwrap();
+        assert_eq!(reopened.committed_lsn(), 1);
+    }
+
+    #[test]
+    fn a_frame_from_a_newer_owl_is_never_read_as_the_end_of_the_log() {
+        let fs = Arc::new(SimulatedFileSystem::new(70));
+        let path = Path::new("newer.owl");
+        {
+            let store = RustStore::new_with_fs(path, 1024 * 1024, fs.clone()).unwrap();
+            store.put_document(&document("a")).unwrap();
+        }
+        let wal = read_file(fs.as_ref(), path);
+        let mut header: [u8; WAL_HEADER_LEN] = wal[..WAL_HEADER_LEN].try_into().unwrap();
+        header[4..6].copy_from_slice(&(WAL_VERSION + 1).to_le_bytes());
+        let check = wal_header_check(&header);
+        header[6..8].copy_from_slice(&check.to_le_bytes());
+        overwrite_at(fs.as_ref(), path, 0, &header);
+
+        let error = RustStore::new_with_fs(path, 1024 * 1024, fs)
+            .err()
+            .expect("a log from a newer Owl must not be cut short");
+        assert!(error.to_string().contains("unsupported WAL format version"));
+    }
+
     #[test]
     fn damaged_frame_length_is_corruption_not_a_torn_tail() {
         let fs = Arc::new(SimulatedFileSystem::new(63));
@@ -15929,6 +16311,7 @@ mod tests {
         {
             let store = RustStore::new_with_fs(path, 1024 * 1024, fs.clone()).unwrap();
             store.put_document(&document("a")).unwrap();
+            store.put_document(&document("b")).unwrap();
         }
         let wal = read_file(fs.as_ref(), path);
         overwrite_at(fs.as_ref(), path, 8, &[wal[8] ^ 0x04]);
@@ -15947,30 +16330,29 @@ mod tests {
             store.put_document(&document("a")).unwrap();
             store.put_document(&document("b")).unwrap();
         }
-        // Rewrite every frame header in the version 2 layout: reserved bytes
-        // zero and a CRC-32 over the payload alone.
+        // Rewrite every frame in the version 2 layout: no synced point,
+        // reserved bytes zero and a CRC-32 over the payload alone.
         let wal = read_file(fs.as_ref(), path);
+        let mut legacy = Vec::new();
         let mut offset = 0usize;
         let mut frames = 0;
         while offset < wal.len() {
-            let payload_len =
+            let body_len =
                 u32::from_le_bytes(wal[offset + 16..offset + 20].try_into().unwrap()) as usize;
-            let payload = &wal[offset + WAL_HEADER_LEN..offset + WAL_HEADER_LEN + payload_len];
-            overwrite_at(
-                fs.as_ref(),
-                path,
-                offset as u64 + 4,
-                &[WAL_LEGACY_VERSION.to_le_bytes(), [0, 0]].concat(),
-            );
-            overwrite_at(
-                fs.as_ref(),
-                path,
-                offset as u64 + 20,
-                &crc32fast::hash(payload).to_le_bytes(),
-            );
-            offset += WAL_HEADER_LEN + payload_len;
+            let body = &wal[offset + WAL_HEADER_LEN..offset + WAL_HEADER_LEN + body_len];
+            let payload = &body[WAL_SYNCED_POINT_LEN..];
+            let mut header = [0u8; WAL_HEADER_LEN];
+            header[0..4].copy_from_slice(&WAL_MAGIC);
+            header[4..6].copy_from_slice(&WAL_LEGACY_VERSION.to_le_bytes());
+            header[8..16].copy_from_slice(&wal[offset + 8..offset + 16]);
+            header[16..20].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+            header[20..24].copy_from_slice(&crc32fast::hash(payload).to_le_bytes());
+            legacy.extend_from_slice(&header);
+            legacy.extend_from_slice(payload);
+            offset += WAL_HEADER_LEN + body_len;
             frames += 1;
         }
+        replace_file(fs.as_ref(), path, &legacy);
         assert_eq!(frames, 2);
 
         let reopened = RustStore::new_with_fs(path, 1024 * 1024, fs.clone()).unwrap();

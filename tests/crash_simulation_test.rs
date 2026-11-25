@@ -606,18 +606,12 @@ fn the_database_opens_after_a_checkpoint_is_retried_and_power_is_lost() {
     }
 }
 
-/// Not yet true, and left out of the usual run for that reason.
-///
-/// The log is read on the understanding that an interrupted append leaves
-/// the file ending inside a frame and nothing else. A disk that keeps a
-/// later unsynced write and loses an earlier one leaves a hole with bytes
-/// after it instead, and recovery takes that for corruption and refuses
-/// to open ("invalid WAL frame magic"). Nothing acknowledged is lost, but
-/// the database stays shut until someone repairs it. Whether to read such
-/// a hole as the end of the log is a decision about what a damaged log
-/// means, and it has not been made.
+/// A disk may keep a later unsynced write and lose an earlier one, which
+/// leaves a hole in the log with bytes after it. Each frame says how much
+/// of the log was on disk when it was written, so recovery can see that
+/// nothing after the hole was written with the hole's bytes synced, and
+/// reads the hole as the end of the log. Nothing acknowledged is past it.
 #[test]
-#[ignore = "recovery refuses a log whose unsynced writes were reordered"]
 fn acknowledged_writes_survive_a_crash_that_reorders_writes() {
     let faults = Faults {
         io_faults: false,
