@@ -30,8 +30,9 @@
 //! lists, so a reader that opened one publication goes on working through
 //! the next. After that it must open again.
 //!
-//! One process writes a database; this module does nothing to keep a
-//! second writer out.
+//! One process writes a database's objects at a time. A writer claims the
+//! database ([`ObjectFileSystem::writer`]), and one that has been replaced
+//! can change nothing its successor relies on: see `Fence`.
 
 use super::RustStore;
 use crate::error::{OQLError, OQLResult};
@@ -66,6 +67,29 @@ pub trait ObjectStore: Send + Sync {
 
     /// The keys that begin with `prefix`, in order.
     fn list(&self, prefix: &str) -> io::Result<Vec<String>>;
+
+    /// A mark that is different for every object ever put under `key`,
+    /// or `None` when nothing is there. Two reads that give the same mark
+    /// saw the same object.
+    fn version(&self, key: &str) -> io::Result<Option<String>>;
+
+    /// Put as [`ObjectStore::put`] does, but only if what is under `key`
+    /// is still what the caller last saw: nothing, for `None`, or the
+    /// object with this mark. Gives the new object's mark, or `None` when
+    /// something else was there and nothing was changed. The check and
+    /// the put are one step: of two callers that saw the same thing, one
+    /// succeeds.
+    fn put_if(
+        &self,
+        key: &str,
+        source: &mut dyn Read,
+        len: u64,
+        expected: Option<&str>,
+    ) -> io::Result<Option<String>>;
+
+    /// Remove the object only if it is still the one with this mark.
+    /// Says whether it was removed.
+    fn delete_if(&self, key: &str, expected: &str) -> io::Result<bool>;
 }
 
 fn not_found(key: &str) -> io::Error {
@@ -91,6 +115,53 @@ impl DirectoryObjectStore {
         })
     }
 
+    /// Hold the directory's lock while `work` runs, so that a check and
+    /// the change that depends on it are one step for every process that
+    /// uses this directory.
+    fn locked<T>(&self, work: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+        let lock = self.directory.join(LOCK);
+        let started = std::time::Instant::now();
+        loop {
+            match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
+                Ok(_) => break,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    if started.elapsed() > std::time::Duration::from_secs(10) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("{} is held; remove it if no process is using the directory", lock.display()),
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let outcome = work();
+        let _ = std::fs::remove_file(&lock);
+        outcome
+    }
+
+    /// The mark of the file at `path`: its length, when it was written
+    /// and, where there is one, the number the file system knows it by. A
+    /// put makes a new file, so all three change.
+    fn mark(path: &Path) -> io::Result<Option<String>> {
+        let metadata = match std::fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let written = metadata
+            .modified()
+            .ok()
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |since| since.as_nanos());
+        #[cfg(unix)]
+        let number = std::os::unix::fs::MetadataExt::ino(&metadata);
+        #[cfg(not(unix))]
+        let number = 0u64;
+        Ok(Some(format!("{}-{written}-{number}", metadata.len())))
+    }
+
     fn path(&self, key: &str) -> io::Result<PathBuf> {
         // A key is a file name. Anything that could leave the directory
         // is refused.
@@ -106,6 +177,9 @@ impl DirectoryObjectStore {
 
 /// What a put in progress is called until it is whole.
 const TEMPORARY: &str = ".putting.";
+
+/// The file that is held while a check and a change are made together.
+const LOCK: &str = ".lock";
 
 impl ObjectStore for DirectoryObjectStore {
     fn put(&self, key: &str, source: &mut dyn Read, len: u64) -> io::Result<()> {
@@ -177,12 +251,44 @@ impl ObjectStore for DirectoryObjectStore {
         for entry in std::fs::read_dir(&self.directory)? {
             let name = entry?.file_name();
             let Some(name) = name.to_str() else { continue };
-            if name.starts_with(prefix) && !name.starts_with(TEMPORARY) {
+            if name.starts_with(prefix) && !name.starts_with(TEMPORARY) && name != LOCK {
                 keys.push(name.to_string());
             }
         }
         keys.sort();
         Ok(keys)
+    }
+
+    fn version(&self, key: &str) -> io::Result<Option<String>> {
+        Self::mark(&self.path(key)?)
+    }
+
+    fn put_if(
+        &self,
+        key: &str,
+        source: &mut dyn Read,
+        len: u64,
+        expected: Option<&str>,
+    ) -> io::Result<Option<String>> {
+        let path = self.path(key)?;
+        self.locked(|| {
+            if Self::mark(&path)?.as_deref() != expected {
+                return Ok(None);
+            }
+            self.put(key, source, len)?;
+            Self::mark(&path)
+        })
+    }
+
+    fn delete_if(&self, key: &str, expected: &str) -> io::Result<bool> {
+        let path = self.path(key)?;
+        self.locked(|| {
+            if Self::mark(&path)?.as_deref() != Some(expected) {
+                return Ok(false);
+            }
+            std::fs::remove_file(&path)?;
+            Ok(true)
+        })
     }
 }
 
@@ -190,7 +296,9 @@ impl ObjectStore for DirectoryObjectStore {
 /// can be told to fail. For tests.
 #[derive(Default)]
 pub struct MemoryObjectStore {
-    objects: Mutex<BTreeMap<String, Arc<Vec<u8>>>>,
+    objects: Mutex<BTreeMap<String, (Arc<Vec<u8>>, u64)>>,
+    /// The mark the next object put will have.
+    next_mark: AtomicU64,
     puts: AtomicU64,
     reads: AtomicU64,
     bytes_read: AtomicU64,
@@ -238,14 +346,15 @@ impl ObjectStore for MemoryObjectStore {
         if bytes.len() as u64 != len {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "a put was given too few bytes"));
         }
-        self.objects.lock().unwrap().insert(key.to_string(), Arc::new(bytes));
+        let mark = self.next_mark.fetch_add(1, Ordering::Relaxed) + 1;
+        self.objects.lock().unwrap().insert(key.to_string(), (Arc::new(bytes), mark));
         self.puts.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     fn read_at(&self, key: &str, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
         self.check()?;
-        let object = self.objects.lock().unwrap().get(key).cloned().ok_or_else(|| not_found(key))?;
+        let (object, _) = self.objects.lock().unwrap().get(key).cloned().ok_or_else(|| not_found(key))?;
         let from = (offset as usize).min(object.len());
         let count = buffer.len().min(object.len() - from);
         buffer[..count].copy_from_slice(&object[from..from + count]);
@@ -256,7 +365,7 @@ impl ObjectStore for MemoryObjectStore {
 
     fn len(&self, key: &str) -> io::Result<Option<u64>> {
         self.check()?;
-        Ok(self.objects.lock().unwrap().get(key).map(|object| object.len() as u64))
+        Ok(self.objects.lock().unwrap().get(key).map(|(object, _)| object.len() as u64))
     }
 
     fn delete(&self, key: &str) -> io::Result<()> {
@@ -275,6 +384,44 @@ impl ObjectStore for MemoryObjectStore {
             .filter(|key| key.starts_with(prefix))
             .cloned()
             .collect())
+    }
+
+    fn version(&self, key: &str) -> io::Result<Option<String>> {
+        self.check()?;
+        Ok(self.objects.lock().unwrap().get(key).map(|(_, mark)| mark.to_string()))
+    }
+
+    fn put_if(
+        &self,
+        key: &str,
+        source: &mut dyn Read,
+        len: u64,
+        expected: Option<&str>,
+    ) -> io::Result<Option<String>> {
+        self.check()?;
+        let mut bytes = Vec::with_capacity(len as usize);
+        source.take(len).read_to_end(&mut bytes)?;
+        if bytes.len() as u64 != len {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "a put was given too few bytes"));
+        }
+        let mut objects = self.objects.lock().unwrap();
+        if objects.get(key).map(|(_, mark)| mark.to_string()).as_deref() != expected {
+            return Ok(None);
+        }
+        let mark = self.next_mark.fetch_add(1, Ordering::Relaxed) + 1;
+        objects.insert(key.to_string(), (Arc::new(bytes), mark));
+        self.puts.fetch_add(1, Ordering::Relaxed);
+        Ok(Some(mark.to_string()))
+    }
+
+    fn delete_if(&self, key: &str, expected: &str) -> io::Result<bool> {
+        self.check()?;
+        let mut objects = self.objects.lock().unwrap();
+        if objects.get(key).map(|(_, mark)| mark.to_string()).as_deref() != Some(expected) {
+            return Ok(false);
+        }
+        objects.remove(key);
+        Ok(true)
     }
 }
 
@@ -539,14 +686,64 @@ impl Read for FromStart<'_> {
     }
 }
 
+/// A writer's claim on a database.
+///
+/// One process may write a database's objects at a time. A writer claims
+/// the database by writing its number, one more than the last writer's,
+/// into the pointer object, on the condition that the pointer is still as
+/// it read it; of two that try together one succeeds. From then on every
+/// change it makes to the object store is on the condition that the
+/// object is as this writer last left it, and the parts it puts carry its
+/// number in their names. So a writer that has been replaced and does not
+/// know it cannot change the pointer, cannot overwrite or delete what its
+/// successor put, and is told so the first time it tries.
+struct Fence {
+    database: String,
+    /// This writer's number.
+    writer: u64,
+    /// The pointer's mark as this writer last wrote it.
+    pointer: Mutex<String>,
+    /// Set once the object store has shown that another writer has taken
+    /// the database. Nothing more is written.
+    lost: AtomicBool,
+}
+
+impl Fence {
+    fn taken(&self) -> io::Error {
+        self.lost.store(true, Ordering::Release);
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("another writer has taken over '{}'; this one has stopped writing to the object store", self.database),
+        )
+    }
+
+    fn held(&self) -> io::Result<()> {
+        match self.lost.load(Ordering::Acquire) {
+            true => Err(self.taken()),
+            false => Ok(()),
+        }
+    }
+}
+
+/// The object each part is kept as, by the part's file name, with the
+/// object's mark where the holder is a writer.
+type Parts = Arc<Mutex<HashMap<String, (String, Option<String>)>>>;
+
+/// The object a part put by writer `writer` is kept as.
+fn part_object(name: &str, writer: u64) -> String {
+    format!("{name}~{writer}")
+}
+
 /// A part being written on the local disk, put in the object store when
 /// it is made durable.
 struct PartUpload {
     file: Box<dyn FileHandle>,
     path: PathBuf,
-    key: String,
+    name: String,
     local: Arc<dyn FileSystem>,
     objects: Arc<dyn ObjectStore>,
+    fence: Option<Arc<Fence>>,
+    parts: Parts,
 }
 
 impl FileHandle for PartUpload {
@@ -577,14 +774,35 @@ impl FileHandle for PartUpload {
         // The handle that wrote the part may not be one that reads.
         let written = open_to_read(self.local.as_ref(), &self.path)?;
         let len = written.size()?;
-        self.objects.put(
-            &self.key,
-            &mut FromStart {
-                file: written.as_ref(),
-                at: 0,
-            },
-            len,
-        )
+        let mut source = FromStart {
+            file: written.as_ref(),
+            at: 0,
+        };
+        let Some(fence) = &self.fence else {
+            return self.objects.put(&self.name, &mut source, len);
+        };
+        fence.held()?;
+        let key = part_object(&self.name, fence.writer);
+        let before = self.parts.lock().unwrap().get(&self.name).cloned();
+        // The object is this writer's own name for the part, so nothing
+        // is there unless this writer put it, in which case it is as this
+        // writer left it.
+        let expected = match &before {
+            Some((object, mark)) if *object == key => mark.clone(),
+            _ => None,
+        };
+        let Some(mark) = self.objects.put_if(&key, &mut source, len, expected.as_deref())? else {
+            return Err(fence.taken());
+        };
+        self.parts.lock().unwrap().insert(self.name.clone(), (key.clone(), Some(mark)));
+        // The same part under an earlier writer's name is no longer the
+        // part. No root lists a part that is being written again.
+        if let Some((object, Some(mark))) = before {
+            if object != key {
+                let _ = self.objects.delete_if(&object, &mark);
+            }
+        }
+        Ok(())
     }
 
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
@@ -608,6 +826,15 @@ impl FileHandle for PartUpload {
 ///
 /// It is for one database: the one whose files are in `directory`. Give
 /// it to the store as its file system.
+///
+/// There are three ways to have one:
+///
+/// - [`ObjectFileSystem::writer`] claims the database, so that only one
+///   process writes its objects. This is the one to write with.
+/// - [`ObjectFileSystem::reader`] reads the last publication and changes
+///   nothing.
+/// - [`ObjectFileSystem::new`] writes without a claim. Nothing stops a
+///   second writer, so it is for a database only one process can reach.
 pub struct ObjectFileSystem {
     local: Arc<dyn FileSystem>,
     objects: Arc<dyn ObjectStore>,
@@ -615,6 +842,11 @@ pub struct ObjectFileSystem {
     cache: Arc<BlockCache>,
     /// A reader's: nothing is put in the object store or deleted from it.
     reads_only: bool,
+    /// A writer's claim, when it has made one.
+    fence: Option<Arc<Fence>>,
+    /// The object each part is kept as. Without a claim or a publication
+    /// that says otherwise, a part is kept under its own name.
+    parts: Parts,
     /// The number of the newest publication this writer knows of.
     published: AtomicU64,
     /// Parts removed since a publication that may list them, each with
@@ -623,18 +855,60 @@ pub struct ObjectFileSystem {
     retired: Mutex<Vec<(String, u64)>>,
 }
 
+/// Remove every local file of the database called `database`.
+fn remove_local(local: &dyn FileSystem, directory: &Path, database: &str) -> io::Result<()> {
+    for path in local.list_dir(directory)? {
+        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+        if belongs_to(database, name) {
+            local.remove(&path)?;
+        }
+    }
+    Ok(())
+}
+
+/// The file in which a directory remembers the claim it last made: the
+/// writer's number, and the number of the first writer in its line.
+fn record_path(directory: &Path, database: &str) -> PathBuf {
+    directory.join(format!("{database}.writer"))
+}
+
+fn read_record(local: &dyn FileSystem, directory: &Path, database: &str) -> io::Result<Option<(u64, u64)>> {
+    let path = record_path(directory, database);
+    if !local.exists(&path) {
+        return Ok(None);
+    }
+    let file = open_to_read(local, &path)?;
+    let mut text = vec![0u8; file.size()? as usize];
+    let read = file.read_at(&mut text, 0)?;
+    let text = String::from_utf8_lossy(&text[..read]).into_owned();
+    let mut numbers = text.split_whitespace().map(str::parse::<u64>);
+    match (numbers.next(), numbers.next()) {
+        (Some(Ok(writer)), Some(Ok(first))) => Ok(Some((writer, first))),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidData, format!("{} cannot be read", path.display()))),
+    }
+}
+
+fn write_record(local: &dyn FileSystem, directory: &Path, database: &str, writer: u64, first: u64) -> io::Result<()> {
+    let mut file = local.create(&record_path(directory, database))?;
+    let text = format!("{writer} {first}\n");
+    let mut done = 0;
+    while done < text.len() {
+        done += match file.write(&text.as_bytes()[done..])? {
+            0 => return Err(io::Error::new(io::ErrorKind::WriteZero, "the writer's record could not be written")),
+            written => written,
+        };
+    }
+    file.flush()?;
+    file.sync()
+}
+
 impl ObjectFileSystem {
-    /// Keep the parts of the database in `directory` in `objects` as well
-    /// as on `local`, and read a part that `local` lacks from `objects`
-    /// through a cache in `directory` of at most `cache_bytes`.
-    pub fn new(
+    fn build(
         local: Arc<dyn FileSystem>,
         objects: Arc<dyn ObjectStore>,
-        directory: impl Into<PathBuf>,
+        directory: PathBuf,
         cache_bytes: u64,
-    ) -> io::Result<Arc<Self>> {
-        let directory = directory.into();
-        let objects_for_number = objects.clone();
+    ) -> io::Result<Self> {
         local.create_dir_all(&directory)?;
         // Blocks kept by an earlier run are not known to this one. They
         // are dropped, so that the cache holds what it counts.
@@ -644,7 +918,7 @@ impl ObjectFileSystem {
                 let _ = local.remove(&path);
             }
         }
-        Ok(Arc::new(Self {
+        Ok(Self {
             cache: Arc::new(BlockCache {
                 local: local.clone(),
                 directory: directory.clone(),
@@ -655,9 +929,175 @@ impl ObjectFileSystem {
             objects,
             directory,
             reads_only: false,
-            published: AtomicU64::new(newest_publication(objects_for_number.as_ref())?),
+            fence: None,
+            parts: Arc::new(Mutex::new(HashMap::new())),
+            published: AtomicU64::new(0),
             retired: Mutex::new(Vec::new()),
-        }))
+        })
+    }
+
+    /// Keep the parts of the database in `directory` in `objects` as well
+    /// as on `local`, and read a part that `local` lacks from `objects`
+    /// through a cache in `directory` of at most `cache_bytes`.
+    ///
+    /// This makes no claim. Use [`ObjectFileSystem::writer`] where a
+    /// second process could reach the same object store.
+    pub fn new(
+        local: Arc<dyn FileSystem>,
+        objects: Arc<dyn ObjectStore>,
+        directory: impl Into<PathBuf>,
+        cache_bytes: u64,
+    ) -> io::Result<Arc<Self>> {
+        let filesystem = Self::build(local, objects, directory.into(), cache_bytes)?;
+        let newest = newest_publication(filesystem.objects.as_ref())?;
+        filesystem.published.store(newest, Ordering::Release);
+        Ok(Arc::new(filesystem))
+    }
+
+    /// Claim the database called `database` and give the file system to
+    /// write it with.
+    ///
+    /// The claim is refused if another writer has claimed the database
+    /// since this directory last did: what is here is then behind, and
+    /// writing from it would undo the other's work. To carry on from what
+    /// that writer last published, use [`ObjectFileSystem::take_over`].
+    pub fn writer(
+        local: Arc<dyn FileSystem>,
+        objects: Arc<dyn ObjectStore>,
+        directory: impl Into<PathBuf>,
+        database: &str,
+        cache_bytes: u64,
+    ) -> io::Result<Arc<Self>> {
+        Self::claim(local, objects, directory.into(), database, cache_bytes, false)
+    }
+
+    /// Become the database's writer on this machine, starting from what
+    /// was last published: fetch that publication into `directory`, in
+    /// place of any files of the database there, and claim the database.
+    ///
+    /// Whatever the writer before had committed and not published is not
+    /// carried over. If that writer is still running it is stopped from
+    /// writing to the object store the next time it tries.
+    pub fn take_over(
+        local: Arc<dyn FileSystem>,
+        objects: Arc<dyn ObjectStore>,
+        directory: impl Into<PathBuf>,
+        database: &str,
+        cache_bytes: u64,
+    ) -> io::Result<Arc<Self>> {
+        Self::claim(local, objects, directory.into(), database, cache_bytes, true)
+    }
+
+    fn claim(
+        local: Arc<dyn FileSystem>,
+        objects: Arc<dyn ObjectStore>,
+        directory: PathBuf,
+        database: &str,
+        cache_bytes: u64,
+        take_over: bool,
+    ) -> io::Result<Arc<Self>> {
+        local.create_dir_all(&directory)?;
+        let pointer = Published::pointer(database);
+        let mut attempts = 0;
+        let (writer, first, claimed, mark) = loop {
+            let current = Published::with_mark(objects.as_ref(), database)?;
+            let last = current.as_ref().map_or(0, |(published, _)| published.writer);
+            let first = if take_over {
+                let Some((published, _)) = current.as_ref().filter(|(published, _)| published.number > 0) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("'{database}' has not been published, so there is nothing to take over from"),
+                    ));
+                };
+                remove_local(local.as_ref(), &directory, database)?;
+                match published.fetch(local.as_ref(), objects.as_ref(), &directory) {
+                    Ok(()) => {}
+                    // Replaced while it was being fetched. Look again.
+                    Err(error) if error.kind() == io::ErrorKind::NotFound && attempts < 5 => {
+                        attempts += 1;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+                // Parts put by writers before this one are this line's
+                // only where the publication lists them.
+                last + 1
+            } else {
+                let record = read_record(local.as_ref(), &directory, database)?;
+                // The record is written before the claim, so a directory
+                // that died between the two holds the next number.
+                let ours = record.is_some_and(|(writer, _)| writer == last || writer == last + 1);
+                if last != 0 && !ours {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "'{database}' has been claimed by another writer (number {last}) since this \
+                             directory last wrote it. What is here is behind. Take over to carry on from \
+                             the last publication."
+                        ),
+                    ));
+                }
+                record.map_or(1, |(_, first)| first)
+            };
+            let writer = last + 1;
+            write_record(local.as_ref(), &directory, database, writer, first)?;
+            let mut claimed = current.as_ref().map(|(published, _)| published.clone()).unwrap_or_default();
+            claimed.writer = writer;
+            let encoded = serde_json::to_vec(&claimed).map_err(io::Error::other)?;
+            let expected = current.as_ref().map(|(_, mark)| mark.as_str());
+            match objects.put_if(&pointer, &mut &encoded[..], encoded.len() as u64, expected)? {
+                Some(mark) => break (writer, first, claimed, mark),
+                // Another claim or a publication came between. Look again.
+                None if attempts < 5 => attempts += 1,
+                None => {
+                    return Err(io::Error::other(format!("'{database}' could not be claimed: it keeps changing")));
+                }
+            }
+        };
+        local.sync_all()?;
+
+        // The parts that are this line's: those the publication lists,
+        // and those put by this line's writers, the newest of each name.
+        let mut parts: HashMap<String, (String, Option<String>)> = HashMap::new();
+        for (name, object) in &claimed.parts {
+            if let Some(mark) = objects.version(object)? {
+                parts.insert(name.clone(), (object.clone(), Some(mark)));
+            }
+        }
+        let mut newest: HashMap<String, (u64, String)> = HashMap::new();
+        for object in objects.list(database)? {
+            let (name, by) = match object.rsplit_once('~') {
+                Some((name, by)) => (name, by.parse::<u64>().ok()),
+                // A part put without a claim is kept under its own name.
+                None => (object.as_str(), Some(0)),
+            };
+            let Some(by) = by else { continue };
+            if part_key(&directory, &directory.join(name)).is_none() || (by != 0 && by < first) {
+                continue;
+            }
+            if newest.get(name).is_none_or(|(other, _)| by > *other) {
+                newest.insert(name.to_string(), (by, object.clone()));
+            }
+        }
+        for (name, (by, object)) in newest {
+            if by == 0 && parts.contains_key(&name) {
+                continue;
+            }
+            if let Some(mark) = objects.version(&object)? {
+                parts.insert(name, (object, Some(mark)));
+            }
+        }
+
+        let mut filesystem = Self::build(local, objects, directory, cache_bytes)?;
+        filesystem.published.store(claimed.number, Ordering::Release);
+        filesystem.parts = Arc::new(Mutex::new(parts));
+        filesystem.fence = Some(Arc::new(Fence {
+            database: database.to_string(),
+            writer,
+            pointer: Mutex::new(mark),
+            lost: AtomicBool::new(false),
+        }));
+        Ok(Arc::new(filesystem))
     }
 
     /// Make ready to read the database called `database` as it was last
@@ -685,12 +1125,7 @@ impl ObjectFileSystem {
             let published = Published::newest(objects.as_ref(), database)?.ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, format!("'{database}' has not been published"))
             })?;
-            for path in local.list_dir(&directory)? {
-                let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
-                if belongs_to(database, name) {
-                    local.remove(&path)?;
-                }
-            }
+            remove_local(local.as_ref(), &directory, database)?;
             match published.fetch(local.as_ref(), objects.as_ref(), &directory) {
                 Ok(()) => break published,
                 Err(error) if error.kind() == io::ErrorKind::NotFound && attempts < 3 => attempts += 1,
@@ -698,9 +1133,11 @@ impl ObjectFileSystem {
             }
         };
         local.sync_all()?;
-        let filesystem = Self::new(local, objects, directory, cache_bytes)?;
-        let mut filesystem = Arc::try_unwrap(filesystem).unwrap_or_else(|_| unreachable!("just made"));
+        let mut filesystem = Self::build(local, objects, directory, cache_bytes)?;
         filesystem.reads_only = true;
+        filesystem.parts = Arc::new(Mutex::new(
+            published.parts.iter().map(|(name, object)| (name.clone(), (object.clone(), None))).collect(),
+        ));
         Ok((Arc::new(filesystem), published))
     }
 
@@ -709,8 +1146,8 @@ impl ObjectFileSystem {
     pub fn drop_local_parts(&self) -> io::Result<usize> {
         let mut dropped = 0;
         for path in self.local.list_dir(&self.directory)? {
-            let Some(key) = part_key(&self.directory, &path) else { continue };
-            if self.objects.len(&key)?.is_some() {
+            let Some(name) = part_key(&self.directory, &path) else { continue };
+            if self.objects.len(&self.object_of(&name))?.is_some() {
                 self.local.remove(&path)?;
                 dropped += 1;
             }
@@ -723,18 +1160,32 @@ impl ObjectFileSystem {
         self.cache.bytes()
     }
 
-    /// The part a path names, when the local disk does not have it.
+    /// The object the part of this name is kept as.
+    fn object_of(&self, name: &str) -> String {
+        match self.parts.lock().unwrap().get(name) {
+            Some((object, _)) => object.clone(),
+            None => name.to_string(),
+        }
+    }
+
+    /// The part a path names, when the local disk does not have it and
+    /// the object store does: its object and its length.
     fn remote(&self, path: &Path) -> io::Result<Option<(String, u64)>> {
-        let Some(key) = part_key(&self.directory, path) else {
+        let Some(name) = part_key(&self.directory, path) else {
             return Ok(None);
         };
         if self.local.exists(path) {
             return Ok(None);
         }
-        if self.retired.lock().unwrap().iter().any(|(other, _)| *other == key) {
+        if self.retired.lock().unwrap().iter().any(|(other, _)| *other == name) {
             return Ok(None);
         }
-        Ok(self.objects.len(&key)?.map(|len| (key, len)))
+        // A writer with a claim sees only its own line's parts.
+        if self.fence.is_some() && !self.parts.lock().unwrap().contains_key(&name) {
+            return Ok(None);
+        }
+        let object = self.object_of(&name);
+        Ok(self.objects.len(&object)?.map(|len| (object, len)))
     }
 
     fn open_remote(&self, key: String, len: u64) -> Box<dyn FileHandle> {
@@ -746,12 +1197,31 @@ impl ObjectFileSystem {
             position: 0,
         })
     }
+
+    /// Delete the object a part is kept as. With a claim, only if it is
+    /// as this writer left it.
+    fn delete_object(&self, name: &str) -> io::Result<()> {
+        let Some(fence) = &self.fence else {
+            return self.objects.delete(name);
+        };
+        fence.held()?;
+        let Some((object, mark)) = self.parts.lock().unwrap().get(name).cloned() else {
+            return Ok(());
+        };
+        if let Some(mark) = mark {
+            if !self.objects.delete_if(&object, &mark)? && self.objects.version(&object)?.is_some() {
+                return Err(fence.taken());
+            }
+        }
+        self.parts.lock().unwrap().remove(name);
+        Ok(())
+    }
 }
 
 impl FileSystem for ObjectFileSystem {
     fn create(&self, path: &Path) -> io::Result<Box<dyn FileHandle>> {
         let file = self.local.create(path)?;
-        let Some(key) = part_key(&self.directory, path) else {
+        let Some(name) = part_key(&self.directory, path) else {
             return Ok(file);
         };
         if self.reads_only {
@@ -760,13 +1230,15 @@ impl FileSystem for ObjectFileSystem {
         }
         // A part of this name made before, and never listed by a root,
         // may have left blocks behind.
-        self.cache.forget(&key);
+        self.cache.forget(&self.object_of(&name));
         Ok(Box::new(PartUpload {
             file,
             path: path.to_path_buf(),
-            key,
+            name,
             local: self.local.clone(),
             objects: self.objects.clone(),
+            fence: self.fence.clone(),
+            parts: self.parts.clone(),
         }))
     }
 
@@ -788,7 +1260,7 @@ impl FileSystem for ObjectFileSystem {
     }
 
     fn remove(&self, path: &Path) -> io::Result<()> {
-        let Some(key) = part_key(&self.directory, path) else {
+        let Some(name) = part_key(&self.directory, path) else {
             return self.local.remove(path);
         };
         if self.reads_only {
@@ -802,15 +1274,19 @@ impl FileSystem for ObjectFileSystem {
         if published == 0 {
             // The object goes first. If that fails the part is still
             // whole in both places, and the removal can be tried again.
-            self.objects.delete(&key)?;
+            self.cache.forget(&self.object_of(&name));
+            self.delete_object(&name)?;
         } else {
             // A publication may still list it. Its object waits.
+            if let Some(fence) = &self.fence {
+                fence.held()?;
+            }
+            self.cache.forget(&self.object_of(&name));
             let mut retired = self.retired.lock().unwrap();
-            if !retired.iter().any(|(other, _)| *other == key) {
-                retired.push((key.clone(), published));
+            if !retired.iter().any(|(other, _)| *other == name) {
+                retired.push((name.clone(), published));
             }
         }
-        self.cache.forget(&key);
         if self.local.exists(path) {
             self.local.remove(path)?;
         }
@@ -857,13 +1333,19 @@ impl FileSystem for ObjectFileSystem {
         if self.reads_only {
             return Ok(listed);
         }
+        // With a claim, the parts are this line's. Without one, they are
+        // whatever parts the object store holds.
+        let names: Vec<String> = match &self.fence {
+            Some(_) => self.parts.lock().unwrap().keys().cloned().collect(),
+            None => self.objects.list("")?,
+        };
         let retired = self.retired.lock().unwrap();
-        for key in self.objects.list("")? {
+        for name in names {
             // A part waiting to be deleted is, to the store, gone.
-            if retired.iter().any(|(other, _)| *other == key) {
+            if retired.iter().any(|(other, _)| *other == name) {
                 continue;
             }
-            let path = directory.join(&key);
+            let path = directory.join(&name);
             if part_key(directory, &path).is_some() && !listed.contains(&path) {
                 listed.push(path);
             }
@@ -903,15 +1385,31 @@ pub struct PublishedFile {
 }
 
 /// A database as it stood at one commit, in the object store for readers.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// The object that holds the newest of these is the pointer. It is also
+/// where a writer's claim is kept, so that a claim and a publication
+/// cannot pass each other.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Published {
-    /// Which publication this is. Each is one more than the last.
+    /// Which publication this is. Each is one more than the last, and
+    /// zero is a database that has been claimed and never published.
     pub number: u64,
     /// The last commit it contains.
     pub committed_lsn: u64,
-    /// Its files, other than parts. A part is an object under its own
-    /// name, shared by every publication that lists it.
+    /// Its files, other than parts.
     pub files: Vec<PublishedFile>,
+    /// The number of the writer that holds the database, or zero when no
+    /// writer has claimed it.
+    #[serde(default)]
+    pub writer: u64,
+    /// The number of the writer that made this publication, which its
+    /// files' objects are named with.
+    #[serde(default)]
+    pub by: u64,
+    /// The object each part it lists is kept as, by the part's file name.
+    /// A part not named here is kept under its own name.
+    #[serde(default)]
+    pub parts: BTreeMap<String, String>,
 }
 
 impl Published {
@@ -920,28 +1418,50 @@ impl Published {
         format!("{database}.published")
     }
 
-    /// The object a file of publication `number` is kept as.
-    fn key(name: &str, number: u64) -> String {
-        format!("{name}@{number}")
+    /// The object a file of publication `number`, made by writer `by`,
+    /// is kept as.
+    fn key(name: &str, number: u64, by: u64) -> String {
+        match by {
+            0 => format!("{name}@{number}"),
+            by => format!("{name}@{number}.{by}"),
+        }
     }
 
     /// The publication a key is a file of, when it is one of `database`'s.
     fn number_of(database: &str, key: &str) -> Option<u64> {
         let (name, number) = key.rsplit_once('@')?;
+        let number = number.split('.').next()?;
         belongs_to(database, name).then(|| number.parse().ok())?
+    }
+
+    /// The pointer as it is now, with its mark.
+    fn with_mark(objects: &dyn ObjectStore, database: &str) -> io::Result<Option<(Self, String)>> {
+        let key = Self::pointer(database);
+        loop {
+            let Some(mark) = objects.version(&key)? else {
+                return Ok(None);
+            };
+            let Some(len) = objects.len(&key)? else {
+                continue;
+            };
+            let mut encoded = vec![0u8; len as usize];
+            let read = objects.read_at(&key, 0, &mut encoded)?;
+            // The mark is of what was read only if it has not moved.
+            if objects.version(&key)?.as_deref() != Some(mark.as_str()) {
+                continue;
+            }
+            let published = serde_json::from_slice(&encoded[..read]).map_err(|error| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("'{key}' cannot be read: {error}"))
+            })?;
+            return Ok(Some((published, mark)));
+        }
     }
 
     /// The newest publication of `database`, if it has been published.
     pub fn newest(objects: &dyn ObjectStore, database: &str) -> io::Result<Option<Self>> {
-        let key = Self::pointer(database);
-        let Some(len) = objects.len(&key)? else {
-            return Ok(None);
-        };
-        let mut encoded = vec![0u8; len as usize];
-        let read = objects.read_at(&key, 0, &mut encoded)?;
-        serde_json::from_slice(&encoded[..read])
-            .map(Some)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, format!("'{key}' cannot be read: {error}")))
+        Ok(Self::with_mark(objects, database)?
+            .map(|(published, _)| published)
+            .filter(|published| published.number > 0))
     }
 
     /// Bring the publication's files to `directory`, each checked against
@@ -949,7 +1469,7 @@ impl Published {
     fn fetch(&self, local: &dyn FileSystem, objects: &dyn ObjectStore, directory: &Path) -> io::Result<()> {
         let mut buffer = vec![0u8; BLOCK as usize];
         for file in &self.files {
-            let key = Self::key(&file.name, self.number);
+            let key = Self::key(&file.name, self.number, self.by);
             let mut target = local.create(&directory.join(&file.name))?;
             let mut checksum = crc32fast::Hasher::new();
             let mut at = 0u64;
@@ -1008,6 +1528,9 @@ impl RustStore {
     ///
     /// The publication before this one is kept, with the parts it lists.
     /// Older ones, and parts only they listed, are deleted.
+    ///
+    /// A writer that has been replaced cannot publish: the pointer is no
+    /// longer as it left it.
     pub fn publish(&self, filesystem: &ObjectFileSystem) -> OQLResult<Published> {
         let failed = |what: &str, error: io::Error| {
             OQLError::storage_error(&format!("publish: cannot {what}: {error}"), None)
@@ -1016,16 +1539,27 @@ impl RustStore {
             return Err(OQLError::storage_error("publish: a reader does not publish", None));
         }
         let (local, objects) = (filesystem.local.as_ref(), filesystem.objects.as_ref());
+        let fence = filesystem.fence.as_deref();
+        if let Some(fence) = fence {
+            fence.held().map_err(|error| failed("publish", error))?;
+        }
+        let by = fence.map_or(0, |fence| fence.writer);
         let published = self.with_files_frozen(|database, committed_lsn| {
             let name = database
                 .file_name()
                 .and_then(|name| name.to_str())
                 .ok_or_else(|| OQLError::storage_error("publish: the database has no name", None))?;
-            let number = Published::newest(objects, name)
-                .map_err(|error| failed("read the last publication", error))?
-                .map_or(0, |newest| newest.number)
-                .max(filesystem.published.load(Ordering::Acquire))
-                + 1;
+            let number = match fence {
+                Some(_) => filesystem.published.load(Ordering::Acquire) + 1,
+                None => {
+                    Published::newest(objects, name)
+                        .map_err(|error| failed("read the last publication", error))?
+                        .map_or(0, |newest| newest.number)
+                        .max(filesystem.published.load(Ordering::Acquire))
+                        + 1
+                }
+            };
+            let record = record_path(&filesystem.directory, name);
             let mut files = Vec::new();
             let listed = local
                 .list_dir(&filesystem.directory)
@@ -1036,6 +1570,7 @@ impl RustStore {
                 };
                 if !belongs_to(name, file_name)
                     || file_name.contains(CACHED)
+                    || path == record
                     || part_key(&filesystem.directory, &path).is_some()
                 {
                     continue;
@@ -1048,7 +1583,7 @@ impl RustStore {
                     checksum: crc32fast::Hasher::new(),
                 };
                 objects
-                    .put(&Published::key(file_name, number), &mut source, bytes)
+                    .put(&Published::key(file_name, number, by), &mut source, bytes)
                     .map_err(|error| failed(&format!("put {file_name}"), error))?;
                 files.push(PublishedFile {
                     name: file_name.to_string(),
@@ -1056,18 +1591,45 @@ impl RustStore {
                     crc32: source.checksum.finalize(),
                 });
             }
+            let parts = {
+                let retired = filesystem.retired.lock().unwrap();
+                let parts = filesystem.parts.lock().unwrap();
+                parts
+                    .iter()
+                    .filter(|(part, _)| !retired.iter().any(|(other, _)| other == *part))
+                    .map(|(part, (object, _))| (part.clone(), object.clone()))
+                    .collect()
+            };
             let published = Published {
                 number,
                 committed_lsn,
                 files,
+                writer: by,
+                by,
+                parts,
             };
             // The pointer goes last. Until it moves, readers see the
             // publication before, whole.
             let encoded = serde_json::to_vec(&published)
                 .map_err(|error| OQLError::storage_error(&format!("publish: cannot encode: {error}"), None))?;
-            objects
-                .put(&Published::pointer(name), &mut &encoded[..], encoded.len() as u64)
-                .map_err(|error| failed("move the pointer", error))?;
+            let key = Published::pointer(name);
+            match fence {
+                None => objects
+                    .put(&key, &mut &encoded[..], encoded.len() as u64)
+                    .map_err(|error| failed("move the pointer", error))?,
+                Some(fence) => {
+                    // Only if it is as this writer left it: a writer that
+                    // has been replaced stops here.
+                    let mut mark = fence.pointer.lock().unwrap();
+                    let moved = objects
+                        .put_if(&key, &mut &encoded[..], encoded.len() as u64, Some(mark.as_str()))
+                        .map_err(|error| failed("move the pointer", error))?;
+                    match moved {
+                        Some(moved) => *mark = moved,
+                        None => return Err(failed("move the pointer", fence.taken())),
+                    }
+                }
+            }
             filesystem.published.store(number, Ordering::Release);
             Ok((name.to_string(), published))
         });
@@ -1084,12 +1646,17 @@ impl RustStore {
                 }
             }
         }
-        let mut retired = filesystem.retired.lock().unwrap();
-        retired.retain(|(key, when)| {
+        let due: Vec<String> = {
+            let retired = filesystem.retired.lock().unwrap();
             // Removed after publication `when`, so `when` may list it and
             // no later one does.
-            *when >= keep_from || objects.delete(key).is_err()
-        });
+            retired.iter().filter(|(_, when)| *when < keep_from).map(|(part, _)| part.clone()).collect()
+        };
+        for part in due {
+            if filesystem.delete_object(&part).is_ok() {
+                filesystem.retired.lock().unwrap().retain(|(other, _)| *other != part);
+            }
+        }
         Ok(published)
     }
 }
@@ -1417,5 +1984,155 @@ mod tests {
         assert!(objects.len(&part).unwrap().is_some(), "the published part waits for a later publication");
         assert!(!filesystem.exists(Path::new(&part)), "to the writer it is gone");
         assert_eq!(codes(&reader), (0..300).collect::<Vec<_>>());
+    }
+
+    fn conditional_changes_are_one_step(store: &dyn ObjectStore) {
+        assert_eq!(store.version("a").unwrap(), None);
+        // Only if nothing is there.
+        let first = store.put_if("a", &mut &b"one"[..], 3, None).unwrap().expect("nothing was there");
+        assert_eq!(store.put_if("a", &mut &b"two"[..], 3, None).unwrap(), None);
+        assert_eq!(store.version("a").unwrap().as_deref(), Some(first.as_str()));
+
+        // Only if it is the object last seen.
+        let second = store.put_if("a", &mut &b"two"[..], 3, Some(&first)).unwrap().expect("it was as seen");
+        assert_ne!(first, second);
+        assert_eq!(store.put_if("a", &mut &b"six"[..], 3, Some(&first)).unwrap(), None);
+        let mut held = [0u8; 3];
+        store.read_at("a", 0, &mut held).unwrap();
+        assert_eq!(&held, b"two");
+
+        assert!(!store.delete_if("a", &first).unwrap());
+        assert!(store.delete_if("a", &second).unwrap());
+        assert_eq!(store.version("a").unwrap(), None);
+        assert!(!store.delete_if("a", &second).unwrap());
+    }
+
+    #[test]
+    fn both_stores_change_an_object_only_if_it_is_as_last_seen() {
+        conditional_changes_are_one_step(&MemoryObjectStore::new());
+        let directory = tempfile::TempDir::new().unwrap();
+        let store = DirectoryObjectStore::new(directory.path()).unwrap();
+        conditional_changes_are_one_step(&store);
+        assert!(store.list("").unwrap().is_empty(), "the lock is not an object");
+    }
+
+    /// Open the database as its writer on the machine `local`.
+    fn write(local: &Arc<SimulatedFileSystem>, objects: &Arc<MemoryObjectStore>) -> (RustStore, Arc<ObjectFileSystem>) {
+        let filesystem = ObjectFileSystem::writer(local.clone(), objects.clone(), "", "shop.owl", 8 << 20).unwrap();
+        let store = RustStore::new_with_fs(Path::new("shop.owl"), 64 << 20, filesystem.clone()).unwrap();
+        (store, filesystem)
+    }
+
+    #[test]
+    fn a_database_has_one_writer() {
+        let objects = Arc::new(MemoryObjectStore::new());
+        let first = Arc::new(SimulatedFileSystem::new(830));
+        let (store, filesystem) = write(&first, &objects);
+        for number in 0..100 {
+            store.put_document(&event(number)).unwrap();
+        }
+        store.checkpoint().unwrap();
+        store.publish(&filesystem).unwrap();
+        drop(store);
+
+        // Another machine cannot simply start writing it.
+        let second = Arc::new(SimulatedFileSystem::new(831));
+        let refused = ObjectFileSystem::writer(second, objects.clone(), "", "shop.owl", 8 << 20).err().unwrap();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+
+        // The machine that wrote it carries on, under a new number, and
+        // finds the parts it put under the old one.
+        let (store, filesystem) = write(&first, &objects);
+        assert_eq!(codes(&store), (0..100).collect::<Vec<_>>());
+        assert!(filesystem.drop_local_parts().unwrap() > 0);
+        drop(store);
+        let (store, _) = write(&first, &objects);
+        assert_eq!(codes(&store), (0..100).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_writer_that_was_replaced_cannot_harm_the_one_that_replaced_it() {
+        let objects = Arc::new(MemoryObjectStore::new());
+        let old_machine = Arc::new(SimulatedFileSystem::new(832));
+        let (old, old_filesystem) = write(&old_machine, &objects);
+        for number in 0..100 {
+            old.put_document(&event(number)).unwrap();
+        }
+        old.checkpoint().unwrap();
+        old.publish(&old_filesystem).unwrap();
+        // Committed and never published: it does not cross.
+        old.put_document(&event(100)).unwrap();
+
+        // A second machine takes the database over from the publication.
+        let new_machine = Arc::new(SimulatedFileSystem::new(833));
+        let new_filesystem =
+            ObjectFileSystem::take_over(new_machine.clone(), objects.clone(), "", "shop.owl", 8 << 20).unwrap();
+        let new = RustStore::new_with_fs(Path::new("shop.owl"), 64 << 20, new_filesystem.clone()).unwrap();
+        assert_eq!(codes(&new), (0..100).collect::<Vec<_>>());
+        for number in 200..300 {
+            new.put_document(&event(number)).unwrap();
+        }
+        new.checkpoint().unwrap();
+        new.publish(&new_filesystem).unwrap();
+        let expected: Vec<i64> = (0..100).chain(200..300).collect();
+
+        // The old writer does not know. It rewrites everything, makes
+        // checkpoints, clears out what it thinks is unused, and tries to
+        // publish. None of it may reach what the new writer relies on.
+        for round in 0..3 {
+            for number in 0..=100 {
+                let mut changed = event(number);
+                changed.fields.insert("round".into(), Value::Integer(round));
+                old.put_document(&changed).unwrap();
+            }
+            let _ = old.checkpoint();
+            let _ = old.wait_for_maintenance();
+            let _ = old.reclaim_obsolete_files();
+            let refused = old.publish(&old_filesystem).err().expect("a replaced writer cannot publish");
+            assert!(refused.to_string().contains("taken over"), "{refused}");
+        }
+        // Once told, it writes nothing more to the object store.
+        let before = objects.list("").unwrap();
+        old.put_document(&event(101)).unwrap();
+        assert!(old.checkpoint().is_err());
+        assert_eq!(objects.list("").unwrap(), before);
+
+        // The new writer's database is whole: to itself, to a reader,
+        // and after it starts again with its parts only in the store.
+        assert_eq!(codes(&new), expected);
+        let (reader, _) = read(834, &objects);
+        assert_eq!(codes(&reader), expected);
+        new.checkpoint().unwrap();
+        new.publish(&new_filesystem).unwrap();
+        drop(new);
+        let (new, new_filesystem) = write(&new_machine, &objects);
+        // Whatever parts it holds locally, if any, go.
+        new_filesystem.drop_local_parts().unwrap();
+        drop(new);
+        let (new, _) = write(&new_machine, &objects);
+        assert_eq!(codes(&new), expected);
+
+        // And the old machine cannot come back as the writer.
+        drop(old);
+        let refused =
+            ObjectFileSystem::writer(old_machine, objects.clone(), "", "shop.owl", 8 << 20).err().unwrap();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn there_is_nothing_to_take_over_before_a_publication() {
+        let objects = Arc::new(MemoryObjectStore::new());
+        let first = Arc::new(SimulatedFileSystem::new(835));
+        let (store, _) = write(&first, &objects);
+        store.put_document(&event(1)).unwrap();
+        store.checkpoint().unwrap();
+
+        let second = Arc::new(SimulatedFileSystem::new(836));
+        let refused =
+            ObjectFileSystem::take_over(second.clone(), objects.clone(), "", "shop.owl", 8 << 20).err().unwrap();
+        assert_eq!(refused.kind(), io::ErrorKind::NotFound);
+        // And a claim that was never published is not something to read.
+        let unread = ObjectFileSystem::reader(second, objects.clone(), "", "shop.owl", 8 << 20).err().unwrap();
+        assert_eq!(unread.kind(), io::ErrorKind::NotFound);
     }
 }
