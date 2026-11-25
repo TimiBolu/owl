@@ -90,11 +90,7 @@ impl Owl {
     /// not grow for as long as the database is used and opening it does
     /// not replay all of it. Nothing does this unasked in a browser.
     pub fn checkpoint(&self) -> Result<(), JsError> {
-        self.executor
-            .store()
-            .checkpoint()
-            .map(|_| ())
-            .map_err(|error| JsError::new(&error.to_string()))
+        self.checkpoint_kept().map_err(|error| JsError::new(&error))
     }
 
     /// Run OQL: schemas, inserts, functions and queries, one after another.
@@ -313,6 +309,13 @@ fn to_json(value: &Value) -> Json {
     }
 }
 
+impl Owl {
+    /// What [`Owl::checkpoint`] does, with what went wrong as text.
+    fn checkpoint_kept(&self) -> Result<(), String> {
+        self.executor.store().checkpoint().map(|_| ()).map_err(|error| error.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +489,109 @@ mod tests {
         }
         let owl = kept(&slots);
         assert_eq!(count(&owl), json!(14));
+        owl.executor.store().verify_integrity().unwrap();
+    }
+    /// A page keeps some files of the pool spare and gives it more between
+    /// one run and the next, never during one, since the engine cannot
+    /// wait for a file. So no run and no checkpoint may make more files
+    /// at once than are spare. This does what `worker.js` does, with its
+    /// numbers, over a database that grows through many checkpoints.
+    #[test]
+    fn no_run_needs_more_files_than_a_page_keeps_spare() {
+        // As in `worker.js`.
+        const FIRST: usize = 32;
+        const SPARE: usize = 12;
+        const MORE: usize = 16;
+        const CHECKPOINT_EVERY: usize = 20;
+
+        let mut slots: Vec<MemorySlot> = (0..FIRST).map(|_| MemorySlot::default()).collect();
+        let files = PoolFileSystem::open(
+            slots.iter().map(|slot| Box::new(slot.clone()) as Box<dyn SlotStorage>).collect(),
+        )
+        .unwrap();
+        let owl = Owl::over(Arc::new(files.clone()), Some(files.clone())).unwrap_or_else(|error| panic!("{error}"));
+        let mut most_needed = 0;
+        let mut most_files = 0;
+        // After a call into the engine: it needed no more files than were
+        // spare, and the page then tops the pool up.
+        let mut after = |what: &str, held_before: usize, spare_before: usize, slots: &mut Vec<MemorySlot>| {
+            let needed = files.most_held().saturating_sub(held_before);
+            most_needed = most_needed.max(needed);
+            most_files = most_files.max(files.files().len());
+            assert!(
+                needed <= SPARE,
+                "{what} made {needed} files at once, and a page keeps {SPARE} spare ({spare_before} were)"
+            );
+            if files.free() < SPARE {
+                let more: Vec<MemorySlot> = (0..MORE).map(|_| MemorySlot::default()).collect();
+                files
+                    .add(more.iter().map(|slot| Box::new(slot.clone()) as Box<dyn SlotStorage>).collect())
+                    .unwrap();
+                slots.extend(more);
+            }
+        };
+
+        let (held, spare) = (files.files().len(), files.free());
+        files.most_held();
+        let made = owl.run_to_json(
+            r#"
+            schema authors { id: String, name: String }
+            schema books { id: String, title: String, year: Integer, author: Ref(authors), tags: List(String) }
+            schema notes { id: String, about: Ref(books), text: String }
+            authors.insert [ { id: "a1", name: "Ursula" }, { id: "a2", name: "Italo" } ]
+            "#,
+        );
+        assert_eq!(made["errors"], json!([]), "{made}");
+        // Indexes of the database's own, besides the ones every database
+        // has, in case each is more files while a checkpoint is made.
+        owl.executor
+            .store()
+            .write_batch(
+                [("by_year", "books", "year"), ("by_title", "books", "title"), ("by_text", "notes", "text"), ("by_name", "authors", "name")]
+                    .into_iter()
+                    .map(|(name, schema, field)| {
+                        owl_db::storage_engine::WriteOperation::PutScalarIndex(owl_db::storage::ScalarIndexDefinition {
+                            name: name.to_string(),
+                            schema: schema.to_string(),
+                            fields: vec![field.to_string()],
+                            unique: false,
+                        })
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        after("the first run", held, spare, &mut slots);
+
+        for run in 0..400usize {
+            let (held, spare) = (files.files().len(), files.free());
+            files.most_held();
+            let rows = (0..25)
+                .map(|row| {
+                    let id = run * 25 + row;
+                    format!(r#"{{ id: "b{id}", title: "Book {id}", year: {}, author: "a{}", tags: ["t{}"] }}"#, 1900 + id % 120, 1 + id % 2, id % 7)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let added = owl.run_to_json(&format!(
+                r#"books.insert [ {rows} ]
+                notes.insert {{ id: "n{run}", about: "b{}", text: "note {run}" }}"#,
+                run * 25
+            ));
+            assert_eq!(added["errors"], json!([]), "run {run}: {added}");
+            after(&format!("run {run}"), held, spare, &mut slots);
+            if (run + 1) % CHECKPOINT_EVERY == 0 {
+                let (held, spare) = (files.files().len(), files.free());
+                files.most_held();
+                owl.checkpoint_kept().unwrap_or_else(|error| panic!("checkpoint after run {run}: {error}"));
+                after(&format!("the checkpoint after run {run}"), held, spare, &mut slots);
+            }
+        }
+        println!(
+            "a call needed at most {most_needed} files at once; the database is {} files, {most_files} at most, in a pool of {}",
+            files.files().len(),
+            slots.len()
+        );
+        assert_eq!(owl.run_to_json("books.count()")["rows"][0]["count"], json!(10_000));
         owl.executor.store().verify_integrity().unwrap();
     }
 }
