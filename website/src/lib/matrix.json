@@ -7,11 +7,11 @@
         "check": "",
         "feature": "Equality",
         "gives": "{\"id\":\"o1\"} {\"id\":\"o2\"} {\"id\":\"o4\"} {\"id\":\"o6\"}",
-        "mongo": "{ status: \"paid\" }",
+        "mongo": "db.orders.find(\n  { status: \"paid\" },\n  { _id: 1 }\n)",
         "note": "",
         "oql": "orders.where { .status == \"paid\" }.select { id }",
         "refuses": "",
-        "sql": "WHERE status = 'paid'",
+        "sql": "SELECT id FROM orders\nWHERE status = 'paid';",
         "test": null
       },
       {
@@ -19,11 +19,11 @@
         "check": "",
         "feature": "Comparison",
         "gives": "{\"id\":\"o2\"} {\"id\":\"o3\"}",
-        "mongo": "{ total: { $gt: 50 } }",
+        "mongo": "db.orders.find(\n  { total: { $gt: 50 } },\n  { _id: 1 }\n)",
         "note": "",
         "oql": "orders.where { .total > 50 }.select { id }",
         "refuses": "",
-        "sql": "WHERE total > 50",
+        "sql": "SELECT id FROM orders\nWHERE total > 50;",
         "test": null
       },
       {
@@ -31,11 +31,11 @@
         "check": "",
         "feature": "And, or, not",
         "gives": "{\"id\":\"o2\"} {\"id\":\"o3\"}",
-        "mongo": "$and, $or, $nor, $not",
+        "mongo": "db.orders.find(\n  { total: { $gt: 20 },\n    $or: [\n      { status: \"open\" },\n      { total: { $not: { $lt: 100 } } }\n    ] },\n  { _id: 1 }\n)",
         "note": "",
         "oql": "orders.where { .total > 20 && (.status == \"open\" || !(.total < 100)) }.select { id }",
         "refuses": "",
-        "sql": "WHERE a AND (b OR NOT c)",
+        "sql": "SELECT id FROM orders\nWHERE total > 20\n  AND (status = 'open'\n       OR NOT total < 100);",
         "test": null
       },
       {
@@ -43,11 +43,11 @@
         "check": "",
         "feature": "In a list",
         "gives": "{\"id\":\"c1\"} {\"id\":\"c3\"} {\"id\":\"c4\"}",
-        "mongo": "{ city: { $in: [...] } }",
+        "mongo": "db.customers.find(\n  { city: { $in: [\"Lagos\", \"Nairobi\"] } },\n  { _id: 1 }\n)",
         "note": "",
         "oql": "customers.where { .city in [\"Lagos\", \"Nairobi\"] }.select { id }",
         "refuses": "",
-        "sql": "WHERE city IN ('Lagos', 'Accra')",
+        "sql": "SELECT id FROM customers\nWHERE city IN ('Lagos', 'Nairobi');",
         "test": null
       },
       {
@@ -55,11 +55,11 @@
         "check": "",
         "feature": "Not in a list",
         "gives": "{\"id\":\"c2\"} {\"id\":\"c5\"}",
-        "mongo": "{ city: { $nin: [...] } }",
+        "mongo": "db.customers.find(\n  { city: { $nin: [\"Lagos\", \"Nairobi\"] } },\n  { _id: 1 }\n)",
         "note": "",
         "oql": "customers.where { !(.city in [\"Lagos\", \"Nairobi\"]) }.select { id }",
         "refuses": "",
-        "sql": "WHERE city NOT IN (...)",
+        "sql": "SELECT id FROM customers\nWHERE city NOT IN ('Lagos', 'Nairobi');",
         "test": null
       },
       {
@@ -67,11 +67,11 @@
         "check": "",
         "feature": "Between",
         "gives": "{\"id\":\"o1\"} {\"id\":\"o3\"} {\"id\":\"o4\"} {\"id\":\"o6\"}",
-        "mongo": "{ total: { $gte: 25, $lte: 60 } }",
+        "mongo": "db.orders.find(\n  { total: { $gte: 25, $lte: 60 } },\n  { _id: 1 }\n)",
         "note": "Two comparisons; there is no `between` word.",
         "oql": "orders.where { .total >= 25 && .total <= 60 }.select { id }",
         "refuses": "",
-        "sql": "WHERE total BETWEEN 25 AND 60",
+        "sql": "SELECT id FROM orders\nWHERE total BETWEEN 25 AND 60;",
         "test": null
       },
       {
@@ -79,11 +79,11 @@
         "check": "",
         "feature": "Text starts with, ends with, contains",
         "gives": "{\"id\":\"c1\"} {\"id\":\"c3\"} {\"id\":\"c4\"} {\"id\":\"c5\"}",
-        "mongo": "{ name: /^A/ }",
+        "mongo": "db.customers.find(\n  { $or: [\n      { name: /^A/ },\n      { email: /\\.org$/ },\n      { city: /rob/ }\n    ] },\n  { _id: 1 }\n)",
         "note": "",
         "oql": "customers.where { starts_with(.name, \"A\") || ends_with(.email, \".org\") || .city contains \"rob\" }.select { id }",
         "refuses": "",
-        "sql": "WHERE name LIKE 'A%'",
+        "sql": "SELECT id FROM customers\nWHERE name LIKE 'A%'\n   OR email LIKE '%.org'\n   OR city LIKE '%rob%';",
         "test": null
       },
       {
@@ -91,11 +91,11 @@
         "check": "",
         "feature": "Regular expression",
         "gives": "{\"id\":\"c1\"}",
-        "mongo": "{ email: { $regex: ... } }",
+        "mongo": "db.customers.find(\n  { email: /^[a-c].*io$/ },\n  { _id: 1 }\n)",
         "note": "",
         "oql": "customers.where { matches(.email, \"^[a-c].*io$\") }.select { id }",
         "refuses": "",
-        "sql": "WHERE email ~ '^[a-c].*io$'",
+        "sql": "SELECT id FROM customers\nWHERE email ~ '^[a-c].*io$';",
         "test": null
       },
       {
@@ -103,11 +103,11 @@
         "check": "",
         "feature": "Ignoring case",
         "gives": "{\"id\":\"c1\"} {\"id\":\"c5\"}",
-        "mongo": "{ name: { $regex: \"^ada$\", $options: \"i\" } }",
+        "mongo": "db.customers.find(\n  { $or: [\n      { $expr: { $eq: [\n          { $toLower: \"$name\" }, \"ada\"\n        ] } },\n      { name: /^EVE$/i }\n    ] },\n  { _id: 1 }\n)",
         "note": "",
         "oql": "customers.where { lower(.name) == \"ada\" || matches(.name, \"(?i)^EVE$\") }.select { id }",
         "refuses": "",
-        "sql": "WHERE name ILIKE 'ada'",
+        "sql": "SELECT id FROM customers\nWHERE lower(name) = 'ada'\n   OR name ~* '^EVE$';",
         "test": null
       },
       {
@@ -115,11 +115,11 @@
         "check": "",
         "feature": "Is null",
         "gives": "{\"id\":\"c2\"}",
-        "mongo": "{ email: null }",
+        "mongo": "db.customers.find(\n  { email: null },\n  { _id: 1 }\n)",
         "note": "",
         "oql": "customers.where { .email == null }.select { id }",
         "refuses": "",
-        "sql": "WHERE email IS NULL",
+        "sql": "SELECT id FROM customers\nWHERE email IS NULL;",
         "test": null
       },
       {
@@ -127,11 +127,11 @@
         "check": "",
         "feature": "Is not null",
         "gives": "{\"id\":\"c2\"} {\"id\":\"c3\"} {\"id\":\"c4\"}",
-        "mongo": "{ referrer: { $ne: null } }",
+        "mongo": "db.customers.find(\n  { referrer: { $ne: null } },\n  { _id: 1 }\n)",
         "note": "",
         "oql": "customers.where { .referrer != null }.select { id }",
         "refuses": "",
-        "sql": "WHERE referrer IS NOT NULL",
+        "sql": "SELECT id FROM customers\nWHERE referrer IS NOT NULL;",
         "test": null
       },
       {
@@ -139,11 +139,11 @@
         "check": "",
         "feature": "Field is present",
         "gives": "{\"id\":\"c1\"} {\"id\":\"c3\"} {\"id\":\"c4\"} {\"id\":\"c5\"}",
-        "mongo": "{ email: { $exists: true } }",
+        "mongo": "db.customers.find(\n  { email: { $exists: true } },\n  { _id: 1 }\n)",
         "note": "",
         "oql": "customers.where { exists(.email) }.select { id }",
         "refuses": "",
-        "sql": "(columns always exist)",
+        "sql": "-- a column is on every row,\n-- so the nearest thing is\nSELECT id FROM customers\nWHERE email IS NOT NULL;",
         "test": null
       },
       {
@@ -151,11 +151,11 @@
         "check": "",
         "feature": "One field against another",
         "gives": "{\"id\":\"p3\"} {\"id\":\"p4\"}",
-        "mongo": "{ $expr: { $gt: [\"$price\", \"$stock\"] } }",
+        "mongo": "db.products.find(\n  { $expr: {\n      $gt: [\"$price\", \"$stock\"]\n    } },\n  { _id: 1 }\n)",
         "note": "",
         "oql": "products.where { .price > .stock }.select { id }",
         "refuses": "",
-        "sql": "WHERE price > stock",
+        "sql": "SELECT id FROM products\nWHERE price > stock;",
         "test": null
       },
       {
@@ -163,11 +163,11 @@
         "check": "",
         "feature": "Arithmetic in a condition",
         "gives": "{\"id\":\"p2\"} {\"id\":\"p4\"}",
-        "mongo": "{ $expr: { $gt: [{ $multiply: [...] }, 400] } }",
+        "mongo": "db.products.find(\n  { $expr: { $gt: [\n      { $multiply: [\"$price\", \"$stock\"] },\n      400\n    ] } },\n  { _id: 1 }\n)",
         "note": "",
         "oql": "products.where { .price * .stock > 400 }.select { id }",
         "refuses": "",
-        "sql": "WHERE price * stock > 400",
+        "sql": "SELECT id FROM products\nWHERE price * stock > 400;",
         "test": null
       },
       {
@@ -175,11 +175,11 @@
         "check": "",
         "feature": "Dates and parts of dates",
         "gives": "{\"id\":\"c3\"}",
-        "mongo": "{ $expr: { $eq: [{ $year: \"$joined\" }, 2025] } }",
+        "mongo": "db.customers.find(\n  { $expr: { $eq: [\n      { $year: \"$joined\" }, 2025\n    ] },\n    joined: {\n      $lt: ISODate(\"2025-07-01\")\n    } },\n  { _id: 1 }\n)",
         "note": "",
         "oql": "customers.where { .joined.year() == 2025 && .joined < \"2025-07-01\" }.select { id }",
         "refuses": "",
-        "sql": "WHERE EXTRACT(YEAR FROM joined) = 2025",
+        "sql": "SELECT id FROM customers\nWHERE EXTRACT(YEAR FROM joined) = 2025\n  AND joined < '2025-07-01';",
         "test": null
       },
       {
@@ -187,11 +187,11 @@
         "check": "",
         "feature": "Kind of value",
         "gives": "{\"count\":4}",
-        "mongo": "{ x: { $type: \"string\" } }",
+        "mongo": "db.customers.countDocuments(\n  { email: { $type: \"string\" } }\n)",
         "note": "",
         "oql": "customers.where { type_of(.email) == \"String\" }.count()",
         "refuses": "",
-        "sql": "pg_typeof(x)",
+        "sql": "-- a column has one type,\n-- so only null differs\nSELECT count(*) FROM customers\nWHERE email IS NOT NULL;",
         "test": null
       }
     ]
@@ -204,11 +204,11 @@
         "check": "",
         "feature": "Chosen fields",
         "gives": "{\"id\":\"c1\",\"name\":\"Ada\"}",
-        "mongo": "{ id: 1, name: 1 }",
+        "mongo": "db.customers.find(\n  { _id: \"c1\" },\n  { name: 1 }\n)",
         "note": "",
         "oql": "customers.where { .id == \"c1\" }.select { id, name }",
         "refuses": "",
-        "sql": "SELECT id, name",
+        "sql": "SELECT id, name FROM customers\nWHERE id = 'c1';",
         "test": null
       },
       {
@@ -216,11 +216,11 @@
         "check": "",
         "feature": "Every field",
         "gives": "{\"category\":\"stationery\",\"id\":\"p1\",\"name\":\"Pen\",\"price\":2.0,\"stock\":100}",
-        "mongo": "find()",
+        "mongo": "db.products.find({ _id: \"p1\" })",
         "note": "",
         "oql": "products.where { .id == \"p1\" }",
         "refuses": "",
-        "sql": "SELECT *",
+        "sql": "SELECT * FROM products\nWHERE id = 'p1';",
         "test": null
       },
       {
@@ -228,11 +228,11 @@
         "check": "",
         "feature": "Every field but some",
         "gives": "{\"id\":\"p1\",\"name\":\"Pen\",\"price\":2.0}",
-        "mongo": "{ stock: 0 }",
+        "mongo": "db.products.find(\n  { _id: \"p1\" },\n  { stock: 0, category: 0 }\n)",
         "note": "",
         "oql": "products.where { .id == \"p1\" }.select { *, -stock, -category }",
         "refuses": "",
-        "sql": "(list the rest)",
+        "sql": "-- no \"all but\": list the rest\nSELECT id, name, price\nFROM products\nWHERE id = 'p1';",
         "test": null
       },
       {
@@ -240,11 +240,11 @@
         "check": "",
         "feature": "Renamed fields",
         "gives": "{\"customer\":\"Ada\"}",
-        "mongo": "{ customer: \"$name\" }",
+        "mongo": "db.customers.find(\n  { _id: \"c1\" },\n  { _id: 0, customer: \"$name\" }\n)",
         "note": "",
         "oql": "customers.where { .id == \"c1\" }.select { customer: .name }",
         "refuses": "",
-        "sql": "SELECT name AS customer",
+        "sql": "SELECT name AS customer\nFROM customers\nWHERE id = 'c1';",
         "test": null
       },
       {
@@ -252,11 +252,11 @@
         "check": "",
         "feature": "Computed fields",
         "gives": "{\"id\":\"p2\",\"worth\":500.0}",
-        "mongo": "{ $multiply: [\"$price\", \"$stock\"] }",
+        "mongo": "db.products.find(\n  { _id: \"p2\" },\n  { worth: {\n      $multiply: [\"$price\", \"$stock\"]\n    } }\n)",
         "note": "",
         "oql": "products.where { .id == \"p2\" }.select { id, worth: .price * .stock }",
         "refuses": "",
-        "sql": "SELECT price * stock AS worth",
+        "sql": "SELECT id, price * stock AS worth\nFROM products\nWHERE id = 'p2';",
         "test": null
       },
       {
@@ -264,11 +264,11 @@
         "check": "",
         "feature": "Distinct rows",
         "gives": "{\"city\":\"Accra\"} {\"city\":\"Lagos\"} {\"city\":\"Nairobi\"}",
-        "mongo": "distinct(\"city\")",
+        "mongo": "db.customers.distinct(\"city\").sort()",
         "note": "",
         "oql": "customers.select { city }.distinct().sort { .city.asc }",
         "refuses": "",
-        "sql": "SELECT DISTINCT city",
+        "sql": "SELECT DISTINCT city\nFROM customers\nORDER BY city;",
         "test": null
       },
       {
@@ -276,11 +276,11 @@
         "check": "",
         "feature": "Conditional value",
         "gives": "{\"id\":\"p1\",\"level\":\"fine\"} {\"id\":\"p2\",\"level\":\"low\"} {\"id\":\"p3\",\"level\":\"out\"}",
-        "mongo": "$cond, $switch",
+        "mongo": "db.products.aggregate([\n  { $sort: { _id: 1 } },\n  { $limit: 3 },\n  { $project: { level: { $switch: {\n      branches: [\n        { case: { $eq: [\"$stock\", 0] },\n          then: \"out\" },\n        { case: { $lt: [\"$stock\", 50] },\n          then: \"low\" }\n      ],\n      default: \"fine\"\n    } } } }\n])",
         "note": "",
         "oql": "products.sort { .id.asc }.limit(3).select { id, level: if .stock == 0 then \"out\" else if .stock < 50 then \"low\" else \"fine\" }",
         "refuses": "",
-        "sql": "CASE WHEN ... THEN ... ELSE ... END",
+        "sql": "SELECT id,\n  CASE WHEN stock = 0 THEN 'out'\n       WHEN stock < 50 THEN 'low'\n       ELSE 'fine'\n  END AS level\nFROM products\nORDER BY id\nLIMIT 3;",
         "test": null
       },
       {
@@ -288,11 +288,11 @@
         "check": "",
         "feature": "Matching on a value",
         "gives": "{\"done\":true,\"id\":\"o1\"} {\"done\":true,\"id\":\"o2\"} {\"done\":false,\"id\":\"o3\"}",
-        "mongo": "$switch",
+        "mongo": "db.orders.aggregate([\n  { $sort: { _id: 1 } },\n  { $limit: 3 },\n  { $project: { done: { $switch: {\n      branches: [\n        { case: { $eq: [\"$status\", \"paid\"] },\n          then: true }\n      ],\n      default: false\n    } } } }\n])",
         "note": "",
         "oql": "orders.sort { .id.asc }.limit(3).select { id, done: match .status { \"paid\" -> true, _ -> false } }",
         "refuses": "",
-        "sql": "CASE status WHEN 'paid' THEN ... END",
+        "sql": "SELECT id,\n  CASE status WHEN 'paid' THEN true\n              ELSE false\n  END AS done\nFROM orders\nORDER BY id\nLIMIT 3;",
         "test": null
       },
       {
@@ -300,11 +300,11 @@
         "check": "",
         "feature": "First value that is present",
         "gives": "{\"email\":\"ada@x.io\",\"id\":\"c1\"} {\"email\":\"none\",\"id\":\"c2\"}",
-        "mongo": "$ifNull",
+        "mongo": "db.customers.find(\n  { _id: { $in: [\"c1\", \"c2\"] } },\n  { email: { $ifNull: [\"$email\", \"none\"] } }\n).sort({ _id: 1 })",
         "note": "",
         "oql": "customers.where { .id in [\"c1\", \"c2\"] }.sort { .id.asc }.select { id, email: .email or \"none\" }",
         "refuses": "",
-        "sql": "COALESCE(email, 'none')",
+        "sql": "SELECT id,\n  COALESCE(email, 'none') AS email\nFROM customers\nWHERE id IN ('c1', 'c2')\nORDER BY id;",
         "test": null
       },
       {
@@ -312,11 +312,11 @@
         "check": "",
         "feature": "Conversion between types",
         "gives": "{\"number\":42,\"real\":100.0,\"text\":\"100\",\"whole\":2}",
-        "mongo": "$toString, $toInt, $toDouble",
+        "mongo": "db.products.find(\n  { _id: \"p1\" },\n  { _id: 0,\n    text: { $toString: \"$stock\" },\n    whole: { $toInt: \"$price\" },\n    real: { $toDouble: \"$stock\" },\n    number: { $toInt: \"42\" } }\n)",
         "note": "",
         "oql": "products.where { .id == \"p1\" }.select { text: to_string(.stock), whole: to_int(.price), real: to_float(.stock), number: to_int(\"42\") }",
         "refuses": "",
-        "sql": "CAST(stock AS text)",
+        "sql": "SELECT stock::text AS text,\n       price::int AS whole,\n       stock::float AS real,\n       '42'::int AS number\nFROM products\nWHERE id = 'p1';",
         "test": null
       },
       {
@@ -324,11 +324,11 @@
         "check": "",
         "feature": "Text functions",
         "gives": "{\"joined\":\"Ada of Lagos\",\"part\":\"ada\",\"pieces\":[\"ada\",\"x.io\"],\"size\":8,\"swapped\":\"ada@owl.dev\",\"up\":\"ADA\"}",
-        "mongo": "$toUpper, $strLenCP, $substrCP, $replaceAll, $trim, $concat",
+        "mongo": "db.customers.find(\n  { _id: \"c1\" },\n  { _id: 0,\n    up: { $toUpper: \"$name\" },\n    size: { $strLenCP: \"$email\" },\n    part: { $substrCP: [\"$email\", 0, 3] },\n    swapped: { $replaceAll: {\n      input: \"$email\", find: \"x.io\",\n      replacement: \"owl.dev\" } },\n    joined: { $concat: [\n      \"$name\", \" of \", \"$city\"] },\n    pieces: { $split: [\"$email\", \"@\"] } }\n)",
         "note": "",
         "oql": "customers.where { .id == \"c1\" }.select { up: upper(.name), size: length(.email), part: substring(.email, 0, 3), swapped: replace(.email, \"x.io\", \"owl.dev\"), joined: concat(.name, \" of \", .city), pieces: split(.email, \"@\") }",
         "refuses": "",
-        "sql": "upper, lower, length, substring, replace, trim, ||",
+        "sql": "SELECT upper(name) AS up,\n  length(email) AS size,\n  substring(email, 1, 3) AS part,\n  replace(email, 'x.io', 'owl.dev')\n    AS swapped,\n  name || ' of ' || city AS joined,\n  string_to_array(email, '@') AS pieces\nFROM customers\nWHERE id = 'c1';",
         "test": null
       },
       {
@@ -336,11 +336,11 @@
         "check": "",
         "feature": "Number functions",
         "gives": "{\"away\":60,\"down\":12,\"root\":7.0,\"rounded\":13,\"squared\":156.25,\"up\":13}",
-        "mongo": "$abs, $round, $floor, $ceil, $sqrt, $pow",
+        "mongo": "db.products.find(\n  { _id: \"p2\" },\n  { _id: 0,\n    rounded: { $round: \"$price\" },\n    down: { $floor: \"$price\" },\n    up: { $ceil: \"$price\" },\n    root: { $sqrt: { $add: [\"$stock\", 9] } },\n    squared: { $pow: [\"$price\", 2] },\n    away: { $abs: {\n      $subtract: [\"$stock\", 100] } } }\n)",
         "note": "",
         "oql": "products.where { .id == \"p2\" }.select { rounded: round(.price), down: floor(.price), up: ceil(.price), root: sqrt(.stock + 9), squared: pow(.price, 2), away: abs(.stock - 100) }",
         "refuses": "",
-        "sql": "abs, round, floor, ceil, sqrt, power",
+        "sql": "SELECT round(price) AS rounded,\n       floor(price) AS down,\n       ceil(price) AS up,\n       sqrt(stock + 9) AS root,\n       power(price, 2) AS squared,\n       abs(stock - 100) AS away\nFROM products\nWHERE id = 'p2';",
         "test": null
       },
       {
@@ -348,11 +348,11 @@
         "check": "",
         "feature": "Date arithmetic",
         "gives": "{\"later\":\"2025-07-20\",\"waited\":527}",
-        "mongo": "$dateAdd, $dateDiff",
+        "mongo": "db.customers.aggregate([\n  { $match: { _id: \"c3\" } },\n  { $lookup: { from: \"customers\",\n      localField: \"referrer\",\n      foreignField: \"_id\", as: \"r\" } },\n  { $unwind: \"$r\" },\n  { $project: { _id: 0,\n      later: { $dateToString: {\n        format: \"%Y-%m-%d\",\n        date: { $dateAdd: {\n          startDate: \"$joined\",\n          unit: \"day\", amount: 30 } } } },\n      waited: { $dateDiff: {\n        startDate: \"$r.joined\",\n        endDate: \"$joined\",\n        unit: \"day\" } } } }\n])",
         "note": "",
         "oql": "customers.where { .id == \"c3\" }.select { later: format_date(add_days(.joined, 30), \"%Y-%m-%d\"), waited: diff_days(.referrer.joined, .joined) }",
         "refuses": "",
-        "sql": "joined + INTERVAL '30 days', a - b",
+        "sql": "SELECT\n  to_char(c.joined + INTERVAL '30 days',\n          'YYYY-MM-DD') AS later,\n  c.joined::date - r.joined::date\n    AS waited\nFROM customers c\nJOIN customers r ON r.id = c.referrer\nWHERE c.id = 'c3';",
         "test": null
       },
       {
@@ -360,11 +360,11 @@
         "check": "",
         "feature": "Date formatting",
         "gives": "{\"month\":\"2024-01\"}",
-        "mongo": "$dateToString",
+        "mongo": "db.customers.find(\n  { _id: \"c1\" },\n  { _id: 0,\n    month: { $dateToString: {\n      format: \"%Y-%m\", date: \"$joined\" } } }\n)",
         "note": "",
         "oql": "customers.where { .id == \"c1\" }.select { month: format_date(.joined, \"%Y-%m\") }",
         "refuses": "",
-        "sql": "to_char(joined, 'YYYY-MM')",
+        "sql": "SELECT to_char(joined, 'YYYY-MM')\n  AS month\nFROM customers\nWHERE id = 'c1';",
         "test": null
       },
       {
@@ -372,11 +372,11 @@
         "check": "",
         "feature": "Nested output",
         "gives": "{\"id\":\"c1\",\"who\":{\"name\":\"Ada\",\"place\":{\"city\":\"Lagos\",\"zip\":\"100001\"}}}",
-        "mongo": "{ who: { name: \"$name\" } }",
+        "mongo": "db.customers.find(\n  { _id: \"c1\" },\n  { who: {\n      name: \"$name\",\n      place: { city: \"$city\",\n               zip: \"$address.zip\" } } }\n)",
         "note": "",
         "oql": "customers.where { .id == \"c1\" }.select { id, who: { name: .name, place: { city: .city, zip: .address.zip } } }",
         "refuses": "",
-        "sql": "json_build_object(...)",
+        "sql": "SELECT id, json_build_object(\n  'name', name,\n  'place', json_build_object(\n    'city', city,\n    'zip', address->>'zip')) AS who\nFROM customers\nWHERE id = 'c1';",
         "test": null
       },
       {
@@ -384,11 +384,11 @@
         "check": "",
         "feature": "List in the output",
         "gives": "{\"figures\":[2.0,100],\"id\":\"p1\"}",
-        "mongo": "[\"$a\", \"$b\"]",
+        "mongo": "db.products.find(\n  { _id: \"p1\" },\n  { figures: [\"$price\", \"$stock\"] }\n)",
         "note": "",
         "oql": "products.where { .id == \"p1\" }.select { id, figures: [.price, .stock] }",
         "refuses": "",
-        "sql": "ARRAY[a, b]",
+        "sql": "SELECT id,\n  ARRAY[price, stock] AS figures\nFROM products\nWHERE id = 'p1';",
         "test": null
       },
       {
@@ -396,11 +396,11 @@
         "check": "",
         "feature": "Order by several keys",
         "gives": "{\"id\":\"c5\"} {\"id\":\"c2\"} {\"id\":\"c3\"} {\"id\":\"c1\"} {\"id\":\"c4\"}",
-        "mongo": "sort({ city: 1, joined: -1 })",
+        "mongo": "db.customers.find({}, { _id: 1 })\n  .sort({ city: 1, joined: -1 })",
         "note": "",
         "oql": "customers.sort { .city.asc, .joined.desc }.select { id }",
         "refuses": "",
-        "sql": "ORDER BY city ASC, joined DESC",
+        "sql": "SELECT id FROM customers\nORDER BY city ASC, joined DESC;",
         "test": null
       },
       {
@@ -408,11 +408,11 @@
         "check": "",
         "feature": "Order by an expression",
         "gives": "{\"id\":\"p4\"} {\"id\":\"p2\"} {\"id\":\"p1\"} {\"id\":\"p5\"} {\"id\":\"p3\"}",
-        "mongo": "$addFields then $sort",
+        "mongo": "db.products.aggregate([\n  { $addFields: { worth: {\n      $multiply: [\"$price\", \"$stock\"] } } },\n  { $sort: { worth: -1, _id: 1 } },\n  { $project: { _id: 1 } }\n])",
         "note": "",
         "oql": "products.sort { (.price * .stock).desc, .id.asc }.select { id }",
         "refuses": "",
-        "sql": "ORDER BY price * stock DESC",
+        "sql": "SELECT id FROM products\nORDER BY price * stock DESC, id;",
         "test": null
       },
       {
@@ -420,11 +420,11 @@
         "check": "",
         "feature": "Where absent values sort",
         "gives": "{\"id\":\"c1\"} {\"id\":\"c3\"} {\"id\":\"c4\"} {\"id\":\"c5\"} {\"id\":\"c2\"}",
-        "mongo": "(absent sorts first)",
+        "mongo": "db.customers.aggregate([\n  { $addFields: { absent: { $eq: [\n      { $ifNull: [\"$email\", null] },\n      null ] } } },\n  { $sort: { absent: 1, email: 1 } },\n  { $project: { _id: 1 } }\n])",
         "note": "An absent value sorts below every other. Sorting on whether it is absent first moves it.",
         "oql": "customers.sort { (.email == null).asc, .email.asc }.select { id }",
         "refuses": "",
-        "sql": "ORDER BY email NULLS LAST",
+        "sql": "SELECT id FROM customers\nORDER BY email NULLS LAST;",
         "test": null
       },
       {
@@ -432,11 +432,11 @@
         "check": "",
         "feature": "Limit and offset",
         "gives": "{\"id\":\"p3\"} {\"id\":\"p2\"}",
-        "mongo": "skip(1).limit(2)",
+        "mongo": "db.products.find({}, { _id: 1 })\n  .sort({ price: -1 })\n  .skip(1)\n  .limit(2)",
         "note": "",
         "oql": "products.sort { .price.desc }.offset(1).limit(2).select { id }",
         "refuses": "",
-        "sql": "LIMIT 2 OFFSET 1",
+        "sql": "SELECT id FROM products\nORDER BY price DESC\nLIMIT 2 OFFSET 1;",
         "test": null
       },
       {
@@ -444,11 +444,11 @@
         "check": "",
         "feature": "Paging from the last row seen",
         "gives": "{\"id\":\"p3\"} {\"id\":\"p4\"}",
-        "mongo": "find({ price: { $gt: 12.5 } }).sort().limit(2)",
+        "mongo": "db.products.find(\n  { $or: [\n      { price: { $gt: 12.5 } },\n      { price: 12.5, _id: { $gt: \"p2\" } }\n    ] },\n  { _id: 1 }\n).sort({ price: 1, _id: 1 })\n .limit(2)",
         "note": "",
         "oql": "products.where { .price > 12.5 || (.price == 12.5 && .id > \"p2\") }.sort { .price.asc, .id.asc }.limit(2).select { id }",
         "refuses": "",
-        "sql": "WHERE (price, id) > (12.5, 'p2') ORDER BY price, id LIMIT 2",
+        "sql": "SELECT id FROM products\nWHERE (price, id) > (12.5, 'p2')\nORDER BY price, id\nLIMIT 2;",
         "test": null
       },
       {
@@ -468,11 +468,11 @@
         "check": "",
         "feature": "Random sample",
         "gives": "{\"count\":2}",
-        "mongo": "{ $sample: { size: 2 } }",
+        "mongo": "db.products.aggregate([\n  { $sample: { size: 2 } },\n  { $count: \"count\" }\n])",
         "note": "",
         "oql": "products.sort { random().asc }.limit(2).count()",
         "refuses": "",
-        "sql": "ORDER BY random() LIMIT 2",
+        "sql": "SELECT count(*) FROM (\n  SELECT id FROM products\n  ORDER BY random()\n  LIMIT 2\n) AS picked;",
         "test": null
       }
     ]
@@ -485,11 +485,11 @@
         "check": "",
         "feature": "Count",
         "gives": "{\"count\":6}",
-        "mongo": "countDocuments()",
+        "mongo": "db.orders.countDocuments()",
         "note": "",
         "oql": "orders.count()",
         "refuses": "",
-        "sql": "SELECT count(*)",
+        "sql": "SELECT count(*) FROM orders;",
         "test": null
       },
       {
@@ -497,11 +497,11 @@
         "check": "",
         "feature": "Sum, average, least, greatest",
         "gives": "{\"avg\":52.666666666666664,\"least\":12.5,\"most\":150.0,\"sum\":316.0}",
-        "mongo": "$sum, $avg, $min, $max",
+        "mongo": "db.orders.aggregate([\n  { $group: { _id: null,\n      sum: { $sum: \"$total\" },\n      avg: { $avg: \"$total\" },\n      least: { $min: \"$total\" },\n      most: { $max: \"$total\" } } }\n])",
         "note": "",
         "oql": "orders.select { sum: sum(.total), avg: avg(.total), least: min(.total), most: max(.total) }",
         "refuses": "",
-        "sql": "sum, avg, min, max",
+        "sql": "SELECT sum(total) AS sum,\n       avg(total) AS avg,\n       min(total) AS least,\n       max(total) AS most\nFROM orders;",
         "test": null
       },
       {
@@ -509,11 +509,11 @@
         "check": "",
         "feature": "Group by",
         "gives": "{\"n\":1,\"status\":\"cancelled\",\"total\":12.5} {\"n\":1,\"status\":\"open\",\"total\":60.0} {\"n\":4,\"status\":\"paid\",\"total\":243.5}",
-        "mongo": "{ $group: { _id: \"$status\" } }",
+        "mongo": "db.orders.aggregate([\n  { $group: { _id: \"$status\",\n      n: { $sum: 1 },\n      total: { $sum: \"$total\" } } },\n  { $sort: { _id: 1 } }\n])",
         "note": "",
         "oql": "orders.group_by { .status }.select { status, n: count(), total: sum(.total) }.sort { .status.asc }",
         "refuses": "",
-        "sql": "GROUP BY status",
+        "sql": "SELECT status, count(*) AS n,\n       sum(total) AS total\nFROM orders\nGROUP BY status\nORDER BY status;",
         "test": null
       },
       {
@@ -521,11 +521,11 @@
         "check": "",
         "feature": "Group by several keys",
         "gives": "{\"city\":\"Accra\",\"n\":1,\"status\":\"open\"} {\"city\":\"Lagos\",\"n\":1,\"status\":\"cancelled\"} {\"city\":\"Lagos\",\"n\":3,\"status\":\"paid\"} {\"city\":\"Nairobi\",\"n\":1,\"status\":\"paid\"}",
-        "mongo": "{ _id: { city: ..., status: ... } }",
+        "mongo": "db.orders.aggregate([\n  { $lookup: { from: \"customers\",\n      localField: \"customer\",\n      foreignField: \"_id\", as: \"c\" } },\n  { $unwind: \"$c\" },\n  { $group: {\n      _id: { city: \"$c.city\",\n             status: \"$status\" },\n      n: { $sum: 1 } } },\n  { $sort: { \"_id.city\": 1,\n             \"_id.status\": 1 } }\n])",
         "note": "",
         "oql": "orders.group_by { city: .customer.city, .status }.select { city, status, n: count() }.sort { .city.asc, .status.asc }",
         "refuses": "",
-        "sql": "GROUP BY city, status",
+        "sql": "SELECT c.city, o.status,\n       count(*) AS n\nFROM orders o\nJOIN customers c ON c.id = o.customer\nGROUP BY c.city, o.status\nORDER BY c.city, o.status;",
         "test": null
       },
       {
@@ -533,11 +533,11 @@
         "check": "",
         "feature": "Group by an expression",
         "gives": "{\"month\":\"2026-01\",\"n\":1} {\"month\":\"2026-02\",\"n\":2} {\"month\":\"2026-03\",\"n\":3}",
-        "mongo": "{ _id: { $dateTrunc: ... } }",
+        "mongo": "db.orders.aggregate([\n  { $group: {\n      _id: { $dateToString: {\n        format: \"%Y-%m\",\n        date: \"$placed\" } },\n      n: { $sum: 1 } } },\n  { $sort: { _id: 1 } }\n])",
         "note": "",
         "oql": "orders.group_by { month: format_date(.placed, \"%Y-%m\") }.select { month, n: count() }.sort { .month.asc }",
         "refuses": "",
-        "sql": "GROUP BY date_trunc('month', placed)",
+        "sql": "SELECT to_char(placed, 'YYYY-MM')\n         AS month,\n       count(*) AS n\nFROM orders\nGROUP BY month\nORDER BY month;",
         "test": null
       },
       {
@@ -545,11 +545,11 @@
         "check": "",
         "feature": "Filter on a group",
         "gives": "{\"customer\":\"c1\",\"n\":2} {\"customer\":\"c3\",\"n\":2}",
-        "mongo": "$match after $group",
+        "mongo": "db.orders.aggregate([\n  { $group: { _id: \"$customer\",\n      n: { $sum: 1 } } },\n  { $match: { n: { $gt: 1 } } },\n  { $sort: { _id: 1 } }\n])",
         "note": "",
         "oql": "orders.group_by { .customer }.select { customer: .customer.id, n: count() }.where { .n > 1 }.sort { .customer.asc }",
         "refuses": "",
-        "sql": "HAVING count(*) > 1",
+        "sql": "SELECT customer, count(*) AS n\nFROM orders\nGROUP BY customer\nHAVING count(*) > 1\nORDER BY customer;",
         "test": null
       },
       {
@@ -557,11 +557,11 @@
         "check": "",
         "feature": "Count of distinct values",
         "gives": "{\"count\":4}",
-        "mongo": "$addToSet then $size",
+        "mongo": "db.orders.distinct(\"customer\").length",
         "note": "",
         "oql": "orders.customer.distinct().count()",
         "refuses": "",
-        "sql": "count(DISTINCT customer)",
+        "sql": "SELECT count(DISTINCT customer)\nFROM orders;",
         "test": null
       },
       {
@@ -569,11 +569,11 @@
         "check": "",
         "feature": "Aggregate over some of the rows",
         "gives": "{\"customer\":\"c1\",\"paid\":2,\"paid_total\":176.5} {\"customer\":\"c2\",\"paid\":0,\"paid_total\":0} {\"customer\":\"c3\",\"paid\":1,\"paid_total\":42.0} {\"customer\":\"c4\",\"paid\":1,\"paid_total\":25.0}",
-        "mongo": "{ $sum: { $cond: [...] } }",
+        "mongo": "db.orders.aggregate([\n  { $group: { _id: \"$customer\",\n      paid: { $sum: { $cond: [\n        { $eq: [\"$status\", \"paid\"] },\n        1, 0 ] } },\n      paid_total: { $sum: { $cond: [\n        { $eq: [\"$status\", \"paid\"] },\n        \"$total\", 0 ] } } } },\n  { $sort: { _id: 1 } }\n])",
         "note": "",
         "oql": "orders.group_by { .customer }.select { customer: .customer.id, paid: where { .status == \"paid\" }.count(), paid_total: where { .status == \"paid\" }.sum(.total) }.sort { .customer.asc }",
         "refuses": "",
-        "sql": "count(*) FILTER (WHERE status = 'paid')",
+        "sql": "SELECT customer,\n  count(*) FILTER (\n    WHERE status = 'paid') AS paid,\n  coalesce(sum(total) FILTER (\n    WHERE status = 'paid'), 0)\n    AS paid_total\nFROM orders\nGROUP BY customer\nORDER BY customer;",
         "test": null
       },
       {
@@ -581,11 +581,11 @@
         "check": "",
         "feature": "Median and percentiles",
         "gives": "{\"median\":34.25,\"p90\":105.0}",
-        "mongo": "$median, $percentile",
+        "mongo": "db.orders.aggregate([\n  { $group: { _id: null,\n      median: { $median: {\n        input: \"$total\",\n        method: \"approximate\" } },\n      p90: { $percentile: {\n        input: \"$total\", p: [0.9],\n        method: \"approximate\" } } } }\n])",
         "note": "",
         "oql": "orders.select { median: median(.total), p90: percentile(.total, 0.9) }",
         "refuses": "",
-        "sql": "percentile_cont(0.5) WITHIN GROUP (ORDER BY total)",
+        "sql": "SELECT\n  percentile_cont(0.5) WITHIN GROUP\n    (ORDER BY total) AS median,\n  percentile_cont(0.9) WITHIN GROUP\n    (ORDER BY total) AS p90\nFROM orders;",
         "test": null
       },
       {
@@ -593,11 +593,11 @@
         "check": "",
         "feature": "Spread",
         "gives": "{\"category\":\"home\",\"sample\":12.5,\"sd\":2.5,\"whole\":6.25} {\"category\":\"kitchen\",\"sample\":null,\"sd\":0.0,\"whole\":0.0} {\"category\":\"stationery\",\"sample\":1800.0,\"sd\":30.0,\"whole\":900.0}",
-        "mongo": "$stdDevSamp, $stdDevPop",
+        "mongo": "db.products.aggregate([\n  { $group: { _id: \"$category\",\n      ss: { $stdDevSamp: \"$stock\" },\n      sd: { $stdDevPop: \"$stock\" } } },\n  { $project: { sd: 1,\n      sample: { $pow: [\"$ss\", 2] },\n      whole: { $pow: [\"$sd\", 2] } } },\n  { $sort: { _id: 1 } }\n])",
         "note": "",
         "oql": "products.group_by { .category }.select { category, sample: variance(.stock), whole: .stock.variance_pop(), sd: .stock.stddev_pop() }.sort { .category.asc }",
         "refuses": "",
-        "sql": "stddev_samp, var_pop",
+        "sql": "SELECT category,\n       var_samp(stock) AS sample,\n       var_pop(stock) AS whole,\n       stddev_pop(stock) AS sd\nFROM products\nGROUP BY category\nORDER BY category;",
         "test": null
       },
       {
@@ -605,11 +605,11 @@
         "check": "",
         "feature": "Values of a group as a list",
         "gives": "{\"status\":\"cancelled\",\"totals\":[12.5]} {\"status\":\"open\",\"totals\":[60.0]} {\"status\":\"paid\",\"totals\":[26.5,150.0,42.0,25.0]}",
-        "mongo": "{ $push: \"$total\" }",
+        "mongo": "db.orders.aggregate([\n  { $group: { _id: \"$status\",\n      totals: { $push: \"$total\" } } },\n  { $sort: { _id: 1 } }\n])",
         "note": "",
         "oql": "orders.group_by { .status }.select { status, totals: .total }.sort { .status.asc }",
         "refuses": "",
-        "sql": "array_agg(total)",
+        "sql": "SELECT status,\n       array_agg(total) AS totals\nFROM orders\nGROUP BY status\nORDER BY status;",
         "test": null
       },
       {
@@ -617,11 +617,11 @@
         "check": "",
         "feature": "Distinct values of a group as a list",
         "gives": "{\"cities\":[\"Lagos\"],\"status\":\"cancelled\"} {\"cities\":[\"Accra\"],\"status\":\"open\"} {\"cities\":[\"Lagos\",\"Nairobi\"],\"status\":\"paid\"}",
-        "mongo": "{ $addToSet: \"$city\" }",
+        "mongo": "db.orders.aggregate([\n  { $lookup: { from: \"customers\",\n      localField: \"customer\",\n      foreignField: \"_id\", as: \"c\" } },\n  { $unwind: \"$c\" },\n  { $group: { _id: \"$status\",\n      cities: { $addToSet: \"$c.city\" } } },\n  { $sort: { _id: 1 } }\n])",
         "note": "",
         "oql": "orders.group_by { .status }.select { status, cities: .customer.city.distinct() }.sort { .status.asc }",
         "refuses": "",
-        "sql": "array_agg(DISTINCT city)",
+        "sql": "SELECT o.status,\n  array_agg(DISTINCT c.city) AS cities\nFROM orders o\nJOIN customers c ON c.id = o.customer\nGROUP BY o.status\nORDER BY o.status;",
         "test": null
       },
       {
@@ -629,11 +629,11 @@
         "check": "",
         "feature": "First or last row of each group",
         "gives": "{\"customer\":\"c1\",\"latest\":\"o2\"} {\"customer\":\"c2\",\"latest\":\"o3\"} {\"customer\":\"c3\",\"latest\":\"o5\"} {\"customer\":\"c4\",\"latest\":\"o6\"}",
-        "mongo": "{ $first: ... } after $sort",
+        "mongo": "db.orders.aggregate([\n  { $sort: { placed: -1 } },\n  { $group: { _id: \"$customer\",\n      latest: { $first: \"$_id\" } } },\n  { $sort: { _id: 1 } }\n])",
         "note": "",
         "oql": "orders.sort { .placed.desc }.group_by { .customer }.select { customer: .customer.id, latest: first().id }.sort { .customer.asc }",
         "refuses": "",
-        "sql": "DISTINCT ON (customer) ... ORDER BY placed DESC",
+        "sql": "SELECT DISTINCT ON (customer)\n       customer, id AS latest\nFROM orders\nORDER BY customer, placed DESC;",
         "test": null
       },
       {
@@ -641,11 +641,11 @@
         "check": "",
         "feature": "Ranges as groups",
         "gives": "{\"n\":1,\"size\":\"large\"} {\"n\":2,\"size\":\"medium\"} {\"n\":3,\"size\":\"small\"}",
-        "mongo": "$bucket",
+        "mongo": "db.orders.aggregate([\n  { $bucket: {\n      groupBy: \"$total\",\n      boundaries: [0, 30, 100],\n      default: \"large\",\n      output: { n: { $sum: 1 } } } }\n])",
         "note": "",
         "oql": "orders.group_by { size: if .total < 30 then \"small\" else if .total < 100 then \"medium\" else \"large\" }.select { size, n: count() }.sort { .size.asc }",
         "refuses": "",
-        "sql": "width_bucket(total, ...) or CASE",
+        "sql": "SELECT\n  CASE WHEN total < 30 THEN 'small'\n       WHEN total < 100 THEN 'medium'\n       ELSE 'large'\n  END AS size,\n  count(*) AS n\nFROM orders\nGROUP BY size\nORDER BY size;",
         "test": null
       },
       {
@@ -653,11 +653,11 @@
         "check": "",
         "feature": "Several summaries in one answer",
         "gives": "{\"by_status\":[{\"n\":1,\"status\":\"cancelled\"},{\"n\":1,\"status\":\"open\"},{\"n\":4,\"status\":\"paid\"}],\"dearest\":[{\"id\":\"o2\"},{\"id\":\"o3\"}]}",
-        "mongo": "$facet",
+        "mongo": "db.orders.aggregate([\n  { $facet: {\n      by_status: [\n        { $group: { _id: \"$status\",\n            n: { $sum: 1 } } },\n        { $sort: { _id: 1 } }\n      ],\n      dearest: [\n        { $sort: { total: -1 } },\n        { $limit: 2 },\n        { $project: { _id: 1 } }\n      ] } }\n])",
         "note": "",
         "oql": "customers.limit(1).select { by_status: orders.group_by { .status }.select { status, n: count() }.sort { .status.asc }, dearest: orders.sort { .total.desc }.limit(2).select { id } }",
         "refuses": "",
-        "sql": "(one query each, or UNION ALL)",
+        "sql": "SELECT\n  (SELECT json_agg(s) FROM (\n     SELECT status, count(*) AS n\n     FROM orders\n     GROUP BY status\n     ORDER BY status) s) AS by_status,\n  (SELECT json_agg(d) FROM (\n     SELECT id FROM orders\n     ORDER BY total DESC\n     LIMIT 2) d) AS dearest;",
         "test": null
       },
       {
@@ -665,11 +665,11 @@
         "check": "",
         "feature": "Subtotals and grand totals",
         "gives": "",
-        "mongo": "(several $group stages in $facet)",
+        "mongo": "(a $facet with one $group for each level of total)",
         "note": "One grouping per query. Subtotals are a second query, or two queries joined with `union`.",
         "oql": "",
         "refuses": "orders.group_by { rollup(.customer.city, .status) }.select { city, status, n: count() }",
-        "sql": "GROUP BY ROLLUP (city, status), CUBE, GROUPING SETS",
+        "sql": "SELECT c.city, o.status,\n       count(*) AS n\nFROM orders o\nJOIN customers c ON c.id = o.customer\nGROUP BY ROLLUP (c.city, o.status);",
         "test": null
       }
     ]
@@ -682,11 +682,11 @@
         "check": "",
         "feature": "Row and the row it refers to",
         "gives": "{\"city\":\"Accra\",\"customer\":\"Bob\",\"id\":\"o3\"}",
-        "mongo": "$lookup then $unwind",
+        "mongo": "db.orders.aggregate([\n  { $match: { _id: \"o3\" } },\n  { $lookup: { from: \"customers\",\n      localField: \"customer\",\n      foreignField: \"_id\", as: \"c\" } },\n  { $unwind: \"$c\" },\n  { $project: { customer: \"$c.name\",\n                city: \"$c.city\" } }\n])",
         "note": "A reference is followed with a dot. No join is written.",
         "oql": "orders.where { .id == \"o3\" }.select { id, customer: .customer.name, city: .customer.city }",
         "refuses": "",
-        "sql": "JOIN customers c ON c.id = o.customer",
+        "sql": "SELECT o.id, c.name AS customer,\n       c.city\nFROM orders o\nJOIN customers c ON c.id = o.customer\nWHERE o.id = 'o3';",
         "test": null
       },
       {
@@ -694,11 +694,11 @@
         "check": "",
         "feature": "Filter through a reference",
         "gives": "{\"id\":\"o1\"} {\"id\":\"o2\"} {\"id\":\"o4\"} {\"id\":\"o5\"}",
-        "mongo": "$lookup then $match",
+        "mongo": "db.orders.aggregate([\n  { $lookup: { from: \"customers\",\n      localField: \"customer\",\n      foreignField: \"_id\", as: \"c\" } },\n  { $match: { \"c.city\": \"Lagos\" } },\n  { $project: { _id: 1 } }\n])",
         "note": "",
         "oql": "orders.where { .customer.city == \"Lagos\" }.select { id }",
         "refuses": "",
-        "sql": "JOIN ... WHERE c.city = 'Lagos'",
+        "sql": "SELECT o.id\nFROM orders o\nJOIN customers c ON c.id = o.customer\nWHERE c.city = 'Lagos';",
         "test": null
       },
       {
@@ -706,11 +706,11 @@
         "check": "",
         "feature": "Optional reference",
         "gives": "{\"id\":\"c1\",\"referrer\":null} {\"id\":\"c2\",\"referrer\":\"Ada\"}",
-        "mongo": "$lookup, preserveNullAndEmptyArrays",
+        "mongo": "db.customers.aggregate([\n  { $sort: { _id: 1 } },\n  { $limit: 2 },\n  { $lookup: { from: \"customers\",\n      localField: \"referrer\",\n      foreignField: \"_id\", as: \"r\" } },\n  { $project: { referrer: {\n      $ifNull: [{ $first: \"$r.name\" },\n                null] } } }\n])",
         "note": "",
         "oql": "customers.sort { .id.asc }.limit(2).select { id, referrer: .referrer.name }",
         "refuses": "",
-        "sql": "LEFT JOIN customers r ON r.id = c.referrer",
+        "sql": "SELECT c.id, r.name AS referrer\nFROM customers c\nLEFT JOIN customers r\n  ON r.id = c.referrer\nORDER BY c.id\nLIMIT 2;",
         "test": null
       },
       {
@@ -718,11 +718,11 @@
         "check": "",
         "feature": "Rows that refer to a row",
         "gives": "{\"id\":\"c1\",\"orders\":2,\"spent\":176.5} {\"id\":\"c2\",\"orders\":1,\"spent\":60.0} {\"id\":\"c3\",\"orders\":2,\"spent\":54.5} {\"id\":\"c4\",\"orders\":1,\"spent\":25.0} {\"id\":\"c5\",\"orders\":0,\"spent\":0}",
-        "mongo": "$lookup then $size",
+        "mongo": "db.customers.aggregate([\n  { $lookup: { from: \"orders\",\n      localField: \"_id\",\n      foreignField: \"customer\",\n      as: \"o\" } },\n  { $project: {\n      orders: { $size: \"$o\" },\n      spent: { $sum: \"$o.total\" } } },\n  { $sort: { _id: 1 } }\n])",
         "note": "Every reference can be followed backwards under the name of the collection that holds it.",
         "oql": "customers.sort { .id.asc }.select { id, orders: .orders.count(), spent: .orders.sum(.total) }",
         "refuses": "",
-        "sql": "LEFT JOIN orders o ON o.customer = c.id GROUP BY c.id",
+        "sql": "SELECT c.id, count(o.id) AS orders,\n  coalesce(sum(o.total), 0) AS spent\nFROM customers c\nLEFT JOIN orders o\n  ON o.customer = c.id\nGROUP BY c.id\nORDER BY c.id;",
         "test": null
       },
       {
@@ -730,11 +730,11 @@
         "check": "",
         "feature": "Related rows nested in the answer",
         "gives": "{\"id\":\"c3\",\"orders\":[{\"id\":\"o4\",\"status\":\"paid\"},{\"id\":\"o5\",\"status\":\"cancelled\"}]}",
-        "mongo": "$lookup",
+        "mongo": "db.customers.aggregate([\n  { $match: { _id: \"c3\" } },\n  { $lookup: { from: \"orders\",\n      localField: \"_id\",\n      foreignField: \"customer\",\n      pipeline: [\n        { $sort: { _id: 1 } },\n        { $project: { status: 1 } }\n      ],\n      as: \"orders\" } },\n  { $project: { orders: 1 } }\n])",
         "note": "",
         "oql": "customers.where { .id == \"c3\" }.select { id, orders: .orders.sort { .id.asc }.select { id, status } }",
         "refuses": "",
-        "sql": "json_agg(o.*) in a lateral join",
+        "sql": "SELECT c.id, (\n  SELECT json_agg(json_build_object(\n    'id', o.id, 'status', o.status)\n    ORDER BY o.id)\n  FROM orders o\n  WHERE o.customer = c.id) AS orders\nFROM customers c\nWHERE c.id = 'c3';",
         "test": null
       },
       {
@@ -742,11 +742,11 @@
         "check": "",
         "feature": "Several steps",
         "gives": "{\"bought\":[\"Book\"],\"id\":\"c4\",\"through\":\"Ada\"}",
-        "mongo": "three $lookup stages",
+        "mongo": "db.customers.aggregate([\n  { $match: { _id: \"c4\" } },\n  { $lookup: { from: \"customers\",\n      localField: \"referrer\",\n      foreignField: \"_id\", as: \"r1\" } },\n  { $lookup: { from: \"customers\",\n      localField: \"r1.referrer\",\n      foreignField: \"_id\", as: \"r2\" } },\n  { $lookup: { from: \"orders\",\n      localField: \"_id\",\n      foreignField: \"customer\",\n      as: \"o\" } },\n  { $lookup: { from: \"products\",\n      localField: \"o.items.product\",\n      foreignField: \"_id\", as: \"p\" } },\n  { $project: {\n      through: { $first: \"$r2.name\" },\n      bought: \"$p.name\" } }\n])",
         "note": "",
         "oql": "customers.where { .id == \"c4\" }.select { id, through: .referrer.referrer.name, bought: .orders.items.product.name }",
         "refuses": "",
-        "sql": "three JOINs",
+        "sql": "SELECT c.id, r2.name AS through, (\n  SELECT array_agg(p.name)\n  FROM orders o\n  JOIN order_items i\n    ON i.order_id = o.id\n  JOIN products p ON p.id = i.product\n  WHERE o.customer = c.id) AS bought\nFROM customers c\nLEFT JOIN customers r1\n  ON r1.id = c.referrer\nLEFT JOIN customers r2\n  ON r2.id = r1.referrer\nWHERE c.id = 'c4';",
         "test": null
       },
       {
@@ -754,11 +754,11 @@
         "check": "",
         "feature": "Row related to its own collection",
         "gives": "{\"id\":\"c1\",\"referred\":2} {\"id\":\"c3\",\"referred\":1}",
-        "mongo": "$lookup from the same collection",
+        "mongo": "db.customers.aggregate([\n  { $match: { referrer: { $ne: null } } },\n  { $group: { _id: \"$referrer\",\n      referred: { $sum: 1 } } },\n  { $sort: { _id: 1 } }\n])",
         "note": "",
         "oql": "customers.where { .referred.exists() }.sort { .id.asc }.select { id, referred: .referred.count() }",
         "refuses": "",
-        "sql": "JOIN customers r ON r.id = c.referrer",
+        "sql": "SELECT r.id, count(*) AS referred\nFROM customers c\nJOIN customers r ON r.id = c.referrer\nGROUP BY r.id\nORDER BY r.id;",
         "test": null
       },
       {
@@ -766,11 +766,11 @@
         "check": "",
         "feature": "Many to many",
         "gives": "{\"buyers\":2,\"id\":\"p1\"} {\"buyers\":3,\"id\":\"p2\"} {\"buyers\":2,\"id\":\"p3\"} {\"buyers\":1,\"id\":\"p4\"} {\"buyers\":0,\"id\":\"p5\"}",
-        "mongo": "$lookup through a list of ids",
+        "mongo": "db.products.aggregate([\n  { $lookup: { from: \"orders\",\n      localField: \"_id\",\n      foreignField: \"items.product\",\n      as: \"o\" } },\n  { $project: { buyers: { $size: {\n      $setUnion: [\"$o.customer\"] } } } },\n  { $sort: { _id: 1 } }\n])",
         "note": "",
         "oql": "products.sort { .id.asc }.select { id, buyers: orders.where { products.id in .items.product.id }.customer.distinct().count() }",
         "refuses": "",
-        "sql": "JOIN through a link table",
+        "sql": "SELECT p.id,\n  count(DISTINCT o.customer) AS buyers\nFROM products p\nLEFT JOIN order_items i\n  ON i.product = p.id\nLEFT JOIN orders o\n  ON o.id = i.order_id\nGROUP BY p.id\nORDER BY p.id;",
         "test": null
       },
       {
@@ -778,11 +778,11 @@
         "check": "",
         "feature": "Rows with a related row",
         "gives": "{\"id\":\"c1\"} {\"id\":\"c3\"} {\"id\":\"c4\"}",
-        "mongo": "$lookup then $match",
+        "mongo": "db.orders.distinct(\n  \"customer\",\n  { status: \"paid\" }\n).sort()",
         "note": "",
         "oql": "customers.where { .orders.where { .status == \"paid\" }.exists() }.sort { .id.asc }.select { id }",
         "refuses": "",
-        "sql": "WHERE EXISTS (SELECT 1 FROM orders ...)",
+        "sql": "SELECT c.id FROM customers c\nWHERE EXISTS (\n  SELECT 1 FROM orders o\n  WHERE o.customer = c.id\n    AND o.status = 'paid')\nORDER BY c.id;",
         "test": null
       },
       {
@@ -790,11 +790,11 @@
         "check": "",
         "feature": "Rows with no related row",
         "gives": "{\"id\":\"c5\"}",
-        "mongo": "$lookup then $match on empty",
+        "mongo": "db.customers.aggregate([\n  { $lookup: { from: \"orders\",\n      localField: \"_id\",\n      foreignField: \"customer\",\n      as: \"o\" } },\n  { $match: { o: [] } },\n  { $project: { _id: 1 } }\n])",
         "note": "",
         "oql": "customers.where { !.orders.exists() }.select { id }",
         "refuses": "",
-        "sql": "WHERE NOT EXISTS (...)",
+        "sql": "SELECT c.id FROM customers c\nWHERE NOT EXISTS (\n  SELECT 1 FROM orders o\n  WHERE o.customer = c.id);",
         "test": null
       },
       {
@@ -802,11 +802,11 @@
         "check": "",
         "feature": "Join on any condition",
         "gives": "{\"id\":\"c1\",\"neighbours\":[{\"id\":\"c3\"}]} {\"id\":\"c2\",\"neighbours\":[{\"id\":\"c5\"}]} {\"id\":\"c3\",\"neighbours\":[{\"id\":\"c1\"}]} {\"id\":\"c4\",\"neighbours\":[]} {\"id\":\"c5\",\"neighbours\":[{\"id\":\"c2\"}]}",
-        "mongo": "$lookup with a pipeline",
+        "mongo": "db.customers.aggregate([\n  { $lookup: { from: \"customers\",\n      let: { city: \"$city\", me: \"$_id\" },\n      pipeline: [\n        { $match: { $expr: { $and: [\n            { $eq: [\"$city\", \"$$city\"] },\n            { $ne: [\"$_id\", \"$$me\"] }\n          ] } } },\n        { $project: { _id: 1 } }\n      ],\n      as: \"neighbours\" } },\n  { $project: { neighbours: 1 } },\n  { $sort: { _id: 1 } }\n])",
         "note": "",
         "oql": "customers.sort { .id.asc }.select { id, neighbours: customers.where { .city == customers.city && .id != customers.id }.select { id } }",
         "refuses": "",
-        "sql": "JOIN customers b ON b.city = a.city AND b.id <> a.id",
+        "sql": "SELECT a.id, coalesce(\n  json_agg(json_build_object(\n    'id', b.id))\n  FILTER (WHERE b.id IS NOT NULL),\n  '[]') AS neighbours\nFROM customers a\nLEFT JOIN customers b\n  ON b.city = a.city AND b.id <> a.id\nGROUP BY a.id\nORDER BY a.id;",
         "test": null
       },
       {
@@ -814,11 +814,11 @@
         "check": "",
         "feature": "Every row with every row",
         "gives": "{\"id\":\"c2\",\"with\":[{\"id\":\"p3\"},{\"id\":\"p4\"}]} {\"id\":\"c5\",\"with\":[{\"id\":\"p3\"},{\"id\":\"p4\"}]}",
-        "mongo": "$lookup with an empty pipeline",
+        "mongo": "db.customers.aggregate([\n  { $match: { city: \"Accra\" } },\n  { $sort: { _id: 1 } },\n  { $lookup: { from: \"products\",\n      pipeline: [\n        { $match: { price: { $gt: 20 } } },\n        { $sort: { _id: 1 } },\n        { $project: { _id: 1 } }\n      ],\n      as: \"with\" } },\n  { $project: { with: 1 } }\n])",
         "note": "The second side comes nested under each row of the first, not as one flat row per pair.",
         "oql": "customers.where { .city == \"Accra\" }.sort { .id.asc }.select { id, with: products.where { .price > 20 }.sort { .id.asc }.select { id } }",
         "refuses": "",
-        "sql": "CROSS JOIN",
+        "sql": "SELECT c.id, p.id AS \"with\"\nFROM customers c\nCROSS JOIN products p\nWHERE c.city = 'Accra'\n  AND p.price > 20\nORDER BY c.id, p.id;",
         "test": null
       },
       {
@@ -826,11 +826,11 @@
         "check": "",
         "feature": "Unmatched rows from both sides",
         "gives": "",
-        "mongo": "(two $lookup stages and $unionWith)",
+        "mongo": "(two $lookup stages put together with $unionWith)",
         "note": "No single form. Each side is a query, and `union` puts them together.",
         "oql": "",
         "refuses": "",
-        "sql": "FULL OUTER JOIN",
+        "sql": "SELECT c.id AS customer,\n       o.id AS \"order\"\nFROM customers c\nFULL OUTER JOIN orders o\n  ON o.customer = c.id;",
         "test": null
       },
       {
@@ -838,11 +838,11 @@
         "check": "",
         "feature": "Hierarchy of any depth",
         "gives": "{\"depth\":1,\"id\":\"c3\"} {\"depth\":2,\"id\":\"c1\"}",
-        "mongo": "$graphLookup",
+        "mongo": "db.customers.aggregate([\n  { $match: { _id: \"c4\" } },\n  { $graphLookup: {\n      from: \"customers\",\n      startWith: \"$referrer\",\n      connectFromField: \"referrer\",\n      connectToField: \"_id\",\n      as: \"up\",\n      depthField: \"depth\" } },\n  { $unwind: \"$up\" },\n  { $sort: { \"up.depth\": 1 } },\n  { $project: { _id: \"$up._id\",\n      depth: { $add: [\"$up.depth\", 1] } } }\n])",
         "note": "",
         "oql": "customers.where { .id == \"c4\" }.walk(.referrer).sort { ._depth.asc }.select { id, depth: ._depth }",
         "refuses": "",
-        "sql": "WITH RECURSIVE",
+        "sql": "WITH RECURSIVE up AS (\n  SELECT referrer, 1 AS depth\n  FROM customers\n  WHERE id = 'c4'\n  UNION ALL\n  SELECT c.referrer, up.depth + 1\n  FROM up\n  JOIN customers c ON c.id = up.referrer\n)\nSELECT referrer AS id, depth\nFROM up\nWHERE referrer IS NOT NULL\nORDER BY depth;",
         "test": null
       },
       {
@@ -850,11 +850,11 @@
         "check": "",
         "feature": "Everything below a row",
         "gives": "{\"below\":3,\"deepest\":2,\"id\":\"c1\"}",
-        "mongo": "$graphLookup",
+        "mongo": "db.customers.aggregate([\n  { $match: { _id: \"c1\" } },\n  { $graphLookup: {\n      from: \"customers\",\n      startWith: \"$_id\",\n      connectFromField: \"_id\",\n      connectToField: \"referrer\",\n      as: \"down\",\n      depthField: \"depth\" } },\n  { $project: {\n      below: { $size: \"$down\" },\n      deepest: { $add: [\n        { $max: \"$down.depth\" }, 1] } } }\n])",
         "note": "",
         "oql": "customers.where { .id == \"c1\" }.select { id, below: .walk(.referred).count(), deepest: .walk(.referred).max(._depth) }",
         "refuses": "",
-        "sql": "WITH RECURSIVE, downwards",
+        "sql": "WITH RECURSIVE down AS (\n  SELECT id, 1 AS depth\n  FROM customers\n  WHERE referrer = 'c1'\n  UNION ALL\n  SELECT c.id, down.depth + 1\n  FROM down\n  JOIN customers c\n    ON c.referrer = down.id\n)\nSELECT 'c1' AS id,\n       count(*) AS below,\n       max(depth) AS deepest\nFROM down;",
         "test": null
       }
     ]
@@ -867,11 +867,11 @@
         "check": "",
         "feature": "One value from another query",
         "gives": "{\"id\":\"o2\"} {\"id\":\"o3\"}",
-        "mongo": "(two queries, or $lookup)",
+        "mongo": "db.orders.aggregate([\n  { $setWindowFields: { output: {\n      mean: { $avg: \"$total\" } } } },\n  { $match: { $expr: {\n      $gt: [\"$total\", \"$mean\"] } } },\n  { $project: { _id: 1 } }\n])",
         "note": "",
         "oql": "orders.where { .total > orders.avg(.total) }.select { id }",
         "refuses": "",
-        "sql": "WHERE total > (SELECT avg(total) FROM orders)",
+        "sql": "SELECT id FROM orders\nWHERE total > (\n  SELECT avg(total) FROM orders);",
         "test": null
       },
       {
@@ -879,11 +879,11 @@
         "check": "",
         "feature": "Query that depends on the row",
         "gives": "{\"id\":\"o2\"} {\"id\":\"o3\"} {\"id\":\"o4\"} {\"id\":\"o6\"}",
-        "mongo": "$lookup with let",
+        "mongo": "db.orders.aggregate([\n  { $setWindowFields: {\n      partitionBy: \"$customer\",\n      output: {\n        most: { $max: \"$total\" } } } },\n  { $match: { $expr: {\n      $eq: [\"$total\", \"$most\"] } } },\n  { $sort: { _id: 1 } },\n  { $project: { _id: 1 } }\n])",
         "note": "",
         "oql": "orders.where { .total == .customer.orders.max(.total) }.sort { .id.asc }.select { id }",
         "refuses": "",
-        "sql": "WHERE total = (SELECT max(total) ... WHERE customer = o.customer)",
+        "sql": "SELECT o.id FROM orders o\nWHERE o.total = (\n  SELECT max(total) FROM orders\n  WHERE customer = o.customer)\nORDER BY o.id;",
         "test": null
       },
       {
@@ -891,11 +891,11 @@
         "check": "",
         "feature": "In the rows of another query",
         "gives": "{\"id\":\"c1\"} {\"id\":\"c2\"}",
-        "mongo": "(two queries, or $lookup)",
+        "mongo": "db.customers.find(\n  { _id: { $in: db.orders.distinct(\n      \"customer\",\n      { total: { $gt: 50 } }) } },\n  { _id: 1 }\n)",
         "note": "",
         "oql": "customers.where { .id in orders.where { .total > 50 }.customer.id }.select { id }",
         "refuses": "",
-        "sql": "WHERE id IN (SELECT customer FROM orders WHERE total > 50)",
+        "sql": "SELECT id FROM customers\nWHERE id IN (\n  SELECT customer FROM orders\n  WHERE total > 50);",
         "test": null
       },
       {
@@ -915,11 +915,11 @@
         "check": "",
         "feature": "Rows of either query",
         "gives": "{\"id\":\"c1\"} {\"id\":\"c3\"} {\"id\":\"c4\"}",
-        "mongo": "$unionWith then $group",
+        "mongo": "db.customers.aggregate([\n  { $match: { city: \"Nairobi\" } },\n  { $unionWith: { coll: \"customers\",\n      pipeline: [\n        { $match: { tags: \"vip\" } }\n      ] } },\n  { $group: { _id: \"$_id\" } },\n  { $sort: { _id: 1 } }\n])",
         "note": "",
         "oql": "customers.where { .city == \"Nairobi\" }.union(customers.where { \"vip\" in .tags }).sort { .id.asc }.select { id }",
         "refuses": "",
-        "sql": "UNION",
+        "sql": "SELECT id FROM customers\nWHERE city = 'Nairobi'\nUNION\nSELECT id FROM customers\nWHERE 'vip' = ANY(tags)\nORDER BY id;",
         "test": null
       },
       {
@@ -927,11 +927,11 @@
         "check": "",
         "feature": "Rows of both, repeats kept",
         "gives": "{\"count\":4}",
-        "mongo": "$unionWith",
+        "mongo": "db.customers.aggregate([\n  { $match: { city: \"Lagos\" } },\n  { $unionWith: { coll: \"customers\",\n      pipeline: [\n        { $match: { tags: \"vip\" } }\n      ] } },\n  { $count: \"count\" }\n])",
         "note": "",
         "oql": "(customers.where { .city == \"Lagos\" } + customers.where { \"vip\" in .tags }).count()",
         "refuses": "",
-        "sql": "UNION ALL",
+        "sql": "SELECT count(*) FROM (\n  SELECT id FROM customers\n  WHERE city = 'Lagos'\n  UNION ALL\n  SELECT id FROM customers\n  WHERE 'vip' = ANY(tags)\n) AS u;",
         "test": null
       },
       {
@@ -939,11 +939,11 @@
         "check": "",
         "feature": "Rows in both queries",
         "gives": "{\"id\":\"c5\"}",
-        "mongo": "(no stage)",
+        "mongo": "// no stage for it; over one\n// collection, both conditions\ndb.customers.find(\n  { city: \"Accra\",\n    email: { $ne: null } },\n  { _id: 1 }\n)",
         "note": "",
         "oql": "customers.where { .city == \"Accra\" }.intersect(customers.where { .email != null }).select { id }",
         "refuses": "",
-        "sql": "INTERSECT",
+        "sql": "SELECT id FROM customers\nWHERE city = 'Accra'\nINTERSECT\nSELECT id FROM customers\nWHERE email IS NOT NULL;",
         "test": null
       },
       {
@@ -951,11 +951,11 @@
         "check": "",
         "feature": "Rows in one query and not the other",
         "gives": "{\"id\":\"c2\"}",
-        "mongo": "(no stage)",
+        "mongo": "// no stage for it; over one\n// collection, the second negated\ndb.customers.find(\n  { city: \"Accra\", email: null },\n  { _id: 1 }\n)",
         "note": "",
         "oql": "customers.where { .city == \"Accra\" }.except(customers.where { .email != null }).select { id }",
         "refuses": "",
-        "sql": "EXCEPT",
+        "sql": "SELECT id FROM customers\nWHERE city = 'Accra'\nEXCEPT\nSELECT id FROM customers\nWHERE email IS NOT NULL;",
         "test": null
       }
     ]
@@ -968,11 +968,11 @@
         "check": "",
         "feature": "Position in a partition",
         "gives": "{\"id\":\"o1\",\"n\":1} {\"id\":\"o2\",\"n\":2} {\"id\":\"o3\",\"n\":1} {\"id\":\"o4\",\"n\":1} {\"id\":\"o5\",\"n\":2} {\"id\":\"o6\",\"n\":1}",
-        "mongo": "$setWindowFields, $documentNumber",
+        "mongo": "db.orders.aggregate([\n  { $setWindowFields: {\n      partitionBy: \"$customer\",\n      sortBy: { placed: 1 },\n      output: {\n        n: { $documentNumber: {} } } } },\n  { $sort: { customer: 1, placed: 1 } },\n  { $project: { n: 1 } }\n])",
         "note": "",
         "oql": "orders.sort { .customer.id.asc, .placed.asc }.partition_by { .customer }.select { id, n: row_number() }",
         "refuses": "",
-        "sql": "row_number() OVER (PARTITION BY customer ORDER BY placed)",
+        "sql": "SELECT id, row_number() OVER (\n  PARTITION BY customer\n  ORDER BY placed) AS n\nFROM orders\nORDER BY customer, placed;",
         "test": null
       },
       {
@@ -980,11 +980,11 @@
         "check": "",
         "feature": "Rank, with and without gaps",
         "gives": "{\"dense\":1,\"id\":\"p4\",\"rank\":1} {\"dense\":2,\"id\":\"p3\",\"rank\":2} {\"dense\":1,\"id\":\"p5\",\"rank\":1} {\"dense\":1,\"id\":\"p2\",\"rank\":1} {\"dense\":2,\"id\":\"p1\",\"rank\":2}",
-        "mongo": "$rank, $denseRank",
+        "mongo": "db.products.aggregate([\n  { $setWindowFields: {\n      partitionBy: \"$category\",\n      sortBy: { price: -1 },\n      output: {\n        rank: { $rank: {} },\n        dense: { $denseRank: {} } } } },\n  { $sort: { category: 1, price: -1 } },\n  { $project: { rank: 1, dense: 1 } }\n])",
         "note": "",
         "oql": "products.sort { .category.asc, .price.desc }.partition_by { .category }.select { id, rank: rank(.price), dense: dense_rank(.price) }",
         "refuses": "",
-        "sql": "rank(), dense_rank()",
+        "sql": "SELECT id,\n       rank() OVER w AS rank,\n       dense_rank() OVER w AS dense\nFROM products\nWINDOW w AS (\n  PARTITION BY category\n  ORDER BY price DESC)\nORDER BY category, price DESC;",
         "test": null
       },
       {
@@ -992,11 +992,11 @@
         "check": "",
         "feature": "Row before and row after",
         "gives": "{\"after\":150.0,\"before\":null,\"id\":\"o1\"} {\"after\":60.0,\"before\":26.5,\"id\":\"o2\"} {\"after\":42.0,\"before\":150.0,\"id\":\"o3\"}",
-        "mongo": "$shift",
+        "mongo": "db.orders.aggregate([\n  { $setWindowFields: {\n      sortBy: { placed: 1 },\n      output: {\n        before: { $shift: {\n          output: \"$total\", by: -1 } },\n        after: { $shift: {\n          output: \"$total\", by: 1 } } } } },\n  { $limit: 3 },\n  { $project: { before: 1, after: 1 } }\n])",
         "note": "",
         "oql": "orders.sort { .placed.asc }.select { id, before: prev(.total), after: next(.total) }.limit(3)",
         "refuses": "",
-        "sql": "lag(total), lead(total)",
+        "sql": "SELECT id,\n  lag(total) OVER w AS before,\n  lead(total) OVER w AS after\nFROM orders\nWINDOW w AS (ORDER BY placed)\nORDER BY placed\nLIMIT 3;",
         "test": null
       },
       {
@@ -1004,11 +1004,11 @@
         "check": "",
         "feature": "Running total",
         "gives": "{\"id\":\"o1\",\"running\":26.5} {\"id\":\"o2\",\"running\":176.5} {\"id\":\"o3\",\"running\":236.5} {\"id\":\"o4\",\"running\":278.5} {\"id\":\"o5\",\"running\":291.0} {\"id\":\"o6\",\"running\":316.0}",
-        "mongo": "$sum with a window of documents",
+        "mongo": "db.orders.aggregate([\n  { $setWindowFields: {\n      sortBy: { placed: 1 },\n      output: { running: {\n        $sum: \"$total\",\n        window: { documents: [\n          \"unbounded\", \"current\"] } } } } },\n  { $project: { running: 1 } }\n])",
         "note": "",
         "oql": "orders.sort { .placed.asc }.select { id, running: so_far().total.sum() }",
         "refuses": "",
-        "sql": "sum(total) OVER (ORDER BY placed)",
+        "sql": "SELECT id, sum(total) OVER (\n  ORDER BY placed) AS running\nFROM orders\nORDER BY placed;",
         "test": null
       },
       {
@@ -1016,11 +1016,11 @@
         "check": "",
         "feature": "Moving window",
         "gives": "{\"id\":\"o1\",\"recent\":26.5} {\"id\":\"o2\",\"recent\":88.25} {\"id\":\"o3\",\"recent\":105.0} {\"id\":\"o4\",\"recent\":51.0} {\"id\":\"o5\",\"recent\":27.25} {\"id\":\"o6\",\"recent\":18.75}",
-        "mongo": "$avg with window: { documents: [-1, 0] }",
+        "mongo": "db.orders.aggregate([\n  { $setWindowFields: {\n      sortBy: { placed: 1 },\n      output: { recent: {\n        $avg: \"$total\",\n        window: {\n          documents: [-1, 0] } } } } },\n  { $project: { recent: 1 } }\n])",
         "note": "",
         "oql": "orders.sort { .placed.asc }.select { id, recent: so_far().last(2).total.avg() }",
         "refuses": "",
-        "sql": "avg(total) OVER (ROWS 1 PRECEDING)",
+        "sql": "SELECT id, avg(total) OVER (\n  ORDER BY placed\n  ROWS 1 PRECEDING) AS recent\nFROM orders\nORDER BY placed;",
         "test": null
       },
       {
@@ -1028,11 +1028,11 @@
         "check": "",
         "feature": "Share of a partition",
         "gives": "{\"id\":\"o1\",\"of\":176.5,\"size\":2} {\"id\":\"o2\",\"of\":176.5,\"size\":2} {\"id\":\"o3\",\"of\":60.0,\"size\":1}",
-        "mongo": "$setWindowFields without a window",
+        "mongo": "db.orders.aggregate([\n  { $setWindowFields: {\n      partitionBy: \"$customer\",\n      output: {\n        of: { $sum: \"$total\" },\n        size: { $count: {} } } } },\n  { $sort: { _id: 1 } },\n  { $limit: 3 },\n  { $project: { of: 1, size: 1 } }\n])",
         "note": "",
         "oql": "orders.sort { .id.asc }.partition_by { .customer }.select { id, of: sum(.total), size: count() }.limit(3)",
         "refuses": "",
-        "sql": "total / sum(total) OVER (PARTITION BY customer)",
+        "sql": "SELECT id,\n  sum(total) OVER w AS \"of\",\n  count(*) OVER w AS size\nFROM orders\nWINDOW w AS (PARTITION BY customer)\nORDER BY id\nLIMIT 3;",
         "test": null
       },
       {
@@ -1040,11 +1040,11 @@
         "check": "",
         "feature": "First and last of a partition",
         "gives": "{\"id\":\"o1\",\"latest\":[{\"id\":\"o2\"}],\"opened_with\":\"o1\"} {\"id\":\"o2\",\"latest\":[{\"id\":\"o2\"}],\"opened_with\":\"o1\"} {\"id\":\"o3\",\"latest\":[{\"id\":\"o3\"}],\"opened_with\":\"o3\"}",
-        "mongo": "$first, $last in $setWindowFields",
+        "mongo": "db.orders.aggregate([\n  { $setWindowFields: {\n      partitionBy: \"$customer\",\n      sortBy: { placed: 1 },\n      output: {\n        opened_with: { $first: \"$_id\" },\n        latest: { $last: \"$_id\" } } } },\n  { $sort: { customer: 1, placed: 1 } },\n  { $limit: 3 },\n  { $project: { opened_with: 1,\n                latest: 1 } }\n])",
         "note": "",
         "oql": "orders.sort { .customer.id.asc, .placed.asc }.partition_by { .customer }.select { id, opened_with: first().id, latest: last(1).select { id } }.limit(3)",
         "refuses": "",
-        "sql": "first_value(id), last_value(id)",
+        "sql": "SELECT id,\n  first_value(id) OVER w\n    AS opened_with,\n  last_value(id) OVER w AS latest\nFROM orders\nWINDOW w AS (\n  PARTITION BY customer\n  ORDER BY placed\n  ROWS BETWEEN UNBOUNDED PRECEDING\n       AND UNBOUNDED FOLLOWING)\nORDER BY customer, placed\nLIMIT 3;",
         "test": null
       },
       {
@@ -1052,11 +1052,11 @@
         "check": "",
         "feature": "Top rows of each partition",
         "gives": "{\"id\":\"o2\"} {\"id\":\"o3\"} {\"id\":\"o4\"} {\"id\":\"o6\"}",
-        "mongo": "$topN",
+        "mongo": "db.orders.aggregate([\n  { $group: { _id: \"$customer\",\n      top: { $topN: { n: 1,\n        sortBy: { total: -1 },\n        output: \"$_id\" } } } },\n  { $sort: { _id: 1 } },\n  { $project: {\n      _id: { $first: \"$top\" } } }\n])",
         "note": "",
         "oql": "orders.sort { .customer.id.asc, .total.desc }.partition_by { .customer }.select { id, n: row_number() }.where { .n == 1 }.select { id }",
         "refuses": "",
-        "sql": "WHERE row_number() ... <= 1 in a subquery",
+        "sql": "SELECT id FROM (\n  SELECT id, customer,\n    row_number() OVER (\n      PARTITION BY customer\n      ORDER BY total DESC) AS n\n  FROM orders\n) ranked\nWHERE n = 1\nORDER BY customer;",
         "test": null
       },
       {
@@ -1064,11 +1064,11 @@
         "check": "",
         "feature": "Equal-sized buckets and relative rank",
         "gives": "",
-        "mongo": "(no operator)",
+        "mongo": "(no operator for it)",
         "note": "Not built in. `row_number()` over `count()` gives the same figures by hand.",
         "oql": "",
         "refuses": "orders.sort { .total.asc }.select { id, quarter: ntile(4) }",
-        "sql": "ntile(4), percent_rank(), cume_dist()",
+        "sql": "SELECT id, ntile(4) OVER (\n  ORDER BY total) AS quarter\nFROM orders;",
         "test": null
       }
     ]
@@ -1081,11 +1081,11 @@
         "check": "",
         "feature": "Field inside an object",
         "gives": "{\"id\":\"c2\",\"street\":\"2 Ring Rd\"} {\"id\":\"c5\",\"street\":\"5 Oxford St\"}",
-        "mongo": "\"address.zip\"",
+        "mongo": "db.customers.find(\n  { \"address.zip\": \"00233\" },\n  { street: \"$address.street\" }\n).sort({ _id: 1 })",
         "note": "",
         "oql": "customers.where { .address.zip == \"00233\" }.sort { .id.asc }.select { id, street: .address.street }",
         "refuses": "",
-        "sql": "address->>'zip'",
+        "sql": "SELECT id,\n  address->>'street' AS street\nFROM customers\nWHERE address->>'zip' = '00233'\nORDER BY id;",
         "test": null
       },
       {
@@ -1093,11 +1093,11 @@
         "check": "",
         "feature": "List holds a value",
         "gives": "{\"id\":\"c1\"} {\"id\":\"c3\"}",
-        "mongo": "{ tags: \"vip\" }",
+        "mongo": "db.customers.find(\n  { tags: \"vip\" },\n  { _id: 1 }\n).sort({ _id: 1 })",
         "note": "",
         "oql": "customers.where { \"vip\" in .tags }.sort { .id.asc }.select { id }",
         "refuses": "",
-        "sql": "'vip' = ANY(tags)",
+        "sql": "SELECT id FROM customers\nWHERE 'vip' = ANY(tags)\nORDER BY id;",
         "test": null
       },
       {
@@ -1105,11 +1105,11 @@
         "check": "",
         "feature": "List holds all of some values",
         "gives": "{\"id\":\"c1\"}",
-        "mongo": "{ tags: { $all: [...] } }",
+        "mongo": "db.customers.find(\n  { tags: { $all: [\"vip\", \"early\"] } },\n  { _id: 1 }\n)",
         "note": "",
         "oql": "customers.where { \"vip\" in .tags && \"early\" in .tags }.select { id }",
         "refuses": "",
-        "sql": "tags @> ARRAY['vip', 'early']",
+        "sql": "SELECT id FROM customers\nWHERE tags @> ARRAY['vip', 'early'];",
         "test": null
       },
       {
@@ -1117,11 +1117,11 @@
         "check": "",
         "feature": "Length of a list",
         "gives": "{\"id\":\"c2\"} {\"id\":\"c5\"}",
-        "mongo": "$size",
+        "mongo": "db.customers.find(\n  { tags: { $size: 0 } },\n  { _id: 1 }\n).sort({ _id: 1 })",
         "note": "",
         "oql": "customers.where { .tags.count() == 0 }.sort { .id.asc }.select { id }",
         "refuses": "",
-        "sql": "cardinality(tags)",
+        "sql": "SELECT id FROM customers\nWHERE cardinality(tags) = 0\nORDER BY id;",
         "test": null
       },
       {
@@ -1129,11 +1129,11 @@
         "check": "",
         "feature": "Element by position",
         "gives": "{\"first\":\"vip\",\"last\":\"early\",\"none\":null}",
-        "mongo": "$arrayElemAt, $first, $last",
+        "mongo": "db.customers.find(\n  { _id: \"c1\" },\n  { _id: 0,\n    first: { $arrayElemAt: [\"$tags\", 0] },\n    last: { $arrayElemAt: [\"$tags\", -1] },\n    none: { $arrayElemAt: [\"$tags\", 9] } }\n)",
         "note": "",
         "oql": "customers.where { .id == \"c1\" }.select { first: .tags[0], last: .tags[-1], none: .tags[9] }",
         "refuses": "",
-        "sql": "tags[1]",
+        "sql": "SELECT tags[1] AS first,\n  tags[cardinality(tags)] AS last,\n  tags[10] AS none\nFROM customers\nWHERE id = 'c1';",
         "test": null
       },
       {
@@ -1141,11 +1141,11 @@
         "check": "",
         "feature": "One element meets several conditions",
         "gives": "{\"id\":\"o1\"} {\"id\":\"o4\"}",
-        "mongo": "$elemMatch",
+        "mongo": "db.orders.find(\n  { items: { $elemMatch: {\n      qty: { $gt: 5 },\n      price: { $lt: 5 } } } },\n  { _id: 1 }\n).sort({ _id: 1 })",
         "note": "",
         "oql": "orders.where { .items.where { .qty > 5 && .price < 5 }.exists() }.sort { .id.asc }.select { id }",
         "refuses": "",
-        "sql": "EXISTS (SELECT 1 FROM unnest(items) ...)",
+        "sql": "SELECT o.id FROM orders o\nWHERE EXISTS (\n  SELECT 1 FROM order_items i\n  WHERE i.order_id = o.id\n    AND i.qty > 5 AND i.price < 5)\nORDER BY o.id;",
         "test": null
       },
       {
@@ -1153,11 +1153,11 @@
         "check": "",
         "feature": "Every element meets a condition",
         "gives": "{\"id\":\"o3\"} {\"id\":\"o6\"}",
-        "mongo": "{ $not: { $elemMatch: ... } }",
+        "mongo": "db.orders.find(\n  { items: { $not: { $elemMatch: {\n      qty: { $lt: 2 } } } } },\n  { _id: 1 }\n).sort({ _id: 1 })",
         "note": "",
         "oql": "orders.where { !.items.where { .qty < 2 }.exists() }.sort { .id.asc }.select { id }",
         "refuses": "",
-        "sql": "NOT EXISTS (... WHERE NOT ...)",
+        "sql": "SELECT o.id FROM orders o\nWHERE NOT EXISTS (\n  SELECT 1 FROM order_items i\n  WHERE i.order_id = o.id\n    AND i.qty < 2)\nORDER BY o.id;",
         "test": null
       },
       {
@@ -1165,11 +1165,11 @@
         "check": "",
         "feature": "One row per element",
         "gives": "{\"order\":\"o1\",\"product\":\"Pen\",\"qty\":7} {\"order\":\"o1\",\"product\":\"Book\",\"qty\":1} {\"order\":\"o2\",\"product\":\"Desk\",\"qty\":1}",
-        "mongo": "$unwind",
+        "mongo": "db.orders.aggregate([\n  { $unwind: \"$items\" },\n  { $sort: { _id: 1, \"items.qty\": -1 } },\n  { $limit: 3 },\n  { $lookup: { from: \"products\",\n      localField: \"items.product\",\n      foreignField: \"_id\", as: \"p\" } },\n  { $project: { _id: 0,\n      order: \"$_id\",\n      product: { $first: \"$p.name\" },\n      qty: \"$items.qty\" } }\n])",
         "note": "",
         "oql": "orders.items.sort { orders.id.asc, .qty.desc }.limit(3).select { order: orders.id, product: .product.name, qty }",
         "refuses": "",
-        "sql": "CROSS JOIN LATERAL unnest(items)",
+        "sql": "SELECT i.order_id AS \"order\",\n       p.name AS product, i.qty\nFROM order_items i\nJOIN products p ON p.id = i.product\nORDER BY i.order_id, i.qty DESC\nLIMIT 3;",
         "test": null
       },
       {
@@ -1177,11 +1177,11 @@
         "check": "",
         "feature": "Group over elements",
         "gives": "{\"product\":\"p1\",\"revenue\":26.0,\"sold\":13} {\"product\":\"p2\",\"revenue\":50.0,\"sold\":4} {\"product\":\"p3\",\"revenue\":90.0,\"sold\":3} {\"product\":\"p4\",\"revenue\":150.0,\"sold\":1}",
-        "mongo": "$unwind then $group",
+        "mongo": "db.orders.aggregate([\n  { $unwind: \"$items\" },\n  { $group: { _id: \"$items.product\",\n      sold: { $sum: \"$items.qty\" },\n      revenue: { $sum: { $multiply: [\n        \"$items.qty\", \"$items.price\"\n      ] } } } },\n  { $sort: { _id: 1 } }\n])",
         "note": "",
         "oql": "orders.items.group_by { product: .product.id }.select { product, sold: sum(.qty), revenue: sum(.qty * .price) }.sort { .product.asc }",
         "refuses": "",
-        "sql": "unnest then GROUP BY",
+        "sql": "SELECT product,\n       sum(qty) AS sold,\n       sum(qty * price) AS revenue\nFROM order_items\nGROUP BY product\nORDER BY product;",
         "test": null
       },
       {
@@ -1189,11 +1189,11 @@
         "check": "",
         "feature": "One field of the elements that match",
         "gives": "{\"big\":[150.0],\"dear\":[\"Book\",\"Desk\"]}",
-        "mongo": "$filter then $map",
+        "mongo": "db.customers.aggregate([\n  { $match: { _id: \"c1\" } },\n  { $lookup: { from: \"orders\",\n      localField: \"_id\",\n      foreignField: \"customer\",\n      as: \"o\" } },\n  { $set: { dear: { $filter: {\n      input: { $reduce: {\n        input: \"$o.items\",\n        initialValue: [],\n        in: { $concatArrays: [\n          \"$$value\", \"$$this\"] } } },\n      cond: { $gt: [\n        \"$$this.price\", 10] } } } } },\n  { $lookup: { from: \"products\",\n      localField: \"dear.product\",\n      foreignField: \"_id\", as: \"p\" } },\n  { $project: { _id: 0,\n      big: { $map: {\n        input: { $filter: {\n          input: \"$o\",\n          cond: { $gt: [\n            \"$$this.total\", 100] } } },\n        in: \"$$this.total\" } },\n      dear: \"$p.name\" } }\n])",
         "note": "",
         "oql": "customers.where { .id == \"c1\" }.select { big: .orders.where { .total > 100 }.total, dear: .orders.items.where { .price > 10 }.product.name }",
         "refuses": "",
-        "sql": "(subquery over unnest)",
+        "sql": "SELECT\n  (SELECT array_agg(o.total)\n   FROM orders o\n   WHERE o.customer = c.id\n     AND o.total > 100) AS big,\n  (SELECT array_agg(p.name)\n   FROM orders o\n   JOIN order_items i\n     ON i.order_id = o.id\n   JOIN products p\n     ON p.id = i.product\n   WHERE o.customer = c.id\n     AND i.price > 10) AS dear\nFROM customers c\nWHERE c.id = 'c1';",
         "test": null
       },
       {
@@ -1201,11 +1201,11 @@
         "check": "",
         "feature": "Some of a list in the answer",
         "gives": "{\"id\":\"o4\",\"small\":[{\"price\":2.0,\"qty\":6}]}",
-        "mongo": "$filter",
+        "mongo": "db.orders.find(\n  { _id: \"o4\" },\n  { small: { $map: {\n      input: { $filter: {\n        input: \"$items\",\n        cond: { $lt: [\n          \"$$this.price\", 10] } } },\n      in: { qty: \"$$this.qty\",\n            price: \"$$this.price\" } } } }\n)",
         "note": "",
         "oql": "orders.where { .id == \"o4\" }.select { id, small: .items.where { .price < 10 }.select { qty, price } }",
         "refuses": "",
-        "sql": "(subquery over unnest)",
+        "sql": "SELECT o.id, (\n  SELECT json_agg(json_build_object(\n    'qty', i.qty, 'price', i.price))\n  FROM order_items i\n  WHERE i.order_id = o.id\n    AND i.price < 10) AS small\nFROM orders o\nWHERE o.id = 'o4';",
         "test": null
       },
       {
@@ -1213,11 +1213,11 @@
         "check": "",
         "feature": "Each element reshaped",
         "gives": "{\"id\":\"o1\",\"lines\":[{\"cost\":14.0,\"name\":\"Pen\"},{\"cost\":12.5,\"name\":\"Book\"}]}",
-        "mongo": "$map",
+        "mongo": "db.orders.aggregate([\n  { $match: { _id: \"o1\" } },\n  { $lookup: { from: \"products\",\n      localField: \"items.product\",\n      foreignField: \"_id\", as: \"p\" } },\n  { $project: { lines: { $map: {\n      input: \"$items\",\n      in: {\n        name: { $arrayElemAt: [\n          \"$p.name\",\n          { $indexOfArray: [\n            \"$p._id\", \"$$this.product\"\n          ] } ] },\n        cost: { $multiply: [\n          \"$$this.qty\", \"$$this.price\"\n        ] } } } } } }\n])",
         "note": "",
         "oql": "orders.where { .id == \"o1\" }.select { id, lines: .items.select { name: .product.name, cost: .qty * .price } }",
         "refuses": "",
-        "sql": "(subquery over unnest)",
+        "sql": "SELECT o.id, (\n  SELECT json_agg(json_build_object(\n    'name', p.name,\n    'cost', i.qty * i.price))\n  FROM order_items i\n  JOIN products p ON p.id = i.product\n  WHERE i.order_id = o.id) AS lines\nFROM orders o\nWHERE o.id = 'o1';",
         "test": null
       },
       {
@@ -1225,11 +1225,11 @@
         "check": "",
         "feature": "List reduced to a value",
         "gives": "{\"id\":\"o1\",\"units\":8,\"value\":26.5} {\"id\":\"o2\",\"units\":1,\"value\":150.0}",
-        "mongo": "$reduce, $sum",
+        "mongo": "db.orders.find({}, {\n  units: { $sum: \"$items.qty\" },\n  value: { $sum: { $map: {\n    input: \"$items\",\n    in: { $multiply: [\n      \"$$this.qty\", \"$$this.price\"\n    ] } } } }\n}).sort({ _id: 1 }).limit(2)",
         "note": "",
         "oql": "orders.sort { .id.asc }.limit(2).select { id, units: .items.sum(.qty), value: .items.sum(.qty * .price) }",
         "refuses": "",
-        "sql": "(subquery over unnest)",
+        "sql": "SELECT order_id AS id,\n       sum(qty) AS units,\n       sum(qty * price) AS value\nFROM order_items\nGROUP BY order_id\nORDER BY order_id\nLIMIT 2;",
         "test": null
       },
       {
@@ -1237,11 +1237,11 @@
         "check": "",
         "feature": "Part of a list",
         "gives": "{\"first\":[{\"qty\":7}],\"id\":\"o1\",\"rest\":[{\"qty\":1}]}",
-        "mongo": "$slice",
+        "mongo": "db.orders.find(\n  { _id: \"o1\" },\n  { first: { $map: {\n      input: { $slice: [\"$items\", 1] },\n      in: { qty: \"$$this.qty\" } } },\n    rest: { $map: {\n      input: { $slice: [\"$items\", 1,\n        { $size: \"$items\" }] },\n      in: { qty: \"$$this.qty\" } } } }\n)",
         "note": "",
         "oql": "orders.where { .id == \"o1\" }.select { id, first: .items.limit(1).select { qty }, rest: .items.offset(1).select { qty } }",
         "refuses": "",
-        "sql": "tags[1:1]",
+        "sql": "SELECT o.id,\n  (SELECT json_agg(f) FROM (\n     SELECT qty FROM order_items\n     WHERE order_id = o.id\n     ORDER BY position\n     LIMIT 1) f) AS first,\n  (SELECT json_agg(r) FROM (\n     SELECT qty FROM order_items\n     WHERE order_id = o.id\n     ORDER BY position\n     OFFSET 1) r) AS rest\nFROM orders o\nWHERE o.id = 'o1';",
         "test": null
       },
       {
@@ -1249,11 +1249,11 @@
         "check": "",
         "feature": "List sorted",
         "gives": "{\"by_qty\":[{\"qty\":6},{\"qty\":1}],\"id\":\"o4\"}",
-        "mongo": "$sortArray",
+        "mongo": "db.orders.find(\n  { _id: \"o4\" },\n  { by_qty: { $map: {\n      input: { $sortArray: {\n        input: \"$items\",\n        sortBy: { qty: -1 } } },\n      in: { qty: \"$$this.qty\" } } } }\n)",
         "note": "",
         "oql": "orders.where { .id == \"o4\" }.select { id, by_qty: .items.sort { .qty.desc }.select { qty } }",
         "refuses": "",
-        "sql": "(subquery with ORDER BY)",
+        "sql": "SELECT o.id, (\n  SELECT json_agg(\n    json_build_object('qty', qty)\n    ORDER BY qty DESC)\n  FROM order_items\n  WHERE order_id = o.id) AS by_qty\nFROM orders o\nWHERE o.id = 'o4';",
         "test": null
       },
       {
@@ -1261,11 +1261,11 @@
         "check": "",
         "feature": "Lists joined",
         "gives": "{\"all\":[\"vip\",\"early\",\"checked\"],\"size\":3}",
-        "mongo": "$concatArrays",
+        "mongo": "db.customers.find(\n  { _id: \"c1\" },\n  { _id: 0,\n    all: { $concatArrays: [\n      \"$tags\", [\"checked\"]] },\n    size: { $size: { $concatArrays: [\n      \"$tags\", [\"checked\"]] } } }\n)",
         "note": "",
         "oql": "customers.where { .id == \"c1\" }.select { all: .tags + [\"checked\"], size: (.tags + [\"checked\"]).count() }",
         "refuses": "",
-        "sql": "a || b",
+        "sql": "SELECT\n  tags || ARRAY['checked'] AS \"all\",\n  cardinality(\n    tags || ARRAY['checked']) AS size\nFROM customers\nWHERE id = 'c1';",
         "test": null
       },
       {
@@ -1273,11 +1273,11 @@
         "check": "",
         "feature": "Row with fields added",
         "gives": "{\"category\":\"kitchen\",\"id\":\"p5\",\"name\":\"Mug\",\"price\":8.0,\"stock\":25,\"worth\":200.0}",
-        "mongo": "$addFields, $mergeObjects",
+        "mongo": "db.products.aggregate([\n  { $match: { _id: \"p5\" } },\n  { $addFields: { worth: {\n      $multiply: [\"$price\", \"$stock\"] } } }\n])",
         "note": "",
         "oql": "products.where { .id == \"p5\" }.select { *, worth: .price * .stock }",
         "refuses": "",
-        "sql": "to_jsonb(c) || '{...}'",
+        "sql": "SELECT *, price * stock AS worth\nFROM products\nWHERE id = 'p5';",
         "test": null
       },
       {
@@ -1285,11 +1285,11 @@
         "check": "notes.sort { .id.asc }.select { id, stars, inner: .about.any[1] }",
         "feature": "Collection with no declared shape",
         "gives": "{\"id\":\"n1\",\"inner\":null,\"stars\":3} {\"id\":\"n2\",\"inner\":\"two\",\"stars\":null}",
-        "mongo": "(the default)",
+        "mongo": "db.notes.insertMany([\n  { _id: \"n1\", text: \"hello\",\n    stars: 3 },\n  { _id: \"n2\",\n    about: { any: [1, \"two\"] } }\n])",
         "note": "",
         "oql": "notes.insert [ { id: \"n1\", text: \"hello\", stars: 3 }, { id: \"n2\", about: { any: [1, \"two\"] } } ]",
         "refuses": "",
-        "sql": "(a jsonb column)",
+        "sql": "CREATE TABLE notes (\n  id text PRIMARY KEY, doc jsonb);\nINSERT INTO notes VALUES\n  ('n1', '{\"text\": \"hello\",\n           \"stars\": 3}'),\n  ('n2', '{\"about\": {\n           \"any\": [1, \"two\"]}}');",
         "test": null
       },
       {
@@ -1297,11 +1297,11 @@
         "check": "",
         "feature": "Names of an object's fields as data",
         "gives": "",
-        "mongo": "$objectToArray",
+        "mongo": "db.customers.aggregate([\n  { $limit: 1 },\n  { $project: { names: { $map: {\n      input: {\n        $objectToArray: \"$address\" },\n      in: \"$$this.k\" } } } }\n])",
         "note": "Field names are written in the query. A query cannot ask what they are.",
         "oql": "",
         "refuses": "customers.limit(1).select { names: keys(.address) }",
-        "sql": "jsonb_each, jsonb_object_keys",
+        "sql": "SELECT jsonb_object_keys(address)\n  AS names\nFROM customers\nLIMIT 1;",
         "test": null
       }
     ]
@@ -1314,11 +1314,11 @@
         "check": "products.where { .id == \"p6\" }.select { name, stock }",
         "feature": "Insert a row",
         "gives": "{\"name\":\"Clip\",\"stock\":900}",
-        "mongo": "insertOne()",
+        "mongo": "db.products.insertOne(\n  { _id: \"p6\", name: \"Clip\",\n    price: 0.5, stock: 900,\n    category: \"stationery\" }\n)",
         "note": "",
         "oql": "products.insert { id: \"p6\", name: \"Clip\", price: 0.5, stock: 900, category: \"stationery\" }",
         "refuses": "",
-        "sql": "INSERT INTO products VALUES (...)",
+        "sql": "INSERT INTO products\n  (id, name, price, stock, category)\nVALUES\n  ('p6', 'Clip', 0.5, 900,\n   'stationery');",
         "test": null
       },
       {
@@ -1326,11 +1326,11 @@
         "check": "products.count()",
         "feature": "Insert many rows",
         "gives": "{\"count\":7}",
-        "mongo": "insertMany()",
+        "mongo": "db.products.insertMany([\n  { _id: \"p6\", name: \"Clip\",\n    price: 0.5, stock: 900,\n    category: \"stationery\" },\n  { _id: \"p7\", name: \"Rug\",\n    price: 80.0, stock: 3,\n    category: \"home\" }\n])",
         "note": "",
         "oql": "products.insert [ { id: \"p6\", name: \"Clip\", price: 0.5, stock: 900, category: \"stationery\" }, { id: \"p7\", name: \"Rug\", price: 80.0, stock: 3, category: \"home\" } ]",
         "refuses": "",
-        "sql": "INSERT ... VALUES (...), (...)",
+        "sql": "INSERT INTO products\n  (id, name, price, stock, category)\nVALUES\n  ('p6', 'Clip', 0.5, 900,\n   'stationery'),\n  ('p7', 'Rug', 80.0, 3, 'home');",
         "test": null
       },
       {
@@ -1338,11 +1338,11 @@
         "check": "orders.where { .status == \"open\" }.count()",
         "feature": "Update the rows a condition picks",
         "gives": "{\"count\":0}",
-        "mongo": "updateMany()",
+        "mongo": "db.orders.updateMany(\n  { status: \"open\" },\n  { $set: { status: \"paid\" } }\n)",
         "note": "",
         "oql": "orders.where { .status == \"open\" }.update { status: \"paid\" }",
         "refuses": "",
-        "sql": "UPDATE ... SET ... WHERE ...",
+        "sql": "UPDATE orders\nSET status = 'paid'\nWHERE status = 'open';",
         "test": null
       },
       {
@@ -1350,11 +1350,11 @@
         "check": "products.where { .id == \"p2\" }.select { stock, price }",
         "feature": "Update from the row's own values",
         "gives": "{\"price\":25.0,\"stock\":39}",
-        "mongo": "$inc, $mul",
+        "mongo": "db.products.updateOne(\n  { _id: \"p2\" },\n  { $inc: { stock: -1 },\n    $mul: { price: 2 } }\n)",
         "note": "",
         "oql": "products.where { .id == \"p2\" }.update { stock -= 1, price: .price * 2 }",
         "refuses": "",
-        "sql": "SET stock = stock - 1, price = price * 1.1",
+        "sql": "UPDATE products\nSET stock = stock - 1,\n    price = price * 2\nWHERE id = 'p2';",
         "test": null
       },
       {
@@ -1362,11 +1362,11 @@
         "check": "orders.where { .id == \"o1\" }.select { total }",
         "feature": "Update from related rows",
         "gives": "{\"total\":28.5}",
-        "mongo": "(read, then write)",
+        "mongo": "// read, then write\nconst o = db.orders.findOne(\n  { _id: \"o1\" })\nconst lines = o.items.reduce(\n  (sum, i) => sum + i.qty * i.price, 0)\nconst count = db.orders.countDocuments(\n  { customer: o.customer })\ndb.orders.updateOne(\n  { _id: \"o1\" },\n  { $set: { total: lines + count } }\n)",
         "note": "",
         "oql": "orders.where { .id == \"o1\" }.update { total: .items.sum(.qty * .price) + .customer.orders.count() }",
         "refuses": "",
-        "sql": "UPDATE ... SET total = (SELECT sum(...) ...)",
+        "sql": "UPDATE orders o\nSET total = (\n    SELECT sum(qty * price)\n    FROM order_items\n    WHERE order_id = o.id)\n  + (\n    SELECT count(*) FROM orders\n    WHERE customer = o.customer)\nWHERE o.id = 'o1';",
         "test": null
       },
       {
@@ -1374,11 +1374,11 @@
         "check": "customers.where { .id == \"c1\" }.select { address }",
         "feature": "Update a field inside an object",
         "gives": "{\"address\":{\"street\":\"1 Marina\",\"zip\":\"100002\"}}",
-        "mongo": "{ $set: { \"address.zip\": ... } }",
+        "mongo": "db.customers.updateOne(\n  { _id: \"c1\" },\n  { $set: { \"address.zip\": \"100002\" } }\n)",
         "note": "",
         "oql": "customers.where { .id == \"c1\" }.update { address.zip: \"100002\" }",
         "refuses": "",
-        "sql": "jsonb_set(address, '{zip}', ...)",
+        "sql": "UPDATE customers\nSET address = jsonb_set(\n  address, '{zip}', '\"100002\"')\nWHERE id = 'c1';",
         "test": null
       },
       {
@@ -1386,11 +1386,11 @@
         "check": "customers.where { .email == null }.sort { .id.asc }.select { id }",
         "feature": "Clear a field",
         "gives": "{\"id\":\"c1\"} {\"id\":\"c2\"}",
-        "mongo": "{ $set: { email: null } }",
+        "mongo": "db.customers.updateOne(\n  { _id: \"c1\" },\n  { $set: { email: null } }\n)",
         "note": "",
         "oql": "customers.where { .id == \"c1\" }.update { email: null }",
         "refuses": "",
-        "sql": "SET email = NULL",
+        "sql": "UPDATE customers\nSET email = NULL\nWHERE id = 'c1';",
         "test": null
       },
       {
@@ -1398,11 +1398,11 @@
         "check": "",
         "feature": "Take a field off a row",
         "gives": "",
-        "mongo": "$unset",
+        "mongo": "db.customers.updateOne(\n  { _id: \"c1\" },\n  { $unset: { email: \"\" } }\n)",
         "note": "A field can be set to null but not removed: `exists(.email)` stays true after `update { email: null }`.",
         "oql": "",
         "refuses": "customers.where { .id == \"c1\" }.update { -email }",
-        "sql": "(columns always exist)",
+        "sql": "(a column is on every row or on none)",
         "test": null
       },
       {
@@ -1410,11 +1410,11 @@
         "check": "customers.where { .id == \"c2\" }.select { tags }",
         "feature": "Add to a list",
         "gives": "{\"tags\":[\"back\"]}",
-        "mongo": "$push",
+        "mongo": "db.customers.updateOne(\n  { _id: \"c2\" },\n  { $push: { tags: \"back\" } }\n)",
         "note": "",
         "oql": "customers.where { .id == \"c2\" }.update { tags += [\"back\"] }",
         "refuses": "",
-        "sql": "SET tags = tags || 'x'",
+        "sql": "UPDATE customers\nSET tags = array_append(tags, 'back')\nWHERE id = 'c2';",
         "test": null
       },
       {
@@ -1422,11 +1422,11 @@
         "check": "customers.where { .id == \"c1\" }.select { tags }",
         "feature": "Add to a list once",
         "gives": "{\"tags\":[\"vip\",\"early\",\"gold\"]}",
-        "mongo": "$addToSet",
+        "mongo": "db.customers.updateOne(\n  { _id: \"c1\" },\n  { $addToSet: { tags: {\n      $each: [\"vip\", \"gold\"] } } }\n)",
         "note": "",
         "oql": "customers.where { .id == \"c1\" }.update { tags: (.tags + [\"vip\", \"gold\"]).distinct() }",
         "refuses": "",
-        "sql": "(CASE WHEN ... )",
+        "sql": "UPDATE customers\nSET tags = ARRAY(\n  SELECT DISTINCT unnest(\n    tags || ARRAY['vip', 'gold']))\nWHERE id = 'c1';",
         "test": null
       },
       {
@@ -1434,11 +1434,11 @@
         "check": "customers.where { .id == \"c1\" }.select { tags }",
         "feature": "Take out of a list",
         "gives": "{\"tags\":[\"early\"]}",
-        "mongo": "$pull",
+        "mongo": "db.customers.updateOne(\n  { _id: \"c1\" },\n  { $pull: { tags: \"vip\" } }\n)",
         "note": "",
         "oql": "customers.where { .id == \"c1\" }.update { tags: .tags.where { . != \"vip\" } }",
         "refuses": "",
-        "sql": "array_remove(tags, 'vip')",
+        "sql": "UPDATE customers\nSET tags = array_remove(tags, 'vip')\nWHERE id = 'c1';",
         "test": null
       },
       {
@@ -1446,11 +1446,11 @@
         "check": "orders.where { .id == \"o1\" }.select { qty: .items.qty }",
         "feature": "Change the elements of a list that match",
         "gives": "{\"qty\":[8,1]}",
-        "mongo": "\"items.$[e].qty\" with arrayFilters",
+        "mongo": "db.orders.updateOne(\n  { _id: \"o1\" },\n  { $inc: { \"items.$[cheap].qty\": 1 } },\n  { arrayFilters: [\n      { \"cheap.price\": { $lt: 5 } }\n    ] }\n)",
         "note": "",
         "oql": "orders.where { .id == \"o1\" }.update { items: .items.select { *, qty: if .price < 5 then .qty + 1 else .qty } }",
         "refuses": "",
-        "sql": "(rebuild the array)",
+        "sql": "UPDATE order_items\nSET qty = qty + 1\nWHERE order_id = 'o1'\n  AND price < 5;",
         "test": null
       },
       {
@@ -1458,11 +1458,11 @@
         "check": "orders.count()",
         "feature": "Delete the rows a condition picks",
         "gives": "{\"count\":5}",
-        "mongo": "deleteMany()",
+        "mongo": "db.orders.deleteMany(\n  { status: \"cancelled\" }\n)",
         "note": "",
         "oql": "orders.where { .status == \"cancelled\" }.delete()",
         "refuses": "",
-        "sql": "DELETE FROM ... WHERE ...",
+        "sql": "DELETE FROM orders\nWHERE status = 'cancelled';",
         "test": null
       },
       {
@@ -1470,11 +1470,11 @@
         "check": "orders.count()",
         "feature": "Delete every row",
         "gives": "{\"count\":0}",
-        "mongo": "deleteMany({})",
+        "mongo": "db.orders.deleteMany({})",
         "note": "",
         "oql": "orders.delete()",
         "refuses": "",
-        "sql": "TRUNCATE, DELETE FROM",
+        "sql": "TRUNCATE orders;",
         "test": null
       },
       {
@@ -1482,11 +1482,11 @@
         "check": "products.where { .id in [\"p1\", \"p9\"] }.sort { .id.asc }.select { id, name }",
         "feature": "Insert or replace",
         "gives": "{\"id\":\"p1\",\"name\":\"Pencil\"} {\"id\":\"p9\",\"name\":\"Tape\"}",
-        "mongo": "replaceOne(..., { upsert: true })",
+        "mongo": "db.products.replaceOne(\n  { _id: \"p1\" },\n  { name: \"Pencil\", price: 1.0,\n    stock: 10,\n    category: \"stationery\" },\n  { upsert: true }\n)\ndb.products.replaceOne(\n  { _id: \"p9\" },\n  { name: \"Tape\", price: 3.0,\n    stock: 10,\n    category: \"stationery\" },\n  { upsert: true }\n)",
         "note": "",
         "oql": "products.upsert on id { id: \"p1\", name: \"Pencil\", price: 1.0, stock: 10, category: \"stationery\" }\nproducts.upsert on id { id: \"p9\", name: \"Tape\", price: 3.0, stock: 10, category: \"stationery\" }",
         "refuses": "",
-        "sql": "INSERT ... ON CONFLICT (id) DO UPDATE",
+        "sql": "INSERT INTO products\n  (id, name, price, stock, category)\nVALUES\n  ('p1', 'Pencil', 1.0, 10,\n   'stationery'),\n  ('p9', 'Tape', 3.0, 10,\n   'stationery')\nON CONFLICT (id) DO UPDATE SET\n  name = EXCLUDED.name,\n  price = EXCLUDED.price,\n  stock = EXCLUDED.stock,\n  category = EXCLUDED.category;",
         "test": null
       },
       {
@@ -1494,11 +1494,11 @@
         "check": "",
         "feature": "Rows a write changed",
         "gives": "{\"id\":\"p3\",\"stock\":1} {\"id\":\"p4\",\"stock\":6}",
-        "mongo": "findOneAndUpdate()",
+        "mongo": "// updateMany gives back counts,\n// so the rows are read after\ndb.products.updateMany(\n  { category: \"home\" },\n  { $inc: { stock: 1 } }\n)\ndb.products.find(\n  { category: \"home\" },\n  { stock: 1 }\n)",
         "note": "",
         "oql": "products.where { .category == \"home\" }.update { stock += 1 }.select { id, stock }",
         "refuses": "",
-        "sql": "UPDATE ... RETURNING *",
+        "sql": "UPDATE products\nSET stock = stock + 1\nWHERE category = 'home'\nRETURNING id, stock;",
         "test": null
       },
       {
@@ -1506,11 +1506,11 @@
         "check": "",
         "feature": "Insert the rows of a query",
         "gives": "",
-        "mongo": "$out, $merge",
+        "mongo": "db.orders.aggregate([\n  { $match: { status: \"cancelled\" } },\n  { $merge: { into: \"archive\" } }\n])",
         "note": "`insert` takes rows written out in the statement. A query's rows cannot be written to a collection.",
         "oql": "",
         "refuses": "archive.insert orders.where { .status == \"cancelled\" }",
-        "sql": "INSERT INTO ... SELECT ...",
+        "sql": "INSERT INTO archive\nSELECT * FROM orders\nWHERE status = 'cancelled';",
         "test": null
       },
       {
@@ -1518,11 +1518,11 @@
         "check": "",
         "feature": "One statement that inserts, updates and deletes by a join",
         "gives": "",
-        "mongo": "$merge with whenMatched",
+        "mongo": "db.incoming.aggregate([\n  { $merge: {\n      into: \"products\",\n      on: \"_id\",\n      whenMatched: \"replace\",\n      whenNotMatched: \"insert\" } }\n])",
         "note": "`upsert` covers insert-or-replace. Anything more is separate statements in a `transaction` block.",
         "oql": "",
         "refuses": "",
-        "sql": "MERGE",
+        "sql": "MERGE INTO products p\nUSING incoming i ON p.id = i.id\nWHEN MATCHED AND i.stock = 0 THEN\n  DELETE\nWHEN MATCHED THEN\n  UPDATE SET stock = i.stock\nWHEN NOT MATCHED THEN\n  INSERT VALUES (i.id, i.name,\n    i.price, i.stock, i.category);",
         "test": null
       }
     ]
@@ -1535,11 +1535,11 @@
         "check": "gauges.select { n: type_of(.n), ratio: type_of(.ratio), live: type_of(.live), at: type_of(.at), names: type_of(.names) }",
         "feature": "Typed fields",
         "gives": "{\"at\":\"DateTime\",\"live\":\"Boolean\",\"n\":\"Integer\",\"names\":\"List\",\"ratio\":\"Float\"}",
-        "mongo": "$jsonSchema validator",
+        "mongo": "db.createCollection(\"gauges\", {\n  validator: { $jsonSchema: {\n    properties: {\n      n: { bsonType: \"int\" },\n      ratio: { bsonType: \"double\" },\n      live: { bsonType: \"bool\" },\n      at: { bsonType: \"date\" },\n      names: { bsonType: \"array\",\n        items: { bsonType: \"string\" } }\n    } } }\n})\ndb.gauges.insertOne(\n  { _id: \"g1\", n: 7, ratio: 0.5,\n    live: true,\n    at: ISODate(\"2026-01-01\"),\n    names: [\"a\"] }\n)",
         "note": "",
         "oql": "schema gauges { id: String, n: Integer, ratio: Float, live: Boolean, at: DateTime, names: List(String) }\ngauges.insert { id: \"g1\", n: 7, ratio: 0.5, live: true, at: \"2026-01-01\", names: [\"a\"] }",
         "refuses": "schema gauges { id: String, n: Integer }\ngauges.insert { id: \"g1\", n: \"seven\" }",
-        "sql": "CREATE TABLE t (n integer, ...)",
+        "sql": "CREATE TABLE gauges (\n  id text PRIMARY KEY,\n  n integer,\n  ratio double precision,\n  live boolean,\n  at timestamptz,\n  names text[]\n);\nINSERT INTO gauges VALUES\n  ('g1', 7, 0.5, true,\n   '2026-01-01', ARRAY['a']);",
         "test": null
       },
       {
@@ -1547,11 +1547,11 @@
         "check": "customers.where { .id == \"c9\" }.select { id, email }",
         "feature": "Optional and required fields",
         "gives": "{\"email\":null,\"id\":\"c9\"}",
-        "mongo": "required: [...]",
+        "mongo": "db.runCommand({\n  collMod: \"customers\",\n  validator: { $jsonSchema: {\n    required: [\"name\", \"city\",\n      \"joined\", \"tags\", \"address\"]\n  } }\n})\ndb.customers.insertOne(\n  { _id: \"c9\", name: \"Zed\",\n    city: \"Lagos\",\n    joined: ISODate(\"2026-01-01\"),\n    tags: [],\n    address: { street: \"9\", zip: \"9\" } }\n)",
         "note": "`email: String?` may be left out. `city: String` may not.",
         "oql": "customers.insert { id: \"c9\", name: \"Zed\", city: \"Lagos\", joined: \"2026-01-01\", tags: [], address: { street: \"9\", zip: \"9\" } }",
         "refuses": "customers.insert { id: \"c9\", name: \"Zed\", joined: \"2026-01-01\", tags: [], address: { street: \"9\", zip: \"9\" } }",
-        "sql": "NOT NULL",
+        "sql": "-- email text, city text NOT NULL\nINSERT INTO customers\n  (id, name, city, joined, tags,\n   address)\nVALUES\n  ('c9', 'Zed', 'Lagos',\n   '2026-01-01', '{}',\n   '{\"street\": \"9\", \"zip\": \"9\"}');",
         "test": null
       },
       {
@@ -1559,11 +1559,11 @@
         "check": "plans.select { tier, label }",
         "feature": "Defaults",
         "gives": "{\"label\":\"A\",\"tier\":\"free\"}",
-        "mongo": "(application code)",
+        "mongo": "// no defaults in the database:\n// the application fills them in\ndb.plans.insertOne(\n  { _id: \"a\", tier: \"free\",\n    label: \"A\", made: new Date() }\n)",
         "note": "",
         "oql": "schema plans { id: String, tier: String = \"free\", label: String = upper(.id), made: DateTime = now() }\nplans.insert { id: \"a\" }",
         "refuses": "",
-        "sql": "DEFAULT 'free'",
+        "sql": "CREATE TABLE plans (\n  id text PRIMARY KEY,\n  tier text DEFAULT 'free',\n  label text GENERATED ALWAYS AS\n    (upper(id)) STORED,\n  made timestamptz DEFAULT now()\n);\nINSERT INTO plans (id) VALUES ('a');",
         "test": null
       },
       {
@@ -1571,11 +1571,11 @@
         "check": "logins.count()",
         "feature": "Unique fields",
         "gives": "{\"count\":1}",
-        "mongo": "createIndex(..., { unique: true })",
+        "mongo": "db.logins.createIndex(\n  { email: 1 }, { unique: true })\ndb.logins.createIndex(\n  { _id: 1, email: 1 },\n  { unique: true })\ndb.logins.insertOne(\n  { _id: \"l1\", email: \"a@x.io\" }\n)",
         "note": "",
         "oql": "schema logins { id: String, email: String unique, unique(id, email) }\nlogins.insert { id: \"l1\", email: \"a@x.io\" }",
         "refuses": "schema logins { id: String, email: String unique }\nlogins.insert [ { id: \"l1\", email: \"a@x.io\" }, { id: \"l2\", email: \"a@x.io\" } ]",
-        "sql": "UNIQUE (email)",
+        "sql": "CREATE TABLE logins (\n  id text PRIMARY KEY,\n  email text UNIQUE,\n  UNIQUE (id, email)\n);\nINSERT INTO logins\nVALUES ('l1', 'a@x.io');",
         "test": null
       },
       {
@@ -1583,11 +1583,11 @@
         "check": "ages.count()",
         "feature": "Conditions every row must meet",
         "gives": "{\"count\":1}",
-        "mongo": "$jsonSchema, $expr validator",
+        "mongo": "db.createCollection(\"ages\", {\n  validator: {\n    age: { $gte: 0, $lt: 150 } }\n})\ndb.ages.insertOne(\n  { _id: \"a1\", age: 36 }\n)",
         "note": "",
         "oql": "schema ages { id: String, age: Integer, check(.age >= 0 && .age < 150) }\nages.insert { id: \"a1\", age: 36 }",
         "refuses": "schema ages { id: String, age: Integer, check(.age >= 0 && .age < 150) }\nages.insert { id: \"a1\", age: -1 }",
-        "sql": "CHECK (age >= 0)",
+        "sql": "CREATE TABLE ages (\n  id text PRIMARY KEY,\n  age integer\n    CHECK (age >= 0 AND age < 150)\n);\nINSERT INTO ages VALUES ('a1', 36);",
         "test": null
       },
       {
@@ -1595,11 +1595,11 @@
         "check": "tickets.count()",
         "feature": "One of a fixed set of values",
         "gives": "{\"count\":1}",
-        "mongo": "enum: [...]",
+        "mongo": "db.createCollection(\"tickets\", {\n  validator: { $jsonSchema: {\n    properties: { state: {\n      enum: [\"open\", \"closed\"] } }\n  } }\n})\ndb.tickets.insertOne(\n  { _id: \"t1\", state: \"open\" }\n)",
         "note": "A `check` on the field. There is no separate enum type.",
         "oql": "schema tickets { id: String, state: String, check(.state in [\"open\", \"closed\"]) }\ntickets.insert { id: \"t1\", state: \"open\" }",
         "refuses": "",
-        "sql": "CREATE TYPE ... AS ENUM",
+        "sql": "CREATE TYPE ticket_state\n  AS ENUM ('open', 'closed');\nCREATE TABLE tickets (\n  id text PRIMARY KEY,\n  state ticket_state\n);\nINSERT INTO tickets\nVALUES ('t1', 'open');",
         "test": null
       },
       {
@@ -1607,11 +1607,11 @@
         "check": "",
         "feature": "References that must resolve",
         "gives": "{\"customer\":\"c1\",\"id\":\"o1\"}",
-        "mongo": "(not enforced)",
+        "mongo": "// not enforced: an order may name\n// a customer that does not exist\ndb.orders.find(\n  { _id: \"o1\" },\n  { customer: 1 }\n)",
         "note": "",
         "oql": "orders.where { .id == \"o1\" }.select { id, customer: .customer.id }",
         "refuses": "orders.insert { id: \"o9\", customer: \"nobody\", status: \"open\", placed: \"2026-01-01\", total: 1.0, items: [] }",
-        "sql": "FOREIGN KEY",
+        "sql": "-- customer text\n--   REFERENCES customers (id)\nSELECT id, customer FROM orders\nWHERE id = 'o1';",
         "test": null
       },
       {
@@ -1619,11 +1619,11 @@
         "check": "files.count()",
         "feature": "What deleting a referenced row does",
         "gives": "{\"count\":0}",
-        "mongo": "(application code)",
+        "mongo": "// not in the database: the\n// application deletes both\ndb.folders.insertOne({ _id: \"f1\" })\ndb.files.insertOne(\n  { _id: \"x\", folder: \"f1\" })\ndb.files.deleteMany({ folder: \"f1\" })\ndb.folders.deleteOne({ _id: \"f1\" })",
         "note": "",
         "oql": "schema folders { id: String }\nschema files { id: String, folder: Ref(folders) on delete cascade, owner: Optional(Ref(customers)) on delete nullify }\nfolders.insert { id: \"f1\" }\nfiles.insert { id: \"x\", folder: \"f1\" }\nfolders.delete()",
         "refuses": "",
-        "sql": "ON DELETE CASCADE, SET NULL, RESTRICT",
+        "sql": "CREATE TABLE folders (\n  id text PRIMARY KEY);\nCREATE TABLE files (\n  id text PRIMARY KEY,\n  folder text REFERENCES folders\n    ON DELETE CASCADE,\n  owner text REFERENCES customers\n    ON DELETE SET NULL\n);\nINSERT INTO folders VALUES ('f1');\nINSERT INTO files (id, folder)\nVALUES ('x', 'f1');\nDELETE FROM folders;",
         "test": null
       },
       {
@@ -1631,11 +1631,11 @@
         "check": "",
         "feature": "Identity of a row",
         "gives": "{\"id\":\"c1\"}",
-        "mongo": "_id",
+        "mongo": "db.customers.find(\n  { _id: \"c1\" },\n  { _id: 1 }\n)",
         "note": "Every row has an `id`, unique in its collection and never changed.",
         "oql": "customers.where { .id == \"c1\" }.select { id }",
         "refuses": "",
-        "sql": "PRIMARY KEY (id)",
+        "sql": "-- id text PRIMARY KEY\nSELECT id FROM customers\nWHERE id = 'c1';",
         "test": null
       },
       {
@@ -1643,11 +1643,11 @@
         "check": "",
         "feature": "Identity made of several fields",
         "gives": "",
-        "mongo": "_id: { tenant: ..., id: ... }",
+        "mongo": "db.seats.insertOne(\n  { _id: { tenant: \"t1\", id: \"s1\" } }\n)",
         "note": "The identity is the one `id` field. Several fields together can be declared `unique`.",
         "oql": "",
         "refuses": "",
-        "sql": "PRIMARY KEY (tenant, id)",
+        "sql": "CREATE TABLE seats (\n  tenant text,\n  id text,\n  PRIMARY KEY (tenant, id)\n);",
         "test": null
       },
       {
@@ -1655,11 +1655,11 @@
         "check": "notes.select { has_id: .id != null }",
         "feature": "Identity chosen by the database",
         "gives": "{\"has_id\":true}",
-        "mongo": "ObjectId",
+        "mongo": "// _id becomes a new ObjectId\ndb.notes.insertOne(\n  { text: \"no id given\" }\n)",
         "note": "",
         "oql": "notes.insert { text: \"no id given\" }",
         "refuses": "",
-        "sql": "SERIAL, GENERATED AS IDENTITY",
+        "sql": "CREATE TABLE notes (\n  id bigint GENERATED ALWAYS\n    AS IDENTITY PRIMARY KEY,\n  text text\n);\nINSERT INTO notes (text)\nVALUES ('no id given');",
         "test": null
       },
       {
@@ -1667,11 +1667,11 @@
         "check": "products.where { .id == \"p1\" }",
         "feature": "Add, rename, retype and drop fields",
         "gives": "{\"id\":\"p1\",\"price\":2.0,\"rating\":5,\"stock\":100.0,\"title\":\"Pen\"}",
-        "mongo": "$set, $rename, $unset over every document",
+        "mongo": "db.products.updateMany({}, [\n  { $set: {\n      title: \"$name\",\n      stock: { $toDouble: \"$stock\" },\n      rating: 5 } },\n  { $unset: [\"name\", \"category\"] }\n])",
         "note": "",
         "oql": "schema products { id: String, title: String from name, price: Float, stock: Float, category: removed, rating: Integer = 5, note: String? }",
         "refuses": "",
-        "sql": "ALTER TABLE ... ADD, RENAME, ALTER TYPE, DROP COLUMN",
+        "sql": "ALTER TABLE products\n  RENAME COLUMN name TO title;\nALTER TABLE products\n  ALTER COLUMN stock\n    TYPE double precision,\n  DROP COLUMN category,\n  ADD COLUMN rating integer\n    DEFAULT 5,\n  ADD COLUMN note text;",
         "test": null
       },
       {
@@ -1679,11 +1679,11 @@
         "check": "scraps.count()",
         "feature": "Drop a collection",
         "gives": "{\"count\":0}",
-        "mongo": "drop()",
+        "mongo": "db.scraps.insertOne({ _id: \"s\" })\ndb.scraps.drop()",
         "note": "",
         "oql": "schema scraps { id: String }\nscraps.insert { id: \"s\" }\ndrop scraps",
         "refuses": "",
-        "sql": "DROP TABLE",
+        "sql": "CREATE TABLE scraps (\n  id text PRIMARY KEY);\nINSERT INTO scraps VALUES ('s');\nDROP TABLE scraps;",
         "test": null
       },
       {
@@ -1691,11 +1691,11 @@
         "check": "orders.paid().sort { .id.asc }.limit(2).select { id, gross: with_tax(.total) }",
         "feature": "Stored functions",
         "gives": "{\"gross\":39.75,\"id\":\"o1\"} {\"gross\":225.0,\"id\":\"o2\"}",
-        "mongo": "(application code)",
+        "mongo": "// functions live in the application\nconst withTax = (amount, rate = 0.5) =>\n  amount * (1 + rate)\nconst paid = () =>\n  db.orders.find({ status: \"paid\" })",
         "note": "",
         "oql": "fn with_tax(amount: Float, rate: Float = 0.5) { amount * (1 + rate) }\nfn paid(rows) { rows.where { .status == \"paid\" } }",
         "refuses": "",
-        "sql": "CREATE FUNCTION",
+        "sql": "CREATE FUNCTION with_tax(\n  amount float, rate float DEFAULT 0.5)\nRETURNS float LANGUAGE sql AS\n  $$ SELECT amount * (1 + rate) $$;\nCREATE VIEW paid AS\n  SELECT * FROM orders\n  WHERE status = 'paid';",
         "test": null
       },
       {
@@ -1703,11 +1703,11 @@
         "check": "orders.paid().count()",
         "feature": "Saved query",
         "gives": "{\"count\":4}",
-        "mongo": "createView()",
+        "mongo": "db.createView(\"paid\", \"orders\", [\n  { $match: { status: \"paid\" } }\n])",
         "note": "A function of rows, used as a step in any query. It is not a named collection.",
         "oql": "fn paid(rows) { rows.where { .status == \"paid\" } }",
         "refuses": "",
-        "sql": "CREATE VIEW",
+        "sql": "CREATE VIEW paid AS\n  SELECT * FROM orders\n  WHERE status = 'paid';",
         "test": null
       },
       {
@@ -1715,11 +1715,11 @@
         "check": "",
         "feature": "Stored result kept up to date",
         "gives": "",
-        "mongo": "$merge on a schedule, on-demand views",
+        "mongo": "// run again to refresh\ndb.orders.aggregate([\n  { $group: { _id: \"$status\",\n      total: { $sum: \"$total\" } } },\n  { $merge: { into: \"sales\" } }\n])",
         "note": "Nothing stores a query's result and refreshes it.",
         "oql": "",
         "refuses": "",
-        "sql": "CREATE MATERIALIZED VIEW",
+        "sql": "CREATE MATERIALIZED VIEW sales AS\n  SELECT status, sum(total)\n  FROM orders\n  GROUP BY status;\nREFRESH MATERIALIZED VIEW sales;",
         "test": null
       },
       {
@@ -1727,11 +1727,11 @@
         "check": "",
         "feature": "Value computed from other fields on every write",
         "gives": "",
-        "mongo": "(application code)",
+        "mongo": "(the application writes it with every change)",
         "note": "A default may be computed, but only when the row is first written.",
         "oql": "",
         "refuses": "",
-        "sql": "GENERATED ALWAYS AS (...) STORED",
+        "sql": "ALTER TABLE products\n  ADD COLUMN worth numeric\n  GENERATED ALWAYS AS\n    (price * stock) STORED;",
         "test": null
       },
       {
@@ -1739,11 +1739,11 @@
         "check": "",
         "feature": "Code that runs when rows change",
         "gives": "",
-        "mongo": "change streams, Atlas triggers",
+        "mongo": "db.orders.watch().on(\"change\",\n  change => { /* react */ })",
         "note": "No triggers.",
         "oql": "",
         "refuses": "",
-        "sql": "CREATE TRIGGER",
+        "sql": "CREATE TRIGGER stamp\n  BEFORE UPDATE ON orders\n  FOR EACH ROW\n  EXECUTE FUNCTION touch();",
         "test": null
       },
       {
@@ -1751,11 +1751,11 @@
         "check": "",
         "feature": "One collection split by a key",
         "gives": "",
-        "mongo": "sharding, time series collections",
+        "mongo": "sh.shardCollection(\n  \"shop.orders\", { placed: 1 })",
         "note": "A collection is not partitioned.",
         "oql": "",
         "refuses": "",
-        "sql": "PARTITION BY RANGE (...)",
+        "sql": "CREATE TABLE orders (\n  id text, placed timestamptz\n) PARTITION BY RANGE (placed);",
         "test": null
       }
     ]
@@ -1768,11 +1768,11 @@
         "check": "jobs.where { .state == \"open\" }.explain()",
         "feature": "Index on a field",
         "gives": "",
-        "mongo": "createIndex({ state: 1 })",
+        "mongo": "db.jobs.createIndex({ state: 1 })",
         "note": "",
         "oql": "schema jobs { id: String, state: String, index(.state) }\njobs.insert [ { id: \"j1\", state: \"open\" }, { id: \"j2\", state: \"done\" } ]",
         "refuses": "",
-        "sql": "CREATE INDEX ON jobs (state)",
+        "sql": "CREATE INDEX ON jobs (state);",
         "test": null
       },
       {
@@ -1780,11 +1780,11 @@
         "check": "jobs.where { .state == \"open\" && .n == 2 }.explain()",
         "feature": "Index on several fields",
         "gives": "",
-        "mongo": "createIndex({ state: 1, n: 1 })",
+        "mongo": "db.jobs.createIndex(\n  { state: 1, n: 1 })",
         "note": "",
         "oql": "schema jobs { id: String, state: String, n: Integer, index(.state, .n) }\njobs.insert [ { id: \"j1\", state: \"open\", n: 1 }, { id: \"j2\", state: \"open\", n: 2 } ]",
         "refuses": "",
-        "sql": "CREATE INDEX ON jobs (state, n)",
+        "sql": "CREATE INDEX ON jobs (state, n);",
         "test": null
       },
       {
@@ -1792,11 +1792,11 @@
         "check": "places.where { .address.zip == \"1\" }.explain()",
         "feature": "Index on a field inside an object",
         "gives": "",
-        "mongo": "createIndex({ \"address.zip\": 1 })",
+        "mongo": "db.places.createIndex(\n  { \"address.zip\": 1 })",
         "note": "The declaration is accepted, but a filter on the field still reads every row.",
         "oql": "schema places { id: String, address: { zip: String }, index(.address.zip) }\nplaces.insert { id: \"a\", address: { zip: \"1\" } }",
         "refuses": "",
-        "sql": "CREATE INDEX ON places ((address->>'zip'))",
+        "sql": "CREATE INDEX ON places\n  ((address->>'zip'));",
         "test": null
       },
       {
@@ -1804,11 +1804,11 @@
         "check": "logins.where { .email == \"a@x.io\" }.explain()",
         "feature": "Index that keeps values unique",
         "gives": "",
-        "mongo": "createIndex(..., { unique: true })",
+        "mongo": "db.logins.createIndex(\n  { email: 1 }, { unique: true })",
         "note": "",
         "oql": "schema logins { id: String, email: String unique }\nlogins.insert { id: \"l1\", email: \"a@x.io\" }",
         "refuses": "",
-        "sql": "CREATE UNIQUE INDEX",
+        "sql": "CREATE UNIQUE INDEX\n  ON logins (email);",
         "test": null
       },
       {
@@ -1816,11 +1816,11 @@
         "check": "",
         "feature": "Index for following references backwards",
         "gives": "{\"n\":2}",
-        "mongo": "createIndex({ customer: 1 })",
+        "mongo": "db.orders.createIndex({ customer: 1 })\ndb.orders.countDocuments(\n  { customer: \"c1\" })",
         "note": "Kept for every reference without being declared.",
         "oql": "customers.where { .id == \"c1\" }.select { n: .orders.count() }",
         "refuses": "",
-        "sql": "CREATE INDEX ON orders (customer)",
+        "sql": "CREATE INDEX ON orders (customer);\nSELECT count(*) AS n FROM orders\nWHERE customer = 'c1';",
         "test": null
       },
       {
@@ -1828,11 +1828,11 @@
         "check": "",
         "feature": "How a query will run",
         "gives": "",
-        "mongo": "explain()",
+        "mongo": "db.orders.find({ status: \"paid\" })\n  .explain()",
         "note": "",
         "oql": "orders.where { .status == \"paid\" }.explain()",
         "refuses": "",
-        "sql": "EXPLAIN",
+        "sql": "EXPLAIN SELECT * FROM orders\nWHERE status = 'paid';",
         "test": null
       },
       {
@@ -1840,11 +1840,11 @@
         "check": "",
         "feature": "Index on the elements of a list",
         "gives": "",
-        "mongo": "multikey index",
+        "mongo": "db.posts.createIndex({ tags: 1 })",
         "note": "A list cannot be an index key, so `\"vip\" in .tags` reads every row.",
         "oql": "",
         "refuses": "schema posts { id: String, tags: List(String), index(.tags) }\nposts.insert { id: \"a\", tags: [\"x\"] }",
-        "sql": "CREATE INDEX ... USING gin (tags)",
+        "sql": "CREATE INDEX ON posts\n  USING gin (tags);",
         "test": null
       },
       {
@@ -1852,11 +1852,11 @@
         "check": "",
         "feature": "Index on an expression",
         "gives": "",
-        "mongo": "(store the value in a field)",
+        "mongo": "(store the lowered value in a field and index that)",
         "note": "An index is on fields as stored.",
         "oql": "",
         "refuses": "schema names { id: String, name: String, index(lower(.name)) }",
-        "sql": "CREATE INDEX ON t (lower(name))",
+        "sql": "CREATE INDEX ON names\n  (lower(name));",
         "test": null
       },
       {
@@ -1864,11 +1864,11 @@
         "check": "",
         "feature": "Index over some of the rows",
         "gives": "",
-        "mongo": "partialFilterExpression",
+        "mongo": "db.jobs.createIndex(\n  { state: 1 },\n  { partialFilterExpression: {\n      state: \"open\" } })",
         "note": "An index covers every row of its collection.",
         "oql": "",
         "refuses": "schema jobs { id: String, state: String, index(.state, where: .state == \"open\") }",
-        "sql": "CREATE INDEX ... WHERE state = 'open'",
+        "sql": "CREATE INDEX ON jobs (state)\nWHERE state = 'open';",
         "test": null
       }
     ]
@@ -1881,11 +1881,11 @@
         "check": "products.where { .id in [\"p1\", \"p2\"] }.sort { .id.asc }.select { stock }",
         "feature": "Several writes kept or dropped together",
         "gives": "{\"stock\":90} {\"stock\":50}",
-        "mongo": "session.withTransaction()",
+        "mongo": "const session =\n  db.getMongo().startSession()\nsession.withTransaction(() => {\n  const products = session\n    .getDatabase(\"shop\").products\n  products.updateOne(\n    { _id: \"p1\" },\n    { $inc: { stock: -10 } })\n  products.updateOne(\n    { _id: \"p2\" },\n    { $inc: { stock: 10 } })\n})",
         "note": "",
         "oql": "transaction {\n  products.where { .id == \"p1\" }.update { stock -= 10 }\n  products.where { .id == \"p2\" }.update { stock += 10 }\n}",
         "refuses": "",
-        "sql": "BEGIN; ...; COMMIT;",
+        "sql": "BEGIN;\nUPDATE products\nSET stock = stock - 10\nWHERE id = 'p1';\nUPDATE products\nSET stock = stock + 10\nWHERE id = 'p2';\nCOMMIT;",
         "test": null
       },
       {
@@ -1969,7 +1969,7 @@
         "note": "A transaction is kept whole or dropped whole.",
         "oql": "",
         "refuses": "",
-        "sql": "SAVEPOINT, ROLLBACK TO",
+        "sql": "BEGIN;\nSAVEPOINT before_stock;\nUPDATE products SET stock = 0;\nROLLBACK TO before_stock;\nCOMMIT;",
         "test": null
       },
       {
@@ -1977,11 +1977,11 @@
         "check": "",
         "feature": "Choice of isolation level",
         "gives": "",
-        "mongo": "readConcern, writeConcern",
+        "mongo": "session.startTransaction({\n  readConcern: { level: \"snapshot\" },\n  writeConcern: { w: \"majority\" }\n})",
         "note": "One level: a transaction reads the database as of its start and is refused at commit if a row it changed was changed by another.",
         "oql": "",
         "refuses": "",
-        "sql": "SET TRANSACTION ISOLATION LEVEL ...",
+        "sql": "BEGIN ISOLATION LEVEL\n  SERIALIZABLE;",
         "test": null
       },
       {
@@ -1993,7 +1993,7 @@
         "note": "No row locks are taken by reads. A conflicting commit is refused and retried instead.",
         "oql": "",
         "refuses": "",
-        "sql": "SELECT ... FOR UPDATE",
+        "sql": "SELECT * FROM products\nWHERE id = 'p1'\nFOR UPDATE;",
         "test": null
       }
     ]
@@ -2006,11 +2006,11 @@
         "check": "docs.nearest { field: .embedding, query: [0.9, 0.1, 0.0], metric: \"cosine\", k: 1 }.select { id }",
         "feature": "Nearest vectors",
         "gives": "{\"id\":\"d1\"}",
-        "mongo": "$vectorSearch (Atlas)",
+        "mongo": "// Atlas only, with a vector\n// index made in Atlas\ndb.docs.insertMany([\n  { _id: \"d1\",\n    embedding: [1.0, 0.0, 0.0] },\n  { _id: \"d2\",\n    embedding: [0.0, 1.0, 0.0] }\n])",
         "note": "",
         "oql": "schema docs { id: String, embedding: Vector(3), index(.embedding, metric: \"cosine\") }\ndocs.insert [ { id: \"d1\", embedding: [1.0, 0.0, 0.0] }, { id: \"d2\", embedding: [0.0, 1.0, 0.0] } ]",
         "refuses": "",
-        "sql": "ORDER BY embedding <-> $1 (pgvector)",
+        "sql": "CREATE EXTENSION vector;\nCREATE TABLE docs (\n  id text PRIMARY KEY,\n  embedding vector(3)\n);\nCREATE INDEX ON docs USING hnsw\n  (embedding vector_cosine_ops);\nINSERT INTO docs VALUES\n  ('d1', '[1, 0, 0]'),\n  ('d2', '[0, 1, 0]');",
         "test": null
       },
       {
@@ -2018,11 +2018,11 @@
         "check": "",
         "feature": "Full-text search",
         "gives": "",
-        "mongo": "$text, $search (Atlas)",
+        "mongo": "db.customers.find(\n  { $text: { $search: \"ada\" } }\n)",
         "note": "No word index, stemming or ranking. Text is matched with `contains` and `matches`, which read the rows.",
         "oql": "",
         "refuses": "customers.search(\"ada\")",
-        "sql": "to_tsvector, @@, ts_rank",
+        "sql": "SELECT id FROM customers\nWHERE to_tsvector(name)\n   @@ to_tsquery('ada');",
         "test": null
       },
       {
@@ -2030,11 +2030,11 @@
         "check": "",
         "feature": "Places and distances",
         "gives": "",
-        "mongo": "2dsphere, $near, $geoWithin",
+        "mongo": "db.customers.find({ location: {\n  $near: {\n    $geometry: { type: \"Point\",\n      coordinates: [3.4, 6.5] },\n    $maxDistance: 1000 } } })",
         "note": "No geographic types or indexes.",
         "oql": "",
         "refuses": "customers.where { near(.address, [3.4, 6.5], 1000) }",
-        "sql": "PostGIS",
+        "sql": "-- PostGIS\nSELECT id FROM customers\nWHERE ST_DWithin(\n  location,\n  ST_MakePoint(3.4, 6.5)::geography,\n  1000);",
         "test": null
       },
       {
@@ -2042,11 +2042,11 @@
         "check": "",
         "feature": "Time series in buckets",
         "gives": "{\"n\":1,\"total\":26.5,\"week\":\"2026-W02\"} {\"n\":2,\"total\":210.0,\"week\":\"2026-W07\"} {\"n\":1,\"total\":42.0,\"week\":\"2026-W09\"}",
-        "mongo": "$dateTrunc, time series collections",
+        "mongo": "db.orders.aggregate([\n  { $group: {\n      _id: { $dateToString: {\n        format: \"%G-W%V\",\n        date: \"$placed\" } },\n      n: { $sum: 1 },\n      total: { $sum: \"$total\" } } },\n  { $sort: { _id: 1 } },\n  { $limit: 3 }\n])",
         "note": "",
         "oql": "orders.group_by { week: format_date(.placed, \"%G-W%V\") }.select { week, n: count(), total: sum(.total) }.sort { .week.asc }.limit(3)",
         "refuses": "",
-        "sql": "date_trunc, date_bin",
+        "sql": "SELECT\n  to_char(placed, 'IYYY-\"W\"IW')\n    AS week,\n  count(*) AS n,\n  sum(total) AS total\nFROM orders\nGROUP BY week\nORDER BY week\nLIMIT 3;",
         "test": null
       },
       {
@@ -2054,11 +2054,11 @@
         "check": "",
         "feature": "Rows that expire",
         "gives": "",
-        "mongo": "TTL index",
+        "mongo": "db.sessions.createIndex(\n  { made: 1 },\n  { expireAfterSeconds: 86400 })",
         "note": "Nothing deletes rows by age. It is a `delete()` run on a schedule.",
         "oql": "",
         "refuses": "",
-        "sql": "(a scheduled DELETE)",
+        "sql": "-- run on a schedule\nDELETE FROM sessions\nWHERE made < now()\n  - INTERVAL '1 day';",
         "test": null
       },
       {
@@ -2066,11 +2066,11 @@
         "check": "",
         "feature": "Being told when rows change",
         "gives": "",
-        "mongo": "change streams",
+        "mongo": "db.orders.watch()",
         "note": "There is change-stream code in the repository, but no test drives it, so it is not counted.",
         "oql": "",
         "refuses": "",
-        "sql": "LISTEN, NOTIFY, logical replication",
+        "sql": "-- with a trigger that calls NOTIFY\nLISTEN orders_changed;",
         "test": null
       }
     ]
@@ -2119,11 +2119,11 @@
         "check": "",
         "feature": "Users, roles and permissions",
         "gives": "",
-        "mongo": "createUser(), roles",
+        "mongo": "db.createUser({\n  user: \"clerk\",\n  pwd: passwordPrompt(),\n  roles: [\n    { role: \"read\", db: \"shop\" }\n  ]\n})",
         "note": "Whoever can open the database can read and write all of it.",
         "oql": "",
         "refuses": "",
-        "sql": "CREATE ROLE, GRANT, row-level security",
+        "sql": "CREATE ROLE clerk LOGIN;\nGRANT SELECT ON orders TO clerk;",
         "test": null
       },
       {

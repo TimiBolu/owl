@@ -232,6 +232,7 @@ struct Defect {
 }
 
 include!("completeness_matrix/rows.rs");
+include!("completeness_matrix/elsewhere.rs");
 
 struct Db {
     _directory: TempDir,
@@ -372,18 +373,54 @@ fn the_written_matrix_is_these_rows() {
     }
 }
 
+/// A row that shows OQL is set beside SQL and MongoDB that say as much:
+/// whole statements, not the name of a keyword.
+#[test]
+fn every_row_that_shows_oql_has_sql_and_mongodb_written_out() {
+    let rows: Vec<Row> = matrix().into_iter().flat_map(|(_, rows)| rows).collect();
+    let written = elsewhere();
+    let mut seen = std::collections::HashSet::new();
+    for (feature, sql, mongo) in &written {
+        assert!(seen.insert(*feature), "'{feature}' is written out twice");
+        assert!(
+            rows.iter().any(|row| row.feature == *feature),
+            "'{feature}' is written out for SQL and MongoDB but is not a row"
+        );
+        assert!(!sql.trim().is_empty() && !mongo.trim().is_empty(), "'{feature}' is blank");
+    }
+    for row in &rows {
+        if !row.oql.is_empty() || !row.refuses.is_empty() {
+            assert!(
+                seen.contains(row.feature),
+                "'{}' shows OQL but has no SQL and MongoDB written out in elsewhere.rs",
+                row.feature
+            );
+        }
+    }
+}
+
 /// The rows as JSON: what the website's matrix page shows.
 fn site_data() -> String {
+    // The website sets whole statements side by side, so it takes the SQL
+    // and MongoDB written out in full where there is one.
+    let whole: std::collections::HashMap<_, _> = elsewhere()
+        .into_iter()
+        .map(|(feature, sql, mongo)| (feature, (sql, mongo)))
+        .collect();
     let areas: Vec<_> = matrix()
         .into_iter()
         .map(|(area, rows)| {
             let rows: Vec<_> = rows
                 .iter()
                 .map(|row| {
+                    let (sql, mongo) = whole
+                        .get(row.feature)
+                        .copied()
+                        .unwrap_or((row.sql, row.mongo));
                     serde_json::json!({
                         "feature": row.feature,
-                        "sql": row.sql,
-                        "mongo": row.mongo,
+                        "sql": sql,
+                        "mongo": mongo,
                         "answer": row.answer.word(),
                         "oql": row.oql,
                         "check": row.check,
