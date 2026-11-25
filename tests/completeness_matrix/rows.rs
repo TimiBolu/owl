@@ -33,11 +33,11 @@ of items, each of which refers to a product.
 "#;
 
 const DEFECTS: &str = r#"
-## Defects found
+## Defects
 
-Things the engine gets wrong, found while writing the rows above. The rows use
-a form that works. Each defect is pinned by the test with the wrong answer it
-gives today, so fixing one fails the test until it is taken off this list.
+Things the engine gets wrong that writing a row turned up. A row uses a form
+that works; the defect is listed here and pinned by the test with the wrong
+answer it gives, so fixing it fails the test until it is taken off this list.
 "#;
 
 fn matrix() -> Vec<(&'static str, Vec<Row>)> {
@@ -119,7 +119,7 @@ fn shaping() -> Vec<Row> {
         yes("Conversion between types", "CAST(stock AS text)", "$toString, $toInt, $toDouble",
             r#"products.where { .id == "p1" }.select { text: to_string(.stock), whole: to_int(.price), real: to_float(.stock), number: to_int("42") }"#, r#"{"number":42,"real":100.0,"text":"100","whole":2}"#),
         yes("Text functions", "upper, lower, length, substring, replace, trim, ||", "$toUpper, $strLenCP, $substrCP, $replaceAll, $trim, $concat",
-            r#"customers.where { .id == "c1" }.select { up: upper(.name), size: length(.email), part: substring(.email, 0, 3), swapped: replace(.email, "x.io", "owl.dev"), joined: concat(.name, " of ", .city) }"#, r#"{"joined":"Ada of Lagos","part":"ada","size":8,"swapped":"ada@owl.dev","up":"ADA"}"#),
+            r#"customers.where { .id == "c1" }.select { up: upper(.name), size: length(.email), part: substring(.email, 0, 3), swapped: replace(.email, "x.io", "owl.dev"), joined: concat(.name, " of ", .city), pieces: split(.email, "@") }"#, r#"{"joined":"Ada of Lagos","part":"ada","pieces":["ada","x.io"],"size":8,"swapped":"ada@owl.dev","up":"ADA"}"#),
         yes("Number functions", "abs, round, floor, ceil, sqrt, power", "$abs, $round, $floor, $ceil, $sqrt, $pow",
             r#"products.where { .id == "p2" }.select { rounded: round(.price), down: floor(.price), up: ceil(.price), root: sqrt(.stock + 9), squared: pow(.price, 2), away: abs(.stock - 100) }"#, r#"{"away":60,"down":12,"root":7.0,"rounded":13,"squared":156.25,"up":13}"#),
         yes("Date arithmetic", "joined + INTERVAL '30 days', a - b", "$dateAdd, $dateDiff",
@@ -232,8 +232,8 @@ fn subqueries() -> Vec<Row> {
             "orders.where { .total > orders.avg(.total) }.select { id }", r#"{"id":"o2"} {"id":"o3"}"#),
         yes("Query that depends on the row", "WHERE total = (SELECT max(total) ... WHERE customer = o.customer)", "$lookup with let",
             "orders.where { .total == .customer.orders.max(.total) }.sort { .id.asc }.select { id }", r#"{"id":"o2"} {"id":"o3"} {"id":"o4"} {"id":"o6"}"#),
-        yes("In the rows of another query", "WHERE id NOT IN (SELECT product FROM order_items)", "(two queries, or $lookup)",
-            "products.where { !(.id in orders.items.product.id) }.select { id }", r#"{"id":"p5"}"#),
+        yes("In the rows of another query", "WHERE id IN (SELECT customer FROM orders WHERE total > 50)", "(two queries, or $lookup)",
+            "customers.where { .id in orders.where { .total > 50 }.customer.id }.select { id }", r#"{"id":"c1"} {"id":"c2"}"#),
         tested("Named query used later", "WITH paid AS (...) SELECT ... FROM paid", "(variables in application code)",
             "tests/oql_language_conformance_test.rs", "a_binding_means_the_expression_it_names")
             .note("`paid = orders.where { .status == \"paid\" }` on a line of its own names the rows for the statements after it."),
@@ -292,6 +292,8 @@ fn documents() -> Vec<Row> {
             "orders.items.sort { orders.id.asc, .qty.desc }.limit(3).select { order: orders.id, product: .product.name, qty }", r#"{"order":"o1","product":"Pen","qty":7} {"order":"o1","product":"Book","qty":1} {"order":"o2","product":"Desk","qty":1}"#),
         yes("Group over elements", "unnest then GROUP BY", "$unwind then $group",
             "orders.items.group_by { product: .product.id }.select { product, sold: sum(.qty), revenue: sum(.qty * .price) }.sort { .product.asc }", r#"{"product":"p1","revenue":26.0,"sold":13} {"product":"p2","revenue":50.0,"sold":4} {"product":"p3","revenue":90.0,"sold":3} {"product":"p4","revenue":150.0,"sold":1}"#),
+        yes("One field of the elements that match", "(subquery over unnest)", "$filter then $map",
+            r#"customers.where { .id == "c1" }.select { big: .orders.where { .total > 100 }.total, dear: .orders.items.where { .price > 10 }.product.name }"#, r#"{"big":[150.0],"dear":["Book","Desk"]}"#),
         yes("Some of a list in the answer", "(subquery over unnest)", "$filter",
             r#"orders.where { .id == "o4" }.select { id, small: .items.where { .price < 10 }.select { qty, price } }"#, r#"{"id":"o4","small":[{"price":2.0,"qty":6}]}"#),
         yes("Each element reshaped", "(subquery over unnest)", "$map",
@@ -543,36 +545,7 @@ fn operations() -> Vec<Row> {
 }
 
 fn defects() -> Vec<Defect> {
-    vec![
-        Defect {
-            what: "A field read after a nested `where`, `sort` or `last` comes back as null",
-            oql: r#"customers.where { .id == "c1" }.select { totals: .orders.where { .total > 100 }.total }"#,
-            gives: r#"{"totals":null}"#,
-            should: r#"{"totals":[150.0]}"#,
-        },
-        Defect {
-            what: "`in` over a filtered query's field matches nothing",
-            oql: "customers.where { .id in orders.where { .total > 50 }.customer.id }.select { id }",
-            gives: "",
-            should: r#"{"id":"c1"} {"id":"c2"}"#,
-        },
-        Defect {
-            what: "A distinct count beside `count()` in an ungrouped `select` counts one row",
-            oql: "orders.select { n: count(), buyers: .customer.distinct().count() }",
-            gives: r#"{"buyers":1,"n":6}"#,
-            should: r#"{"buyers":4,"n":6}"#,
-        },
-        Defect {
-            what: "`stddev(...)` written as a call in an ungrouped `select` answers once per row",
-            oql: "products.limit(2).select { sd: stddev_pop(.stock) }",
-            gives: r#"{"sd":null} {"sd":null}"#,
-            should: r#"{"sd":30.0}"#,
-        },
-        Defect {
-            what: "`split` gives its pieces as one piece of text, not a list",
-            oql: r#"customers.where { .id == "c1" }.select { pieces: split(.email, "@") }"#,
-            gives: r#"{"pieces":"[\"ada\", \"x.io\"]"}"#,
-            should: r#"{"pieces":["ada","x.io"]}"#,
-        },
-    ]
+    // The five found when the matrix was first written are fixed, and are
+    // held by `what_the_matrix_found_stays_fixed` in the conformance tests.
+    Vec::new()
 }

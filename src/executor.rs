@@ -8524,6 +8524,34 @@ impl<S: DocumentStore> QueryExecutor<S> {
     fn get_field_from_value(&self, value: &Value, field_name: &str) -> OQLResult<Value> {
         match value {
             Value::Object(obj) => Ok(obj.get(field_name).cloned().unwrap_or(Value::Null)),
+            // A row reached through a reference is read where it is kept.
+            Value::Reference(reference) => match self.resolve_objref_target(reference)? {
+                Some(target) => self.get_field_value(
+                    &target,
+                    &FieldAccess { path: vec![field_name.to_string()] },
+                ),
+                None => Ok(Value::Null),
+            },
+            // The rows a nested `where`, `sort` or `last` left: the field
+            // of each, as a path through a collection gives it. Values
+            // that are absent are left out.
+            Value::List(rows)
+                if rows.is_empty()
+                    || rows
+                        .iter()
+                        .any(|row| matches!(row, Value::Object(_) | Value::Reference(_))) =>
+            {
+                let mut values = Vec::with_capacity(rows.len());
+                for row in rows {
+                    match self.get_field_from_value(row, field_name)? {
+                        Value::Null => {}
+                        Value::List(more) => values.extend(more),
+                        value => values.push(value),
+                    }
+                }
+                MANY_VALUED.with(|flag| flag.set(true));
+                Ok(Value::List(values))
+            }
             _ => Ok(Value::Null),
         }
     }
@@ -9208,6 +9236,36 @@ impl<S: DocumentStore> QueryExecutor<S> {
         if has_aggregation && !is_grouped_data {
             // Handle aggregation over all documents - return single result document
             let mut projected_fields = crate::document::Fields::default();
+
+            // A path or a library statistic in such a select ranges over
+            // every row, as it does over the rows of a group. The rows are
+            // then held as one group, where the statement can keep them.
+            let needs_whole = StatementGuard::active()
+                && select_block
+                    .fields
+                    .iter()
+                    .any(|field| Self::expression_reads_whole_input(&field.expression));
+            let (documents, _whole) = if needs_whole {
+                let mut fields = crate::document::Fields::default();
+                fields.insert(
+                    "_group_schema".to_string(),
+                    Value::String(documents.first().map(|row| row.schema.clone()).unwrap_or_default()),
+                );
+                fields.insert("group_count".to_string(), Value::Integer(documents.len() as i64));
+                let key = StatementScope::keep_group_rows(documents);
+                let rows = StatementScope::group_rows(&key).expect("just kept");
+                fields.insert("_group_rows".to_string(), Value::String(key));
+                WHOLE_INPUT.with(|whole| {
+                    whole.borrow_mut().push(Document::with_id(
+                        "group_0".to_string(),
+                        "group".to_string(),
+                        fields,
+                    ))
+                });
+                (rows, Some(WholeInputGuard))
+            } else {
+                (Arc::new(documents), None)
+            };
 
             for select_field in &select_block.fields {
                 let field_name = match &select_field.alias {
@@ -11270,6 +11328,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
             Expression::FunctionCall { name, args } => {
                 let of_two_values = matches!(name.as_str(), "min" | "max") && args.len() == 2;
                 (Self::is_aggregate_name(name) && !of_two_values)
+                    || Self::is_library_statistic_of_a_path(name, args)
                     || args.iter().any(Self::expression_contains_aggregate)
             }
             Expression::IfThenElse {
@@ -11323,6 +11382,60 @@ impl<S: DocumentStore> QueryExecutor<S> {
             | Expression::Identifier(_)
             | Expression::FieldAccess(_)
             | Expression::Literal(_) => false,
+        }
+    }
+
+    /// Whether an expression, in a select that reduces its rows to one, is
+    /// itself about all of those rows: a path through them that is then
+    /// reduced, or a library statistic of one.
+    fn reads_whole_input(expression: &Expression) -> bool {
+        match expression {
+            Expression::CollectionExpression { source, .. } => {
+                matches!(source.as_ref(), Expression::FieldAccess(_))
+            }
+            Expression::FunctionCall { name, args } => {
+                Self::is_library_statistic_of_a_path(name, args)
+            }
+            _ => false,
+        }
+    }
+
+    /// `stddev(.pay)`: a library statistic of a path from the row, which
+    /// is one answer for the rows together, as `sum(.pay)` is. Of anything
+    /// else, as in `so_far().pay.stddev()`, it is a function of that value.
+    fn is_library_statistic_of_a_path(name: &str, args: &[Expression]) -> bool {
+        matches!(name, "variance" | "stddev" | "variance_pop" | "stddev_pop" | "mode")
+            && matches!(args, [Expression::FieldAccess(_)])
+    }
+
+    /// Whether any part of an expression is about all the rows, looking
+    /// where `evaluate_collection_aggregate_expression` looks.
+    fn expression_reads_whole_input(expression: &Expression) -> bool {
+        if Self::reads_whole_input(expression) {
+            return true;
+        }
+        let any = |expressions: &[Expression]| expressions.iter().any(Self::expression_reads_whole_input);
+        match expression {
+            Expression::FunctionCall { args, .. } => any(args),
+            Expression::IfThenElse { then_expr, else_expr, .. } => {
+                Self::expression_reads_whole_input(then_expr)
+                    || Self::expression_reads_whole_input(else_expr)
+            }
+            Expression::LogicalAnd(left, right)
+            | Expression::LogicalOr(left, right)
+            | Expression::BinaryOp { left, right, .. } => {
+                Self::expression_reads_whole_input(left) || Self::expression_reads_whole_input(right)
+            }
+            Expression::LogicalNot(inner) => Self::expression_reads_whole_input(inner),
+            Expression::ArrayAccess { array, index } => {
+                Self::expression_reads_whole_input(array) || Self::expression_reads_whole_input(index)
+            }
+            Expression::ChainedAccess { base, .. } => Self::expression_reads_whole_input(base),
+            Expression::Block(expressions) | Expression::ArrayLiteral(expressions) => any(expressions),
+            Expression::ObjectLiteral(fields) => fields
+                .iter()
+                .any(|field| Self::expression_reads_whole_input(&field.value)),
+            _ => false,
         }
     }
 
@@ -11429,6 +11542,14 @@ impl<S: DocumentStore> QueryExecutor<S> {
             Expression::ChainedAccess { base, field } => {
                 let base = self.evaluate_collection_aggregate_expression(documents, base)?;
                 self.get_field_from_value(&base, field)
+            }
+            // `.customer.distinct().count()` and `stddev(.stock)` range
+            // over every row, as they do over the rows of a group.
+            _ if Self::reads_whole_input(expression)
+                && WHOLE_INPUT.with(|whole| !whole.borrow().is_empty()) =>
+            {
+                let whole = WHOLE_INPUT.with(|whole| whole.borrow().last().cloned());
+                self.evaluate_expression(&whole.expect("checked"), expression)
             }
             Expression::Block(expressions) => {
                 let mut value = Value::Null;
@@ -14280,6 +14401,24 @@ thread_local! {
     /// Set when a path was just read that passes through a collection, so
     /// that a comparison can tell such a value from a list that is stored.
     static MANY_VALUED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    /// While a select reduces all its rows to one: those rows as a group,
+    /// innermost select last.
+    static WHOLE_INPUT: std::cell::RefCell<Vec<Document>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Lets go of a select's rows-as-a-group when the select is done.
+struct WholeInputGuard;
+
+impl Drop for WholeInputGuard {
+    fn drop(&mut self) {
+        WHOLE_INPUT.with(|whole| {
+            whole.borrow_mut().pop();
+        });
+    }
 }
 
 thread_local! {

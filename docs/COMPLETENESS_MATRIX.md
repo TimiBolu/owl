@@ -39,14 +39,14 @@ of items, each of which refers to a product.
 | Relationships and joins | 13 | 1 | 1 |
 | Subqueries and sets | 8 | 0 | 0 |
 | Window functions | 8 | 0 | 1 |
-| Documents and lists | 17 | 0 | 1 |
+| Documents and lists | 18 | 0 | 1 |
 | Writing | 15 | 0 | 3 |
 | Schema | 12 | 2 | 5 |
 | Indexes | 5 | 0 | 4 |
 | Transactions | 7 | 0 | 3 |
 | Search and specialised data | 2 | 0 | 4 |
 | Operations | 3 | 0 | 3 |
-| **All** | **144** | **3** | **26** |
+| **All** | **145** | **3** | **26** |
 
 ## Filtering
 
@@ -83,7 +83,7 @@ of items, each of which refers to a product.
 | Matching on a value | `CASE status WHEN 'paid' THEN ... END` | `$switch` | yes | `orders.sort { .id.asc }.limit(3).select { id, done: match .status { "paid" -> true, _ -> false } }` |
 | First value that is present | `COALESCE(email, 'none')` | `$ifNull` | yes | `customers.where { .id in ["c1", "c2"] }.sort { .id.asc }.select { id, email: .email or "none" }` |
 | Conversion between types | `CAST(stock AS text)` | `$toString, $toInt, $toDouble` | yes | `products.where { .id == "p1" }.select { text: to_string(.stock), whole: to_int(.price), real: to_float(.stock), number: to_int("42") }` |
-| Text functions | `upper, lower, length, substring, replace, trim, \|\|` | `$toUpper, $strLenCP, $substrCP, $replaceAll, $trim, $concat` | yes | `customers.where { .id == "c1" }.select { up: upper(.name), size: length(.email), part: substring(.email, 0, 3), swapped: replace(.email, "x.io", "owl.dev"), joined: concat(.name, " of ", .city) }` |
+| Text functions | `upper, lower, length, substring, replace, trim, \|\|` | `$toUpper, $strLenCP, $substrCP, $replaceAll, $trim, $concat` | yes | `customers.where { .id == "c1" }.select { up: upper(.name), size: length(.email), part: substring(.email, 0, 3), swapped: replace(.email, "x.io", "owl.dev"), joined: concat(.name, " of ", .city), pieces: split(.email, "@") }` |
 | Number functions | `abs, round, floor, ceil, sqrt, power` | `$abs, $round, $floor, $ceil, $sqrt, $pow` | yes | `products.where { .id == "p2" }.select { rounded: round(.price), down: floor(.price), up: ceil(.price), root: sqrt(.stock + 9), squared: pow(.price, 2), away: abs(.stock - 100) }` |
 | Date arithmetic | `joined + INTERVAL '30 days', a - b` | `$dateAdd, $dateDiff` | yes | `customers.where { .id == "c3" }.select { later: format_date(add_days(.joined, 30), "%Y-%m-%d"), waited: diff_days(.referrer.joined, .joined) }` |
 | Date formatting | `to_char(joined, 'YYYY-MM')` | `$dateToString` | yes | `customers.where { .id == "c1" }.select { month: format_date(.joined, "%Y-%m") }` |
@@ -144,7 +144,7 @@ of items, each of which refers to a product.
 |---|---|---|---|---|
 | One value from another query | `WHERE total > (SELECT avg(total) FROM orders)` | Two queries, or $lookup | yes | `orders.where { .total > orders.avg(.total) }.select { id }` |
 | Query that depends on the row | `WHERE total = (SELECT max(total) ... WHERE customer = o.customer)` | `$lookup with let` | yes | `orders.where { .total == .customer.orders.max(.total) }.sort { .id.asc }.select { id }` |
-| In the rows of another query | `WHERE id NOT IN (SELECT product FROM order_items)` | Two queries, or $lookup | yes | `products.where { !(.id in orders.items.product.id) }.select { id }` |
+| In the rows of another query | `WHERE id IN (SELECT customer FROM orders WHERE total > 50)` | Two queries, or $lookup | yes | `customers.where { .id in orders.where { .total > 50 }.customer.id }.select { id }` |
 | Named query used later | `WITH paid AS (...) SELECT ... FROM paid` | Variables in application code | yes | Covered by `a_binding_means_the_expression_it_names` in `tests/oql_language_conformance_test.rs`.<br>`paid = orders.where { .status == "paid" }` on a line of its own names the rows for the statements after it. |
 | Rows of either query | `UNION` | `$unionWith then $group` | yes | `customers.where { .city == "Nairobi" }.union(customers.where { "vip" in .tags }).sort { .id.asc }.select { id }` |
 | Rows of both, repeats kept | `UNION ALL` | `$unionWith` | yes | Customers.where { .city == "Lagos" } + customers.where { "vip" in .tags }).count( |
@@ -178,6 +178,7 @@ of items, each of which refers to a product.
 | Every element meets a condition | `NOT EXISTS (... WHERE NOT ...)` | `{ $not: { $elemMatch: ... } }` | yes | `orders.where { !.items.where { .qty < 2 }.exists() }.sort { .id.asc }.select { id }` |
 | One row per element | `CROSS JOIN LATERAL unnest(items)` | `$unwind` | yes | `orders.items.sort { orders.id.asc, .qty.desc }.limit(3).select { order: orders.id, product: .product.name, qty }` |
 | Group over elements | `unnest then GROUP BY` | `$unwind then $group` | yes | `orders.items.group_by { product: .product.id }.select { product, sold: sum(.qty), revenue: sum(.qty * .price) }.sort { .product.asc }` |
+| One field of the elements that match | Subquery over unnest | `$filter then $map` | yes | `customers.where { .id == "c1" }.select { big: .orders.where { .total > 100 }.total, dear: .orders.items.where { .price > 10 }.product.name }` |
 | Some of a list in the answer | Subquery over unnest | `$filter` | yes | `orders.where { .id == "o4" }.select { id, small: .items.where { .price < 10 }.select { qty, price } }` |
 | Each element reshaped | Subquery over unnest | `$map` | yes | `orders.where { .id == "o1" }.select { id, lines: .items.select { name: .product.name, cost: .qty * .price } }` |
 | List reduced to a value | Subquery over unnest | `$reduce, $sum` | yes | `orders.sort { .id.asc }.limit(2).select { id, units: .items.sum(.qty), value: .items.sum(.qty * .price) }` |
@@ -286,16 +287,10 @@ of items, each of which refers to a product.
 | Copies of the database on other machines | `streaming replication` | `replica sets` | no | One process owns a database. There is replication code in the repository, but no test drives it, so it is not counted. |
 | One database spread over machines | Extensions such as Citus | `sharding` | no | A database lives on one machine. |
 
-## Defects found
+## Defects
 
-Things the engine gets wrong, found while writing the rows above. The rows use
-a form that works. Each defect is pinned by the test with the wrong answer it
-gives today, so fixing one fails the test until it is taken off this list.
+Things the engine gets wrong that writing a row turned up. A row uses a form
+that works; the defect is listed here and pinned by the test with the wrong
+answer it gives, so fixing it fails the test until it is taken off this list.
 
-| What | Query | Gives | Should give |
-|---|---|---|---|
-| A field read after a nested `where`, `sort` or `last` comes back as null | `customers.where { .id == "c1" }.select { totals: .orders.where { .total > 100 }.total }` | `{"totals":null}` | `{"totals":[150.0]}` |
-| `in` over a filtered query's field matches nothing | `customers.where { .id in orders.where { .total > 50 }.customer.id }.select { id }` | No rows | `{"id":"c1"} {"id":"c2"}` |
-| A distinct count beside `count()` in an ungrouped `select` counts one row | `orders.select { n: count(), buyers: .customer.distinct().count() }` | `{"buyers":1,"n":6}` | `{"buyers":4,"n":6}` |
-| `stddev(...)` written as a call in an ungrouped `select` answers once per row | `products.limit(2).select { sd: stddev_pop(.stock) }` | `{"sd":null} {"sd":null}` | `{"sd":30.0}` |
-| `split` gives its pieces as one piece of text, not a list | `customers.where { .id == "c1" }.select { pieces: split(.email, "@") }` | `{"pieces":"[\"ada\", \"x.io\"]"}` | `{"pieces":["ada","x.io"]}` |
+None at present.

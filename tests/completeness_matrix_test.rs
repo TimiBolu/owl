@@ -457,6 +457,10 @@ fn render() -> String {
     }
 
     out.push_str(DEFECTS);
+    if defects().is_empty() {
+        out.push_str("\nNone at present.\n");
+        return out;
+    }
     out.push_str("\n| What | Query | Gives | Should give |\n|---|---|---|---|\n");
     for defect in defects() {
         writeln!(
