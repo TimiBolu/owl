@@ -4217,3 +4217,73 @@ fn counting_related_rows_for_every_row_matches_counting_them_one_row_at_a_time()
         Value::Integer(29)
     );
 }
+
+/// Five wrong answers the completeness matrix turned up, each given without
+/// an error.
+#[test]
+fn what_the_matrix_found_stays_fixed() {
+    let db = Db::new();
+    db.script(
+        r#"
+        schema buyers { id: String, email: String }
+        schema sales { id: String, buyer: Ref(buyers), total: Integer, lines: List({ sku: String, qty: Integer }) }
+        buyers.insert [ { id: "b1", email: "ada@x.io" }, { id: "b2", email: "bob@y.org" }, { id: "b3", email: "cy@z.net" } ]
+        sales.insert [
+          { id: "s1", buyer: "b1", total: 10, lines: [ { sku: "pen", qty: 7 }, { sku: "ink", qty: 1 } ] },
+          { id: "s2", buyer: "b1", total: 70, lines: [ { sku: "desk", qty: 1 } ] },
+          { id: "s3", buyer: "b2", total: 30, lines: [] }
+        ]
+        "#,
+    );
+    let int = Value::Integer;
+    let list = |values: &[i64]| Value::List(values.iter().copied().map(Value::Integer).collect());
+
+    // A field read after a nested where, sort or last is the field of each
+    // row left, not null.
+    let row = &db.rows(
+        r#"buyers.where { .id == "b1" }.select {
+             over: .sales.where { .total > 50 }.total,
+             sorted: .sales.sort { .total.desc }.total,
+             none: .sales.where { .total > 999 }.total,
+             skus: .sales.lines.where { .qty > 1 }.sku,
+             who: .sales.where { .total > 50 }.buyer.email
+           }"#,
+    )[0];
+    assert_eq!(row.get_field("over"), Some(&list(&[70])));
+    assert_eq!(row.get_field("sorted"), Some(&list(&[70, 10])));
+    assert_eq!(row.get_field("none"), Some(&Value::List(vec![])));
+    assert_eq!(row.get_field("skus"), Some(&Value::List(vec![text("pen")])));
+    assert_eq!(row.get_field("who"), Some(&Value::List(vec![text("ada@x.io")])));
+    // What is stored as a list of plain values still has no fields.
+    db.script(r#"notes.insert { id: "n1", tags: ["a", "b"] }"#);
+    assert_eq!(db.scalar("notes.select { t: (.tags + []).nothing }", "t"), Value::Null);
+
+    // `in` over a filtered query's field.
+    assert_eq!(db.ids("buyers.where { .id in sales.where { .total > 20 }.buyer.id }.sort { .id.asc }"), ["b1", "b2"]);
+    assert_eq!(db.ids("buyers.where { !(.id in sales.where { .total > 20 }.buyer.id) }"), ["b3"]);
+
+    // A path reduced beside an aggregate ranges over every row, as it does
+    // in a group.
+    let row = &db.rows("sales.select { n: count(), buyers: .buyer.distinct().count(), units: .lines.qty.sum() }")[0];
+    assert_eq!(row.get_field("n"), Some(&int(3)));
+    assert_eq!(row.get_field("buyers"), Some(&int(2)));
+    assert_eq!(row.get_field("units"), Some(&int(9)));
+    let grouped = &db.rows("sales.group_by { all: 1 }.select { n: count(), buyers: .buyer.distinct().count(), units: .lines.qty.sum() }")[0];
+    assert_eq!(grouped.get_field("buyers"), row.get_field("buyers"));
+    assert_eq!(grouped.get_field("units"), row.get_field("units"));
+    // On its own, with no aggregate beside it, it is still about each row.
+    assert_eq!(db.rows("buyers.sort { .id.asc }.select { id, n: .sales.count() }").len(), 3);
+
+    // A library statistic written as a call gives one answer for all rows,
+    // the one its other forms give.
+    let called = db.scalar("sales.select { sd: stddev_pop(.total) }", "sd");
+    assert_eq!(db.rows("sales.select { sd: stddev_pop(.total) }").len(), 1);
+    assert_eq!(called, db.scalar("sales.total.stddev_pop()", "stddev_pop"));
+    assert!(matches!(called, Value::Float(found) if (found - 24.944382578492944).abs() < 1e-9), "{called:?}");
+
+    // `split` gives a list.
+    let row = &db.rows(r#"buyers.where { .id == "b1" }.select { parts: split(.email, "@"), n: split(.email, "@").count(), host: split(.email, "@")[1] }"#)[0];
+    assert_eq!(row.get_field("parts"), Some(&Value::List(vec![text("ada"), text("x.io")])));
+    assert_eq!(row.get_field("n"), Some(&int(2)));
+    assert_eq!(row.get_field("host"), Some(&text("x.io")));
+}

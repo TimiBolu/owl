@@ -587,18 +587,12 @@ fn string_split(args: &[Value]) -> OQLResult<Value> {
         }
     };
 
-    // For now, return a string representation of the array
-    // In a full implementation, we'd need a List/Array value type
-    let parts: Vec<&str> = string.split(delimiter).collect();
-    let result = format!(
-        "[{}]",
-        parts
-            .iter()
-            .map(|s| format!("\"{}\"", s))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    Ok(Value::String(result))
+    Ok(Value::List(
+        string
+            .split(delimiter.as_str())
+            .map(|piece| Value::String(piece.to_string()))
+            .collect(),
+    ))
 }
 
 /// Check if string starts with prefix
