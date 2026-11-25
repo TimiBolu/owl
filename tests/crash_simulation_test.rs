@@ -18,7 +18,9 @@ use owl_db::document::Fields;
 use owl_db::schema::{FieldType, Schema};
 use owl_db::simulation::SimulatedFileSystem;
 use owl_db::storage::DocumentStore;
-use owl_db::storage_engine::{AutoCheckpointPolicy, RustStore, WriteOperation};
+use owl_db::storage_engine::{
+    AutoCheckpointPolicy, MemoryObjectStore, ObjectFileSystem, ObjectStore, RustStore, WriteOperation,
+};
 use owl_db::{Document, Value};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -76,6 +78,71 @@ fn operation(change: &Change) -> WriteOperation {
             schema: collection.clone(),
             id: id.clone(),
         },
+    }
+}
+
+/// An object store that is reached from one machine and cannot be
+/// reached once that machine has lost power: a dead machine puts and
+/// deletes nothing. What is already in the store stays.
+struct Tethered {
+    store: Arc<MemoryObjectStore>,
+    machine: Arc<SimulatedFileSystem>,
+}
+
+impl Tethered {
+    fn up(&self) -> std::io::Result<()> {
+        match self.machine.is_down() {
+            true => Err(std::io::Error::other("the machine is down")),
+            false => Ok(()),
+        }
+    }
+}
+
+impl ObjectStore for Tethered {
+    fn put(&self, key: &str, source: &mut dyn std::io::Read, len: u64) -> std::io::Result<()> {
+        self.up()?;
+        self.store.put(key, source, len)
+    }
+
+    fn read_at(&self, key: &str, offset: u64, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.up()?;
+        self.store.read_at(key, offset, buffer)
+    }
+
+    fn len(&self, key: &str) -> std::io::Result<Option<u64>> {
+        self.up()?;
+        self.store.len(key)
+    }
+
+    fn delete(&self, key: &str) -> std::io::Result<()> {
+        self.up()?;
+        self.store.delete(key)
+    }
+
+    fn list(&self, prefix: &str) -> std::io::Result<Vec<String>> {
+        self.up()?;
+        self.store.list(prefix)
+    }
+
+    fn version(&self, key: &str) -> std::io::Result<Option<String>> {
+        self.up()?;
+        self.store.version(key)
+    }
+
+    fn put_if(
+        &self,
+        key: &str,
+        source: &mut dyn std::io::Read,
+        len: u64,
+        expected: Option<&str>,
+    ) -> std::io::Result<Option<String>> {
+        self.up()?;
+        self.store.put_if(key, source, len, expected)
+    }
+
+    fn delete_if(&self, key: &str, expected: &str) -> std::io::Result<bool> {
+        self.up()?;
+        self.store.delete_if(key, expected)
     }
 }
 
@@ -165,6 +232,16 @@ struct Run {
     trace: Vec<String>,
     crashes: usize,
     io_faults: bool,
+    /// The object store the database's parts are kept in, when the run
+    /// is of a database that keeps them there.
+    objects: Option<Arc<MemoryObjectStore>>,
+    /// The file system the open store was given, which is what publishes
+    /// and what drops local parts.
+    layer: Option<Arc<ObjectFileSystem>>,
+    /// What a reader may see: the rows of the last publication, or, while
+    /// a publication was cut off, of either that one or the one before.
+    /// `None` is a database never published.
+    published: Vec<Option<Rows>>,
 }
 
 /// What may go wrong with the disk, besides losing power.
@@ -174,6 +251,9 @@ struct Faults {
     io_faults: bool,
     /// A crash may keep a later unsynced write and lose an earlier one.
     reorder: bool,
+    /// The database keeps its parts in an object store, publishes for
+    /// readers, and drops its local parts now and then.
+    objects: bool,
 }
 
 /// What a step did, as the workload saw it.
@@ -186,7 +266,11 @@ enum Outcome {
 
 impl Run {
     fn new(seed: u64, faults: Faults) -> Self {
-        let Faults { io_faults, reorder } = faults;
+        let Faults {
+            io_faults,
+            reorder,
+            objects,
+        } = faults;
         Self {
             seed,
             rng: StdRng::seed_from_u64(seed),
@@ -200,7 +284,65 @@ impl Run {
             trace: Vec::new(),
             crashes: 0,
             io_faults,
+            objects: objects.then(|| Arc::new(MemoryObjectStore::new())),
+            layer: None,
+            published: vec![None],
         }
+    }
+
+    /// Open the store on the run's machine: on its disk alone, or as the
+    /// writer of a database whose parts are in the object store.
+    fn open(&mut self) -> Result<RustStore, String> {
+        let Some(objects) = &self.objects else {
+            return open(&self.filesystem).map_err(|error| error.to_string());
+        };
+        let tethered = Arc::new(Tethered {
+            store: objects.clone(),
+            machine: self.filesystem.clone(),
+        });
+        let layer = ObjectFileSystem::writer(self.filesystem.clone(), tethered, "", DATABASE, 4 << 20)
+            .map_err(|error| format!("cannot claim the database: {error}"))?;
+        let store =
+            RustStore::new_with_fs(Path::new(DATABASE), 1 << 30, layer.clone()).map_err(|error| error.to_string())?;
+        store
+            .configure_auto_checkpoint(AutoCheckpointPolicy::disabled())
+            .map_err(|error| error.to_string())?;
+        self.layer = Some(layer);
+        Ok(store)
+    }
+
+    /// A reader on a machine of its own must see a publication that was
+    /// made: the last one, or, if the last was cut off, that or the one
+    /// before. And what it opens must be sound.
+    fn check_reader(&mut self) -> Result<(), String> {
+        let Some(objects) = self.objects.clone() else {
+            return Ok(());
+        };
+        let machine = Arc::new(SimulatedFileSystem::new(self.seed ^ 0x51ed_270b));
+        let found = match ObjectFileSystem::reader(machine, objects, "", DATABASE, 1 << 20) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(self.fail(format!("a reader cannot fetch the publication: {error}"))),
+            Ok((filesystem, _)) => {
+                let reader = RustStore::new_with_fs(Path::new(DATABASE), 1 << 30, filesystem)
+                    .map_err(|error| self.fail(format!("a reader cannot open the publication: {error}")))?;
+                reader
+                    .verify_integrity()
+                    .map_err(|error| self.fail(format!("a reader's integrity check fails: {error}")))?;
+                Some(read(&reader).map_err(|error| self.fail(format!("a reader: {error}")))?)
+            }
+        };
+        if !self.published.contains(&found) {
+            let message = match (&found, self.published.last().cloned().flatten()) {
+                (Some(found), Some(last)) => {
+                    format!("a reader sees rows that were not published: {}", difference(&last, found))
+                }
+                (None, _) => "a reader finds nothing published, though a publication was made".to_string(),
+                (Some(_), None) => "a reader sees a publication that was never made".to_string(),
+            };
+            return Err(self.fail(message));
+        }
+        self.published = vec![found];
+        Ok(())
     }
 
     fn fail(&self, message: String) -> String {
@@ -248,6 +390,36 @@ impl Run {
 
     /// Run one step of the workload against an open store.
     fn step(&mut self, store: &RustStore) -> Outcome {
+        // A database with its parts in an object store publishes and
+        // drops its local parts as part of its work. These draw from the
+        // seed only in such a run, so the others are the runs they were.
+        if let Some(layer) = self.layer.clone() {
+            let pick = self.rng.gen_range(0..100);
+            if pick < 20 {
+                let (name, result) = if pick < 13 {
+                    // What a reader may see from here on is these rows,
+                    // or, if this is cut off, still the rows before.
+                    self.published.push(Some(self.rows.clone()));
+                    let result = store.publish(&layer).map(|_| ()).map_err(|error| error.to_string());
+                    if result.is_ok() {
+                        self.published = vec![Some(self.rows.clone())];
+                    }
+                    ("publish", result)
+                } else {
+                    ("drop local parts", layer.drop_local_parts().map(|_| ()).map_err(|error| error.to_string()))
+                };
+                return match result {
+                    Ok(()) => {
+                        self.trace.push(format!("{name}: done"));
+                        Outcome::Done(Vec::new())
+                    }
+                    Err(error) => {
+                        self.trace.push(format!("{name}: {error}"));
+                        Outcome::Unknown(Vec::new(), error)
+                    }
+                };
+            }
+        }
         let pick = self.rng.gen_range(0..100);
         let (name, changes, result): (String, Vec<Change>, Result<(), String>) = if pick < 45 {
             let changes = self.changes(5);
@@ -339,7 +511,7 @@ impl Run {
                 let after = self.rng.gen_range(1..=12);
                 self.filesystem.crash_after(after, true);
             }
-            let opened = open(&self.filesystem);
+            let opened = self.open();
             self.filesystem.disarm();
             match opened {
                 Ok(store) if !self.filesystem.is_down() => return Ok(store),
@@ -356,7 +528,7 @@ impl Run {
             }
         }
         self.filesystem.recover();
-        open(&self.filesystem).map_err(|error| self.fail(format!("cannot reopen: {error}")))
+        self.open().map_err(|error| self.fail(format!("cannot reopen: {error}")))
     }
 
     /// The store must hold what was acknowledged, with the step that was
@@ -387,19 +559,24 @@ impl Run {
         if let Err(error) = store.verify_integrity() {
             // Say whether the disk has really lost something, by opening
             // it afresh beside the store that is already open.
-            let lost = match open(&self.filesystem).map_err(|e| e.to_string()).and_then(|again| read(&again)) {
+            // (Not where the parts are in an object store: a second
+            // open would claim the database from the first.)
+            let again = match self.objects {
+                Some(_) => Err("not opened afresh".to_string()),
+                None => open(&self.filesystem).map_err(|e| e.to_string()).and_then(|again| read(&again)),
+            };
+            let lost = match again {
                 Ok(again) if again == self.rows => "a fresh open still holds every row".to_string(),
                 Ok(again) => format!("a fresh open has lost rows: {}", difference(&self.rows, &again)),
                 Err(error) => format!("a fresh open fails: {error}"),
             };
             return Err(self.fail(format!("integrity check fails: {error}; {lost}")));
         }
-        Ok(())
+        self.check_reader()
     }
 
     fn run(&mut self, steps: usize) -> Result<(), String> {
-        let mut store =
-            open(&self.filesystem).map_err(|error| self.fail(format!("cannot open: {error}")))?;
+        let mut store = self.open().map_err(|error| self.fail(format!("cannot open: {error}")))?;
         let fields = HashMap::from([
             ("n".to_string(), FieldType::Integer),
             ("pad".to_string(), FieldType::String),
@@ -415,7 +592,8 @@ impl Run {
             // Now and then, close and open again with nothing wrong.
             if self.rng.gen_bool(0.05) {
                 drop(store);
-                store = open(&self.filesystem)
+                store = self
+                    .open()
                     .map_err(|error| self.fail(format!("cannot reopen cleanly: {error}")))?;
                 self.trace.push("reopened".to_string());
                 self.check(&store, &[])?;
@@ -485,7 +663,8 @@ impl Run {
             )));
         }
         drop(store);
-        let store = open(&self.filesystem)
+        let store = self
+            .open()
             .map_err(|error| self.fail(format!("cannot reopen at the end: {error}")))?;
         self.check(&store, &[])
     }
@@ -570,6 +749,7 @@ fn acknowledged_writes_survive_a_crash_at_any_point() {
     let faults = Faults {
         io_faults: false,
         reorder: false,
+        objects: false,
     };
     sweep(1, seeds(300), 60, faults);
 }
@@ -579,6 +759,7 @@ fn acknowledged_writes_survive_failing_writes_and_syncs() {
     let faults = Faults {
         io_faults: true,
         reorder: false,
+        objects: false,
     };
     sweep(100_000, seeds(300), 60, faults);
 }
@@ -597,6 +778,7 @@ fn the_database_opens_after_a_checkpoint_is_retried_and_power_is_lost() {
     let faults = Faults {
         io_faults: true,
         reorder: false,
+        objects: false,
     };
     for seed in [101_261, 100_722] {
         let mut run = Run::new(seed, faults);
@@ -616,8 +798,49 @@ fn acknowledged_writes_survive_a_crash_that_reorders_writes() {
     let faults = Faults {
         io_faults: false,
         reorder: true,
+        objects: false,
     };
     sweep(200_000, seeds(300), 60, faults);
+}
+
+/// The same promises for a database that keeps its parts in an object
+/// store: it claims the database each time it opens, publishes for
+/// readers, and now and then drops its local parts so that they are read
+/// back from the object store. The object store keeps what it was given
+/// when the machine dies, and a dead machine gives it nothing more. After
+/// every crash a reader on a machine of its own must also see a
+/// publication that was made, whole.
+#[test]
+fn acknowledged_writes_survive_a_crash_with_parts_in_an_object_store() {
+    let faults = Faults {
+        io_faults: false,
+        reorder: false,
+        objects: true,
+    };
+    sweep(300_000, seeds(300), 60, faults);
+}
+
+/// The same, on a disk that may keep a later unsynced write and lose an
+/// earlier one.
+#[test]
+fn acknowledged_writes_survive_a_reordering_crash_with_parts_in_an_object_store() {
+    let faults = Faults {
+        io_faults: false,
+        reorder: true,
+        objects: true,
+    };
+    sweep(400_000, seeds(300), 60, faults);
+}
+
+/// The same, on a disk whose writes and syncs fail now and then.
+#[test]
+fn acknowledged_writes_survive_failing_writes_with_parts_in_an_object_store() {
+    let faults = Faults {
+        io_faults: true,
+        reorder: false,
+        objects: true,
+    };
+    sweep(500_000, seeds(300), 60, faults);
 }
 
 #[test]
@@ -625,6 +848,7 @@ fn one_seed_gives_one_run() {
     let faults = Faults {
         io_faults: false,
         reorder: false,
+        objects: false,
     };
     let once = {
         let mut run = Run::new(7, faults);

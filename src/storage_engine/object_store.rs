@@ -729,6 +729,19 @@ impl Fence {
 /// object's mark where the holder is a writer.
 type Parts = Arc<Mutex<HashMap<String, (String, Option<String>)>>>;
 
+/// An object that was a part until the store removed the part, kept for
+/// the readers of a publication that may list it. It is the object that
+/// waits, not the part's name: a part of the same name may be made again.
+struct Retired {
+    object: String,
+    /// Its mark, where the holder is a writer with a claim.
+    mark: Option<String>,
+    /// The number of the newest publication when it was removed.
+    when: u64,
+}
+
+type RetiredObjects = Arc<Mutex<Vec<Retired>>>;
+
 /// The object a part put by writer `writer` is kept as.
 fn part_object(name: &str, writer: u64) -> String {
     format!("{name}~{writer}")
@@ -744,6 +757,8 @@ struct PartUpload {
     objects: Arc<dyn ObjectStore>,
     fence: Option<Arc<Fence>>,
     parts: Parts,
+    retired: RetiredObjects,
+    published: Arc<AtomicU64>,
 }
 
 impl FileHandle for PartUpload {
@@ -779,27 +794,43 @@ impl FileHandle for PartUpload {
             at: 0,
         };
         let Some(fence) = &self.fence else {
-            return self.objects.put(&self.name, &mut source, len);
+            self.objects.put(&self.name, &mut source, len)?;
+            // The object is the part again, and no longer waits to go.
+            self.retired.lock().unwrap().retain(|retired| retired.object != self.name);
+            return Ok(());
         };
         fence.held()?;
         let key = part_object(&self.name, fence.writer);
         let before = self.parts.lock().unwrap().get(&self.name).cloned();
         // The object is this writer's own name for the part, so nothing
-        // is there unless this writer put it, in which case it is as this
+        // is there unless this writer put it: as the part, or as a part
+        // since removed and waiting to go. Either way it is as this
         // writer left it.
+        let waiting = {
+            let retired = self.retired.lock().unwrap();
+            retired.iter().find(|retired| retired.object == key).and_then(|retired| retired.mark.clone())
+        };
         let expected = match &before {
             Some((object, mark)) if *object == key => mark.clone(),
-            _ => None,
+            _ => waiting,
         };
         let Some(mark) = self.objects.put_if(&key, &mut source, len, expected.as_deref())? else {
             return Err(fence.taken());
         };
+        self.retired.lock().unwrap().retain(|retired| retired.object != key);
         self.parts.lock().unwrap().insert(self.name.clone(), (key.clone(), Some(mark)));
         // The same part under an earlier writer's name is no longer the
-        // part. No root lists a part that is being written again.
-        if let Some((object, Some(mark))) = before {
+        // part. A publication may list it, so it waits like any other.
+        if let Some((object, mark)) = before {
             if object != key {
-                let _ = self.objects.delete_if(&object, &mark);
+                let when = self.published.load(Ordering::Acquire);
+                match (when, &mark) {
+                    (0, Some(mark)) => {
+                        let _ = self.objects.delete_if(&object, mark);
+                    }
+                    (0, None) => {}
+                    _ => self.retired.lock().unwrap().push(Retired { object, mark, when }),
+                }
             }
         }
         Ok(())
@@ -848,11 +879,10 @@ pub struct ObjectFileSystem {
     /// that says otherwise, a part is kept under its own name.
     parts: Parts,
     /// The number of the newest publication this writer knows of.
-    published: AtomicU64,
-    /// Parts removed since a publication that may list them, each with
-    /// the number of the newest publication when it was removed. Their
-    /// objects are deleted once no kept publication can list them.
-    retired: Mutex<Vec<(String, u64)>>,
+    published: Arc<AtomicU64>,
+    /// Objects of parts removed since a publication that may list them.
+    /// They are deleted once no kept publication can.
+    retired: RetiredObjects,
 }
 
 /// Remove every local file of the database called `database`.
@@ -888,8 +918,15 @@ fn read_record(local: &dyn FileSystem, directory: &Path, database: &str) -> io::
     }
 }
 
+/// What the record is called while it is being written. It takes its
+/// name only once whole, so that a crash leaves the old record or the new.
+fn record_being_written(directory: &Path, database: &str) -> PathBuf {
+    directory.join(format!("{database}.writer.new"))
+}
+
 fn write_record(local: &dyn FileSystem, directory: &Path, database: &str, writer: u64, first: u64) -> io::Result<()> {
-    let mut file = local.create(&record_path(directory, database))?;
+    let staged = record_being_written(directory, database);
+    let mut file = local.create(&staged)?;
     let text = format!("{writer} {first}\n");
     let mut done = 0;
     while done < text.len() {
@@ -899,7 +936,10 @@ fn write_record(local: &dyn FileSystem, directory: &Path, database: &str, writer
         };
     }
     file.flush()?;
-    file.sync()
+    file.sync()?;
+    drop(file);
+    local.rename(&staged, &record_path(directory, database))?;
+    local.sync_all()
 }
 
 impl ObjectFileSystem {
@@ -931,8 +971,8 @@ impl ObjectFileSystem {
             reads_only: false,
             fence: None,
             parts: Arc::new(Mutex::new(HashMap::new())),
-            published: AtomicU64::new(0),
-            retired: Mutex::new(Vec::new()),
+            published: Arc::new(AtomicU64::new(0)),
+            retired: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
@@ -1177,7 +1217,9 @@ impl ObjectFileSystem {
         if self.local.exists(path) {
             return Ok(None);
         }
-        if self.retired.lock().unwrap().iter().any(|(other, _)| *other == name) {
+        // Without a claim a part is its own object, and one that waits to
+        // be deleted is, to the store, gone.
+        if self.fence.is_none() && self.retired.lock().unwrap().iter().any(|retired| retired.object == name) {
             return Ok(None);
         }
         // A writer with a claim sees only its own line's parts.
@@ -1239,6 +1281,8 @@ impl FileSystem for ObjectFileSystem {
             objects: self.objects.clone(),
             fence: self.fence.clone(),
             parts: self.parts.clone(),
+            retired: self.retired.clone(),
+            published: self.published.clone(),
         }))
     }
 
@@ -1277,14 +1321,25 @@ impl FileSystem for ObjectFileSystem {
             self.cache.forget(&self.object_of(&name));
             self.delete_object(&name)?;
         } else {
-            // A publication may still list it. Its object waits.
-            if let Some(fence) = &self.fence {
-                fence.held()?;
-            }
+            // A publication may still list it. Its object waits, and
+            // the name is free for a part to be made under again.
             self.cache.forget(&self.object_of(&name));
-            let mut retired = self.retired.lock().unwrap();
-            if !retired.iter().any(|(other, _)| *other == name) {
-                retired.push((name.clone(), published));
+            let waiting = match &self.fence {
+                Some(fence) => {
+                    fence.held()?;
+                    self.parts.lock().unwrap().remove(&name)
+                }
+                None => Some((name.clone(), None)),
+            };
+            if let Some((object, mark)) = waiting {
+                let mut retired = self.retired.lock().unwrap();
+                if !retired.iter().any(|retired| retired.object == object) {
+                    retired.push(Retired {
+                        object,
+                        mark,
+                        when: published,
+                    });
+                }
             }
         }
         if self.local.exists(path) {
@@ -1342,7 +1397,7 @@ impl FileSystem for ObjectFileSystem {
         let retired = self.retired.lock().unwrap();
         for name in names {
             // A part waiting to be deleted is, to the store, gone.
-            if retired.iter().any(|(other, _)| *other == name) {
+            if self.fence.is_none() && retired.iter().any(|retired| retired.object == name) {
                 continue;
             }
             let path = directory.join(&name);
@@ -1571,6 +1626,7 @@ impl RustStore {
                 if !belongs_to(name, file_name)
                     || file_name.contains(CACHED)
                     || path == record
+                    || path == record_being_written(&filesystem.directory, name)
                     || part_key(&filesystem.directory, &path).is_some()
                 {
                     continue;
@@ -1592,13 +1648,8 @@ impl RustStore {
                 });
             }
             let parts = {
-                let retired = filesystem.retired.lock().unwrap();
                 let parts = filesystem.parts.lock().unwrap();
-                parts
-                    .iter()
-                    .filter(|(part, _)| !retired.iter().any(|(other, _)| other == *part))
-                    .map(|(part, (object, _))| (part.clone(), object.clone()))
-                    .collect()
+                parts.iter().map(|(part, (object, _))| (part.clone(), object.clone())).collect()
             };
             let published = Published {
                 number,
@@ -1646,17 +1697,23 @@ impl RustStore {
                 }
             }
         }
-        let due: Vec<String> = {
-            let retired = filesystem.retired.lock().unwrap();
-            // Removed after publication `when`, so `when` may list it and
-            // no later one does.
-            retired.iter().filter(|(_, when)| *when < keep_from).map(|(part, _)| part.clone()).collect()
-        };
-        for part in due {
-            if filesystem.delete_object(&part).is_ok() {
-                filesystem.retired.lock().unwrap().retain(|(other, _)| *other != part);
+        // Removed after publication `when`, so `when` may list it and no
+        // later one does.
+        let mut retired = filesystem.retired.lock().unwrap();
+        retired.retain(|retired| {
+            if retired.when >= keep_from {
+                return true;
             }
-        }
+            let gone = match &retired.mark {
+                // With a claim, only if it is as this writer left it.
+                Some(mark) => {
+                    objects.delete_if(&retired.object, mark).unwrap_or(false)
+                        || matches!(objects.version(&retired.object), Ok(None))
+                }
+                None => objects.delete(&retired.object).is_ok(),
+            };
+            !gone
+        });
         Ok(published)
     }
 }
