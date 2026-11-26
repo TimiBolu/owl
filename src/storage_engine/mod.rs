@@ -18,6 +18,7 @@ mod object_ref;
 mod object_store;
 mod parts;
 mod record;
+mod s3;
 mod store;
 pub mod vector;
 
@@ -36,6 +37,7 @@ pub use object_store::{
 };
 pub(crate) use record::{BorrowedRecordValue, CompiledSchema, RecordCodec, RecordView};
 pub use backup::{BackupFile, BackupInfo};
+pub use s3::{Request, Response, S3Config, S3Faults, S3ObjectStore, SimulatedS3, Transport};
 pub use store::{
     AutoCheckpointPolicy, IntegrityReport, MaintenanceStatus, ReclamationReport, RustStore,
     StorageLayoutStats, TransactionBinding, WriteOperation,

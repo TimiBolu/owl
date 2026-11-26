@@ -19,7 +19,8 @@ use owl_db::schema::{FieldType, Schema};
 use owl_db::simulation::SimulatedFileSystem;
 use owl_db::storage::DocumentStore;
 use owl_db::storage_engine::{
-    AutoCheckpointPolicy, MemoryObjectStore, ObjectFileSystem, ObjectStore, RustStore, WriteOperation,
+    AutoCheckpointPolicy, MemoryObjectStore, ObjectFileSystem, ObjectStore, RustStore, S3Config, S3Faults,
+    S3ObjectStore, SimulatedS3, WriteOperation,
 };
 use owl_db::{Document, Value};
 use rand::rngs::StdRng;
@@ -85,7 +86,7 @@ fn operation(change: &Change) -> WriteOperation {
 /// reached once that machine has lost power: a dead machine puts and
 /// deletes nothing. What is already in the store stays.
 struct Tethered {
-    store: Arc<MemoryObjectStore>,
+    store: Arc<dyn ObjectStore>,
     machine: Arc<SimulatedFileSystem>,
 }
 
@@ -234,7 +235,7 @@ struct Run {
     io_faults: bool,
     /// The object store the database's parts are kept in, when the run
     /// is of a database that keeps them there.
-    objects: Option<Arc<MemoryObjectStore>>,
+    objects: Option<Arc<dyn ObjectStore>>,
     /// The file system the open store was given, which is what publishes
     /// and what drops local parts.
     layer: Option<Arc<ObjectFileSystem>>,
@@ -251,9 +252,21 @@ struct Faults {
     io_faults: bool,
     /// A crash may keep a later unsynced write and lose an earlier one.
     reorder: bool,
-    /// The database keeps its parts in an object store, publishes for
-    /// readers, and drops its local parts now and then.
-    objects: bool,
+    /// Whether the database keeps its parts in an object store, publishes
+    /// for readers, and drops its local parts now and then; and in what.
+    objects: Objects,
+}
+
+/// Where a run's database keeps its parts besides its own disk.
+#[derive(Clone, Copy, PartialEq)]
+enum Objects {
+    /// Nowhere.
+    No,
+    /// An object store that does as it is asked.
+    Memory,
+    /// S3, through the S3 client, where the S3 is a simulated one that
+    /// loses requests and answers, fails, and cuts answers short.
+    S3,
 }
 
 /// What a step did, as the workload saw it.
@@ -284,7 +297,35 @@ impl Run {
             trace: Vec::new(),
             crashes: 0,
             io_faults,
-            objects: objects.then(|| Arc::new(MemoryObjectStore::new())),
+            objects: match objects {
+                Objects::No => None,
+                Objects::Memory => Some(Arc::new(MemoryObjectStore::new())),
+                Objects::S3 => {
+                    let s3 = SimulatedS3::new("owl", true, seed ^ 0x0b1e_c7ed).with_page(5);
+                    s3.set_faults(S3Faults {
+                        lost_request: 0.03,
+                        error: 0.03,
+                        lost_answer: 0.06,
+                        cut_short: 0.06,
+                    });
+                    let config = S3Config {
+                        bucket: "owl".to_string(),
+                        region: "us-east-1".to_string(),
+                        access_key: "AKIDEXAMPLE".to_string(),
+                        secret_key: "secret".to_string(),
+                        endpoint: "s3.test".to_string(),
+                        path_style: true,
+                        prefix: "crash/".to_string(),
+                        // Small, so that parts and logs go up in parts.
+                        part_bytes: 700,
+                        // Enough that a request failing every time is
+                        // not chance.
+                        attempts: 40,
+                    };
+                    let clock = Arc::new(|| 1_700_000_000);
+                    Some(Arc::new(S3ObjectStore::new(config, Arc::new(s3), clock, u128::from(seed))))
+                }
+            },
             layer: None,
             published: vec![None],
         }
@@ -749,7 +790,7 @@ fn acknowledged_writes_survive_a_crash_at_any_point() {
     let faults = Faults {
         io_faults: false,
         reorder: false,
-        objects: false,
+        objects: Objects::No,
     };
     sweep(1, seeds(300), 60, faults);
 }
@@ -759,7 +800,7 @@ fn acknowledged_writes_survive_failing_writes_and_syncs() {
     let faults = Faults {
         io_faults: true,
         reorder: false,
-        objects: false,
+        objects: Objects::No,
     };
     sweep(100_000, seeds(300), 60, faults);
 }
@@ -778,7 +819,7 @@ fn the_database_opens_after_a_checkpoint_is_retried_and_power_is_lost() {
     let faults = Faults {
         io_faults: true,
         reorder: false,
-        objects: false,
+        objects: Objects::No,
     };
     for seed in [101_261, 100_722] {
         let mut run = Run::new(seed, faults);
@@ -798,7 +839,7 @@ fn acknowledged_writes_survive_a_crash_that_reorders_writes() {
     let faults = Faults {
         io_faults: false,
         reorder: true,
-        objects: false,
+        objects: Objects::No,
     };
     sweep(200_000, seeds(300), 60, faults);
 }
@@ -815,7 +856,7 @@ fn acknowledged_writes_survive_a_crash_with_parts_in_an_object_store() {
     let faults = Faults {
         io_faults: false,
         reorder: false,
-        objects: true,
+        objects: Objects::Memory,
     };
     sweep(300_000, seeds(300), 60, faults);
 }
@@ -827,7 +868,7 @@ fn acknowledged_writes_survive_a_reordering_crash_with_parts_in_an_object_store(
     let faults = Faults {
         io_faults: false,
         reorder: true,
-        objects: true,
+        objects: Objects::Memory,
     };
     sweep(400_000, seeds(300), 60, faults);
 }
@@ -838,9 +879,35 @@ fn acknowledged_writes_survive_failing_writes_with_parts_in_an_object_store() {
     let faults = Faults {
         io_faults: true,
         reorder: false,
-        objects: true,
+        objects: Objects::Memory,
     };
     sweep(500_000, seeds(300), 60, faults);
+}
+
+/// The same again through the S3 client, against an S3 that loses about
+/// one request or answer in six: a request never arrives, the service
+/// fails, a request is applied and its answer lost, a read is answered
+/// short. The store, its claim, its publications and its readers must
+/// come out as they do against an object store that never errs.
+#[test]
+fn acknowledged_writes_survive_a_crash_with_parts_in_a_failing_s3() {
+    let faults = Faults {
+        io_faults: false,
+        reorder: false,
+        objects: Objects::S3,
+    };
+    sweep(600_000, seeds(300), 60, faults);
+}
+
+/// And with the disk reordering its unsynced writes as well.
+#[test]
+fn acknowledged_writes_survive_a_reordering_crash_with_parts_in_a_failing_s3() {
+    let faults = Faults {
+        io_faults: false,
+        reorder: true,
+        objects: Objects::S3,
+    };
+    sweep(700_000, seeds(300), 60, faults);
 }
 
 #[test]
@@ -848,7 +915,7 @@ fn one_seed_gives_one_run() {
     let faults = Faults {
         io_faults: false,
         reorder: false,
-        objects: false,
+        objects: Objects::No,
     };
     let once = {
         let mut run = Run::new(7, faults);
