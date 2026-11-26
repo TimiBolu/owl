@@ -9380,18 +9380,13 @@ impl<S: DocumentStore> QueryExecutor<S> {
             // `.customer == customers.where { .name == "Bob" }`: a query
             // that gives one row stands for that row when a reference is
             // asked whether it is it.
-            let the_one = |value: Value, other: &Value| match value {
-                Value::List(mut items)
-                    if rows
-                        && items.len() == 1
-                        && matches!(other, Value::String(_))
-                        && matches!(operator, ComparisonOperator::Equal | ComparisonOperator::NotEqual) =>
-                {
-                    items.remove(0)
-                }
+            let one_row = rows && matches!(operator, ComparisonOperator::Equal | ComparisonOperator::NotEqual);
+            let the_one = |value: Value, other_is_an_id: bool| match value {
+                Value::List(mut items) if one_row && other_is_an_id && items.len() == 1 => items.remove(0),
                 value => value,
             };
-            let (left, right) = (the_one(left.clone(), &right), the_one(right.clone(), &left));
+            let (left_is_an_id, right_is_an_id) = (matches!(left, Value::String(_)), matches!(right, Value::String(_)));
+            let (left, right) = (the_one(left, right_is_an_id), the_one(right, left_is_an_id));
             return Ok(crate::value_semantics::matches(&left, operator, &right));
         }
         // A list of references, as a path through a collection gives, is
