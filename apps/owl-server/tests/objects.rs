@@ -6,7 +6,7 @@ use axum::http::{Request, StatusCode};
 use axum::Router;
 use http_body_util::BodyExt;
 use owl_db::storage::RustStore;
-use owl_server::{open_in_objects, router, ObjectOptions, Objects, Options, Role};
+use owl_server::{checkpoint_if_written, open_in_objects, router, ObjectOptions, Objects, Options, Reader, Role};
 use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::Arc;
@@ -84,8 +84,8 @@ async fn a_reader_serves_what_the_writer_checkpointed_and_takes_no_writes() {
     let (status, body) = reader
         .post("/v1/insert", json!({ "collection": "notes", "documents": [{ "id": "mine", "n": 1 }] }))
         .await;
-    assert_ne!(status, StatusCode::OK, "{body}");
-    assert!(body.to_string().contains("read-only"), "{body}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "read_only", "{body}");
     let (status, body) = reader.post("/v1/query", json!({ "query": "notes.delete()" })).await;
     assert_ne!(status, StatusCode::OK, "{body}");
     assert_eq!(reader.count().await, 300);
@@ -130,4 +130,59 @@ async fn a_second_server_cannot_write_the_database_unless_it_takes_it_over() {
     drop(first);
     let refused = Service::open(here.path(), bucket.path(), Role::Writer).err().unwrap();
     assert!(refused.contains("claimed by another writer"), "{refused}");
+}
+
+#[tokio::test]
+async fn a_reader_that_is_refreshed_serves_the_newer_publication_without_restarting() {
+    let (bucket, here, there) = (TempDir::new().unwrap(), TempDir::new().unwrap(), TempDir::new().unwrap());
+    let writer = Service::open(here.path(), bucket.path(), Role::Writer).unwrap();
+    writer.insert(0..100).await;
+
+    // A checkpoint is made when something has been written, and only then.
+    assert!(checkpoint_if_written(&writer.store).unwrap());
+    assert!(!checkpoint_if_written(&writer.store).unwrap());
+
+    let options = ObjectOptions {
+        objects: Objects::Directory(bucket.path().to_path_buf()),
+        role: Role::Reader,
+        cache_bytes: 8 << 20,
+    };
+    let data = there.path().join("shop.owl");
+    let (mut reader, store) = Reader::open(&data, 64 << 20, &options).unwrap();
+    let (app, janitor) = router(store.clone(), Options::default());
+    let slot = janitor.store();
+    let serving = Service { store, app };
+    assert_eq!(serving.count().await, 100);
+    let first = reader.published();
+
+    // Nothing newer: nothing to do.
+    assert!(reader.refresh().unwrap().is_none());
+
+    // The writer writes and checkpoints. The same server, asked again,
+    // answers with the new rows.
+    for round in 1..=3u32 {
+        writer.insert(round * 100..round * 100 + 100).await;
+        assert_eq!(serving.count().await, u64::from(round) * 100, "not before it is refreshed");
+        assert!(checkpoint_if_written(&writer.store).unwrap());
+        let newer = reader.refresh().unwrap().expect("a newer publication was made");
+        slot.replace(newer);
+        assert_eq!(serving.count().await, u64::from(round) * 100 + 100);
+        assert!(reader.refresh().unwrap().is_none());
+    }
+    assert!(reader.published() > first);
+
+    // It is still a reader.
+    let (status, body) = serving
+        .post("/v1/insert", json!({ "collection": "notes", "documents": [{ "id": "mine", "n": 1 }] }))
+        .await;
+    assert_ne!(status, StatusCode::OK, "{body}");
+
+    // Copies it no longer needs are removed: the last two are kept.
+    let copies = there.path().join("shop.owl.copies");
+    let mut kept: Vec<String> = std::fs::read_dir(&copies)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    kept.sort();
+    assert_eq!(kept, ["2", "3"]);
 }
