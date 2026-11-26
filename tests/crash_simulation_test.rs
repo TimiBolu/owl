@@ -233,6 +233,11 @@ struct Run {
     trace: Vec<String>,
     crashes: usize,
     io_faults: bool,
+    /// Whether the run's disks reorder unsynced writes when they crash.
+    reorder: bool,
+    /// How many machines have written the database: one, and one more
+    /// for every take-over.
+    machines: u64,
     /// The object store the database's parts are kept in, when the run
     /// is of a database that keeps them there.
     objects: Option<Arc<dyn ObjectStore>>,
@@ -297,6 +302,8 @@ impl Run {
             trace: Vec::new(),
             crashes: 0,
             io_faults,
+            reorder,
+            machines: 1,
             objects: match objects {
                 Objects::No => None,
                 Objects::Memory => Some(Arc::new(MemoryObjectStore::new())),
@@ -354,6 +361,77 @@ impl Run {
             store.publish_after_checkpoints(layer.clone()).map_err(|error| error.to_string())?;
         }
         self.layer = Some(layer);
+        Ok(store)
+    }
+
+    /// Another machine takes the database over from its last publication
+    /// while the machine that was writing it is still running and does not
+    /// know. The run goes on with the new machine.
+    ///
+    /// What was committed after the publication does not cross: that is
+    /// what taking over means, so what is promised from here on is what
+    /// was published. The old writer then carries on for a while, writing,
+    /// checkpointing, clearing out and trying to publish. None of it may
+    /// reach the new writer's database or its readers, and its publishing
+    /// must be refused.
+    fn take_over(&mut self, old: RustStore) -> Result<RustStore, String> {
+        let Some(objects) = self.objects.clone() else {
+            return Ok(old);
+        };
+        let published = match self.published.as_slice() {
+            [Some(rows)] => rows.clone(),
+            // Nothing published, or a publication cut off and not yet
+            // seen by a reader: not a moment to take over at.
+            _ => return Ok(old),
+        };
+        let old_layer = self.layer.clone();
+        self.machines += 1;
+        let machine = {
+            let filesystem = SimulatedFileSystem::new(self.seed ^ self.machines.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            filesystem.set_in_order_only(!self.reorder);
+            Arc::new(filesystem)
+        };
+        let tethered = Arc::new(Tethered {
+            store: objects,
+            machine: machine.clone(),
+        });
+        let layer = ObjectFileSystem::take_over(machine.clone(), tethered, "", DATABASE, 4 << 20)
+            .map_err(|error| self.fail(format!("cannot take the database over: {error}")))?;
+        let store = RustStore::new_with_fs(Path::new(DATABASE), 1 << 30, layer.clone())
+            .map_err(|error| self.fail(format!("cannot open the database taken over: {error}")))?;
+        store
+            .configure_auto_checkpoint(AutoCheckpointPolicy::disabled())
+            .map_err(|error| self.fail(error.to_string()))?;
+        if self.publishes_itself() {
+            store.publish_after_checkpoints(layer.clone()).map_err(|error| self.fail(error.to_string()))?;
+        }
+        self.trace.push(format!("machine {} took the database over", self.machines));
+
+        // The old writer, still up, does what a writer does.
+        for _ in 0..self.rng.gen_range(1..=4) {
+            let changes = self.changes(3);
+            let _ = old.write_batch(changes.iter().map(operation).collect());
+            match self.rng.gen_range(0..4) {
+                0 => drop(old.checkpoint()),
+                1 => drop(old.compact()),
+                2 => drop(old.compact_and_reclaim()),
+                _ => drop(old.reclaim_obsolete_files()),
+            }
+            let _ = old.wait_for_maintenance();
+            if let Some(old_layer) = &old_layer {
+                if old.publish(old_layer).is_ok() {
+                    return Err(self.fail("a writer that was replaced published all the same".to_string()));
+                }
+            }
+        }
+        drop(old);
+        self.trace.push("the old writer carried on, and stopped".to_string());
+
+        self.filesystem = machine;
+        self.layer = Some(layer);
+        self.rows = published.clone();
+        self.published = vec![Some(published)];
+        self.check(&store, &[])?;
         Ok(store)
     }
 
@@ -663,6 +741,12 @@ impl Run {
                     .map_err(|error| self.fail(format!("cannot reopen cleanly: {error}")))?;
                 self.trace.push("reopened".to_string());
                 self.check(&store, &[])?;
+            }
+
+            // Now and then, where the parts are in an object store,
+            // another machine takes the database over.
+            if self.objects.is_some() && self.rng.gen_bool(0.04) {
+                store = self.take_over(store)?;
             }
 
             let armed = self.rng.gen_bool(0.3);
