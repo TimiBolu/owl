@@ -72,29 +72,9 @@ pub struct ObjectOptions {
     pub cache_bytes: u64,
 }
 
-/// Open the database at `data` with its parts in an object store.
-///
-/// `data` is where the database's own files are kept on this machine: a
-/// writer's log and roots, a reader's copy of the publication, and the
-/// cache of parts either reads.
-pub fn open_in_objects(
-    data: &std::path::Path,
-    max_size_bytes: usize,
-    options: &ObjectOptions,
-) -> Result<Arc<RustStore>, String> {
-    use owl_db::simulation::filesystem::RealFileSystem;
-    use owl_db::storage_engine::{
-        DirectoryObjectStore, HttpTransport, ObjectFileSystem, ObjectStore, S3ObjectStore,
-    };
-    // The directory has to be named the way the store will name it.
-    let data = std::path::absolute(data).map_err(|error| format!("{}: {error}", data.display()))?;
-    let directory = data.parent().ok_or("the database path has no directory")?.to_path_buf();
-    let name = data
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or("the database path has no file name")?
-        .to_string();
-    let objects: Arc<dyn ObjectStore> = match &options.objects {
+fn object_store(objects: &Objects) -> Result<Arc<dyn owl_db::storage_engine::ObjectStore>, String> {
+    use owl_db::storage_engine::{DirectoryObjectStore, HttpTransport, S3ObjectStore};
+    Ok(match objects {
         Objects::Directory(path) => Arc::new(
             DirectoryObjectStore::new(path).map_err(|error| format!("open {}: {error}", path.display()))?,
         ),
@@ -102,29 +82,153 @@ pub fn open_in_objects(
             let transport = Arc::new(HttpTransport::new(*secure, Duration::from_secs(60)));
             Arc::new(S3ObjectStore::over(config.clone(), transport))
         }
-    };
+    })
+}
+
+/// The directory a database path is in and the name of its file, with the
+/// directory named the way the store will name it.
+fn directory_and_name(data: &std::path::Path) -> Result<(std::path::PathBuf, String), String> {
+    let data = std::path::absolute(data).map_err(|error| format!("{}: {error}", data.display()))?;
+    let directory = data.parent().ok_or("the database path has no directory")?.to_path_buf();
+    let name = data
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("the database path has no file name")?
+        .to_string();
+    Ok((directory, name))
+}
+
+/// Open the database at `data` with its parts in an object store.
+///
+/// `data` is where the database's own files are kept on this machine: a
+/// writer's log and roots, and the cache of parts it reads. A reader
+/// keeps its copies of publications in a directory beside it; see
+/// [`Reader`], which this makes and drops for a reader that will not be
+/// refreshed.
+pub fn open_in_objects(
+    data: &std::path::Path,
+    max_size_bytes: usize,
+    options: &ObjectOptions,
+) -> Result<Arc<RustStore>, String> {
+    use owl_db::simulation::filesystem::RealFileSystem;
+    use owl_db::storage_engine::ObjectFileSystem;
+    if options.role == Role::Reader {
+        return Ok(Reader::open(data, max_size_bytes, options)?.1);
+    }
+    let (directory, name) = directory_and_name(data)?;
+    let objects = object_store(&options.objects)?;
     let local = Arc::new(RealFileSystem::new());
     let failed = |what: &str, error: std::io::Error| format!("{what} '{name}': {error}");
     let filesystem = match options.role {
-        Role::Writer => ObjectFileSystem::writer(local, objects, &directory, &name, options.cache_bytes)
-            .map_err(|error| failed("claim", error))?,
         Role::TakeOver => ObjectFileSystem::take_over(local, objects, &directory, &name, options.cache_bytes)
             .map_err(|error| failed("take over", error))?,
-        Role::Reader => {
-            ObjectFileSystem::reader(local, objects, &directory, &name, options.cache_bytes)
-                .map_err(|error| failed("fetch the publication of", error))?
-                .0
-        }
+        _ => ObjectFileSystem::writer(local, objects, &directory, &name, options.cache_bytes)
+            .map_err(|error| failed("claim", error))?,
     };
-    let store = RustStore::new_with_fs(&data, max_size_bytes, filesystem.clone())
+    let store = RustStore::new_with_fs(directory.join(&name), max_size_bytes, filesystem.clone())
         .map_err(|error| format!("open {}: {error}", data.display()))?;
-    match options.role {
-        Role::Reader => store.set_read_only(true),
-        Role::Writer | Role::TakeOver => store
-            .publish_after_checkpoints(filesystem)
-            .map_err(|error| error.to_string())?,
-    }
+    store.publish_after_checkpoints(filesystem).map_err(|error| error.to_string())?;
     Ok(Arc::new(store))
+}
+
+/// A reader of a database in an object store, which can look for a newer
+/// publication and open it.
+///
+/// Each publication it opens is fetched into a directory of its own,
+/// under `<data>.copies`, so that the one being served is not touched
+/// while the next is fetched. A copy is removed once the one after it has
+/// been replaced in turn, by which time no request is still reading it.
+pub struct Reader {
+    objects: Arc<dyn owl_db::storage_engine::ObjectStore>,
+    copies: std::path::PathBuf,
+    name: String,
+    max_size_bytes: usize,
+    cache_bytes: u64,
+    /// The number of the publication being served.
+    published: u64,
+    /// How many copies have been made.
+    made: u64,
+}
+
+impl Reader {
+    /// Fetch the last publication and open it.
+    pub fn open(
+        data: &std::path::Path,
+        max_size_bytes: usize,
+        options: &ObjectOptions,
+    ) -> Result<(Self, Arc<RustStore>), String> {
+        let (directory, name) = directory_and_name(data)?;
+        let copies = directory.join(format!("{name}.copies"));
+        // Copies an earlier run left are of no use to this one.
+        if copies.exists() {
+            std::fs::remove_dir_all(&copies).map_err(|error| format!("clear {}: {error}", copies.display()))?;
+        }
+        let mut reader = Self {
+            objects: object_store(&options.objects)?,
+            copies,
+            name,
+            max_size_bytes,
+            cache_bytes: options.cache_bytes,
+            published: 0,
+            made: 0,
+        };
+        let store = reader.fetch()?;
+        Ok((reader, store))
+    }
+
+    fn fetch(&mut self) -> Result<Arc<RustStore>, String> {
+        use owl_db::simulation::filesystem::RealFileSystem;
+        use owl_db::storage_engine::ObjectFileSystem;
+        let directory = self.copies.join(self.made.to_string());
+        let (filesystem, published) = ObjectFileSystem::reader(
+            Arc::new(RealFileSystem::new()),
+            self.objects.clone(),
+            &directory,
+            &self.name,
+            self.cache_bytes,
+        )
+        .map_err(|error| format!("fetch the publication of '{}': {error}", self.name))?;
+        let store = RustStore::new_with_fs(directory.join(&self.name), self.max_size_bytes, filesystem)
+            .map_err(|error| format!("open the publication of '{}': {error}", self.name))?;
+        store.set_read_only(true);
+        // The copy before the one this replaces has had a whole turn for
+        // its requests to finish.
+        if self.made >= 2 {
+            let _ = std::fs::remove_dir_all(self.copies.join((self.made - 2).to_string()));
+        }
+        self.made += 1;
+        self.published = published.number;
+        Ok(Arc::new(store))
+    }
+
+    /// The number of the publication being served.
+    pub fn published(&self) -> u64 {
+        self.published
+    }
+
+    /// If a newer publication has been made, fetch and open it.
+    pub fn refresh(&mut self) -> Result<Option<Arc<RustStore>>, String> {
+        let newest = owl_db::storage_engine::Published::newest(self.objects.as_ref(), &self.name)
+            .map_err(|error| format!("look for a publication of '{}': {error}", self.name))?;
+        match newest {
+            Some(newest) if newest.number != self.published => self.fetch().map(Some),
+            _ => Ok(None),
+        }
+    }
+}
+
+/// Make a checkpoint if anything has been committed since the last one.
+/// Says whether one was made.
+///
+/// A server that keeps its database in an object store publishes at each
+/// checkpoint, so this is what bounds how far behind its readers can be.
+pub fn checkpoint_if_written(store: &RustStore) -> Result<bool, String> {
+    let status = store.maintenance_status().map_err(|error| error.to_string())?;
+    if status.commits_since_checkpoint == 0 {
+        return Ok(false);
+    }
+    store.checkpoint().map_err(|error| error.to_string())?;
+    Ok(true)
 }
 
 /// How the server is run.
@@ -154,16 +258,36 @@ impl Default for Options {
 
 #[derive(Clone)]
 struct Server {
-    store: Arc<RustStore>,
+    /// The database being served. A reader's is replaced when a newer
+    /// publication is fetched; a request keeps the one it began with.
+    store: StoreSlot,
     options: Arc<Options>,
     /// Open transactions and when each was last used.
     transactions: Arc<Mutex<HashMap<u64, Instant>>>,
 }
 
+/// Where the server keeps the database it serves, so that it can be
+/// changed for another while the server runs.
+#[derive(Clone)]
+pub struct StoreSlot(Arc<std::sync::RwLock<Arc<RustStore>>>);
+
+impl StoreSlot {
+    /// The database being served now.
+    pub fn get(&self) -> Arc<RustStore> {
+        self.0.read().expect("store slot").clone()
+    }
+
+    /// Serve `store` from now on. Requests under way finish against the
+    /// one they began with. A transaction open in the old one is lost.
+    pub fn replace(&self, store: Arc<RustStore>) {
+        *self.0.write().expect("store slot") = store;
+    }
+}
+
 /// The service. Call [`expire_idle_transactions`] on a timer beside it.
 pub fn router(store: Arc<RustStore>, options: Options) -> (Router, Janitor) {
     let server = Server {
-        store,
+        store: StoreSlot(Arc::new(std::sync::RwLock::new(store))),
         options: Arc::new(options),
         transactions: Arc::new(Mutex::new(HashMap::new())),
     };
@@ -209,9 +333,14 @@ impl Janitor {
             idle
         };
         for id in &idle {
-            let _ = self.server.store.rollback_transaction(*id);
+            let _ = self.server.store.get().rollback_transaction(*id);
         }
         idle.len()
+    }
+
+    /// The slot the served database is kept in.
+    pub fn store(&self) -> StoreSlot {
+        self.server.store.clone()
     }
 
     /// Check for idle transactions until the process ends.
@@ -258,6 +387,9 @@ impl From<OQLError> for Failure {
             | OQLError::ParseError { .. }
             | OQLError::FunctionError { .. }
             | OQLError::QueryExecution { .. } => (StatusCode::UNPROCESSABLE_ENTITY, "rejected"),
+            // A reader's copy takes no writes. That is the caller's to
+            // know, not a fault of the server.
+            _ if error.to_string().contains("read-only copy") => (StatusCode::FORBIDDEN, "read_only"),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
         };
         Self::new(status, code, error.to_string())
@@ -343,12 +475,13 @@ impl Server {
                 ))
             }
         }
-        let _bound = self.store.bind_transaction(id)?;
+        let store = self.store.get();
+        let _bound = store.bind_transaction(id)?;
         work()
     }
 
     fn executor(&self) -> QueryExecutor<RustStore> {
-        QueryExecutor::new_with_real_clock(self.store.clone())
+        QueryExecutor::new_with_real_clock(self.store.get())
     }
 
     fn forget(&self, id: u64) -> bool {
@@ -453,7 +586,7 @@ async fn script(State(server): State<Server>, axum::Json(request): axum::Json<Sc
 
 async fn begin(State(server): State<Server>) -> Response {
     blocking(move || {
-        let id = server.store.begin_transaction()?;
+        let id = server.store.get().begin_transaction()?;
         server
             .transactions
             .lock()
@@ -472,7 +605,7 @@ async fn commit(State(server): State<Server>, Path(id): Path<u64>) -> Response {
             }
             .into());
         }
-        server.store.commit_transaction(id)?;
+        server.store.get().commit_transaction(id)?;
         Ok(json!({ "committed": true }))
     })
     .await
@@ -486,7 +619,7 @@ async fn rollback(State(server): State<Server>, Path(id): Path<u64>) -> Response
             }
             .into());
         }
-        server.store.rollback_transaction(id)?;
+        server.store.get().rollback_transaction(id)?;
         Ok(json!({ "rolled_back": true }))
     })
     .await
@@ -515,7 +648,7 @@ async fn backup(State(server): State<Server>) -> Response {
             }
             sequence += 1;
         };
-        let info = server.store.backup(&destination)?;
+        let info = server.store.get().backup(&destination)?;
         Ok(json!({
             "name": name,
             "committed_lsn": info.committed_lsn,

@@ -2,7 +2,9 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use owl_db::storage::RustStore;
 use owl_db::storage_engine::S3Config;
-use owl_server::{open_in_objects, router, ObjectOptions, Objects, Options, Role};
+use owl_server::{
+    checkpoint_if_written, open_in_objects, router, ObjectOptions, Objects, Options, Reader, Role,
+};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -80,6 +82,17 @@ struct Arguments {
     /// hold, in MiB.
     #[arg(long, default_value_t = 256)]
     object_cache_mib: u64,
+    /// Make a checkpoint this often, in seconds, when anything has been
+    /// written since the last. With an object store a checkpoint is when
+    /// readers see new data, so this bounds how far behind they can be.
+    /// Without it checkpoints are made by size alone.
+    #[arg(long, env = "OWL_CHECKPOINT_SECONDS")]
+    checkpoint_seconds: Option<u64>,
+    /// With --read-only: look for a newer publication this often, in
+    /// seconds, and serve it when there is one. Without it the server
+    /// shows what was published when it started.
+    #[arg(long, env = "OWL_REFRESH_SECONDS", requires = "read_only")]
+    refresh_seconds: Option<u64>,
 }
 
 impl Arguments {
@@ -147,9 +160,18 @@ async fn main() -> Result<()> {
     if objects.is_some() && arguments.restore_from.is_some() {
         return Err(anyhow!("--restore-from is not for a database kept in an object store"));
     }
+    let mut reader = None;
     let store = match (&objects, &arguments.restore_from) {
         (Some(objects), _) => {
-            let store = open_in_objects(&arguments.data, max_size, objects).map_err(|error| anyhow!(error))?;
+            let store = match objects.role {
+                Role::Reader => {
+                    let (opened, store) =
+                        Reader::open(&arguments.data, max_size, objects).map_err(|error| anyhow!(error))?;
+                    reader = Some(opened);
+                    store
+                }
+                _ => open_in_objects(&arguments.data, max_size, objects).map_err(|error| anyhow!(error))?,
+            };
             println!(
                 "{} {} at commit {}, with its parts in an object store",
                 match objects.role {
@@ -186,7 +208,53 @@ async fn main() -> Result<()> {
             backup_directory: arguments.backup_dir,
         },
     );
+    let slot = janitor.store();
     tokio::spawn(janitor.run());
+    if let Some(seconds) = arguments.checkpoint_seconds.filter(|_| reader.is_none()) {
+        let slot = slot.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(seconds.max(1)));
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let store = slot.get();
+                // A checkpoint is disk work, and must not hold up requests.
+                match tokio::task::spawn_blocking(move || checkpoint_if_written(&store)).await {
+                    Ok(Err(error)) => eprintln!("timed checkpoint failed: {error}"),
+                    Ok(Ok(_)) | Err(_) => {}
+                }
+            }
+        });
+    }
+    if let (Some(seconds), Some(mut reader)) = (arguments.refresh_seconds, reader) {
+        let decoded = arguments.decoded_documents;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(seconds.max(1)));
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let refreshed = tokio::task::spawn_blocking(move || {
+                    let outcome = reader.refresh();
+                    (reader, outcome)
+                })
+                .await;
+                let Ok((returned, outcome)) = refreshed else { break };
+                reader = returned;
+                match outcome {
+                    Ok(Some(store)) => {
+                        if let Some(budget) = decoded {
+                            let _ = store.set_decoded_budget(Some(budget));
+                        }
+                        println!("now serving publication {}", reader.published());
+                        slot.replace(store);
+                    }
+                    Ok(None) => {}
+                    // The publication being served is still served.
+                    Err(error) => eprintln!("refresh failed: {error}"),
+                }
+            }
+        });
+    }
     let listener = tokio::net::TcpListener::bind(arguments.listen)
         .await
         .with_context(|| format!("listen on {}", arguments.listen))?;

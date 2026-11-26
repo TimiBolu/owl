@@ -98,6 +98,8 @@ database for reading, with nothing but the bucket.
 | `--read-only` | | Serve what was last published; take no writes |
 | `--take-over` | | Become the writer, starting from what was last published |
 | `--object-cache-mib` | | Most the local cache of parts may hold; 256 by default |
+| `--checkpoint-seconds` | `OWL_CHECKPOINT_SECONDS` | Checkpoint this often when something has been written |
+| `--refresh-seconds` | `OWL_REFRESH_SECONDS` | With `--read-only`: look this often for a newer publication |
 
 The access key and secret are read from `AWS_ACCESS_KEY_ID` and
 `AWS_SECRET_ACCESS_KEY`.
@@ -107,10 +109,24 @@ The access key and secret are read from `AWS_ACCESS_KEY_ID` and
 checkpoint, which is when readers can see what it has written. A second
 server started the same way against the same bucket is refused.
 
+Left alone, a server checkpoints by size: at about 16 MB of log or 10,000
+commits. Give the writer `--checkpoint-seconds` to checkpoint on a timer
+as well, whenever something has been written. That is what bounds how far
+behind readers can be.
+
 **Any number read.** A server started with `--read-only` fetches the last
-publication into the directory of `--data` and serves it. It refuses
-writes. It shows the database as it was published when the server started:
-start it again to see later data.
+publication and serves it. It refuses writes with `403` and the code
+`read_only`. With `--refresh-seconds` it looks that often for a newer
+publication and serves it when there is one, without restarting; without
+it, it shows the database as published when the server started.
+
+A reader keeps its copies of publications in `<data>.copies`, each in a
+directory of its own, and removes one once two newer ones have been
+fetched. A request under way when a newer one is swapped in finishes
+against the copy it began with.
+
+With both timers, a reader is behind the writer by at most about the two
+intervals added together, plus the time to publish and fetch.
 
 **Taking over.** If the writer is gone, start another with `--take-over`.
 It begins from the last publication, so whatever the old writer committed
@@ -119,11 +135,11 @@ running it keeps answering from its own disk, but it can no longer publish
 and cannot be started again as the writer.
 
 ```bash
-owl-server --data /var/owl/shop.owl --s3-bucket my-bucket --s3-prefix shop/
+owl-server --data /var/owl/shop.owl --s3-bucket my-bucket --s3-prefix shop/ --checkpoint-seconds 10
 ```
 
 ```bash
-owl-server --data /var/owl-reader/shop.owl --s3-bucket my-bucket --s3-prefix shop/ --read-only --listen 127.0.0.1:7879
+owl-server --data /var/owl-reader/shop.owl --s3-bucket my-bucket --s3-prefix shop/ --read-only --refresh-seconds 10 --listen 127.0.0.1:7879
 ```
 
 Checked against MinIO. Not yet run against AWS itself.
