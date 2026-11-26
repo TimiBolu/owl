@@ -700,6 +700,12 @@ struct Fence {
     database: String,
     /// This writer's number.
     writer: u64,
+    /// The number of the first writer in this writer's line. Parts put by
+    /// a writer before it are this line's only where a publication this
+    /// line began from lists them.
+    first: u64,
+    /// The number of the newest publication when this writer claimed.
+    claimed_at: u64,
     /// The pointer's mark as this writer last wrote it.
     pointer: Mutex<String>,
     /// Set once the object store has shown that another writer has taken
@@ -1133,6 +1139,8 @@ impl ObjectFileSystem {
         filesystem.fence = Some(Arc::new(Fence {
             database: database.to_string(),
             writer,
+            first,
+            claimed_at: claimed.number,
             pointer: Mutex::new(mark),
             lost: AtomicBool::new(false),
         }));
@@ -1696,6 +1704,33 @@ impl super::store::StoreCore {
                 }
             }
         }
+        // Parts another line of writers left behind: put by a writer that
+        // was replaced and went on a while, or listed only by publications
+        // from before this line began. Once the two kept publications are
+        // both this writer's, no reader can be reading one, and a writer
+        // that was replaced can publish none.
+        if let Some(fence) = fence.filter(|fence| published.number >= fence.claimed_at + 2) {
+            let ours: std::collections::HashSet<String> = {
+                let parts = filesystem.parts.lock().unwrap();
+                let retired = filesystem.retired.lock().unwrap();
+                parts
+                    .values()
+                    .map(|(object, _)| object.clone())
+                    .chain(retired.iter().map(|retired| retired.object.clone()))
+                    .collect()
+            };
+            if let Ok(keys) = objects.list(&name) {
+                for key in keys {
+                    let Some((part, by)) = key.rsplit_once('~') else { continue };
+                    let other_line = by.parse::<u64>().is_ok_and(|by| by < fence.first);
+                    let is_part = part_key(&filesystem.directory, &filesystem.directory.join(part)).is_some();
+                    if other_line && is_part && !ours.contains(&key) {
+                        let _ = objects.delete(&key);
+                    }
+                }
+            }
+        }
+
         // Removed after publication `when`, so `when` may list it and no
         // later one does.
         let mut retired = filesystem.retired.lock().unwrap();
@@ -2245,5 +2280,62 @@ mod tests {
             "the failed publication is on record: {:?}",
             status.last_error
         );
+    }
+
+    #[test]
+    fn what_a_replaced_writer_left_behind_is_cleared_away() {
+        let objects = Arc::new(MemoryObjectStore::new());
+        let old_machine = Arc::new(SimulatedFileSystem::new(850));
+        let (old, old_filesystem) = write(&old_machine, &objects);
+        for number in 0..200 {
+            old.put_document(&event(number)).unwrap();
+        }
+        old.checkpoint().unwrap();
+        old.publish(&old_filesystem).unwrap();
+
+        let new_machine = Arc::new(SimulatedFileSystem::new(851));
+        let new_filesystem =
+            ObjectFileSystem::take_over(new_machine, objects.clone(), "", "shop.owl", 8 << 20).unwrap();
+        let new = RustStore::new_with_fs(Path::new("shop.owl"), 64 << 20, new_filesystem.clone()).unwrap();
+
+        // The old writer goes on: it rewrites everything into a new part,
+        // which nothing will ever list.
+        for number in 0..200 {
+            let mut changed = event(number);
+            changed.fields.insert("round".into(), Value::Integer(1));
+            old.put_document(&changed).unwrap();
+        }
+        let _ = old.compact();
+        drop(old);
+        let parts = |objects: &MemoryObjectStore| -> Vec<String> {
+            objects.list("").unwrap().into_iter().filter(|key| key.contains(".part.") && key.contains('~')).collect()
+        };
+        let left = parts(&objects);
+        assert!(left.iter().any(|key| key.ends_with("~1")), "the old writer put parts: {left:?}");
+
+        // The new writer rewrites everything too, so that the part it
+        // began from is listed by nothing, and publishes. After its
+        // second publication both kept publications are its own.
+        for round in 2..=3 {
+            for number in 0..200 {
+                let mut changed = event(number);
+                changed.fields.insert("round".into(), Value::Integer(round));
+                new.put_document(&changed).unwrap();
+            }
+            new.compact_and_reclaim().unwrap();
+            new.wait_for_maintenance().unwrap();
+            new.publish(&new_filesystem).unwrap();
+        }
+        // One more, for the part it began from to stop waiting.
+        new.put_document(&event(999)).unwrap();
+        new.checkpoint().unwrap();
+        new.publish(&new_filesystem).unwrap();
+
+        let left = parts(&objects);
+        assert!(left.iter().all(|key| !key.ends_with("~1")), "nothing of the old writer's is left: {left:?}");
+        // And what the new writer needs is all there.
+        let (reader, _) = read(852, &objects);
+        assert_eq!(codes(&reader), (0..200).chain(999..1000).collect::<Vec<_>>());
+        assert_eq!(codes(&new), (0..200).chain(999..1000).collect::<Vec<_>>());
     }
 }
