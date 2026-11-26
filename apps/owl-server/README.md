@@ -124,6 +124,8 @@ A reader keeps its copies of publications in `<data>.copies`, each in a
 directory of its own, and removes one once two newer ones have been
 fetched. A request under way when a newer one is swapped in finishes
 against the copy it began with.
+The parts it has read from the bucket are cached in one place for all of
+them, so a newer publication reads again only what is new.
 
 With both timers, a reader is behind the writer by at most about the two
 intervals added together, plus the time to publish and fetch.

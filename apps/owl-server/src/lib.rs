@@ -143,7 +143,9 @@ pub struct Reader {
     copies: std::path::PathBuf,
     name: String,
     max_size_bytes: usize,
-    cache_bytes: u64,
+    /// The parts read so far, kept across copies: a newer publication
+    /// mostly lists parts an older one already fetched.
+    cache: owl_db::storage_engine::PartCache,
     /// The number of the publication being served.
     published: u64,
     /// How many copies have been made.
@@ -163,12 +165,18 @@ impl Reader {
         if copies.exists() {
             std::fs::remove_dir_all(&copies).map_err(|error| format!("clear {}: {error}", copies.display()))?;
         }
+        let cache = owl_db::storage_engine::PartCache::new(
+            Arc::new(owl_db::simulation::filesystem::RealFileSystem::new()),
+            copies.join("cache"),
+            options.cache_bytes,
+        )
+        .map_err(|error| format!("make {}: {error}", copies.display()))?;
         let mut reader = Self {
             objects: object_store(&options.objects)?,
             copies,
             name,
             max_size_bytes,
-            cache_bytes: options.cache_bytes,
+            cache,
             published: 0,
             made: 0,
         };
@@ -180,12 +188,12 @@ impl Reader {
         use owl_db::simulation::filesystem::RealFileSystem;
         use owl_db::storage_engine::ObjectFileSystem;
         let directory = self.copies.join(self.made.to_string());
-        let (filesystem, published) = ObjectFileSystem::reader(
+        let (filesystem, published) = ObjectFileSystem::reader_sharing(
             Arc::new(RealFileSystem::new()),
             self.objects.clone(),
             &directory,
             &self.name,
-            self.cache_bytes,
+            &self.cache,
         )
         .map_err(|error| format!("fetch the publication of '{}': {error}", self.name))?;
         let store = RustStore::new_with_fs(directory.join(&self.name), self.max_size_bytes, filesystem)

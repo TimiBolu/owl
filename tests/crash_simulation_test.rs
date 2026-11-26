@@ -391,17 +391,56 @@ impl Run {
             filesystem.set_in_order_only(!self.reorder);
             Arc::new(filesystem)
         };
-        let tethered = Arc::new(Tethered {
+        let tethered: Arc<dyn ObjectStore> = Arc::new(Tethered {
             store: objects,
             machine: machine.clone(),
         });
-        let layer = ObjectFileSystem::take_over(machine.clone(), tethered, "", DATABASE, 4 << 20)
-            .map_err(|error| self.fail(format!("cannot take the database over: {error}")))?;
-        let store = RustStore::new_with_fs(Path::new(DATABASE), 1 << 30, layer.clone())
-            .map_err(|error| self.fail(format!("cannot open the database taken over: {error}")))?;
-        store
-            .configure_auto_checkpoint(AutoCheckpointPolicy::disabled())
-            .map_err(|error| self.fail(error.to_string()))?;
+        // The new machine may lose power while it takes over. Whoever is
+        // running it starts it again: to take over once more, or, not
+        // knowing how far it got, simply as the writer, which is right if
+        // it had claimed the database and is refused if it had not, and
+        // then it takes over. The old writer does nothing meanwhile.
+        let mut attempts = 0;
+        let (layer, store) = loop {
+            if attempts < 6 && self.rng.gen_bool(0.3) {
+                let after = self.rng.gen_range(1..=40);
+                machine.crash_after(after, true);
+            }
+            let as_writer = attempts > 0 && self.rng.gen_bool(0.5);
+            let opened = (|| {
+                let taken = || {
+                    ObjectFileSystem::take_over(machine.clone(), tethered.clone(), "", DATABASE, 4 << 20)
+                        .map_err(|error| format!("cannot take the database over: {error}"))
+                };
+                let layer = match as_writer {
+                    false => taken()?,
+                    true => match ObjectFileSystem::writer(machine.clone(), tethered.clone(), "", DATABASE, 4 << 20)
+                    {
+                        Ok(layer) => layer,
+                        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => taken()?,
+                        Err(error) => return Err(format!("cannot claim the database: {error}")),
+                    },
+                };
+                let store = RustStore::new_with_fs(Path::new(DATABASE), 1 << 30, layer.clone())
+                    .map_err(|error| format!("cannot open the database taken over: {error}"))?;
+                store
+                    .configure_auto_checkpoint(AutoCheckpointPolicy::disabled())
+                    .map_err(|error| error.to_string())?;
+                Ok((layer, store))
+            })();
+            machine.disarm();
+            match opened {
+                Ok(pair) if !machine.is_down() => break pair,
+                Ok(_) | Err(_) if machine.is_down() => {
+                    self.crashes += 1;
+                    attempts += 1;
+                    self.trace.push("the machine taking over lost power".to_string());
+                    machine.recover();
+                }
+                Err(error) => return Err(self.fail(error)),
+                Ok(_) => unreachable!("an open on a machine that is up was taken above"),
+            }
+        };
         if self.publishes_itself() {
             store.publish_after_checkpoints(layer.clone()).map_err(|error| self.fail(error.to_string()))?;
         }
