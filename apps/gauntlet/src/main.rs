@@ -97,6 +97,19 @@ enum Command {
         #[arg(long, default_value_t = 0)]
         compactions: usize,
     },
+    /// Write the generated rows, one file of JSON lines a table, and what
+    /// Owl answers to each query, so that another engine can be loaded with
+    /// the same data and held to the same answers.
+    Export {
+        #[arg(long, default_value_t = 2000)]
+        people: usize,
+        /// The directory to write into.
+        #[arg(long)]
+        to: PathBuf,
+        /// Only answer queries whose name contains this text.
+        #[arg(long)]
+        only: Option<String>,
+    },
     /// An experiment: time two slow questions over rows, over the store's
     /// column segments and over plain arrays.
     Columns {
@@ -122,7 +135,8 @@ fn queries(only: Option<&str>) -> Result<Vec<Query>> {
             let name = entry.ok()?.file_name().into_string().ok()?;
             name.strip_suffix(".sql").map(str::to_string)
         })
-        .filter(|name| only.is_none_or(|text| name.contains(text)))
+        // Several names may be given, with commas between them.
+        .filter(|name| only.is_none_or(|text| text.split(',').any(|part| name.contains(part))))
         .collect();
     names.sort();
     names
@@ -809,12 +823,47 @@ fn show(people: usize, rows: usize, wanted: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn cell_json(cell: &Cell) -> Json {
+    match cell {
+        Cell::Text(value) => Json::from(value.clone()),
+        Cell::Int(value) => Json::from(*value),
+        Cell::Float(value) => Json::from(*value),
+        Cell::Absent => Json::Null,
+        Cell::Texts(values) => Json::from(values.clone()),
+        Cell::Rows(rows) => Json::Array(rows.iter().map(row_json).collect()),
+    }
+}
+
+fn row_json(row: &Row) -> Json {
+    Json::Object(row.iter().map(|(name, cell)| ((*name).to_string(), cell_json(cell))).collect())
+}
+
+fn export(people: usize, to: &std::path::Path, only: Option<&str>) -> Result<()> {
+    use std::io::Write;
+    std::fs::create_dir_all(to.join("answers"))?;
+    for table in data::generate(people) {
+        let mut file = std::io::BufWriter::new(std::fs::File::create(to.join(format!("{}.jsonl", table.name)))?);
+        for row in &table.rows {
+            writeln!(file, "{}", row_json(row))?;
+        }
+        println!("{}: {} rows", table.name, table.rows.len());
+    }
+    let loaded = load(people)?;
+    for query in queries(only)? {
+        let Some(oql) = &query.oql else { continue };
+        let answer = loaded.owl.query(oql).map_err(|error| anyhow!("{}: {error}", query.name))?;
+        std::fs::write(to.join("answers").join(format!("{}.json", query.name)), serde_json::to_string(&answer)?)?;
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     match Arguments::parse().command {
         Command::Check { people, only } => run(people, only.as_deref(), None),
         Command::Bench { people, only, samples } => run(people, only.as_deref(), Some(samples)),
         Command::Show { people, rows, queries } => show(people, rows, &queries),
         Command::Columns { people, samples } => columns::run(&load(people)?.owl, samples),
+        Command::Export { people, to, only } => export(people, &to, only.as_deref()),
         Command::Memory { people, only } => memory(people, only.as_deref()),
         Command::Scale { people, at, reopens, copies, compactions, scattered } => {
             SCATTERED.store(scattered, std::sync::atomic::Ordering::Relaxed);
