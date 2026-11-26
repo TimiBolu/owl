@@ -504,7 +504,17 @@ impl ObjectStore for S3ObjectStore {
         self.put_object(key, source, len, condition)
     }
 
+    /// Not every server that speaks S3 honours a condition on a delete:
+    /// some remove the object whatever it is. So the object is looked at
+    /// first, and the delete is only sent if it is the one expected. Where
+    /// the condition is honoured the two are one step; where it is not,
+    /// an object put between the look and the delete would be removed.
+    /// Nothing in the store depends on that gap being closed: a writer
+    /// deletes only objects under names that are its own line's.
     fn delete_if(&self, key: &str, expected: &str) -> io::Result<bool> {
+        if self.head(key)?.is_none_or(|head| head.mark != expected) {
+            return Ok(false);
+        }
         let mut request = self.request("DELETE", Some(key));
         request.headers.push(("if-match".into(), expected.to_string()));
         let (response, unanswered) = self.send(&request)?;
@@ -516,6 +526,67 @@ impl ObjectStore for S3ObjectStore {
             404 | 412 => Ok(false),
             _ => Err(failed("delete an object", &response)),
         }
+    }
+}
+
+/// The transport that opens a socket: HTTP/1.1, over TLS or not.
+///
+/// It does nothing clever. It sends the request as it was built, and
+/// gives back whatever status came with its headers and body. It does not
+/// follow redirects, decode bodies, or try again: the client above
+/// decides those. A response that does not arrive whole is no response.
+#[cfg(feature = "s3")]
+pub struct HttpTransport {
+    agent: ureq::Agent,
+    scheme: &'static str,
+}
+
+#[cfg(feature = "s3")]
+impl HttpTransport {
+    /// Over TLS when `secure`. `timeout` is for a whole request, from
+    /// connecting to the last byte of the answer.
+    pub fn new(secure: bool, timeout: std::time::Duration) -> Self {
+        Self {
+            agent: ureq::AgentBuilder::new().timeout(timeout).redirects(0).build(),
+            scheme: if secure { "https" } else { "http" },
+        }
+    }
+}
+
+#[cfg(feature = "s3")]
+impl Transport for HttpTransport {
+    fn send(&self, request: &Request) -> io::Result<Response> {
+        let url = format!("{}://{}{}", self.scheme, request.host, request.target());
+        let mut call = self.agent.request(request.method, &url);
+        for (name, value) in &request.headers {
+            // The host and the length are the transport's to write, from
+            // the same URL and body.
+            if !name.eq_ignore_ascii_case("host") && !name.eq_ignore_ascii_case("content-length") {
+                call = call.set(name, value);
+            }
+        }
+        let sent = match request.method {
+            "PUT" | "POST" => call.send_bytes(&request.body),
+            _ => call.call(),
+        };
+        let response = match sent {
+            // A status that is a refusal is still an answer.
+            Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+            Err(ureq::Error::Transport(error)) => {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, format!("no answer came: {error}")));
+            }
+        };
+        let status = response.status();
+        let headers: Vec<(String, String)> = response
+            .headers_names()
+            .into_iter()
+            .filter_map(|name| response.header(&name).map(|value| (name.clone(), value.to_string())))
+            .collect();
+        let mut body = Vec::new();
+        if request.method != "HEAD" {
+            response.into_reader().read_to_end(&mut body)?;
+        }
+        Ok(Response { status, headers, body })
     }
 }
 
@@ -631,8 +702,47 @@ fn sign(request: &mut Request, config: &S3Config, at: &str) {
 
 // The little XML that S3 answers in.
 
+/// Text as it was before it was put in XML: the named entities, and the
+/// numbered ones, which some servers use for a quotation mark.
 fn unescaped(text: &str) -> String {
-    text.replace("&quot;", "\"").replace("&apos;", "'").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let Some(end) = rest.find(';').filter(|end| *end <= 10) else {
+            out.push('&');
+            rest = &rest[1..];
+            continue;
+        };
+        let entity = &rest[1..end];
+        let character = match entity {
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "amp" => Some('&'),
+            _ => entity
+                .strip_prefix('#')
+                .and_then(|number| match number.strip_prefix(['x', 'X']) {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                    None => number.parse().ok(),
+                })
+                .and_then(char::from_u32),
+        };
+        match character {
+            Some(character) => {
+                out.push(character);
+                rest = &rest[end + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn escaped(text: &str) -> String {
@@ -699,6 +809,9 @@ pub struct SimulatedS3 {
     path_style: bool,
     /// How many keys a listing gives at a time.
     page: usize,
+    /// Deletes whatever is there, whatever the request said it must be,
+    /// as some servers do.
+    deletes_regardless: bool,
     state: Mutex<Simulated>,
     requests: AtomicU64,
     faulted: AtomicU64,
@@ -728,6 +841,7 @@ impl SimulatedS3 {
             bucket: bucket.to_string(),
             path_style,
             page: 1000,
+            deletes_regardless: false,
             state: Mutex::new(Simulated {
                 objects: BTreeMap::new(),
                 uploads: HashMap::new(),
@@ -743,6 +857,12 @@ impl SimulatedS3 {
     /// Give listings this many keys at a time.
     pub fn with_page(mut self, page: usize) -> Self {
         self.page = page.max(1);
+        self
+    }
+
+    /// Ignore the condition on a delete, as some servers that speak S3 do.
+    pub fn deleting_regardless(mut self) -> Self {
+        self.deletes_regardless = true;
         self
     }
 
@@ -914,7 +1034,7 @@ impl SimulatedS3 {
                         token: upload.token,
                     },
                 );
-                let body = format!("<?xml version=\"1.0\"?><CompleteMultipartUploadResult><ETag>{}</ETag></CompleteMultipartUploadResult>", escaped(&mark));
+                let body = format!("<?xml version=\"1.0\"?><CompleteMultipartUploadResult><ETag>{}</ETag></CompleteMultipartUploadResult>", mark.replace('"', "&#34;"));
                 answer(200, &[], body.into_bytes())
             }
             "DELETE" if request.param("uploadId").is_some() => {
@@ -922,8 +1042,10 @@ impl SimulatedS3 {
                 answer(204, &[], Vec::new())
             }
             "DELETE" => {
-                if let Some(refused) = Self::refused(request, state.objects.get(&key)) {
-                    return refused;
+                if !self.deletes_regardless {
+                    if let Some(refused) = Self::refused(request, state.objects.get(&key)) {
+                        return refused;
+                    }
                 }
                 state.objects.remove(&key);
                 answer(204, &[], Vec::new())
@@ -1065,6 +1187,14 @@ mod tests {
     }
 
     #[test]
+    fn text_is_read_out_of_xml_whichever_way_it_was_put_in() {
+        // Found against a real server, which numbers its quotation marks.
+        let xml = "<R><ETag>&#34;ab-3&#34;</ETag><ETag>&quot;cd&quot;</ETag><Key>a&amp;b &#x41; &lt;c&gt; d&e</Key></R>";
+        assert_eq!(texts_of(xml, "ETag"), ["\"ab-3\"", "\"cd\""]);
+        assert_eq!(text_of(xml, "Key").unwrap(), "a&b A <c> d&e");
+    }
+
+    #[test]
     fn a_time_is_written_as_s3_reads_it() {
         assert_eq!(amz_date(0), "19700101T000000Z");
         assert_eq!(amz_date(1_369_353_600), "20130524T000000Z");
@@ -1193,12 +1323,256 @@ mod tests {
         }
     }
 
+    /// Found against a real server: it deleted an object that was not
+    /// the one the request named. The client must not lean on the server
+    /// for that.
+    #[test]
+    fn a_server_that_ignores_the_condition_on_a_delete_deletes_only_what_was_meant() {
+        let s3 = Arc::new(SimulatedS3::new("owl", true, 5).deleting_regardless());
+        let store = S3ObjectStore::new(config(), s3, Arc::new(|| 1_700_000_000), 5);
+        does_what_an_object_store_does(&store);
+        let old = store.put_if("kept", &mut &b"one"[..], 3, None).unwrap().unwrap();
+        let new = store.put_if("kept", &mut &b"two"[..], 3, Some(&old)).unwrap().unwrap();
+        assert!(!store.delete_if("kept", &old).unwrap());
+        assert_eq!(whole(&store, "kept"), b"two");
+        assert!(store.delete_if("kept", &new).unwrap());
+    }
+
     #[test]
     fn a_service_that_never_answers_is_an_error_and_not_a_wait() {
         let (store, s3) = store(3, S3Faults { lost_request: 1.0, ..S3Faults::default() });
         let error = store.put("a", &mut &b"x"[..], 1).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         assert_eq!(s3.requests().0, 40);
+    }
+
+    /// A small HTTP server in front of a simulated S3, so that requests
+    /// cross a real socket: what the client built is written to the wire
+    /// by the transport, read back here, and has to mean the same.
+    #[cfg(feature = "s3")]
+    fn serve(s3: Arc<SimulatedS3>) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        fn decoded(text: &str) -> String {
+            let bytes = text.as_bytes();
+            let mut out = Vec::new();
+            let mut at = 0;
+            while at < bytes.len() {
+                if bytes[at] == b'%' && at + 2 < bytes.len() + 0 {
+                    let hex = std::str::from_utf8(&bytes[at + 1..at + 3]).unwrap();
+                    out.push(u8::from_str_radix(hex, 16).unwrap());
+                    at += 3;
+                } else {
+                    out.push(bytes[at]);
+                    at += 1;
+                }
+            }
+            String::from_utf8(out).unwrap()
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let mut words = line.split_whitespace();
+                let method = match words.next() {
+                    Some("GET") => "GET",
+                    Some("HEAD") => "HEAD",
+                    Some("PUT") => "PUT",
+                    Some("POST") => "POST",
+                    Some("DELETE") => "DELETE",
+                    _ => continue,
+                };
+                let target = words.next().unwrap_or("/").to_string();
+                let mut headers = Vec::new();
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    let Some((name, value)) = header.trim_end().split_once(':') else { break };
+                    headers.push((name.to_string(), value.trim().to_string()));
+                }
+                let len = super::header(&headers, "content-length").and_then(|len| len.parse().ok()).unwrap_or(0);
+                let mut body = vec![0u8; len];
+                std::io::Read::read_exact(&mut reader, &mut body).unwrap();
+                let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+                let request = Request {
+                    method,
+                    host: super::header(&headers, "host").unwrap_or_default().to_string(),
+                    path: decoded(path),
+                    query: query
+                        .split('&')
+                        .filter(|pair| !pair.is_empty())
+                        .map(|pair| {
+                            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+                            (decoded(name), decoded(value))
+                        })
+                        .collect(),
+                    headers,
+                    body,
+                };
+                // No answer: the connection just closes.
+                let Ok(response) = s3.send(&request) else { continue };
+                let mut stream = stream;
+                let mut head = format!("HTTP/1.1 {} X\r\nconnection: close\r\n", response.status);
+                for (name, value) in &response.headers {
+                    head.push_str(&format!("{name}: {value}\r\n"));
+                }
+                head.push_str("\r\n");
+                let _ = stream.write_all(head.as_bytes());
+                if method != "HEAD" {
+                    let _ = stream.write_all(&response.body);
+                }
+            }
+        });
+        address
+    }
+
+    /// The whole client over a real socket: once with nothing wrong, then
+    /// with requests lost, failed, unanswered and answered short.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn the_client_does_the_same_over_a_socket() {
+        for (seed, faults) in [(1, S3Faults::default()), (2, harsh()), (3, harsh())] {
+            let s3 = Arc::new(SimulatedS3::new("owl", true, seed).with_page(3));
+            s3.set_faults(faults);
+            let mut config = config();
+            config.endpoint = serve(s3.clone());
+            let transport = Arc::new(HttpTransport::new(false, std::time::Duration::from_secs(10)));
+            let store = S3ObjectStore::new(config, transport, Arc::new(|| 1_700_000_000), u128::from(seed));
+            does_what_an_object_store_does(&store);
+            assert!(s3.keys().iter().all(|key| key.starts_with("dbs/")));
+        }
+    }
+
+    /// The same against a real S3 or a server that speaks its protocol.
+    /// It is told where by the environment, and left out otherwise:
+    ///
+    /// ```text
+    /// OWL_S3_ENDPOINT=127.0.0.1:9000 OWL_S3_BUCKET=owl-test \
+    /// OWL_S3_ACCESS_KEY=... OWL_S3_SECRET_KEY=... \
+    /// cargo test --release --features s3 --lib against_a_real_s3 -- --ignored
+    /// ```
+    ///
+    /// `OWL_S3_REGION` defaults to `us-east-1`, `OWL_S3_SECURE=1` uses
+    /// TLS, and `OWL_S3_VIRTUAL_HOST=1` puts the bucket in the host. The
+    /// bucket is made if it is not there, and only keys under a prefix of
+    /// this test's own are touched.
+    #[cfg(feature = "s3")]
+    #[test]
+    #[ignore = "needs an S3 to talk to; see the comment"]
+    fn the_client_does_the_same_against_a_real_s3() {
+        let variable = |name: &str| std::env::var(name).ok();
+        let endpoint = variable("OWL_S3_ENDPOINT").expect("OWL_S3_ENDPOINT");
+        let config = S3Config {
+            bucket: variable("OWL_S3_BUCKET").expect("OWL_S3_BUCKET"),
+            region: variable("OWL_S3_REGION").unwrap_or_else(|| "us-east-1".into()),
+            access_key: variable("OWL_S3_ACCESS_KEY").expect("OWL_S3_ACCESS_KEY"),
+            secret_key: variable("OWL_S3_SECRET_KEY").expect("OWL_S3_SECRET_KEY"),
+            endpoint,
+            path_style: variable("OWL_S3_VIRTUAL_HOST").is_none(),
+            prefix: format!("owl-client-test-{}/", rand::random::<u64>()),
+            // The smallest part S3 takes, so that a put in parts is real.
+            part_bytes: 5 << 20,
+            attempts: 4,
+        };
+        let secure = variable("OWL_S3_SECURE").is_some();
+        let transport = Arc::new(HttpTransport::new(secure, std::time::Duration::from_secs(60)));
+        let store = S3ObjectStore::over(config, transport);
+
+        // Make the bucket. One that is there already is no failure.
+        // (Sent once, by hand: the client reads a 409 as a write to try
+        // again, and here it means the bucket exists.)
+        let mut make = store.request("PUT", None);
+        sign(&mut make, &store.config, &amz_date((store.clock)()));
+        let made = store.transport.send(&make).unwrap();
+        assert!(matches!(made.status, 200 | 409), "the bucket could not be made: {}", failed("make it", &made));
+
+        does_what_an_object_store_does(&store);
+
+        // A put in parts of real size, conditional, and read back.
+        let long: Vec<u8> = (0..(11u32 << 20)).map(|n| (n % 251) as u8).collect();
+        let first = store.put_if("big", &mut &long[..], long.len() as u64, None).unwrap().expect("nothing was there");
+        assert_eq!(store.put_if("big", &mut &long[..], long.len() as u64, None).unwrap(), None);
+        assert_eq!(store.len("big").unwrap(), Some(long.len() as u64));
+        assert_eq!(store.version("big").unwrap().as_deref(), Some(first.as_str()));
+        let mut middle = [0u8; 64];
+        let at = (5 << 20) - 32;
+        assert_eq!(store.read_at("big", at as u64, &mut middle).unwrap(), 64);
+        assert_eq!(&middle[..], &long[at..at + 64]);
+        let second =
+            store.put_if("big", &mut &long[..1000], 1000, Some(&first)).unwrap().expect("it was as seen");
+        assert_eq!(store.put_if("big", &mut &long[..1000], 1000, Some(&first)).unwrap(), None);
+
+        assert!(store.delete_if("big", &second).unwrap());
+
+        // And a database: written and published by one process, read by
+        // another that has nothing but the bucket.
+        {
+            use crate::document::{Document, Fields, Value};
+            use crate::simulation::filesystem::RealFileSystem;
+            use crate::storage::DocumentStore;
+            use crate::storage_engine::{ObjectFileSystem, RustStore};
+            let store: Arc<dyn ObjectStore> = Arc::new(store);
+            let codes = |database: &RustStore| {
+                let mut codes: Vec<i64> = database
+                    .scan_documents("events")
+                    .unwrap()
+                    .iter()
+                    .map(|event| match event.fields.get("code") {
+                        Some(Value::Integer(code)) => *code,
+                        other => panic!("an event without a code: {other:?}"),
+                    })
+                    .collect();
+                codes.sort();
+                codes
+            };
+            let (here, there) = (tempfile::TempDir::new().unwrap(), tempfile::TempDir::new().unwrap());
+            let local = Arc::new(RealFileSystem::new());
+            let filesystem =
+                ObjectFileSystem::writer(local.clone(), store.clone(), here.path(), "shop.owl", 8 << 20).unwrap();
+            let writer = RustStore::new_with_fs(here.path().join("shop.owl"), 64 << 20, filesystem.clone()).unwrap();
+            for number in 0..2000 {
+                let mut event = Document::with_id(format!("e{number:05}"), "events".to_string(), Fields::default());
+                event.fields.insert("code".into(), Value::Integer(number));
+                event.fields.insert("note".into(), Value::String("x".repeat(300)));
+                writer.put_document(&event).unwrap();
+            }
+            writer.checkpoint().unwrap();
+            writer.publish(&filesystem).unwrap();
+            assert!(filesystem.drop_local_parts().unwrap() > 0);
+
+            let (filesystem, published) =
+                ObjectFileSystem::reader(local, store.clone(), there.path(), "shop.owl", 8 << 20).unwrap();
+            assert_eq!(published.number, 1);
+            let reader = RustStore::new_with_fs(there.path().join("shop.owl"), 64 << 20, filesystem).unwrap();
+            assert_eq!(codes(&reader), (0..2000).collect::<Vec<_>>());
+            assert_eq!(codes(&writer), (0..2000).collect::<Vec<_>>());
+
+            // Leave nothing behind.
+            for key in store.list("").unwrap() {
+                store.delete(&key).unwrap();
+            }
+            assert!(store.list("").unwrap().is_empty());
+        }
+    }
+
+    #[cfg(feature = "s3")]
+    #[test]
+    fn a_server_that_is_not_there_is_no_answer() {
+        // A port nothing listens on.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        let mut config = config();
+        config.endpoint = address;
+        config.attempts = 2;
+        let transport = Arc::new(HttpTransport::new(false, std::time::Duration::from_secs(2)));
+        let store = S3ObjectStore::new(config, transport, Arc::new(|| 1_700_000_000), 1);
+        assert_eq!(store.len("a").unwrap_err().kind(), io::ErrorKind::TimedOut);
     }
 
     #[test]

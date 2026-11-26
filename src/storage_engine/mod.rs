@@ -38,6 +38,8 @@ pub use object_store::{
 pub(crate) use record::{BorrowedRecordValue, CompiledSchema, RecordCodec, RecordView};
 pub use backup::{BackupFile, BackupInfo};
 pub use s3::{Request, Response, S3Config, S3Faults, S3ObjectStore, SimulatedS3, Transport};
+#[cfg(feature = "s3")]
+pub use s3::HttpTransport;
 pub use store::{
     AutoCheckpointPolicy, IntegrityReport, MaintenanceStatus, ReclamationReport, RustStore,
     StorageLayoutStats, TransactionBinding, WriteOperation,
