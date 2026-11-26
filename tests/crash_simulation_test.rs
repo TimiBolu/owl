@@ -348,8 +348,17 @@ impl Run {
         store
             .configure_auto_checkpoint(AutoCheckpointPolicy::disabled())
             .map_err(|error| error.to_string())?;
+        // Every other seed has the store publish after its checkpoints
+        // by itself, besides when the workload asks.
+        if self.publishes_itself() {
+            store.publish_after_checkpoints(layer.clone()).map_err(|error| error.to_string())?;
+        }
         self.layer = Some(layer);
         Ok(store)
+    }
+
+    fn publishes_itself(&self) -> bool {
+        self.objects.is_some() && self.seed % 2 == 1
     }
 
     /// A reader on a machine of its own must see a publication that was
@@ -499,18 +508,34 @@ impl Run {
             } else {
                 ("transaction rolled back".to_string(), Vec::new(), result)
             }
-        } else if pick < 75 {
-            let result = store.checkpoint().map(|_| ()).map_err(|e| e.to_string());
-            ("checkpoint".to_string(), Vec::new(), result)
-        } else if pick < 85 {
-            let result = store.compact().map(|_| ()).map_err(|e| e.to_string());
-            ("compact".to_string(), Vec::new(), result)
         } else if pick < 93 {
-            let result = store
-                .compact_and_reclaim()
-                .map(|_| ())
-                .map_err(|e| e.to_string());
-            ("compact and reclaim".to_string(), Vec::new(), result)
+            // A store that publishes after its checkpoints may publish
+            // here. What a reader may see from now on is these rows, or,
+            // if this is cut off, still the rows before.
+            let publishes = self.publishes_itself();
+            if publishes {
+                self.published.push(Some(self.rows.clone()));
+            }
+            let (name, result) = if pick < 75 {
+                ("checkpoint", store.checkpoint().map(|_| ()).map_err(|e| e.to_string()))
+            } else if pick < 85 {
+                ("compact", store.compact().map(|_| ()).map_err(|e| e.to_string()))
+            } else {
+                (
+                    "compact and reclaim",
+                    store.compact_and_reclaim().map(|_| ()).map_err(|e| e.to_string()),
+                )
+            };
+            let mut result = result;
+            if publishes && result.is_ok() && !self.filesystem.is_down() {
+                // A publication that failed is not said by the checkpoint
+                // it followed. With nothing wrong, none should fail.
+                match store.maintenance_status().map(|status| status.last_error) {
+                    Ok(Some(error)) => result = Err(format!("the publication after it failed: {error}")),
+                    _ => self.published = vec![Some(self.rows.clone())],
+                }
+            }
+            (name.to_string(), Vec::new(), result)
         } else {
             let result = store
                 .reclaim_obsolete_files()
