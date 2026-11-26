@@ -2562,6 +2562,9 @@ pub struct StoreCore {
     last_checkpoint: Mutex<Option<CheckpointInfo>>,
     last_maintenance_error: Mutex<Option<String>>,
     poisoned: AtomicBool,
+    /// Set for a copy that is there to be read, such as a reader's copy
+    /// of a publication: every commit is refused.
+    read_only: AtomicBool,
 }
 
 pub struct RustStore {
@@ -3122,6 +3125,7 @@ impl RustStore {
             last_checkpoint: Mutex::new(None),
             last_maintenance_error: Mutex::new(None),
             poisoned: AtomicBool::new(false),
+            read_only: AtomicBool::new(false),
         });
         if sealed_wal_existed {
             core.refresh_record_root_handle()?;
@@ -3443,6 +3447,12 @@ impl RustStore {
         transaction: Option<u64>,
         reserved: &ReservedRefs,
     ) -> OQLResult<u64> {
+        if self.read_only.load(Ordering::Acquire) {
+            return Err(OQLError::storage_error(
+                "this database is a read-only copy and takes no writes",
+                None,
+            ));
+        }
         let _commit = self
             .commit_lock
             .lock()
@@ -3732,6 +3742,15 @@ impl RustStore {
         };
         self.core.publish_if_asked();
         Ok(info)
+    }
+
+    /// Refuse every commit from now on, or stop refusing them.
+    ///
+    /// For a copy that is there to be read: a reader's copy of a
+    /// publication is its own, and a write to it would be kept only until
+    /// the publication is fetched again.
+    pub fn set_read_only(&self, read_only: bool) {
+        self.read_only.store(read_only, Ordering::Release);
     }
 
     /// Publish for readers after every checkpoint and compaction from now

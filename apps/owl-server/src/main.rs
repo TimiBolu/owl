@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use owl_db::storage::RustStore;
-use owl_server::{router, Options};
+use owl_db::storage_engine::S3Config;
+use owl_server::{open_in_objects, router, ObjectOptions, Objects, Options, Role};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,6 +39,94 @@ struct Arguments {
     /// Roll back a transaction left untouched for this many seconds.
     #[arg(long, default_value_t = 60)]
     transaction_idle_seconds: u64,
+
+    /// Keep the database's parts in this S3 bucket as well as on disk.
+    /// The access key and secret are read from AWS_ACCESS_KEY_ID and
+    /// AWS_SECRET_ACCESS_KEY.
+    #[arg(long, env = "OWL_S3_BUCKET")]
+    s3_bucket: Option<String>,
+    /// The bucket's region.
+    #[arg(long, env = "OWL_S3_REGION", default_value = "us-east-1")]
+    s3_region: String,
+    /// The host to reach the bucket at, with its port if it has one, for
+    /// a server that speaks S3 and is not AWS. The bucket then goes in
+    /// the path.
+    #[arg(long, env = "OWL_S3_ENDPOINT")]
+    s3_endpoint: Option<String>,
+    /// Reach --s3-endpoint over plain HTTP, not TLS.
+    #[arg(long)]
+    s3_insecure: bool,
+    /// What every key begins with in the bucket.
+    #[arg(long, env = "OWL_S3_PREFIX", default_value = "")]
+    s3_prefix: String,
+    #[arg(long, env = "AWS_ACCESS_KEY_ID", hide = true, hide_env_values = true)]
+    s3_access_key: Option<String>,
+    #[arg(long, env = "AWS_SECRET_ACCESS_KEY", hide = true, hide_env_values = true)]
+    s3_secret_key: Option<String>,
+    /// Keep the database's parts in this directory, one file an object,
+    /// as an object store. For a mounted bucket, or to try it out.
+    #[arg(long, env = "OWL_OBJECTS_DIR", conflicts_with = "s3_bucket")]
+    objects_dir: Option<PathBuf>,
+    /// With an object store: serve what was last published there, taking
+    /// no writes. --data is where this server keeps its copy.
+    #[arg(long)]
+    read_only: bool,
+    /// With an object store: become the database's writer, starting from
+    /// what was last published, in place of the server that was. Any
+    /// files of the database at --data are replaced.
+    #[arg(long, conflicts_with = "read_only")]
+    take_over: bool,
+    /// The most the local cache of parts read from the object store may
+    /// hold, in MiB.
+    #[arg(long, default_value_t = 256)]
+    object_cache_mib: u64,
+}
+
+impl Arguments {
+    /// The object store asked for, if one was.
+    fn objects(&self) -> Result<Option<ObjectOptions>> {
+        let objects = match (&self.s3_bucket, &self.objects_dir) {
+            (Some(bucket), _) => {
+                let key = |value: &Option<String>, name: &str| {
+                    value.clone().ok_or_else(|| anyhow!("--s3-bucket needs {name} in the environment"))
+                };
+                let mut config = S3Config::aws(
+                    bucket,
+                    &self.s3_region,
+                    &key(&self.s3_access_key, "AWS_ACCESS_KEY_ID")?,
+                    &key(&self.s3_secret_key, "AWS_SECRET_ACCESS_KEY")?,
+                );
+                config.prefix = self.s3_prefix.clone();
+                if let Some(endpoint) = &self.s3_endpoint {
+                    config.endpoint = endpoint.clone();
+                    config.path_style = true;
+                }
+                if self.s3_insecure && self.s3_endpoint.is_none() {
+                    return Err(anyhow!("--s3-insecure is for --s3-endpoint; AWS is reached over TLS"));
+                }
+                Objects::S3 {
+                    config,
+                    secure: !self.s3_insecure,
+                }
+            }
+            (None, Some(directory)) => Objects::Directory(directory.clone()),
+            (None, None) => {
+                if self.read_only || self.take_over {
+                    return Err(anyhow!("--read-only and --take-over need --s3-bucket or --objects-dir"));
+                }
+                return Ok(None);
+            }
+        };
+        Ok(Some(ObjectOptions {
+            objects,
+            role: match (self.read_only, self.take_over) {
+                (true, _) => Role::Reader,
+                (_, true) => Role::TakeOver,
+                _ => Role::Writer,
+            },
+            cache_bytes: self.object_cache_mib << 20,
+        }))
+    }
 }
 
 #[tokio::main]
@@ -54,8 +143,26 @@ async fn main() -> Result<()> {
         .max_gib
         .checked_mul(1 << 30)
         .ok_or_else(|| anyhow!("--max-gib is too large"))?;
-    let store = Arc::new(match &arguments.restore_from {
-        Some(backup) => {
+    let objects = arguments.objects()?;
+    if objects.is_some() && arguments.restore_from.is_some() {
+        return Err(anyhow!("--restore-from is not for a database kept in an object store"));
+    }
+    let store = match (&objects, &arguments.restore_from) {
+        (Some(objects), _) => {
+            let store = open_in_objects(&arguments.data, max_size, objects).map_err(|error| anyhow!(error))?;
+            println!(
+                "{} {} at commit {}, with its parts in an object store",
+                match objects.role {
+                    Role::Writer => "writing",
+                    Role::TakeOver => "took over",
+                    Role::Reader => "reading a publication of",
+                },
+                arguments.data.display(),
+                store.committed_lsn()
+            );
+            store
+        }
+        (None, Some(backup)) => {
             let store = RustStore::restore(backup, &arguments.data, max_size)
                 .with_context(|| format!("restore {}", backup.display()))?;
             println!(
@@ -64,11 +171,13 @@ async fn main() -> Result<()> {
                 arguments.data.display(),
                 store.committed_lsn()
             );
-            store
+            Arc::new(store)
         }
-        None => RustStore::new(&arguments.data, max_size)
-            .with_context(|| format!("open Owl database {}", arguments.data.display()))?,
-    });
+        (None, None) => Arc::new(
+            RustStore::new(&arguments.data, max_size)
+                .with_context(|| format!("open Owl database {}", arguments.data.display()))?,
+        ),
+    };
     let (app, janitor) = router(
         store.clone(),
         Options {

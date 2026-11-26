@@ -17,6 +17,7 @@ cargo run --release -p owl-server -- --data shop.owl --listen 127.0.0.1:7878 --t
 | `--decoded-documents` | `OWL_DECODED_DOCUMENTS` | none | Hold at most this many documents decoded in memory. The rest are decoded when read, from records read back from the checkpoint files, and a writer waits for overdue checkpoints so that memory stays bounded while loading |
 | `--backup-dir` | `OWL_BACKUP_DIR` | none | Where `POST /v1/backups` writes backups |
 | `--restore-from` | | none | Restore this backup as `--data` before serving; `--data` must not exist |
+| `--s3-bucket` and others | | none | Keep the database in an object store; see below |
 
 The server refuses to listen on anything but loopback without a token. It
 speaks plain HTTP: put it behind a TLS-terminating proxy to cross a network
@@ -79,6 +80,53 @@ To come back from one, start a server with `--restore-from <backup>` and a
 manifest, copied, opened and audited before the server answers anything. A
 backup that is damaged or incomplete is refused, and nothing is ever
 restored over an existing database.
+
+## A database in an object store
+
+A server can keep the database's large files, its checkpoint parts, in an
+S3 bucket as well as on its own disk. Other servers can then serve the same
+database for reading, with nothing but the bucket.
+
+| Option | Environment | What it does |
+|---|---|---|
+| `--s3-bucket` | `OWL_S3_BUCKET` | Keep the parts in this bucket |
+| `--s3-region` | `OWL_S3_REGION` | The bucket's region; `us-east-1` by default |
+| `--s3-endpoint` | `OWL_S3_ENDPOINT` | Host and port of a server that speaks S3 and is not AWS |
+| `--s3-insecure` | | Reach `--s3-endpoint` over plain HTTP |
+| `--s3-prefix` | `OWL_S3_PREFIX` | What every key begins with in the bucket |
+| `--objects-dir` | `OWL_OBJECTS_DIR` | Use a directory as the object store, one file an object |
+| `--read-only` | | Serve what was last published; take no writes |
+| `--take-over` | | Become the writer, starting from what was last published |
+| `--object-cache-mib` | | Most the local cache of parts may hold; 256 by default |
+
+The access key and secret are read from `AWS_ACCESS_KEY_ID` and
+`AWS_SECRET_ACCESS_KEY`.
+
+**One server writes.** Started with a bucket and neither `--read-only` nor
+`--take-over`, a server claims the database. It publishes after every
+checkpoint, which is when readers can see what it has written. A second
+server started the same way against the same bucket is refused.
+
+**Any number read.** A server started with `--read-only` fetches the last
+publication into the directory of `--data` and serves it. It refuses
+writes. It shows the database as it was published when the server started:
+start it again to see later data.
+
+**Taking over.** If the writer is gone, start another with `--take-over`.
+It begins from the last publication, so whatever the old writer committed
+after its last checkpoint is not carried over. If the old writer is still
+running it keeps answering from its own disk, but it can no longer publish
+and cannot be started again as the writer.
+
+```bash
+owl-server --data /var/owl/shop.owl --s3-bucket my-bucket --s3-prefix shop/
+```
+
+```bash
+owl-server --data /var/owl-reader/shop.owl --s3-bucket my-bucket --s3-prefix shop/ --read-only --listen 127.0.0.1:7879
+```
+
+Checked against MinIO. Not yet run against AWS itself.
 
 ## Failures
 

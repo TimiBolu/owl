@@ -36,6 +36,97 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Where a database's parts are kept besides the server's own disk.
+#[derive(Clone, Debug)]
+pub enum Objects {
+    /// A directory: one file for each object. For a bucket that is
+    /// mounted, and for trying things out.
+    Directory(std::path::PathBuf),
+    /// An S3 bucket, or one on a server that speaks S3. `secure` is
+    /// whether to use TLS.
+    S3 { config: owl_db::storage_engine::S3Config, secure: bool },
+}
+
+/// What this server is to a database kept in an object store.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// Its one writer. It claims the database, and publishes after every
+    /// checkpoint so that readers can follow. Refused if another writer
+    /// has claimed the database since this directory last wrote it.
+    Writer,
+    /// Its writer from now on, starting from what was last published,
+    /// in place of whichever server was writing it.
+    TakeOver,
+    /// A reader. It fetches the last publication and serves it. It takes
+    /// no writes, and shows what was published when it started.
+    Reader,
+}
+
+/// A database kept in an object store, and how to open it.
+#[derive(Clone, Debug)]
+pub struct ObjectOptions {
+    pub objects: Objects,
+    pub role: Role,
+    /// The most the local cache of parts read from the object store may
+    /// hold, in bytes.
+    pub cache_bytes: u64,
+}
+
+/// Open the database at `data` with its parts in an object store.
+///
+/// `data` is where the database's own files are kept on this machine: a
+/// writer's log and roots, a reader's copy of the publication, and the
+/// cache of parts either reads.
+pub fn open_in_objects(
+    data: &std::path::Path,
+    max_size_bytes: usize,
+    options: &ObjectOptions,
+) -> Result<Arc<RustStore>, String> {
+    use owl_db::simulation::filesystem::RealFileSystem;
+    use owl_db::storage_engine::{
+        DirectoryObjectStore, HttpTransport, ObjectFileSystem, ObjectStore, S3ObjectStore,
+    };
+    // The directory has to be named the way the store will name it.
+    let data = std::path::absolute(data).map_err(|error| format!("{}: {error}", data.display()))?;
+    let directory = data.parent().ok_or("the database path has no directory")?.to_path_buf();
+    let name = data
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or("the database path has no file name")?
+        .to_string();
+    let objects: Arc<dyn ObjectStore> = match &options.objects {
+        Objects::Directory(path) => Arc::new(
+            DirectoryObjectStore::new(path).map_err(|error| format!("open {}: {error}", path.display()))?,
+        ),
+        Objects::S3 { config, secure } => {
+            let transport = Arc::new(HttpTransport::new(*secure, Duration::from_secs(60)));
+            Arc::new(S3ObjectStore::over(config.clone(), transport))
+        }
+    };
+    let local = Arc::new(RealFileSystem::new());
+    let failed = |what: &str, error: std::io::Error| format!("{what} '{name}': {error}");
+    let filesystem = match options.role {
+        Role::Writer => ObjectFileSystem::writer(local, objects, &directory, &name, options.cache_bytes)
+            .map_err(|error| failed("claim", error))?,
+        Role::TakeOver => ObjectFileSystem::take_over(local, objects, &directory, &name, options.cache_bytes)
+            .map_err(|error| failed("take over", error))?,
+        Role::Reader => {
+            ObjectFileSystem::reader(local, objects, &directory, &name, options.cache_bytes)
+                .map_err(|error| failed("fetch the publication of", error))?
+                .0
+        }
+    };
+    let store = RustStore::new_with_fs(&data, max_size_bytes, filesystem.clone())
+        .map_err(|error| format!("open {}: {error}", data.display()))?;
+    match options.role {
+        Role::Reader => store.set_read_only(true),
+        Role::Writer | Role::TakeOver => store
+            .publish_after_checkpoints(filesystem)
+            .map_err(|error| error.to_string())?,
+    }
+    Ok(Arc::new(store))
+}
+
 /// How the server is run.
 #[derive(Clone, Debug)]
 pub struct Options {
