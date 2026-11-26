@@ -33,7 +33,8 @@ pub use group_commit::GroupCommitter;
 pub use key::TypedKey;
 pub use object_ref::ObjRef;
 pub use object_store::{
-    DirectoryObjectStore, MemoryObjectStore, ObjectFileSystem, ObjectStore, Published, PublishedFile,
+    DirectoryObjectStore, MemoryObjectStore, ObjectFileSystem, ObjectStore, PartCache, Published,
+    PublishedFile,
 };
 pub(crate) use record::{BorrowedRecordValue, CompiledSchema, RecordCodec, RecordView};
 pub use backup::{BackupFile, BackupInfo};

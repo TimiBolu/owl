@@ -336,11 +336,11 @@
         "check": "",
         "feature": "Number functions",
         "gives": "{\"away\":60,\"down\":12,\"root\":7.0,\"rounded\":13,\"squared\":156.25,\"up\":13}",
-        "mongo": "db.products.find(\n  { _id: \"p2\" },\n  { _id: 0,\n    rounded: { $round: \"$price\" },\n    down: { $floor: \"$price\" },\n    up: { $ceil: \"$price\" },\n    root: { $sqrt: { $add: [\"$stock\", 9] } },\n    squared: { $pow: [\"$price\", 2] },\n    away: { $abs: {\n      $subtract: [\"$stock\", 100] } } }\n)",
+        "mongo": "db.products.find(\n  { _id: \"p2\" },\n  { _id: 0,\n    // $round takes a half to the even\n    rounded: { $floor: {\n      $add: [\"$price\", 0.5] } },\n    down: { $floor: \"$price\" },\n    up: { $ceil: \"$price\" },\n    root: { $sqrt: { $add: [\"$stock\", 9] } },\n    squared: { $pow: [\"$price\", 2] },\n    away: { $abs: {\n      $subtract: [\"$stock\", 100] } } }\n)",
         "note": "",
         "oql": "products.where { .id == \"p2\" }.select { rounded: round(.price), down: floor(.price), up: ceil(.price), root: sqrt(.stock + 9), squared: pow(.price, 2), away: abs(.stock - 100) }",
         "refuses": "",
-        "sql": "SELECT round(price) AS rounded,\n       floor(price) AS down,\n       ceil(price) AS up,\n       sqrt(stock + 9) AS root,\n       power(price, 2) AS squared,\n       abs(stock - 100) AS away\nFROM products\nWHERE id = 'p2';",
+        "sql": "SELECT round(price::numeric) AS rounded,\n       floor(price) AS down,\n       ceil(price) AS up,\n       sqrt(stock + 9) AS root,\n       power(price, 2) AS squared,\n       abs(stock - 100) AS away\nFROM products\nWHERE id = 'p2';",
         "test": null
       },
       {
@@ -581,7 +581,7 @@
         "check": "",
         "feature": "Median and percentiles",
         "gives": "{\"median\":34.25,\"p90\":105.0}",
-        "mongo": "db.orders.aggregate([\n  { $group: { _id: null,\n      median: { $median: {\n        input: \"$total\",\n        method: \"approximate\" } },\n      p90: { $percentile: {\n        input: \"$total\", p: [0.9],\n        method: \"approximate\" } } } }\n])",
+        "mongo": "// picks a value that is there:\n// 26.5 and [150], not 34.25 and 105\ndb.orders.aggregate([\n  { $group: { _id: null,\n      median: { $median: {\n        input: \"$total\",\n        method: \"approximate\" } },\n      p90: { $percentile: {\n        input: \"$total\", p: [0.9],\n        method: \"approximate\" } } } }\n])",
         "note": "",
         "oql": "orders.select { median: median(.total), p90: percentile(.total, 0.9) }",
         "refuses": "",
@@ -617,7 +617,7 @@
         "check": "",
         "feature": "Distinct values of a group as a list",
         "gives": "{\"cities\":[\"Lagos\"],\"status\":\"cancelled\"} {\"cities\":[\"Accra\"],\"status\":\"open\"} {\"cities\":[\"Lagos\",\"Nairobi\"],\"status\":\"paid\"}",
-        "mongo": "db.orders.aggregate([\n  { $lookup: { from: \"customers\",\n      localField: \"customer\",\n      foreignField: \"_id\", as: \"c\" } },\n  { $unwind: \"$c\" },\n  { $group: { _id: \"$status\",\n      cities: { $addToSet: \"$c.city\" } } },\n  { $sort: { _id: 1 } }\n])",
+        "mongo": "db.orders.aggregate([\n  { $lookup: { from: \"customers\",\n      localField: \"customer\",\n      foreignField: \"_id\", as: \"c\" } },\n  { $unwind: \"$c\" },\n  { $group: { _id: \"$status\",\n      cities: { $addToSet: \"$c.city\" } } },\n  // a set comes in no order\n  { $set: { cities: { $sortArray: {\n      input: \"$cities\", sortBy: 1 } } } },\n  { $sort: { _id: 1 } }\n])",
         "note": "",
         "oql": "orders.group_by { .status }.select { status, cities: .customer.city.distinct() }.sort { .status.asc }",
         "refuses": "",
@@ -1474,7 +1474,7 @@
         "note": "",
         "oql": "orders.delete()",
         "refuses": "",
-        "sql": "TRUNCATE orders;",
+        "sql": "TRUNCATE orders CASCADE;",
         "test": null
       },
       {
@@ -1755,7 +1755,7 @@
         "note": "A collection is not partitioned.",
         "oql": "",
         "refuses": "",
-        "sql": "CREATE TABLE orders (\n  id text, placed timestamptz\n) PARTITION BY RANGE (placed);",
+        "sql": "CREATE TABLE events (\n  id text, placed timestamptz\n) PARTITION BY RANGE (placed);",
         "test": null
       }
     ]

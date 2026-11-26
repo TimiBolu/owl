@@ -184,5 +184,5 @@ async fn a_reader_that_is_refreshed_serves_the_newer_publication_without_restart
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
     kept.sort();
-    assert_eq!(kept, ["2", "3"]);
+    assert_eq!(kept, ["2", "3", "cache"]);
 }

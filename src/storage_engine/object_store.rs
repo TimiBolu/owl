@@ -537,6 +537,42 @@ impl BlockCache {
     }
 }
 
+/// A cache of parts read from an object store, kept in a directory.
+///
+/// A file system makes one of its own unless it is given one. Giving the
+/// same one to each copy a reader opens lets a newer publication read the
+/// parts an older one already fetched: a part is put once and never
+/// changed, so what was cached for it stays true.
+#[derive(Clone)]
+pub struct PartCache(Arc<BlockCache>);
+
+impl PartCache {
+    /// A cache in `directory` on `local` that holds at most `bytes`.
+    /// Blocks an earlier run left there are dropped: this run does not
+    /// know them, and the cache must hold what it counts.
+    pub fn new(local: Arc<dyn FileSystem>, directory: impl Into<PathBuf>, bytes: u64) -> io::Result<Self> {
+        let directory = directory.into();
+        local.create_dir_all(&directory)?;
+        for path in local.list_dir(&directory)? {
+            let cached = path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.contains(CACHED));
+            if cached {
+                let _ = local.remove(&path);
+            }
+        }
+        Ok(Self(Arc::new(BlockCache {
+            local,
+            directory,
+            budget: bytes,
+            held: Mutex::new(Held::default()),
+        })))
+    }
+
+    /// How many bytes it holds.
+    pub fn bytes(&self) -> u64 {
+        self.0.bytes()
+    }
+}
+
 /// The name of the part a path is, when it is one in `directory`.
 fn part_key(directory: &Path, path: &Path) -> Option<String> {
     if path.parent() != Some(directory) {
@@ -706,6 +742,8 @@ struct Fence {
     first: u64,
     /// The number of the newest publication when this writer claimed.
     claimed_at: u64,
+    /// The name of this writer's directory, which the pointer holds it by.
+    holder: String,
     /// The pointer's mark as this writer last wrote it.
     pointer: Mutex<String>,
     /// Set once the object store has shown that another writer has taken
@@ -901,13 +939,24 @@ fn remove_local(local: &dyn FileSystem, directory: &Path, database: &str) -> io:
     Ok(())
 }
 
-/// The file in which a directory remembers the claim it last made: the
-/// writer's number, and the number of the first writer in its line.
+/// The file in which a directory remembers who it is as a writer: a name
+/// of its own, made once and at random, and the number of the first
+/// writer in its line.
+///
+/// The name is what a claim is recognised by. The pointer says which
+/// name holds the database, and a directory may write only if that is
+/// its own. A number would not do: a writer that died between choosing
+/// the next number and claiming it would later find that number in the
+/// pointer, claimed by whoever took over, and take it for its own.
 fn record_path(directory: &Path, database: &str) -> PathBuf {
     directory.join(format!("{database}.writer"))
 }
 
-fn read_record(local: &dyn FileSystem, directory: &Path, database: &str) -> io::Result<Option<(u64, u64)>> {
+fn read_record(
+    local: &dyn FileSystem,
+    directory: &Path,
+    database: &str,
+) -> io::Result<Option<(Option<String>, u64)>> {
     let path = record_path(directory, database);
     if !local.exists(&path) {
         return Ok(None);
@@ -916,9 +965,14 @@ fn read_record(local: &dyn FileSystem, directory: &Path, database: &str) -> io::
     let mut text = vec![0u8; file.size()? as usize];
     let read = file.read_at(&mut text, 0)?;
     let text = String::from_utf8_lossy(&text[..read]).into_owned();
-    let mut numbers = text.split_whitespace().map(str::parse::<u64>);
-    match (numbers.next(), numbers.next()) {
-        (Some(Ok(writer)), Some(Ok(first))) => Ok(Some((writer, first))),
+    let mut words = text.split_whitespace();
+    match (words.next(), words.next().map(str::parse::<u64>)) {
+        (Some(name), Some(Ok(first))) => {
+            // A record from before directories had names begins with a
+            // writer's number. It names no one.
+            let named = name.len() == 32 && name.bytes().all(|byte| byte.is_ascii_hexdigit());
+            Ok(Some((named.then(|| name.to_string()), first)))
+        }
         _ => Err(io::Error::new(io::ErrorKind::InvalidData, format!("{} cannot be read", path.display()))),
     }
 }
@@ -929,10 +983,10 @@ fn record_being_written(directory: &Path, database: &str) -> PathBuf {
     directory.join(format!("{database}.writer.new"))
 }
 
-fn write_record(local: &dyn FileSystem, directory: &Path, database: &str, writer: u64, first: u64) -> io::Result<()> {
+fn write_record(local: &dyn FileSystem, directory: &Path, database: &str, name: &str, first: u64) -> io::Result<()> {
     let staged = record_being_written(directory, database);
     let mut file = local.create(&staged)?;
-    let text = format!("{writer} {first}\n");
+    let text = format!("{name} {first}\n");
     let mut done = 0;
     while done < text.len() {
         done += match file.write(&text.as_bytes()[done..])? {
@@ -954,22 +1008,19 @@ impl ObjectFileSystem {
         directory: PathBuf,
         cache_bytes: u64,
     ) -> io::Result<Self> {
+        let cache = PartCache::new(local.clone(), directory.clone(), cache_bytes)?;
+        Self::build_with(local, objects, directory, cache)
+    }
+
+    fn build_with(
+        local: Arc<dyn FileSystem>,
+        objects: Arc<dyn ObjectStore>,
+        directory: PathBuf,
+        cache: PartCache,
+    ) -> io::Result<Self> {
         local.create_dir_all(&directory)?;
-        // Blocks kept by an earlier run are not known to this one. They
-        // are dropped, so that the cache holds what it counts.
-        for path in local.list_dir(&directory)? {
-            let cached = path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.contains(CACHED));
-            if cached {
-                let _ = local.remove(&path);
-            }
-        }
         Ok(Self {
-            cache: Arc::new(BlockCache {
-                local: local.clone(),
-                directory: directory.clone(),
-                budget: cache_bytes,
-                held: Mutex::new(Held::default()),
-            }),
+            cache: cache.0,
             local,
             objects,
             directory,
@@ -1044,16 +1095,29 @@ impl ObjectFileSystem {
         local.create_dir_all(&directory)?;
         let pointer = Published::pointer(database);
         let mut attempts = 0;
-        let (writer, first, claimed, mark) = loop {
+        let (writer, first, claimed, mark, name) = loop {
             let current = Published::with_mark(objects.as_ref(), database)?;
             let last = current.as_ref().map_or(0, |(published, _)| published.writer);
-            let first = if take_over {
+            let holder = current.as_ref().map(|(published, _)| published.holder.clone()).unwrap_or_default();
+            let (name, first) = if take_over {
                 let Some((published, _)) = current.as_ref().filter(|(published, _)| published.number > 0) else {
                     return Err(io::Error::new(
                         io::ErrorKind::NotFound,
                         format!("'{database}' has not been published, so there is nothing to take over from"),
                     ));
                 };
+                // The record goes first, and is gone for good before
+                // anything else is touched. An earlier attempt may have
+                // claimed and left its record; with that record beside
+                // files half removed or half fetched, this directory
+                // would pass for the writer it is not. Until this
+                // take-over has claimed, the directory is no one.
+                for record in [record_path(&directory, database), record_being_written(&directory, database)] {
+                    if local.exists(&record) {
+                        local.remove(&record)?;
+                    }
+                }
+                local.sync_all()?;
                 remove_local(local.as_ref(), &directory, database)?;
                 match published.fetch(local.as_ref(), objects.as_ref(), &directory) {
                     Ok(()) => {}
@@ -1064,14 +1128,16 @@ impl ObjectFileSystem {
                     }
                     Err(error) => return Err(error),
                 }
-                // Parts put by writers before this one are this line's
-                // only where the publication lists them.
-                last + 1
+                // A new name, for a new line of writers. Parts put by
+                // writers before this one are this line's only where the
+                // publication lists them.
+                (format!("{:032x}", rand::random::<u128>()), last + 1)
             } else {
                 let record = read_record(local.as_ref(), &directory, database)?;
-                // The record is written before the claim, so a directory
-                // that died between the two holds the next number.
-                let ours = record.is_some_and(|(writer, _)| writer == last || writer == last + 1);
+                let named = record.as_ref().and_then(|(name, _)| name.clone());
+                // A pointer that names no holder was claimed before
+                // directories had names, or never claimed.
+                let ours = holder.is_empty() || named.as_deref() == Some(holder.as_str());
                 if last != 0 && !ours {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
@@ -1082,16 +1148,23 @@ impl ObjectFileSystem {
                         ),
                     ));
                 }
-                record.map_or(1, |(_, first)| first)
+                (
+                    named.unwrap_or_else(|| format!("{:032x}", rand::random::<u128>())),
+                    record.map_or(1, |(_, first)| first),
+                )
             };
             let writer = last + 1;
-            write_record(local.as_ref(), &directory, database, writer, first)?;
+            // Before the claim. If this dies between the two, the pointer
+            // names someone else and this directory is refused, which is
+            // right: it has claimed nothing.
+            write_record(local.as_ref(), &directory, database, &name, first)?;
             let mut claimed = current.as_ref().map(|(published, _)| published.clone()).unwrap_or_default();
             claimed.writer = writer;
+            claimed.holder = name.clone();
             let encoded = serde_json::to_vec(&claimed).map_err(io::Error::other)?;
             let expected = current.as_ref().map(|(_, mark)| mark.as_str());
             match objects.put_if(&pointer, &mut &encoded[..], encoded.len() as u64, expected)? {
-                Some(mark) => break (writer, first, claimed, mark),
+                Some(mark) => break (writer, first, claimed, mark, name),
                 // Another claim or a publication came between. Look again.
                 None if attempts < 5 => attempts += 1,
                 None => {
@@ -1141,6 +1214,7 @@ impl ObjectFileSystem {
             writer,
             first,
             claimed_at: claimed.number,
+            holder: name,
             pointer: Mutex::new(mark),
             lost: AtomicBool::new(false),
         }));
@@ -1164,6 +1238,22 @@ impl ObjectFileSystem {
         cache_bytes: u64,
     ) -> io::Result<(Arc<Self>, Published)> {
         let directory = directory.into();
+        let cache = PartCache::new(local.clone(), directory.clone(), cache_bytes)?;
+        Self::reader_sharing(local, objects, directory, database, &cache)
+    }
+
+    /// As [`ObjectFileSystem::reader`], reading parts through `cache`,
+    /// which other copies of the database may share. A reader that opens
+    /// one publication after another gives each the same cache, kept
+    /// somewhere other than `directory`.
+    pub fn reader_sharing(
+        local: Arc<dyn FileSystem>,
+        objects: Arc<dyn ObjectStore>,
+        directory: impl Into<PathBuf>,
+        database: &str,
+        cache: &PartCache,
+    ) -> io::Result<(Arc<Self>, Published)> {
+        let directory = directory.into();
         local.create_dir_all(&directory)?;
         // A publication can be replaced while it is being fetched. Its
         // files are then gone, and the newer one is fetched instead.
@@ -1180,7 +1270,7 @@ impl ObjectFileSystem {
             }
         };
         local.sync_all()?;
-        let mut filesystem = Self::build(local, objects, directory, cache_bytes)?;
+        let mut filesystem = Self::build_with(local, objects, directory, cache.clone())?;
         filesystem.reads_only = true;
         filesystem.parts = Arc::new(Mutex::new(
             published.parts.iter().map(|(name, object)| (name.clone(), (object.clone(), None))).collect(),
@@ -1464,6 +1554,11 @@ pub struct Published {
     /// writer has claimed it.
     #[serde(default)]
     pub writer: u64,
+    /// The name of the directory that holds the database: see
+    /// `record_path`. Empty when no writer has claimed it, or one did
+    /// before directories had names.
+    #[serde(default)]
+    pub holder: String,
     /// The number of the writer that made this publication, which its
     /// files' objects are named with.
     #[serde(default)]
@@ -1663,6 +1758,7 @@ impl super::store::StoreCore {
                 committed_lsn,
                 files,
                 writer: by,
+                holder: fence.map(|fence| fence.holder.clone()).unwrap_or_default(),
                 by,
                 parts,
             };
@@ -2337,5 +2433,48 @@ mod tests {
         let (reader, _) = read(852, &objects);
         assert_eq!(codes(&reader), (0..200).chain(999..1000).collect::<Vec<_>>());
         assert_eq!(codes(&new), (0..200).chain(999..1000).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_reader_that_keeps_its_cache_does_not_fetch_a_part_twice() {
+        let objects = Arc::new(MemoryObjectStore::new());
+        let (writer, filesystem) = written(860, &objects);
+        writer.publish(&filesystem).unwrap();
+
+        let machine = Arc::new(SimulatedFileSystem::new(861));
+        let cache = PartCache::new(machine.clone(), "cache", 8 << 20).unwrap();
+        let open = |copy: &str| {
+            let (filesystem, _) =
+                ObjectFileSystem::reader_sharing(machine.clone(), objects.clone(), copy, "shop.owl", &cache).unwrap();
+            RustStore::new_with_fs(Path::new(copy).join("shop.owl"), 64 << 20, filesystem).unwrap()
+        };
+        let first = open("copy-0");
+        assert_eq!(codes(&first), (0..=300).collect::<Vec<_>>());
+        let held = cache.bytes();
+        assert!(held > 0);
+
+        // A later publication lists the same part. A second copy, opened
+        // beside the first, reads it from what the first one fetched.
+        writer.put_document(&event(301)).unwrap();
+        writer.publish(&filesystem).unwrap();
+        let before = objects.bytes_read();
+        let second = open("copy-1");
+        assert_eq!(codes(&second), (0..=301).collect::<Vec<_>>());
+        let with_cache = objects.bytes_read() - before;
+        assert_eq!(cache.bytes(), held, "nothing more was fetched into the cache");
+
+        // The same copy opened with a cache of its own fetches the part.
+        let before = objects.bytes_read();
+        let alone = Arc::new(SimulatedFileSystem::new(862));
+        let (filesystem, _) = ObjectFileSystem::reader(alone, objects.clone(), "", "shop.owl", 8 << 20).unwrap();
+        let third = RustStore::new_with_fs(Path::new("shop.owl"), 64 << 20, filesystem).unwrap();
+        assert_eq!(codes(&third), (0..=301).collect::<Vec<_>>());
+        let without_cache = objects.bytes_read() - before;
+        assert!(
+            with_cache + held <= without_cache,
+            "sharing read {with_cache} bytes and not sharing read {without_cache}, with {held} cached"
+        );
+        // The first copy is untouched by the second.
+        assert_eq!(codes(&first), (0..=300).collect::<Vec<_>>());
     }
 }
