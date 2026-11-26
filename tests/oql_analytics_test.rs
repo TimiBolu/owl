@@ -356,6 +356,55 @@ fn a_walk_follows_a_relationship_to_any_depth() {
 }
 
 #[test]
+fn a_walk_keeps_the_row_it_started_from() {
+    let db = company();
+    let pairs = |query: &str| db.table(query, &["from", "id"]);
+    let pair = |from: &str, id: &str| vec![text(from), text(id)];
+    // The collection's name is the row the walk started from, as it is
+    // after a path step, and not the row the walk reached.
+    assert_eq!(
+        pairs("staff.where { .id == \"e\" }.walk(.boss).select { from: staff.id, id }"),
+        vec![pair("e", "d"), pair("e", "b"), pair("e", "a")]
+    );
+    assert_eq!(
+        pairs("staff.where { .id == \"e\" }.routes(.boss).select { from: staff.id, id }"),
+        vec![pair("e", "d"), pair("e", "b"), pair("e", "a")]
+    );
+    // In a filter after the walk too.
+    assert_eq!(
+        db.ids("staff.where { .id == \"e\" }.walk(.boss).where { .pay > staff.pay + 30 }"),
+        ["b", "a"]
+    );
+    // From several rows, each row reached is given once for each row it
+    // was reached from: there is a starting row to name for every one.
+    assert_eq!(
+        pairs(
+            "teams.where { .id == \"t1\" || .id == \"t2\" }.walk(.children)
+               .select { from: teams.id, id }.sort { .from.asc, .id.asc }"
+        ),
+        vec![
+            pair("t1", "t2"), pair("t1", "t3"), pair("t1", "t4"), pair("t1", "t5"),
+            pair("t2", "t4"), pair("t2", "t5"),
+        ]
+    );
+    // A walk after a step: the name is still the row the query began at,
+    // whether that is another collection or the same one.
+    assert_eq!(
+        pairs("edges.where { .id == \"e1\" }.dst.walk(.outgoing.dst).select { from: edges.id, id }"),
+        vec![pair("e1", "n3"), pair("e1", "n1"), pair("e1", "n2")]
+    );
+    assert_eq!(
+        pairs("staff.where { .id == \"e\" }.boss.walk(.boss).select { from: staff.id, id }"),
+        vec![pair("e", "b"), pair("e", "a")]
+    );
+    // And so it is after two steps with something between them.
+    assert_eq!(
+        pairs("staff.where { .id == \"e\" }.boss.where { .pay > 0 }.boss.select { from: staff.id, id }"),
+        vec![pair("e", "b")]
+    );
+}
+
+#[test]
 fn position_functions_see_the_rows_around_a_row() {
     let db = company();
     let n = |value: i64| int(value);

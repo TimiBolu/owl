@@ -613,7 +613,9 @@ impl<S: DocumentStore> QueryExecutor<S> {
             // the rows it starts from: which rows they are, and the field
             // it leaves them by when that is one they hold.
             let mut before = before.to_vec();
-            if let Some(Operation::Walk { path, paths: false, .. }) = after.first() {
+            // Not when what follows names the rows it starts from: then
+            // any of their fields may be read.
+            if let (Some(Operation::Walk { path, paths: false, .. }), None) = (after.first(), &origin) {
                 let narrowed = before.iter().all(|operation| {
                     matches!(
                         operation,
@@ -745,6 +747,42 @@ impl<S: DocumentStore> QueryExecutor<S> {
                                 }
                                 reached
                             }
+                        }
+                    }
+                    Operation::Walk { path, depth, every, paths } if origin.is_some() => {
+                        // What follows may name the rows the walk starts
+                        // from, or a row an earlier step kept. Each row
+                        // reached answers for the one it was reached from.
+                        let following = &after[position + 1..];
+                        let in_hand = documents.first().map(|row| row.schema.clone());
+                        let wanted = in_hand
+                            .as_deref()
+                            .map(|collection| Self::anchored_paths(following, collection))
+                            .filter(|paths| !paths.is_empty());
+                        let collection = in_hand.unwrap_or_default();
+                        for document in &mut documents {
+                            if let Some(origin) = self.origin_of(document, &collection, wanted.as_deref())? {
+                                document.fields.insert(ORIGIN_FIELD.to_string(), origin);
+                            }
+                        }
+                        if documents.iter().any(|row| row.fields.contains_key(ORIGIN_FIELD)) {
+                            // A row reached from two starting rows has two
+                            // rows to answer for, so each start is walked
+                            // on its own.
+                            let mut reached = Vec::new();
+                            for document in documents {
+                                reached.extend(self.apply_walk(
+                                    vec![document],
+                                    path,
+                                    depth.as_ref(),
+                                    None,
+                                    *every,
+                                    *paths,
+                                )?);
+                            }
+                            reached
+                        } else {
+                            self.apply_walk(documents, path, depth.as_ref(), None, *every, *paths)?
                         }
                     }
                     _ => self.apply_operation(documents, operation, &query.collection)?,
@@ -881,7 +919,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
         let step = query
             .operations
             .iter()
-            .position(|operation| matches!(operation, Operation::Step(_)))?;
+            .position(|operation| matches!(operation, Operation::Step(_) | Operation::Walk { .. }))?;
         // Any `name.field` after the step may name the collection the
         // query starts from, or one the steps pass through.
         let after = &query.operations[step + 1..];
@@ -1198,6 +1236,40 @@ impl<S: DocumentStore> QueryExecutor<S> {
         paths
     }
 
+    /// What the rows reached from `document` keep of the row they answer
+    /// for. `wanted` are the paths read of a row of `collection`, which
+    /// `document` is one of; without it, what an earlier step kept is
+    /// passed on.
+    ///
+    /// A row that already answers for a row of the same collection keeps
+    /// doing so: in `staff.boss.walk(.boss)`, `staff` is the row the query
+    /// began at, not the boss the walk left from.
+    fn origin_of(
+        &self,
+        document: &Document,
+        collection: &str,
+        wanted: Option<&[Vec<String>]>,
+    ) -> OQLResult<Option<Value>> {
+        let carried = document.fields.get(ORIGIN_FIELD);
+        let same = matches!(
+            carried,
+            Some(Value::Object(origin))
+                if matches!(origin.get(ORIGIN_NAME), Some(Value::String(name)) if name == collection)
+        );
+        let Some(paths) = wanted.filter(|_| !same) else {
+            return Ok(carried.cloned());
+        };
+        let mut kept = crate::document::Fields::with_capacity_and_hasher(paths.len() + 1, Default::default());
+        kept.insert(ORIGIN_NAME.to_string(), Value::String(collection.to_string()));
+        for path in paths {
+            kept.insert(
+                path.join("."),
+                self.get_field_value(document, &FieldAccess { path: path.clone() })?,
+            );
+        }
+        Ok(Some(Value::Object(kept)))
+    }
+
     /// A path step that lets the rows it reaches still answer for the row
     /// they came from. `wanted` are the paths to keep from each row of
     /// `collection`; without it, what an earlier step kept is passed on.
@@ -1210,20 +1282,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
     ) -> OQLResult<Vec<Document>> {
         let mut reached = Vec::new();
         for document in &documents {
-            let origin = match wanted {
-                Some(paths) => {
-                    let mut kept = crate::document::Fields::with_capacity_and_hasher(paths.len() + 1, Default::default());
-                    kept.insert(ORIGIN_NAME.to_string(), Value::String(collection.to_string()));
-                    for path in paths {
-                        kept.insert(
-                            path.join("."),
-                            self.get_field_value(document, &FieldAccess { path: path.clone() })?,
-                        );
-                    }
-                    Some(Value::Object(kept))
-                }
-                None => document.fields.get(ORIGIN_FIELD).cloned(),
-            };
+            let origin = self.origin_of(document, collection, wanted)?;
             for mut row in self.path_source_rows(document, &path.path)?.0 {
                 if let Some(origin) = &origin {
                     row.fields.insert(ORIGIN_FIELD.to_string(), origin.clone());
@@ -12959,6 +13018,11 @@ impl<S: DocumentStore> QueryExecutor<S> {
                         next_through.push(std::rc::Rc::new(came));
                     } else if !seen.insert(key) {
                         continue;
+                    }
+                    // What the row the walk left from answers for, the
+                    // rows it reaches answer for too.
+                    if let Some(origin) = row.fields.get(ORIGIN_FIELD) {
+                        found.fields.insert(ORIGIN_FIELD.to_string(), origin.clone());
                     }
                     if paths {
                         let way = extended(row, between, &found);
