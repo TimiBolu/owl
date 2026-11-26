@@ -34,7 +34,6 @@
 //! database ([`ObjectFileSystem::writer`]), and one that has been replaced
 //! can change nothing its successor relies on: see `Fence`.
 
-use super::RustStore;
 use crate::error::{OQLError, OQLResult};
 use crate::simulation::filesystem::{FileHandle, FileOptions, FileSystem, MemoryMap};
 use serde::{Deserialize, Serialize};
@@ -1573,7 +1572,7 @@ impl Read for Summed<'_> {
     }
 }
 
-impl RustStore {
+impl super::store::StoreCore {
     /// Publish the database, as of its last commit, for readers.
     ///
     /// `filesystem` is the one this store was opened with. Every file of
@@ -2191,5 +2190,60 @@ mod tests {
         // And a claim that was never published is not something to read.
         let unread = ObjectFileSystem::reader(second, objects.clone(), "", "shop.owl", 8 << 20).err().unwrap();
         assert_eq!(unread.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn a_store_asked_to_publishes_after_each_checkpoint() {
+        let objects = Arc::new(MemoryObjectStore::new());
+        let machine = Arc::new(SimulatedFileSystem::new(840));
+        let (store, filesystem) = write(&machine, &objects);
+        store.publish_after_checkpoints(filesystem).unwrap();
+        // Nothing is published for being asked.
+        assert!(Published::newest(objects.as_ref(), "shop.owl").unwrap().is_none());
+
+        for number in 0..100 {
+            store.put_document(&event(number)).unwrap();
+        }
+        store.checkpoint().unwrap();
+        assert_eq!(Published::newest(objects.as_ref(), "shop.owl").unwrap().unwrap().number, 1);
+        let (reader, _) = read(841, &objects);
+        assert_eq!(codes(&reader), (0..100).collect::<Vec<_>>());
+
+        // Writes alone publish nothing; the next checkpoint does.
+        for number in 100..150 {
+            store.put_document(&event(number)).unwrap();
+        }
+        store.wait_for_maintenance().unwrap();
+        assert_eq!(Published::newest(objects.as_ref(), "shop.owl").unwrap().unwrap().number, 1);
+        store.compact().unwrap();
+        assert_eq!(Published::newest(objects.as_ref(), "shop.owl").unwrap().unwrap().number, 2);
+        let (reader, _) = read(842, &objects);
+        assert_eq!(codes(&reader), (0..150).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_publication_that_fails_does_not_fail_its_checkpoint() {
+        let objects = Arc::new(MemoryObjectStore::new());
+        let machine = Arc::new(SimulatedFileSystem::new(843));
+        let (store, filesystem) = write(&machine, &objects);
+        for number in 0..100 {
+            store.put_document(&event(number)).unwrap();
+        }
+        store.checkpoint().unwrap();
+        store.publish(&filesystem).unwrap();
+
+        // Another machine takes the database over. This store can no
+        // longer publish, and its checkpoints are still its own to make.
+        let other = Arc::new(SimulatedFileSystem::new(844));
+        ObjectFileSystem::take_over(other, objects.clone(), "", "shop.owl", 8 << 20).unwrap();
+        store.publish_after_checkpoints(filesystem).unwrap();
+        store.put_document(&event(100)).unwrap();
+        store.checkpoint().expect("an incremental checkpoint puts no part and is made");
+        let status = store.maintenance_status().unwrap();
+        assert!(
+            status.last_error.as_deref().is_some_and(|error| error.contains("taken over")),
+            "the failed publication is on record: {:?}",
+            status.last_error
+        );
     }
 }

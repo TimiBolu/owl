@@ -6,6 +6,7 @@ use super::checkpoint::{
     TypedSegmentFileDescriptor, TypedSegmentHandle,
 };
 use super::column_segment::TypedCell;
+use super::object_store::ObjectFileSystem;
 use super::cow::CowRecordDirectory;
 use super::delta::{RecordDeltaLookup, RecordPageDelta, RecordRootHandle};
 use super::index_delta::{
@@ -2550,6 +2551,11 @@ pub struct StoreCore {
     commits_in_flight: AtomicUsize,
     next_transaction_id: AtomicU64,
     checkpoint_sequence: AtomicU64,
+    /// The file system to publish through after each checkpoint, when the
+    /// store has been asked to keep readers up to date.
+    publisher: Mutex<Option<Arc<ObjectFileSystem>>>,
+    /// The checkpoint and the last commit of the last such publication.
+    published_at: Mutex<Option<(u64, u64)>>,
     record_delta_base_lsn: AtomicU64,
     auto_checkpoint_policy: Mutex<AutoCheckpointPolicy>,
     commits_since_checkpoint: AtomicU64,
@@ -3106,6 +3112,8 @@ impl RustStore {
             commits_in_flight: AtomicUsize::new(0),
             next_transaction_id: AtomicU64::new(1),
             checkpoint_sequence: AtomicU64::new(checkpoint_sequence),
+            publisher: Mutex::new(None),
+            published_at: Mutex::new(None),
             record_delta_base_lsn: AtomicU64::new(record_delta_base_lsn),
             auto_checkpoint_policy: Mutex::new(AutoCheckpointPolicy::for_size_limit(
                 max_size_bytes,
@@ -3544,40 +3552,6 @@ impl RustStore {
         }
     }
 
-    /// Run `work` while the database's files stand still: no commit, no
-    /// checkpoint and no reclamation can change them, and everything
-    /// committed is in them. Readers carry on. `work` is given the database
-    /// path and the last committed sequence number.
-    pub(super) fn with_files_frozen<T>(
-        &self,
-        work: impl FnOnce(&Path, u64) -> OQLResult<T>,
-    ) -> OQLResult<T> {
-        let _checkpoint = self
-            .checkpoint_lock
-            .lock()
-            .map_err(|_| OQLError::generic("checkpoint lock poisoned"))?;
-        let _commit = self
-            .commit_lock
-            .lock()
-            .map_err(|_| OQLError::generic("storage commit lock poisoned"))?;
-        {
-            let mut wal = self
-                .wal
-                .lock()
-                .map_err(|_| OQLError::generic("WAL lock poisoned"))?;
-            wal.as_mut()
-                .ok_or_else(|| OQLError::storage_error("active WAL handle is unavailable", None))?
-                .sync()
-                .map_err(|error| storage_io("sync WAL", &self.wal_path, error))?;
-        }
-        let committed = self
-            .state
-            .read()
-            .map_err(|_| OQLError::generic("storage state lock poisoned"))?
-            .committed_lsn;
-        work(&self.wal_path, committed)
-    }
-
     pub fn committed_lsn(&self) -> u64 {
         self.state.read().map(|s| s.committed_lsn).unwrap_or(0)
     }
@@ -3749,11 +3723,33 @@ impl RustStore {
                 None,
             ));
         }
-        let _checkpoint = self
-            .checkpoint_lock
+        let info = {
+            let _checkpoint = self
+                .checkpoint_lock
+                .lock()
+                .map_err(|_| OQLError::generic("checkpoint lock poisoned"))?;
+            self.core.checkpoint_concurrent()?
+        };
+        self.core.publish_if_asked();
+        Ok(info)
+    }
+
+    /// Publish for readers after every checkpoint and compaction from now
+    /// on, through `filesystem`, which must be the one this store was
+    /// opened with. Readers then see the database as of its last
+    /// checkpoint without anyone calling [`StoreCore::publish`]. Being
+    /// asked publishes nothing; the next checkpoint does, whether or not
+    /// it finds anything new.
+    ///
+    /// A publication that fails does not fail the checkpoint it follows.
+    /// It is kept as the last maintenance error, and the next checkpoint
+    /// tries again.
+    pub fn publish_after_checkpoints(&self, filesystem: Arc<ObjectFileSystem>) -> OQLResult<()> {
+        *self
+            .publisher
             .lock()
-            .map_err(|_| OQLError::generic("checkpoint lock poisoned"))?;
-        self.core.checkpoint_concurrent()
+            .map_err(|_| OQLError::generic("publisher lock poisoned"))? = Some(filesystem);
+        Ok(())
     }
 
     /// Force a bounded full compaction into a new immutable base generation.
@@ -3767,11 +3763,15 @@ impl RustStore {
                 None,
             ));
         }
-        let _checkpoint = self
-            .checkpoint_lock
-            .lock()
-            .map_err(|_| OQLError::generic("checkpoint lock poisoned"))?;
-        self.core.compact_concurrent()
+        let info = {
+            let _checkpoint = self
+                .checkpoint_lock
+                .lock()
+                .map_err(|_| OQLError::generic("checkpoint lock poisoned"))?;
+            self.core.compact_concurrent()?
+        };
+        self.core.publish_if_asked();
+        Ok(info)
     }
 
     /// [`Self::compact`], then remove the copy it replaced.
@@ -3791,17 +3791,84 @@ impl RustStore {
                 None,
             ));
         }
-        let _checkpoint = self
-            .checkpoint_lock
-            .lock()
-            .map_err(|_| OQLError::generic("checkpoint lock poisoned"))?;
-        let info = self.core.compact_concurrent()?;
-        let reclaimed = self.reclaim_after_audit()?;
+        let (info, reclaimed) = {
+            let _checkpoint = self
+                .checkpoint_lock
+                .lock()
+                .map_err(|_| OQLError::generic("checkpoint lock poisoned"))?;
+            let info = self.core.compact_concurrent()?;
+            (info, self.reclaim_after_audit()?)
+        };
+        self.core.publish_if_asked();
         Ok((info, reclaimed))
     }
 }
 
 impl StoreCore {
+    /// Run `work` while the database's files stand still: no commit, no
+    /// checkpoint and no reclamation can change them, and everything
+    /// committed is in them. Readers carry on. `work` is given the database
+    /// path and the last committed sequence number.
+    pub(super) fn with_files_frozen<T>(
+        &self,
+        work: impl FnOnce(&Path, u64) -> OQLResult<T>,
+    ) -> OQLResult<T> {
+        let _checkpoint = self
+            .checkpoint_lock
+            .lock()
+            .map_err(|_| OQLError::generic("checkpoint lock poisoned"))?;
+        let _commit = self
+            .commit_lock
+            .lock()
+            .map_err(|_| OQLError::generic("storage commit lock poisoned"))?;
+        {
+            let mut wal = self
+                .wal
+                .lock()
+                .map_err(|_| OQLError::generic("WAL lock poisoned"))?;
+            wal.as_mut()
+                .ok_or_else(|| OQLError::storage_error("active WAL handle is unavailable", None))?
+                .sync()
+                .map_err(|error| storage_io("sync WAL", &self.wal_path, error))?;
+        }
+        let committed = self
+            .state
+            .read()
+            .map_err(|_| OQLError::generic("storage state lock poisoned"))?
+            .committed_lsn;
+        work(&self.wal_path, committed)
+    }
+
+    /// Publish for readers if this store was asked to after checkpoints,
+    /// unless what it last published is the database as it stands: the
+    /// same checkpoint and the same last commit. A checkpoint that found
+    /// nothing new still publishes if this store has not published yet.
+    /// A failure is kept as the last maintenance error: the checkpoint it
+    /// follows has been made, and failing that would say otherwise.
+    ///
+    /// Not to be called with the checkpoint lock held: publishing takes it.
+    fn publish_if_asked(&self) {
+        let Some(filesystem) = self.publisher.lock().ok().and_then(|publisher| publisher.clone()) else {
+            return;
+        };
+        let committed = match self.state.read() {
+            Ok(state) => state.committed_lsn,
+            Err(_) => return,
+        };
+        let stands = (self.checkpoint_sequence.load(Ordering::Acquire), committed);
+        if self.published_at.lock().is_ok_and(|published| *published == Some(stands)) {
+            return;
+        }
+        match self.publish(&filesystem) {
+            Ok(published) => {
+                if let Ok(mut at) = self.published_at.lock() {
+                    *at = Some((stands.0, published.committed_lsn));
+                }
+            }
+            Err(error) => self.record_maintenance_error(error.to_string()),
+        }
+    }
+
     fn prepare_checkpoint(&self) -> OQLResult<PendingCheckpoint> {
         let (sequence, checkpoint_lsn, commits_at_snapshot) = {
             let _commit = self
@@ -5413,8 +5480,14 @@ fn maintenance_worker(core: Arc<StoreCore>, receiver: Receiver<MaintenanceMessag
 }
 
 fn run_scheduled_maintenance(core: &StoreCore) {
+    let before = core.checkpoint_sequence.load(Ordering::Acquire);
     if let Err(error) = core.maybe_auto_checkpoint() {
         core.record_maintenance_error(error.to_string());
+    }
+    // Only if a checkpoint was made. Looking whether one is due is not
+    // a reason to publish.
+    if core.checkpoint_sequence.load(Ordering::Acquire) != before {
+        core.publish_if_asked();
     }
 }
 
