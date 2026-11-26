@@ -608,8 +608,9 @@ export function Matrix() {
                 has to be refused, so a row that starts working fails the test until it is moved.
               </p>
               <p className="sub">
-                Only the Owl column is run. The SQL and MongoDB beside it are written by hand to ask the same question
-                of the same shop, and are there to compare by eye.
+                The SQL and MongoDB beside it are checked too, by a separate tool that runs each on PostgreSQL 17 and
+                MongoDB 7 against the same shop and compares its rows with Owl's. A few cannot be run there, for want
+                of an extension or a replica set, and the tool names them.
               </p>
               <a
                 className="btn solid"
@@ -631,6 +632,9 @@ export function Matrix() {
                 </li>
                 <li>
                   The SQL and MongoDB: <code>tests/completeness_matrix/elsewhere.rs</code>
+                </li>
+                <li>
+                  What runs them: <code>tools/matrix_check/check.py</code>
                 </li>
                 <li>
                   SQL here means PostgreSQL, with an order's items in a table of their own. MongoDB means mongosh over

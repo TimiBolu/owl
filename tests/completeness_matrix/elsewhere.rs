@@ -7,11 +7,16 @@
 // a whole OQL query is set beside a whole SQL statement and a whole
 // MongoDB one, not beside a keyword.
 //
-// Nothing here is run. The SQL is PostgreSQL over the same shop kept the
-// relational way: `tags` is `text[]`, `address` is `jsonb`, and an order's
-// items are rows of `order_items (order_id, position, product, qty,
-// price)`. The MongoDB is mongosh over the same documents as Owl, with the
-// id in `_id` and a reference held as the id it points to.
+// The matrix test does not run these. `tools/matrix_check/check.py` does:
+// it runs each on PostgreSQL 17 and MongoDB 7 against the same shop and
+// compares its rows with the rows the test holds Owl to. Run it after
+// changing anything here.
+//
+// The SQL is PostgreSQL over the shop kept the relational way: `tags` is
+// `text[]`, `address` is `jsonb`, and an order's items are rows of
+// `order_items (order_id, position, product, qty, price)`. The MongoDB is
+// mongosh over the same documents as Owl, with the id in `_id` and a
+// reference held as the id it points to.
 //
 // Lines are kept short so that three columns fit side by side.
 
@@ -297,7 +302,7 @@ r#"db.customers.find(
     pieces: { $split: ["$email", "@"] } }
 )"#),
         ("Number functions",
-r#"SELECT round(price) AS rounded,
+r#"SELECT round(price::numeric) AS rounded,
        floor(price) AS down,
        ceil(price) AS up,
        sqrt(stock + 9) AS root,
@@ -308,7 +313,9 @@ WHERE id = 'p2';"#,
 r#"db.products.find(
   { _id: "p2" },
   { _id: 0,
-    rounded: { $round: "$price" },
+    // $round takes a half to the even
+    rounded: { $floor: {
+      $add: ["$price", 0.5] } },
     down: { $floor: "$price" },
     up: { $ceil: "$price" },
     root: { $sqrt: { $add: ["$stock", 9] } },
@@ -539,7 +546,9 @@ r#"SELECT
   percentile_cont(0.9) WITHIN GROUP
     (ORDER BY total) AS p90
 FROM orders;"#,
-r#"db.orders.aggregate([
+r#"// picks a value that is there:
+// 26.5 and [150], not 34.25 and 105
+db.orders.aggregate([
   { $group: { _id: null,
       median: { $median: {
         input: "$total",
@@ -590,6 +599,9 @@ r#"db.orders.aggregate([
   { $unwind: "$c" },
   { $group: { _id: "$status",
       cities: { $addToSet: "$c.city" } } },
+  // a set comes in no order
+  { $set: { cities: { $sortArray: {
+      input: "$cities", sortBy: 1 } } } },
   { $sort: { _id: 1 } }
 ])"#),
         ("First or last row of each group",
@@ -1619,7 +1631,7 @@ r#"db.orders.deleteMany(
   { status: "cancelled" }
 )"#),
         ("Delete every row",
-r#"TRUNCATE orders;"#,
+r#"TRUNCATE orders CASCADE;"#,
 r#"db.orders.deleteMany({})"#),
         ("Insert or replace",
 r#"INSERT INTO products
@@ -1936,7 +1948,7 @@ r#"CREATE TRIGGER stamp
 r#"db.orders.watch().on("change",
   change => { /* react */ })"#),
         ("One collection split by a key",
-r#"CREATE TABLE orders (
+r#"CREATE TABLE events (
   id text, placed timestamptz
 ) PARTITION BY RANGE (placed);"#,
 r#"sh.shardCollection(
