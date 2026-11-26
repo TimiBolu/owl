@@ -142,7 +142,7 @@ pub enum RebalanceStatus {
 /// # Example
 ///
 /// ```
-/// use oql::distributed::ShardManager;
+/// use owl_db::distributed::ShardManager;
 ///
 /// let mut manager = ShardManager::new();
 ///

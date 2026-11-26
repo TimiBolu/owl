@@ -193,7 +193,7 @@ pub struct OptimizationStats {
 /// # Example
 ///
 /// ```
-/// use oql::distributed::{DistributedQueryPlanner, ShardManager};
+/// use owl_db::distributed::{DistributedQueryPlanner, ShardManager};
 /// use std::sync::Arc;
 ///
 /// let shard_manager = Arc::new(ShardManager::new());

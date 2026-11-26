@@ -24,8 +24,8 @@ use std::fmt;
 /// # Example
 ///
 /// ```
-/// use oql::distributed::GlobalObjRef;
-/// use oql::document::ObjRef;
+/// use owl_db::distributed::GlobalObjRef;
+/// use owl_db::document::ObjRef;
 ///
 /// // Create from local reference
 /// let local_ref = ObjRef::new(1024);

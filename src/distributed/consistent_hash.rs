@@ -47,7 +47,7 @@ impl Ord for VirtualNode {
 /// # Example
 ///
 /// ```
-/// use oql::distributed::ConsistentHashRing;
+/// use owl_db::distributed::ConsistentHashRing;
 ///
 /// let mut ring = ConsistentHashRing::new();
 /// ring.add_shard(0);
@@ -92,7 +92,7 @@ impl ConsistentHashRing {
     ///
     /// # Example
     /// ```
-    /// # use oql::distributed::ConsistentHashRing;
+    /// # use owl_db::distributed::ConsistentHashRing;
     /// let mut ring = ConsistentHashRing::new();
     /// ring.add_shard(0);
     /// ring.add_shard(1);
@@ -161,7 +161,7 @@ impl ConsistentHashRing {
     ///
     /// # Example
     /// ```
-    /// # use oql::distributed::ConsistentHashRing;
+    /// # use owl_db::distributed::ConsistentHashRing;
     /// # let mut ring = ConsistentHashRing::new();
     /// # ring.add_shard(0);
     /// let shard = ring.get_shard_for_object("user123").unwrap();
@@ -205,7 +205,7 @@ impl ConsistentHashRing {
     ///
     /// # Example
     /// ```
-    /// # use oql::distributed::ConsistentHashRing;
+    /// # use owl_db::distributed::ConsistentHashRing;
     /// # let mut ring = ConsistentHashRing::new();
     /// # ring.add_shard(0);
     /// let oql = "User.insert { id: 'user123', name: 'Alice' }";
