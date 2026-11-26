@@ -401,10 +401,10 @@ fn test_error_handling_type_mismatches() {
     // Test type comparison errors
     let query_str = r#"users.where { .name == 42 }"#; // String field compared to integer
     let query = parse_oql(query_str).expect("Query should parse");
-    let results = fixture.executor.execute_query(&query).expect("Query should execute");
-    
-    // Should return no results due to type mismatch, but not error
-    assert_eq!(results.len(), 0);
+    // A field declared as text can never equal a number: on a collection
+    // with a schema that is said, not answered with no rows.
+    let error = fixture.executor.execute_query(&query).expect_err("a comparison that cannot hold").to_string();
+    assert!(error.contains("'.name' is text and 42 is a number"), "{error}");
 }
 
 #[test]
@@ -448,6 +448,16 @@ fn test_error_handling_empty_collections() {
         r#"empty_collection.where { .name == "test" }.delete"#,
     ];
     
+    // A name nothing was ever written under is a mistake.
+    for query_str in &empty_queries {
+        let query = parse_oql(query_str).expect("Query should parse");
+        let error = fixture.executor.execute_query(&query).expect_err("an unknown collection").to_string();
+        assert!(error.contains("'empty_collection' is not defined"), "{error}");
+    }
+    // Once it has been written to and emptied, it is an empty collection.
+    for setup in [r#"empty_collection.insert { id: "e1", name: "gone" }"#, "empty_collection.delete()"] {
+        fixture.executor.execute_query(&parse_oql(setup).unwrap()).expect("setup");
+    }
     for query_str in empty_queries {
         let query = parse_oql(query_str).expect("Query should parse");
         let results = fixture.executor.execute_query(&query).expect("Query should execute on empty collection");

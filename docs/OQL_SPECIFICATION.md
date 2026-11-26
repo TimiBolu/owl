@@ -62,7 +62,10 @@ principles document, but everything else depends on it:
 | Feature | Form | Status |
 |---|---|---|
 | Line comment | `// to end of line` | Works |
-| Block comment | `/* ... */` | Out. One comment form is enough. |
+| Block comment | `/* ... */` | Works |
+| SQL line comment | `-- to end of line` | Works. The two dashes are followed by a space or the end of the line, so `a --b` is still arithmetic. |
+| String in single quotes | `'paid'` | Works, with the same escapes as double quotes |
+| A closing `;` | `orders.count();` | Works: allowed after a statement, and ignored |
 | Identifier | `[A-Za-z_][A-Za-z0-9_]*` | Works |
 | Integer, float | `42`, `-7`, `3.14`, `-0.5` | Works |
 | String with escapes | `"a \"b\" \n \u{1F989}"` | Works |
@@ -262,7 +265,18 @@ literal syntax, and reads and writes are symmetric.
 | Membership `x in [..]` | Works |
 | `list contains x`, `text contains part` | Works |
 | `starts_with`, `ends_with` infix | Works |
-| Range `x between a and b` | Out. `x >= a && x <= b` is already direct. |
+| Range `x between a and b`, `x not between a and b` | Works. Both ends are included. |
+| `x not in [..]`, `x is null`, `x is not null` | Works |
+| `text like "A%"`, `ilike`, `not like` | Works. `%` is any run of characters and `_` is any one; `ilike` ignores case. |
+| `list contains_all [..]`, `list contains_any [..]` | Works |
+| Several values compared in order | Works: `(.price, .id) > (12.5, "p2")` compares the first pair and goes on to the next only when they are equal, which is how a page starts after the last row seen. |
+| A field alone as a condition | Works: `where { .email }` keeps the rows where it is present and not empty, false or zero; `where { !.email }` the rest. A field declared `Boolean` is read as itself. |
+| A field compared with a literal of another kind | An error on a collection with a schema: `.total > "50"` on `total: Float`, `.id == 1`, `.placed > "soon"`. It could never hold, and used to answer with no rows. Text that is a timestamp may be compared with a `DateTime`. |
+| A reference compared with a row or a query | Works: `.customer == customers.where { .name == "Bob" }` when the query gives one row, and `.customer in customers.where { .city == "Lagos" }` for any number. |
+| A value added to or taken from a list | Works: `.tags + "gold"`, `.tags - "vip"`, `.tags - ["vip", "early"]` |
+| Timestamps and lengths of time | Works: `.joined + days(30)`, `.joined - weeks(1)`, and `a - b` for two timestamps is a length of time. Lengths of time compare, add, multiply by a number and divide by one another: `(.b - .a) / days(1)` is the days between. `weeks days hours minutes seconds` make one; `in_days in_hours in_minutes in_seconds` read one as a number. |
+| `\|\|` between two texts | "Or", as everywhere: the first that is present. It never joins them, as SQL's `\|\|` does. Text is joined with `+` or `concat`. |
+| Division of two whole numbers | A whole number: `7 / 2` is `3`. With a `Float` on either side it is `3.5`. |
 | Parentheses for conditions and for operands | Works |
 | A comparison is an ordinary boolean expression | Works |
 | A path through a collection compared with one value | An error, for `== != < <= > >=`: `.orders.total > 100` has a total for every order, and whether any or all must exceed 100 is not for the engine to guess. The message gives the spelling for "any": `.orders.where { .total > 100 }.exists()`, or `.orders.total contains 100` for equality. It used to be false for every row. `contains`, `in` and comparison with a list are unaffected. |
@@ -276,6 +290,7 @@ literal syntax, and reads and writes are symmetric.
 | `match x { "a" -> 1, _ -> 0 }` | Works |
 | Match guards | Works: `match .status { "paid" if .amount > 200 -> "big", _ -> "other" }` |
 | `coalesce(a, b, ...)`, `if_null(a, b)` | Works |
+| `case { cond -> a, cond -> b, _ -> c }` | Works: the first condition that holds, as SQL's searched `CASE` |
 
 ### 5.5 Literals for structured values
 
@@ -313,7 +328,8 @@ Gaps found:
 | `length(list)` | Works. `length` counts the characters of text and the elements of a list. |
 | Regular expression match | Works: `matches(text, pattern)`. One function, no operator. The pattern is found anywhere in the text unless anchored with `^` and `$`; `(?i)` at its start ignores case. Matching time grows with the text only: there are no back-references or look-around. Null, or a value that is not text, matches nothing; a pattern that does not parse is an error. A leading `where { matches(.field, "^prefix..") }` reads only the range of the field that starts with the prefix, through an index when the field has one. |
 | `to_bool`, `to_datetime`, `days_until(from, to)`, `days_since(as_of, earlier)` | Works |
-| List helpers beyond collection operations | Out. `where`, `select`, `sort`, `count` and the rest already apply to lists. |
+| List helpers beyond collection operations | Works: `join(list, sep)`, `reverse(list)`, `index_of(list, value)` (null when it is not there), `keys(object)`, and slices `.tags[1:]`, `.tags[:2]`, `.name[0:2]`, which also cut text. |
+| `round(x, places)`, `repeat(text, n)`, `truncate(text, n)`, `truncate(when, "month")`, `when.format("%Y-%m")` | Works |
 
 ---
 
@@ -660,6 +676,7 @@ operation on; what precedes it still uses indexes and column reads.
 | Atomicity comes from the storage engine's own transaction | Works. The whole-database copy is used only for a store that has no transaction mechanism. |
 | A failure during commit rolls the block back and is reported | Works *(not exercised by a test: it needs an injected storage fault)* |
 | Functions defined inside a rolled-back block are removed with it | Works |
+| A block answers with the rows of its last statement | Works, as a script answers with the rows of its last statement. A block that is dropped answers with its error alone. |
 
 ---
 
@@ -777,8 +794,8 @@ A parse error names what was expected in the language's own symbols and
 shows where:
 
 ```text
-Unexpected token: Expected '}', found 'between' at line 1, column 20:
-  users.where { .age between 1 }
+Unexpected token: Expected '}', found 'roughly' at line 1, column 20:
+  users.where { .age roughly 1 }
                      ^
 ```
 
@@ -803,6 +820,42 @@ without running it:
 | `plan` | the physical plan as text |
 
 `explain()` must be the last operation.
+
+---
+
+## 20a. Forms that read as a SQL or MongoDB user expects
+
+Added after the completeness matrix showed where a query took more words in
+OQL than elsewhere, or was accepted and answered wrongly. Every row here is
+held by `tests/oql_language_gaps_test.rs`. The conditions, operators and
+functions among them are listed in section 5; these are the rest.
+
+| Feature | Form | Notes |
+|---|---|---|
+| Any, all, none of related rows or a list | `.orders.any { .status == "paid" }`, `.items.all { .qty >= 2 }`, `.orders.none { .total > 100 }` | `all` holds for a row with none, as it does in SQL. At the top level `orders.any { .. }` asks whether any row matches. |
+| The first rows, the last row | `.first(2)`, `.last()` | `first(n)` is `limit(n)`. |
+| The row with the most or least of something | `products.max_by { .price }`, `min_by { .. }` | Also inside a group: `group_by { .customer }.select { top: max_by { .total }.id }`. |
+| A random sample | `products.sample(2)` | |
+| Delete by a condition | `orders.delete { .status == "cancelled" }` | The same as `where { .. }.delete()`. |
+| Insert the rows of a query | `archive.insert(orders.where { .status == "cancelled" })` | |
+| What a write gives back | `orders.where { .. }.update { .. }.select { id, status }` | Insert, update, upsert and delete give back the rows they wrote or removed, so what follows reads them. |
+| Take a field off a row | `update { -email }` | `exists(.email)` is then false. `email: null` keeps the field, holding null. |
+| Add to and take from a list | `update { tags += "gold" }`, `update { tags -= "vip" }` | |
+| Change one element of a list | `update { tags[0]: "gold" }`, `update { items[0].qty += 1 }` | |
+| Change the elements that match | `update { items.where { .price < 5 }.qty += 1 }` | |
+| Set a reference from a query | `update { customer: customers.where { .name == "Ada" } }` | The query gives one row. |
+| The fields of an object set beside the others | `select { id, ...address }` | |
+| A list of plain values reshaped | `.tags.select { upper(.) }` | Gives a list of values, not of rows. |
+| A total beside each row's own values | `select { id, share: .total / sum(.total) }` | Every row is given, with the total over all of them. A select of totals alone is still one row. |
+| An aggregate named the SQL way | `avg(orders.total)` | The same as `orders.avg(.total)`. `avg(.total)` in a filter is an error, because it is given one row; so is a total over a path that holds a list on every row, as `sum(.items.qty)`: the message gives `.items.sum(.qty)`. |
+| Count of distinct values, count and total of some rows | `count(distinct .customer)`, `count(where .status == "paid")`, `sum(.total where .status == "paid")`, `count(.total > 50)` | |
+| Filter on a group before shaping it | `group_by { .customer }.having { count() > 1 }` | |
+| A key through a reference names itself | `group_by { .customer.city, .status }.select { city, status }` | |
+| The ids of a group's rows | `group_by { .status }.select { status, ids: .id }` | `.id` on a group used to be the group's own made-up id. |
+| Subtotals and grand totals | `group_by { rollup(.city, .status) }`, `group_by { cube(.a, .b) }` | `rollup` adds a row for each leading run of the keys and one for the whole; `cube` adds one for every combination. A key a subtotal leaves out is null in its row. `rollup` and `cube` take every key of the grouping. |
+| Buckets of equal size, and rank as a share | `ntile(4)`, `percent_rank(.total)`, `cume_dist(.total)` | Position functions of section 11.1: over the sorted rows, or each partition. |
+| Sort keys | `sort { .city, -.joined }`, `.email.nulls_last`, `.email.nulls_first` | Ascending when no direction is given; a leading `-` is descending. |
+| A name nothing has | `nosuch.count()`, `where { .status == open }`, `.joined.year` | Errors, each saying what was probably meant: a collection that was never written to (one that was emptied still answers), a bare word that is not a field (text goes in quotes), and a field read off a plain value (`year` is a function: `.joined.year()`). All three used to answer with nothing. |
 
 ---
 
@@ -833,13 +886,17 @@ P partial or wrong in some form, N missing.
 Stated so that their absence is a decision, not an oversight.
 
 - Join syntax. Relationships are navigated.
-- A separate array language (`any`, `map`, `unwind`, `$elemMatch`).
+- A separate array language (`map`, `unwind`, `$elemMatch`). `any`, `all` and
+  `none` were on this list and are now words over the same collections
+  everything else works on (section 20a).
 - Update operator families (`$set`, `$push`, `$inc`). Shaped updates and `+=` cover them.
-- `ROLLUP`, `CUBE`, facets, histogram families. Window functions and set
-  operations were on this list and no longer are: analytical queries cannot
-  be written without them (sections 6.2 and 11.1).
+- Facets and histogram families. Window functions, set operations, `rollup`
+  and `cube` were on this list and no longer are: analytical queries cannot
+  be written without them (sections 6.2, 11.1 and 20a).
 - Regex as an operator. One function at most.
-- `between`, block comments, nested transactions, isolation-level syntax.
+- Nested transactions, isolation-level syntax. `between` and block comments
+  were on this list; leaving them out saved nothing and cost every reader
+  who came from SQL a moment's doubt.
 - Full-text and geospatial search.
 
 ---

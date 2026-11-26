@@ -629,15 +629,27 @@ fn absent_values_never_fail_a_filter_or_a_sort() {
             ["c"],
             "{collection}"
         );
-        // Comparing unrelated types is a non-match, not an error.
+        // Comparing unrelated values is a non-match, not an error: here a
+        // price, which may hold anything, against text.
         assert_eq!(
             db.scalar(
-                &format!("{collection}.where {{ .id > 5 }}.count()"),
+                &format!("{collection}.where {{ .label > .price }}.count()"),
                 "count"
             ),
             Value::Integer(0),
             "{collection}"
         );
+        // Where a schema says what a field holds, comparing it with a
+        // value of another kind written in the query could never hold, and
+        // is said. Where nothing says, it is a non-match like any other.
+        let mismatched = db.try_rows(&format!("{collection}.where {{ .id > 5 }}.count()"));
+        match collection {
+            "typed" => {
+                let error = mismatched.unwrap_err();
+                assert!(error.contains("'.id' is text and 5 is a number"), "{error}");
+            }
+            _ => assert_eq!(mismatched.unwrap()[0].get_field("count"), Some(&Value::Integer(0))),
+        }
 
         // Nulls sort first, deterministically.
         assert_eq!(
@@ -2396,10 +2408,10 @@ fn functions_have_local_names_and_can_be_redefined() {
 
 #[test]
 fn parse_errors_point_at_the_users_text() {
-    let error = parse_oql("users.where { .age between 1 }").unwrap_err().to_string();
-    assert!(error.contains("'between'"), "{error}");
+    let error = parse_oql("users.where { .age roughly 1 }").unwrap_err().to_string();
+    assert!(error.contains("'roughly'"), "{error}");
     assert!(error.contains("line 1, column 20"), "{error}");
-    assert!(error.contains("users.where { .age between 1 }\n"), "{error}");
+    assert!(error.contains("users.where { .age roughly 1 }\n"), "{error}");
     assert!(error.ends_with("                   ^"), "{error:?}");
 
     let error = parse_oql("users\n  .where { .age > 1 }\n  .select { id, name: }")
@@ -2411,7 +2423,7 @@ fn parse_errors_point_at_the_users_text() {
 
     // No parser-internal names reach the user.
     for query in [
-        "users.where { .age between 1 }",
+        "users.where { .age roughly 1 }",
         "users.select { id, name: }",
         "users.where { .a == }",
         "users.limit(",
@@ -2837,9 +2849,12 @@ fn timestamp_filters_agree_whether_or_not_an_index_serves_them() {
         assert_eq!(counted, reference, "{filter}");
     }
     assert!(!db.ids(r#"entries.where { .at >= "2026-01-10" && .at < "2026-01-12" }"#).is_empty());
-    // Text that is not a timestamp matches nothing, on either path.
-    assert!(db.ids(r#"entries.where { .at >= "soon" }.select { id }"#).is_empty());
-    assert_eq!(db.scalar(r#"entries.where { .at >= "soon" }.count()"#, "count"), Value::Integer(0));
+    // Text that is not a timestamp could never be compared with one, and
+    // is refused on either path.
+    for query in [r#"entries.where { .at >= "soon" }.select { id }"#, r#"entries.where { .at >= "soon" }.count()"#] {
+        let error = db.try_rows(query).unwrap_err();
+        assert!(error.contains("text that is not a timestamp"), "{error}");
+    }
 }
 
 #[test]
@@ -3170,7 +3185,7 @@ fn folding_with_the_evaluator_matches_aggregating_rows() {
         "sales.where { shop == \"s2\" }.count()",
         "sales.where { id > \"v040\" }.count()",
         "sales.where { .qty > sales.avg(.qty) }.count()",
-        "sales.where { .shop.tier > 3 }.count()",
+        "sales.where { .shop.tier > .qty }.count()",
         // A filter on groups.
         "sales.group_by { .shop.id }.having { count() >= 23 }.select { shop_id, n: count(), mean: avg(.price) }",
         "sales.group_by { .state }.having { sum(.qty) > 100 && count() > 1 }.select { state, units: sum(.qty) }",

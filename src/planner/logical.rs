@@ -298,6 +298,15 @@ impl LogicalPlanner {
                     .with_field_updates(field_updates))
             }
 
+            Operation::Subtotals { .. } => Err(crate::error::OQLError::generic(
+                "subtotals are not planned here",
+            )),
+
+            // Inserting the rows of a query is run by the general executor.
+            Operation::InsertFrom(_) => Err(crate::error::OQLError::generic(
+                "inserting the rows of a query is not planned here",
+            )),
+
             Operation::InsertMany(insert_blocks) => {
                 // For batch insert, validate all blocks
                 for insert_block in insert_blocks {

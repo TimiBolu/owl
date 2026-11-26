@@ -355,6 +355,29 @@ impl FunctionRegistry {
     /// Register utility functions
     fn register_utility_functions(&mut self) {
         self.register("coalesce", utility_coalesce);
+        self.register("like", text_like);
+        self.register("ilike", text_ilike);
+        self.register("contains_all", list_contains_all);
+        self.register("contains_any", list_contains_any);
+        self.register("join", list_join);
+        self.register("reverse", reverse);
+        self.register("index_of", index_of);
+        self.register("repeat", string_repeat);
+        self.register("slice", slice);
+        self.register("keys", object_keys);
+        self.register("truncate", truncate_text_or_timestamp);
+        self.register("format", text_or_datetime_format);
+        self.register("weeks", duration_weeks);
+        self.register("days", duration_days);
+        self.register("hours", duration_hours);
+        self.register("minutes", duration_minutes);
+        self.register("seconds", duration_seconds);
+        self.register("truthy", truthy);
+        self.register("in_days", duration_in_days);
+        self.register("in_hours", duration_in_hours);
+        self.register("in_minutes", duration_in_minutes);
+        self.register("in_seconds", duration_in_seconds);
+        self.register("list_set", list_set);
         self.register("to_bool", utility_to_bool);
         self.register("to_datetime", utility_to_datetime);
         self.register("if_null", utility_if_null);
@@ -947,9 +970,23 @@ fn math_abs(args: &[Value]) -> OQLResult<Value> {
 
 /// Round to nearest integer
 fn math_round(args: &[Value]) -> OQLResult<Value> {
+    // `round(x, 2)`: to that many places after the point, as a float.
+    if let [value, Value::Integer(places)] = args {
+        let scale = 10f64.powi((*places).clamp(-15, 15) as i32);
+        return match value {
+            Value::Integer(i) => Ok(Value::Float(((*i as f64) * scale).round() / scale)),
+            Value::Float(f) => Ok(Value::Float((f * scale).round() / scale)),
+            Value::Null => Ok(Value::Null),
+            other => Err(OQLError::TypeError {
+                expected: "numeric type".to_string(),
+                actual: other.type_name().to_string(),
+            }),
+        };
+    }
     if args.len() != 1 {
         return Err(OQLError::Generic {
-            message: "round() expects exactly 1 argument".to_string(),
+            message: "round() expects a number, and optionally how many places to keep: round(x) or round(x, 2)"
+                .to_string(),
         });
     }
 
@@ -1462,6 +1499,18 @@ fn datetime_parse(args: &[Value]) -> OQLResult<Value> {
     }
 }
 
+/// `truncate(text, 3)` is the first three characters; `truncate(when,
+/// "month")` is the start of the month.
+fn truncate_text_or_timestamp(args: &[Value]) -> OQLResult<Value> {
+    match args {
+        [Value::String(text), Value::Integer(length)] => {
+            Ok(Value::String(text.chars().take((*length).max(0) as usize).collect()))
+        }
+        [Value::Null, Value::Integer(_)] => Ok(Value::Null),
+        _ => text_or_datetime_truncate(args),
+    }
+}
+
 /// Timestamps may arrive as text (RFC 3339 or a bare date), for example
 /// from a collection that stores them in a `String` field. Time functions
 /// read such text as the instant it denotes.
@@ -1496,6 +1545,7 @@ accept_timestamp_text! {
     text_or_datetime_add_days => datetime_add_days,
     text_or_datetime_add_hours => datetime_add_hours,
     text_or_datetime_diff_days => datetime_diff_days,
+    text_or_datetime_truncate => datetime_truncate,
 }
 
 /// Extract year from date
@@ -1909,7 +1959,342 @@ fn datetime_seconds_until(args: &[Value]) -> OQLResult<Value> {
 /// Whole days since the second timestamp, as of the first:
 /// `now().days_since(.created_at)`.
 fn datetime_days_since(args: &[Value]) -> OQLResult<Value> {
+    // `days_since(.joined)`: whole days from then until now.
+    if let [earlier] = args {
+        return Ok(match timestamps_from_text(std::slice::from_ref(earlier)).as_slice() {
+            [Value::DateTime(earlier)] => Value::Integer((Utc::now() - *earlier).num_days()),
+            [Value::Null] => Value::Null,
+            [other] => {
+                return Err(OQLError::TypeError {
+                    expected: "a timestamp".to_string(),
+                    actual: other.type_name().to_string(),
+                })
+            }
+            _ => unreachable!("one argument was given"),
+        });
+    }
     Ok(two_timestamps("days_since", args)?
         .map(|(as_of, earlier)| Value::Integer((as_of - earlier).num_days()))
         .unwrap_or(Value::Null))
+}
+
+
+// What makes common questions short to ask.
+
+fn wrong_arguments(usage: &str) -> OQLError {
+    OQLError::FunctionError {
+        message: format!("expected {usage}"),
+    }
+}
+
+/// A SQL pattern as a regular expression: `%` is any run of characters and
+/// `_` is any one. Everything else stands for itself.
+fn pattern_from_like(pattern: &str, ignoring_case: bool) -> String {
+    let mut regex = String::from(if ignoring_case { "(?is)^" } else { "(?s)^" });
+    for character in pattern.chars() {
+        match character {
+            '%' => regex.push_str(".*"),
+            '_' => regex.push('.'),
+            other => regex.push_str(&regex_syntax::escape(&other.to_string())),
+        }
+    }
+    regex.push('$');
+    regex
+}
+
+fn like(args: &[Value], ignoring_case: bool) -> OQLResult<Value> {
+    let [text, Value::String(pattern)] = args else {
+        return Err(wrong_arguments("like(text, pattern), with % for any run of characters and _ for one"));
+    };
+    let compiled = compiled_pattern(&pattern_from_like(pattern, ignoring_case))?;
+    Ok(Value::Boolean(match text {
+        Value::String(text) => compiled.is_match(text),
+        _ => false,
+    }))
+}
+
+/// `.name like "A%"`.
+fn text_like(args: &[Value]) -> OQLResult<Value> {
+    like(args, false)
+}
+
+/// `.name ilike "ada%"`: the same, whatever the case of the letters.
+fn text_ilike(args: &[Value]) -> OQLResult<Value> {
+    like(args, true)
+}
+
+/// `.tags contains_all ["vip", "early"]`: every one of them is in the list.
+fn list_contains_all(args: &[Value]) -> OQLResult<Value> {
+    match args {
+        [Value::List(held), Value::List(wanted)] => Ok(Value::Boolean(
+            wanted.iter().all(|one| held.iter().any(|item| crate::value_semantics::equal(item, one))),
+        )),
+        [Value::Null, _] => Ok(Value::Boolean(false)),
+        _ => Err(wrong_arguments("contains_all(list, list)")),
+    }
+}
+
+/// `.tags contains_any ["vip", "early"]`: at least one of them is.
+fn list_contains_any(args: &[Value]) -> OQLResult<Value> {
+    match args {
+        [Value::List(held), Value::List(wanted)] => Ok(Value::Boolean(
+            wanted.iter().any(|one| held.iter().any(|item| crate::value_semantics::equal(item, one))),
+        )),
+        [Value::Null, _] => Ok(Value::Boolean(false)),
+        _ => Err(wrong_arguments("contains_any(list, list)")),
+    }
+}
+
+fn as_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Null => String::new(),
+        other => other.to_string_repr(),
+    }
+}
+
+/// `.tags.join(", ")`.
+fn list_join(args: &[Value]) -> OQLResult<Value> {
+    match args {
+        [Value::List(items), Value::String(between)] => {
+            Ok(Value::String(items.iter().map(as_text).collect::<Vec<_>>().join(between)))
+        }
+        [Value::List(items)] => Ok(Value::String(items.iter().map(as_text).collect())),
+        [Value::Null, ..] => Ok(Value::Null),
+        _ => Err(wrong_arguments("join(list, text between)")),
+    }
+}
+
+/// A list or a text, back to front.
+fn reverse(args: &[Value]) -> OQLResult<Value> {
+    match args {
+        [Value::List(items)] => Ok(Value::List(items.iter().rev().cloned().collect())),
+        [Value::String(text)] => Ok(Value::String(text.chars().rev().collect())),
+        [Value::Null] => Ok(Value::Null),
+        _ => Err(wrong_arguments("reverse(list or text)")),
+    }
+}
+
+/// Where something first is in a list or a text, counting from zero, or
+/// null when it is not there.
+fn index_of(args: &[Value]) -> OQLResult<Value> {
+    match args {
+        [Value::List(items), wanted] => Ok(items
+            .iter()
+            .position(|item| crate::value_semantics::equal(item, wanted))
+            .map_or(Value::Null, |at| Value::Integer(at as i64))),
+        [Value::String(text), Value::String(part)] => Ok(text
+            .find(part.as_str())
+            .map_or(Value::Null, |at| Value::Integer(text[..at].chars().count() as i64))),
+        [Value::Null, _] => Ok(Value::Null),
+        _ => Err(wrong_arguments("index_of(list, value) or index_of(text, part)")),
+    }
+}
+
+/// `repeat("ab", 3)`.
+fn string_repeat(args: &[Value]) -> OQLResult<Value> {
+    match args {
+        [Value::String(text), Value::Integer(times)] => {
+            let times = (*times).clamp(0, 100_000) as usize;
+            Ok(Value::String(text.repeat(times)))
+        }
+        [Value::Null, _] => Ok(Value::Null),
+        _ => Err(wrong_arguments("repeat(text, how many times)")),
+    }
+}
+
+/// Where a slice's bound falls in something `len` long: counted from the
+/// end when negative, and kept inside it.
+fn bound(at: &Value, len: usize, absent: usize) -> OQLResult<usize> {
+    match at {
+        Value::Null => Ok(absent),
+        Value::Integer(at) if *at < 0 => Ok(len.saturating_sub(at.unsigned_abs() as usize)),
+        Value::Integer(at) => Ok((*at as usize).min(len)),
+        other => Err(OQLError::TypeError {
+            expected: "a whole number".to_string(),
+            actual: other.type_name().to_string(),
+        }),
+    }
+}
+
+/// `.tags[1:3]` and `slice(.tags, 1, 3)`: from the first place up to, and
+/// not including, the second. Either may be left out, and a negative one
+/// counts from the end.
+fn slice(args: &[Value]) -> OQLResult<Value> {
+    let (whole, from, to) = match args {
+        [whole, from, to] => (whole, from, to),
+        [whole, from] => (whole, from, &Value::Null),
+        _ => return Err(wrong_arguments("slice(list or text, from, to)")),
+    };
+    match whole {
+        Value::List(items) => {
+            let (from, to) = (bound(from, items.len(), 0)?, bound(to, items.len(), items.len())?);
+            Ok(Value::List(items.get(from..to.max(from)).unwrap_or_default().to_vec()))
+        }
+        Value::String(text) => {
+            let characters: Vec<char> = text.chars().collect();
+            let (from, to) = (
+                bound(from, characters.len(), 0)?,
+                bound(to, characters.len(), characters.len())?,
+            );
+            Ok(Value::String(characters.get(from..to.max(from)).unwrap_or_default().iter().collect()))
+        }
+        Value::Null => Ok(Value::Null),
+        other => Err(OQLError::TypeError {
+            expected: "a list or a text".to_string(),
+            actual: other.type_name().to_string(),
+        }),
+    }
+}
+
+/// The names of an object's fields.
+fn object_keys(args: &[Value]) -> OQLResult<Value> {
+    match args {
+        [Value::Object(fields)] => Ok(Value::List(fields.keys().cloned().map(Value::String).collect())),
+        [Value::Null] => Ok(Value::Null),
+        _ => Err(wrong_arguments("keys(object)")),
+    }
+}
+
+/// A timestamp at the start of its year, month, week, day, hour or minute:
+/// `.placed.truncate("month")`.
+fn datetime_truncate(args: &[Value]) -> OQLResult<Value> {
+    let (at, unit) = match args {
+        [Value::DateTime(at), Value::String(unit)] => (*at, unit.as_str()),
+        [Value::Null, _] => return Ok(Value::Null),
+        _ => return Err(wrong_arguments("truncate(timestamp, \"year\" | \"month\" | \"week\" | \"day\" | \"hour\" | \"minute\")")),
+    };
+    let day = at.date_naive();
+    let start = match unit {
+        "year" => day.with_month(1).and_then(|day| day.with_day(1)).and_then(|day| day.and_hms_opt(0, 0, 0)),
+        "month" => day.with_day(1).and_then(|day| day.and_hms_opt(0, 0, 0)),
+        "week" => (day - Duration::days(i64::from(day.weekday().num_days_from_monday()))).and_hms_opt(0, 0, 0),
+        "day" => day.and_hms_opt(0, 0, 0),
+        "hour" => day.and_hms_opt(at.hour(), 0, 0),
+        "minute" => day.and_hms_opt(at.hour(), at.minute(), 0),
+        other => {
+            return Err(OQLError::FunctionError {
+                message: format!("truncate does not know the unit \"{other}\""),
+            })
+        }
+    };
+    Ok(start.map_or(Value::Null, |start| Value::DateTime(start.and_utc())))
+}
+
+/// The field a length of time is kept in: its seconds. A length of time is
+/// an object with this one field, so that it can be added to a timestamp
+/// and is what one timestamp less another gives.
+pub const DURATION_SECONDS: &str = "$seconds";
+
+/// A length of time of this many seconds.
+pub fn duration(seconds: i64) -> Value {
+    let mut fields = crate::document::Fields::default();
+    fields.insert(DURATION_SECONDS.to_string(), Value::Integer(seconds));
+    Value::Object(fields)
+}
+
+/// The seconds in a length of time, if the value is one.
+pub fn duration_seconds_of(value: &Value) -> Option<i64> {
+    match value {
+        Value::Object(fields) if fields.len() == 1 => match fields.get(DURATION_SECONDS) {
+            Some(Value::Integer(seconds)) => Some(*seconds),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn duration_of(args: &[Value], name: &str, seconds_each: i64) -> OQLResult<Value> {
+    match args {
+        [Value::Integer(count)] => Ok(duration(count.saturating_mul(seconds_each))),
+        [Value::Float(count)] => Ok(duration((count * seconds_each as f64) as i64)),
+        [Value::Null] => Ok(Value::Null),
+        _ => Err(wrong_arguments(&format!("{name}(how many)"))),
+    }
+}
+
+/// `.joined + days(30)`.
+fn duration_days(args: &[Value]) -> OQLResult<Value> {
+    duration_of(args, "days", 86_400)
+}
+
+fn duration_weeks(args: &[Value]) -> OQLResult<Value> {
+    duration_of(args, "weeks", 7 * 86_400)
+}
+
+fn duration_hours(args: &[Value]) -> OQLResult<Value> {
+    duration_of(args, "hours", 3_600)
+}
+
+fn duration_minutes(args: &[Value]) -> OQLResult<Value> {
+    duration_of(args, "minutes", 60)
+}
+
+fn duration_seconds(args: &[Value]) -> OQLResult<Value> {
+    duration_of(args, "seconds", 1)
+}
+
+/// Whether a value counts as true where a yes or no is wanted: anything
+/// but null and false. So `where { .email }` is the rows that have one.
+fn truthy(args: &[Value]) -> OQLResult<Value> {
+    match args {
+        [value] => Ok(Value::Boolean(!matches!(value, Value::Null | Value::Boolean(false)))),
+        _ => Err(wrong_arguments("truthy(value)")),
+    }
+}
+
+/// A list with the element at one place changed: wholly, with no path, or
+/// one field of it, by path. It is what `update { items[0].qty: 9 }` means.
+fn list_set(args: &[Value]) -> OQLResult<Value> {
+    let [Value::List(items), Value::Integer(at), Value::List(path), value] = args else {
+        return Err(wrong_arguments("a list, a place in it, and a value"));
+    };
+    let place = if *at < 0 { items.len() as i64 + at } else { *at };
+    if place < 0 || place as usize >= items.len() {
+        return Err(OQLError::FunctionError {
+            message: format!("the list has {} element(s), so there is none at [{at}]", items.len()),
+        });
+    }
+    let mut items = items.clone();
+    let mut target = &mut items[place as usize];
+    for name in path {
+        let Value::String(name) = name else {
+            return Err(wrong_arguments("field names along the path"));
+        };
+        let Value::Object(fields) = target else {
+            return Err(OQLError::FunctionError {
+                message: format!("the element at [{at}] has no field '{name}': it is not an object"),
+            });
+        };
+        target = fields.get_or_insert_with(name, || Value::Null);
+    }
+    *target = value.clone();
+    Ok(Value::List(items))
+}
+
+fn duration_in(args: &[Value], name: &str, seconds_each: f64) -> OQLResult<Value> {
+    match args {
+        [Value::Null] => Ok(Value::Null),
+        [length] => duration_seconds_of(length)
+            .map(|seconds| Value::Float(seconds as f64 / seconds_each))
+            .ok_or_else(|| wrong_arguments(&format!("{name}(a length of time)"))),
+        _ => Err(wrong_arguments(&format!("{name}(a length of time)"))),
+    }
+}
+
+/// `(now() - .joined).in_days()`: a length of time as a number of days.
+fn duration_in_days(args: &[Value]) -> OQLResult<Value> {
+    duration_in(args, "in_days", 86_400.0)
+}
+
+fn duration_in_hours(args: &[Value]) -> OQLResult<Value> {
+    duration_in(args, "in_hours", 3_600.0)
+}
+
+fn duration_in_minutes(args: &[Value]) -> OQLResult<Value> {
+    duration_in(args, "in_minutes", 60.0)
+}
+
+fn duration_in_seconds(args: &[Value]) -> OQLResult<Value> {
+    duration_in(args, "in_seconds", 1.0)
 }

@@ -319,7 +319,37 @@ impl<S: DocumentStore> QueryExecutor<S> {
 
     /// Execute an OQL query and return matching documents
     pub fn execute_query(&self, query: &OQLQuery) -> OQLResult<Vec<Document>> {
-        self.atomically(query, || self.execute_statement(query))
+        let outermost = !StatementGuard::active();
+        let mut rows = self.atomically(query, || self.execute_statement(query))?;
+        if outermost {
+            Self::name_plain_values(query, &mut rows);
+        }
+        Ok(rows)
+    }
+
+    /// The rows of `customers.city.distinct()` are plain values. In the
+    /// answer each is a row with one field, named for the path that gave
+    /// it, as `customers.select { city }.distinct()` would name it.
+    fn name_plain_values(query: &OQLQuery, rows: &mut [Document]) {
+        if !rows.iter().any(|row| row.fields.contains_key(SCALAR_ROW_FIELD)) {
+            return;
+        }
+        let name = query
+            .operations
+            .iter()
+            .rev()
+            .find_map(|operation| match operation {
+                Operation::Step(path) => path.path.last().cloned(),
+                _ => None,
+            })
+            .unwrap_or_else(|| "value".to_string());
+        for row in rows {
+            if row.fields.len() == 1 {
+                if let Some(value) = row.fields.remove(SCALAR_ROW_FIELD) {
+                    row.fields.insert(name.clone(), value);
+                }
+            }
+        }
     }
 
     /// Run a statement so that, if it writes, it is one indivisible step.
@@ -341,6 +371,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 operation,
                 Operation::Insert(_)
                     | Operation::InsertMany(_)
+                    | Operation::InsertFrom(_)
                     | Operation::Upsert(_)
                     | Operation::Update(_)
                     | Operation::Delete
@@ -368,6 +399,21 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
         if let Some(Operation::Call(arguments)) = query.operations.first() {
             return self.execute_call_query(query, arguments);
+        }
+        // A read of a collection that has no schema and has never held a
+        // row is far more often a misspelt name than an empty collection.
+        let writes = query.operations.iter().any(|operation| {
+            matches!(
+                operation,
+                Operation::Insert(_)
+                    | Operation::InsertMany(_)
+                    | Operation::InsertFrom(_)
+                    | Operation::Upsert(_)
+                    | Operation::FunctionDef(_)
+            )
+        });
+        if !writes && self.schema_of(&query.collection)?.is_none() {
+            self.check_collection_is_known(&query.collection)?;
         }
         profile_call!("execute_query", {
             if let Some(documents) = self.tie_broken_top_k(query)? {
@@ -721,7 +767,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
         // Check if this is an INSERT-only operation
         if query.operations.len() == 1 {
             match &query.operations[0] {
-                Operation::Insert(_) | Operation::InsertMany(_) => {
+                Operation::Insert(_) | Operation::InsertMany(_) | Operation::InsertFrom(_) => {
                     is_insert_only = true;
                 }
                 _ => {}
@@ -2199,6 +2245,10 @@ impl<S: DocumentStore> QueryExecutor<S> {
                             None => Place::Any,
                         })
                     }
+                    FieldType::String => return Ok(Place::Value { path, kind: "text" }),
+                    FieldType::Integer | FieldType::Float => return Ok(Place::Value { path, kind: "a number" }),
+                    FieldType::Boolean => return Ok(Place::Value { path, kind: "a yes or no" }),
+                    FieldType::DateTime => return Ok(Place::Value { path, kind: "a timestamp" }),
                     _ => return Ok(Place::Any),
                 }
             }
@@ -2208,6 +2258,18 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
         match place {
             Place::Any => Ok(Place::Any),
+            // `.joined.year`: there is nothing inside a timestamp to read.
+            // Almost always a function was meant.
+            Place::Value { path, kind } => {
+                let path = path.trim_end_matches("[]");
+                let meant = match self.functions.get_function(name).is_some() {
+                    true => format!(" {name} is a function: write .{path}.{name}()"),
+                    false => String::new(),
+                };
+                Err(OQLError::SchemaValidation {
+                    message: format!("'.{path}' is {kind}, which has no field '{name}'.{meant}"),
+                })
+            }
             Place::Rows(schema) => {
                 if DocumentSystemField::from_name(name).is_some() {
                     return Ok(Place::Any);
@@ -2347,6 +2409,11 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     place = self.path_place(&place, &path.path)?;
                 }
                 Operation::Combine { other, .. } => self.check_expression(&Place::Any, other)?,
+                Operation::Subtotals { keys, .. } => {
+                    for key in keys {
+                        self.check_expression(&place, key)?;
+                    }
+                }
                 Operation::Limit(_)
                 | Operation::Offset(_)
                 | Operation::LimitExpr(_)
@@ -2399,6 +2466,13 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     if compares && one_value(value) && self.declared_a_list(place, &access.path)? {
                         return Err(Self::list_compared_with_one(access, value, operator));
                     }
+                    if let (true, Expression::Literal(literal)) = (compares, value) {
+                        if let Some(kind) = self.declared_kind(place, &access.path) {
+                            if let Some(error) = Self::compared_across_kinds(access, kind, literal) {
+                                return Err(error);
+                            }
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -2427,7 +2501,52 @@ impl<S: DocumentStore> QueryExecutor<S> {
             Place::Shape { fields, .. } => {
                 is_list(fields.iter().find(|(name, _)| name == last).map(|(_, declared)| declared))
             }
-            Place::Shaped { .. } | Place::Any => false,
+            Place::Shaped { .. } | Place::Value { .. } | Place::Any => false,
+        })
+    }
+
+    /// What a path ends at, when the schema declares it a plain value.
+    fn declared_kind(&self, place: &Place, path: &[String]) -> Option<&'static str> {
+        // Every row's id is text, declared or not.
+        if path.len() == 1 && path[0] == "id" && matches!(place, Place::Rows(_)) {
+            return Some("text");
+        }
+        match self.path_place(place, path) {
+            Ok(Place::Value { kind, .. }) => Some(kind),
+            _ => None,
+        }
+    }
+
+    /// A field declared as one kind of value compared with a literal of
+    /// another. It could never hold, so it is almost certainly a mistake:
+    /// `.total > "50"` for `.total > 50`.
+    fn compared_across_kinds(access: &FieldAccess, kind: &str, value: &Literal) -> Option<OQLError> {
+        let (written, fits) = match value {
+            Literal::String(text) => (
+                format!("\"{text}\""),
+                // Text may be a timestamp written out.
+                kind == "text"
+                    || (kind == "a timestamp" && crate::value_semantics::parse_timestamp(text).is_some()),
+            ),
+            Literal::Integer(number) => (number.to_string(), kind == "a number"),
+            Literal::Float(number) => (number.to_string(), kind == "a number"),
+            Literal::Boolean(truth) => (truth.to_string(), kind == "a yes or no"),
+            Literal::Timestamp(_) | Literal::Null => return None,
+        };
+        if fits {
+            return None;
+        }
+        let what = match value {
+            Literal::String(_) if kind == "a timestamp" => "text that is not a timestamp",
+            Literal::String(_) => "text",
+            Literal::Integer(_) | Literal::Float(_) => "a number",
+            _ => "a yes or no",
+        };
+        Some(OQLError::SchemaValidation {
+            message: format!(
+                "'.{}' is {kind} and {written} is {what}, so comparing them could never hold",
+                access.path.join(".")
+            ),
         })
     }
 
@@ -2486,13 +2605,18 @@ impl<S: DocumentStore> QueryExecutor<S> {
             Some(len) => len > 0,
             None => !self.store.scan_documents(name)?.is_empty(),
         };
-        if holds_documents {
+        // A collection that was emptied is still a collection.
+        if holds_documents || self.store.collection_was_made(name)? {
             return Ok(());
         }
         let names = self.schema_names()?;
         let closest = names
             .iter()
-            .map(|known| (Self::edit_distance(known, name), known))
+            // Names differ by case: `CUSTOMERS` is not `customers`.
+            .map(|known| match known.eq_ignore_ascii_case(name) {
+                true => (0, known),
+                false => (Self::edit_distance(known, name), known),
+            })
             .filter(|(distance, _)| *distance <= 2)
             .min()
             .map(|(_, known)| format!(" Did you mean '{known}'?"))
@@ -3673,6 +3797,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 operation,
                 Operation::Insert(_)
                     | Operation::InsertMany(_)
+                    | Operation::InsertFrom(_)
                     | Operation::Upsert(_)
                     | Operation::Update(_)
                     | Operation::Delete
@@ -5184,6 +5309,8 @@ impl<S: DocumentStore> QueryExecutor<S> {
             Operation::InsertMany(insert_blocks) => {
                 self.apply_insert_many_operation(collection, insert_blocks)
             }
+            Operation::InsertFrom(rows) => self.apply_insert_from(collection, rows),
+            Operation::Subtotals { keys, cube } => self.apply_subtotals(documents, keys, *cube),
             Operation::Upsert(upsert_block) => {
                 self.apply_upsert_operation(documents, collection, upsert_block)
             }
@@ -6026,6 +6153,27 @@ impl<S: DocumentStore> QueryExecutor<S> {
                             "query parameter {name} has no value; bind it before executing"
                         ),
                     });
+                }
+                // A bare word that is none of those and not a field the
+                // row's collection declares names nothing. Reading it as
+                // null would turn a slip into a wrong answer: a status
+                // written without its quotes, a word from another language.
+                if document.get_field(name).is_none()
+                    && DocumentSystemField::from_name(name).is_none()
+                    && !name.starts_with('_')
+                    && document.schema != "group"
+                {
+                    if let Some(schema) = self.schema_of(&document.schema)? {
+                        if !schema.fields.contains_key(name) && !self.is_relationship(&document.schema, name)? {
+                            return Err(OQLError::SchemaValidation {
+                                message: format!(
+                                    "'{name}' is not a field of '{}', nor anything else with a name here. \
+                                     Text is written in quotes",
+                                    document.schema
+                                ),
+                            });
+                        }
+                    }
                 }
                 self.get_field_value(
                     document,
@@ -8471,12 +8619,108 @@ impl<S: DocumentStore> QueryExecutor<S> {
             {
                 Ok(Value::List(only.clone()))
             }
+            // One more on the end: `tags += "new"`.
+            (Value::List(items), one)
+                if matches!(operator, BinaryOperator::Add)
+                    && !one.is_null()
+                    && crate::functions::duration_seconds_of(one).is_none() =>
+            {
+                Ok(Value::List(items.iter().cloned().chain([one.clone()]).collect()))
+            }
+            // A list without some values: `tags -= ["old"]`, `.tags - "old"`.
+            (Value::List(items), without) if matches!(operator, BinaryOperator::Subtract) => {
+                let gone = |item: &Value| match without {
+                    Value::List(those) => those.iter().any(|one| self.values_equal(item, one)),
+                    one => self.values_equal(item, one),
+                };
+                Ok(Value::List(items.iter().filter(|item| !gone(item)).cloned().collect()))
+            }
+            // Time. A length of time is what `days(3)` gives and what one
+            // timestamp less another gives. Text that is a timestamp is one.
+            _ if matches!(operator, BinaryOperator::Add | BinaryOperator::Subtract)
+                && Self::is_time(left)
+                && Self::is_time(right) =>
+            {
+                let adding = matches!(operator, BinaryOperator::Add);
+                let length = crate::functions::duration_seconds_of;
+                let instant = |value: &Value| match value {
+                    Value::DateTime(at) => Some(*at),
+                    Value::String(text) => crate::value_semantics::parse_timestamp(text),
+                    _ => None,
+                };
+                let moved = |at: chrono::DateTime<chrono::Utc>, seconds: i64| {
+                    at.checked_add_signed(chrono::Duration::seconds(seconds))
+                        .map(Value::DateTime)
+                        .ok_or_else(|| OQLError::FunctionError {
+                            message: "that time is outside what a timestamp can hold".to_string(),
+                        })
+                };
+                match (instant(left), length(left), instant(right), length(right)) {
+                    (Some(at), _, _, Some(seconds)) => moved(at, if adding { seconds } else { -seconds }),
+                    (_, Some(seconds), Some(at), _) if adding => moved(at, seconds),
+                    (Some(later), _, Some(earlier), _) if !adding => {
+                        Ok(crate::functions::duration((later - earlier).num_seconds()))
+                    }
+                    (_, Some(a), _, Some(b)) => Ok(crate::functions::duration(if adding { a + b } else { a - b })),
+                    _ => Err(OQLError::FunctionError {
+                        message: "a length of time is added to or taken from a timestamp, and one \
+                                  timestamp less another is the length of time between them"
+                            .to_string(),
+                    }),
+                }
+            }
+            // A length of time times or over a number.
+            (length, Value::Integer(_) | Value::Float(_))
+                if matches!(operator, BinaryOperator::Multiply | BinaryOperator::Divide)
+                    && crate::functions::duration_seconds_of(length).is_some() =>
+            {
+                let seconds = crate::functions::duration_seconds_of(length).unwrap_or_default() as f64;
+                let by = match right {
+                    Value::Integer(by) => *by as f64,
+                    Value::Float(by) => *by,
+                    _ => 1.0,
+                };
+                match operator {
+                    BinaryOperator::Divide if by == 0.0 => Err(OQLError::FunctionError {
+                        message: "Division by zero".to_string(),
+                    }),
+                    BinaryOperator::Divide => Ok(crate::functions::duration((seconds / by) as i64)),
+                    _ => Ok(crate::functions::duration((seconds * by) as i64)),
+                }
+            }
+            // One length of time over another is how many times it goes:
+            // `(now() - .joined) / days(1)` is the days since.
+            (a, b)
+                if matches!(operator, BinaryOperator::Divide)
+                    && crate::functions::duration_seconds_of(a).is_some()
+                    && crate::functions::duration_seconds_of(b).is_some() =>
+            {
+                let (a, b) = (
+                    crate::functions::duration_seconds_of(a).unwrap_or_default(),
+                    crate::functions::duration_seconds_of(b).unwrap_or_default(),
+                );
+                match b {
+                    0 => Err(OQLError::FunctionError {
+                        message: "Division by zero".to_string(),
+                    }),
+                    _ => Ok(Value::Float(a as f64 / b as f64)),
+                }
+            }
             _ => Err(OQLError::FunctionError {
                 message: format!(
                     "Invalid binary operation: {:?} {:?} {:?}",
                     left, operator, right
                 ),
             }),
+        }
+    }
+
+    /// A timestamp, text that is one, or a length of time.
+    fn is_time(value: &Value) -> bool {
+        match value {
+            Value::DateTime(_) => true,
+            Value::String(text) => crate::value_semantics::parse_timestamp(text).is_some(),
+            other => crate::functions::duration_seconds_of(other).is_some(),
         }
     }
 
@@ -8635,8 +8879,11 @@ impl<S: DocumentStore> QueryExecutor<S> {
             if field_access.path.len() == 1 {
                 let field_name = &field_access.path[0];
 
-                // Handle special fields
-                if let Some(system_field) = DocumentSystemField::from_name(field_name) {
+                // Handle special fields. A group is not a row of the
+                // collection: `.id` on one is the ids of its rows, read
+                // below like any other field the group does not key on.
+                let of_group = document.schema == "group" && document.fields.contains_key("_group_rows");
+                if let Some(system_field) = DocumentSystemField::from_name(field_name).filter(|_| !of_group) {
                     return Ok(system_field.value(document));
                 }
                 // Use optimized field access with caching.
@@ -9117,14 +9364,34 @@ impl<S: DocumentStore> QueryExecutor<S> {
             (left, right),
             (
                 Value::Reference(_) | Value::GlobalReference(_),
-                Value::String(_) | Value::List(_)
+                Value::String(_) | Value::List(_) | Value::Object(_)
             ) | (
-                Value::String(_),
+                Value::String(_) | Value::Object(_),
                 Value::Reference(_) | Value::GlobalReference(_) | Value::List(_)
             )
         ) {
-            let left = self.reference_as_id(left)?;
-            let right = self.reference_as_id(right)?;
+            // A row is likewise identified by its id, so a reference may be
+            // compared with a row, and looked for among the rows of a
+            // query: `.customer in customers.where { .city == "Lagos" }`.
+            let referring = |value: &Value| matches!(value, Value::Reference(_) | Value::GlobalReference(_));
+            let rows = referring(left) || referring(right);
+            let left = Self::row_as_id(self.reference_as_id(left)?, rows);
+            let right = Self::row_as_id(self.reference_as_id(right)?, rows);
+            // `.customer == customers.where { .name == "Bob" }`: a query
+            // that gives one row stands for that row when a reference is
+            // asked whether it is it.
+            let the_one = |value: Value, other: &Value| match value {
+                Value::List(mut items)
+                    if rows
+                        && items.len() == 1
+                        && matches!(other, Value::String(_))
+                        && matches!(operator, ComparisonOperator::Equal | ComparisonOperator::NotEqual) =>
+                {
+                    items.remove(0)
+                }
+                value => value,
+            };
+            let (left, right) = (the_one(left.clone(), &right), the_one(right.clone(), &left));
             return Ok(crate::value_semantics::matches(&left, operator, &right));
         }
         // A list of references, as a path through a collection gives, is
@@ -9139,6 +9406,22 @@ impl<S: DocumentStore> QueryExecutor<S> {
             }
         }
         Ok(crate::value_semantics::matches(left, operator, right))
+    }
+
+    /// A row, or each row of a list, as its id, when `rows` are being
+    /// compared with a reference. Anything else is left as it is.
+    fn row_as_id(value: Value, rows: bool) -> Value {
+        if !rows {
+            return value;
+        }
+        match value {
+            Value::Object(fields) => match fields.get("id") {
+                Some(id @ Value::String(_)) => id.clone(),
+                _ => Value::Object(fields),
+            },
+            Value::List(items) => Value::List(items.into_iter().map(|item| Self::row_as_id(item, true)).collect()),
+            other => other,
+        }
     }
 
     /// Replace a reference, or references inside a list, with the id of the
@@ -9233,6 +9516,21 @@ impl<S: DocumentStore> QueryExecutor<S> {
             return self.select_by_position(documents, select_block);
         }
 
+        // A select with a total and a row's own value beside it, as in
+        // `select { id, share: .total / sum(.total) }`, is every row with
+        // the total over all of them: one partition that holds every row.
+        if has_aggregation
+            && !is_grouped_data
+            && select_block.fields.iter().any(|field| Self::reads_the_row(&field.expression))
+        {
+            let all_rows = GroupByBlock {
+                fields: Vec::new(),
+                computed: Vec::new(),
+            };
+            let documents = self.apply_partition_by(documents, &all_rows)?;
+            return self.select_by_position(documents, select_block);
+        }
+
         if has_aggregation && !is_grouped_data {
             // Handle aggregation over all documents - return single result document
             let mut projected_fields = crate::document::Fields::default();
@@ -9311,6 +9609,36 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 projected_documents.push(document.with_projected_fields(projected_fields));
             }
             Ok(projected_documents)
+        }
+    }
+
+    /// Whether an expression reads a value of the row in hand, outside any
+    /// aggregate and any chain over a collection.
+    fn reads_the_row(expression: &Expression) -> bool {
+        let any = |parts: &[&Expression]| parts.iter().any(|part| Self::reads_the_row(part));
+        match expression {
+            Expression::FieldAccess(access) => !access.path.is_empty() && access.path[0] != "*",
+            Expression::Identifier(name) => {
+                !name.starts_with('$')
+                    && CallFrame::value(name).is_none()
+                    && CallFrame::row(name).is_none()
+                    && CallFrame::collection(name).is_none()
+            }
+            Expression::FunctionCall { name, .. } if Self::is_aggregate_name(name) => false,
+            Expression::FunctionCall { name, args } => {
+                !Self::is_library_statistic_of_a_path(name, args) && args.iter().any(Self::reads_the_row)
+            }
+            Expression::BinaryOp { left, right, .. }
+            | Expression::LogicalAnd(left, right)
+            | Expression::LogicalOr(left, right) => any(&[left, right]),
+            Expression::LogicalNot(inner) => Self::reads_the_row(inner),
+            Expression::IfThenElse { then_expr, else_expr, .. } => any(&[then_expr, else_expr]),
+            Expression::ChainedAccess { base, .. } => Self::reads_the_row(base),
+            Expression::ArrayAccess { array, index } => any(&[array, index]),
+            Expression::ArrayLiteral(items) | Expression::Block(items) => items.iter().any(Self::reads_the_row),
+            Expression::ObjectLiteral(fields) => fields.iter().any(|field| Self::reads_the_row(&field.value)),
+            // A chain over a collection, a query, a comparison, a literal.
+            _ => false,
         }
     }
 
@@ -9496,6 +9824,29 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 arity(0..=0, "row_number()")?;
                 Ok(Value::Integer(place as i64 + 1))
             }
+            // The rows of the partition dealt into `n` buckets as evenly as
+            // they go, the earlier buckets taking what is left over.
+            "ntile" => {
+                arity(1..=1, "ntile(buckets)")?;
+                let buckets = (self.evaluate_row_count(name, &args[0])? as usize).max(1);
+                let (size, over) = (members.len() / buckets, members.len() % buckets);
+                let bucket = match place < over * (size + 1) {
+                    true => place / (size + 1),
+                    false => over + (place - over * (size + 1)) / size.max(1),
+                };
+                Ok(Value::Integer(bucket as i64 + 1))
+            }
+            // The share of the partition's rows at or before this one's
+            // value: rows with the same value share it.
+            "cume_dist" => {
+                arity(1..=1, "with the value the rows are ordered by, as in cume_dist(.score)")?;
+                let mine = at(members[place], &args[0])?;
+                let mut end = place + 1;
+                while end < members.len() && self.values_equal(&mine, &at(members[end], &args[0])?) {
+                    end += 1;
+                }
+                Ok(Value::Float(end as f64 / members.len() as f64))
+            }
             "prev" | "next" => {
                 arity(1..=2, "prev(value) or prev(value, rows)")?;
                 let distance = match args.get(1) {
@@ -9537,8 +9888,15 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     state.last = Some(value);
                     state.taken += 1;
                 }
-                let answer = if name == "rank" { state.rank } else { state.dense_rank };
+                let answer = if name == "dense_rank" { state.dense_rank } else { state.rank };
                 frame.running.borrow_mut().insert(key, state);
+                // How far through the partition the rank is, from 0 to 1.
+                if name == "percent_rank" {
+                    return Ok(Value::Float(match members.len() {
+                        0 | 1 => 0.0,
+                        rows => (answer - 1) as f64 / (rows - 1) as f64,
+                    }));
+                }
                 Ok(Value::Integer(answer))
             }
         }
@@ -9818,6 +10176,27 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 );
                 continue;
             }
+            // `...address` puts the fields of an object in the row.
+            if let Expression::FunctionCall { name, args } = &select_field.expression {
+                if name == crate::parser::SPREAD_FIELDS {
+                    let spread = match args.first() {
+                        Some(of) => self.with_reference_rows(self.evaluate_expression(document, of)?)?,
+                        None => Value::Null,
+                    };
+                    match spread {
+                        Value::Object(fields) => projected_fields
+                            .extend(fields.iter().map(|(name, value)| (name.clone(), value.clone()))),
+                        Value::Null => {}
+                        other => {
+                            return Err(OQLError::TypeError {
+                                expected: "an object to take the fields of".to_string(),
+                                actual: other.type_name().to_string(),
+                            })
+                        }
+                    }
+                    continue;
+                }
+            }
             // `-name` leaves out a field that `*` brought in.
             if matches!(&select_field.expression, Expression::Identifier(marker) if marker == crate::parser::OMITTED_FIELD)
             {
@@ -9846,7 +10225,32 @@ impl<S: DocumentStore> QueryExecutor<S> {
 
             projected_fields.insert(field_name, value);
         }
+        // Plain values shaped by one unnamed entry are still plain values:
+        // `.tags.select { upper(.) }` is a list of text, not of objects.
+        if let ([only], true) = (select_block.fields.as_slice(), document.fields.contains_key(SCALAR_ROW_FIELD)) {
+            let named = match &only.expression {
+                Expression::FieldAccess(access) => !access.path.is_empty(),
+                _ => false,
+            };
+            if only.alias.is_none() && !named && projected_fields.len() == 1 {
+                if let Some(value) = projected_fields.values().next().cloned() {
+                    return Ok(crate::document::Fields::from_iter([(SCALAR_ROW_FIELD.to_string(), value)]));
+                }
+            }
+        }
         Ok(projected_fields)
+    }
+
+    /// A reference as the row it is to, for the fields of that row to be
+    /// read; anything else as it is.
+    fn with_reference_rows(&self, value: Value) -> OQLResult<Value> {
+        Ok(match &value {
+            Value::Reference(reference) => match self.referenced_document(reference)? {
+                Some(document) => Self::row_as_value(&document),
+                None => Value::Null,
+            },
+            _ => value,
+        })
     }
 
     /// Apply INSERT operation
@@ -10285,6 +10689,25 @@ impl<S: DocumentStore> QueryExecutor<S> {
         )
     }
 
+    /// `archive.insert(orders.where { .. })`: insert the rows of a query.
+    /// Each row goes in with the fields it has and under the id it has, and
+    /// is typed and checked against this collection's schema like any other
+    /// insert. One durable write for all of them.
+    fn apply_insert_from(&self, collection: &str, rows: &Expression) -> OQLResult<Vec<Document>> {
+        let scope = Document::new(collection.to_string(), crate::document::Fields::default());
+        let rows = self.rows_of_expression(&scope, rows)?;
+        self.insert_rows(
+            collection,
+            rows.len(),
+            rows.iter().map(|row| {
+                let id = (!row.fields.contains_key("id") && !row.id.is_empty())
+                    .then(|| Ok(("id".to_string(), Value::String(row.id.clone()))));
+                id.into_iter()
+                    .chain(row.fields.iter().map(|(name, value)| Ok((name.clone(), value.clone()))))
+            }),
+        )
+    }
+
     /// Insert documents given as field values rather than as OQL text.
     ///
     /// This is `collection.insert [ .. ]` without the parse: the same type
@@ -10547,6 +10970,23 @@ impl<S: DocumentStore> QueryExecutor<S> {
         use crate::schema::FieldType;
 
         match (value, field_type) {
+            // A reference may be given as the row it is to: the row itself,
+            // or a query that gives exactly one.
+            (Value::Object(row), FieldType::Reference(_)) if matches!(row.get("id"), Some(Value::String(_))) => {
+                let id = row.get("id").cloned().unwrap_or(Value::Null);
+                self.convert_to_schema_type(id, field_type, _current_collection)
+            }
+            (Value::List(mut rows), FieldType::Reference(ref_type)) => match rows.len() {
+                1 => self.convert_to_schema_type(rows.remove(0), field_type, _current_collection),
+                0 if !ref_type.required => Ok(Value::Null),
+                found => Err(OQLError::ReferenceError {
+                    message: format!(
+                        "a reference to '{}' is to one row, and the query given for it has {found}. \
+                         Narrow it, or take first()",
+                        ref_type.target_schema
+                    ),
+                }),
+            },
             // If we have a string but schema expects a reference, convert it
             (Value::String(ref_id), FieldType::Reference(ref_type)) => {
                 let target_schema = &ref_type.target_schema;
@@ -10647,8 +11087,19 @@ impl<S: DocumentStore> QueryExecutor<S> {
         let schema = self.schema_of(&document.schema).ok().flatten();
 
         for update_field in &update_block.fields {
-            let mut new_value = self.evaluate_expression(&document, &update_field.value)?;
             let path: Vec<&str> = update_field.name.split('.').collect();
+            // `-email`: the field is taken off the row.
+            if matches!(&update_field.value, Expression::Identifier(marker) if marker == crate::parser::REMOVED_FIELD)
+            {
+                if update_field.name == "id" {
+                    return Err(OQLError::SchemaValidation {
+                        message: "a row cannot be without its id".to_string(),
+                    });
+                }
+                Self::take_off(&mut document.fields, &path);
+                continue;
+            }
+            let mut new_value = self.evaluate_expression(&document, &update_field.value)?;
             if path.len() == 1 {
                 if update_field.name == "id"
                     && !self.values_equal(&new_value, &Value::String(document.id.clone()))
@@ -10691,6 +11142,21 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
 
         Ok(document)
+    }
+
+    /// Take the field at `path` off, if it is there.
+    fn take_off(fields: &mut crate::document::Fields, path: &[&str]) {
+        match path {
+            [] => {}
+            [name] => {
+                fields.remove(name);
+            }
+            [name, rest @ ..] => {
+                if let Some(Value::Object(inner)) = fields.get_mut(name) {
+                    Self::take_off(inner, rest);
+                }
+            }
+        }
     }
 
     fn field_type_is_object(field_type: &crate::schema::FieldType) -> bool {
@@ -11186,17 +11652,41 @@ impl<S: DocumentStore> QueryExecutor<S> {
             "variance" | "stddev" | "variance_pop" | "stddev_pop" => {
                 self.library_or_user_function(document, name, args)
             }
+            // `avg(orders.total)`: an aggregate given a collection, or the
+            // rows of a query, is over those rows.
+            "count" | "sum" | "avg" | "min" | "max" | "median" | "product"
+                if args.len() == 1 && self.rows_named_by(&args[0])?.is_some() =>
+            {
+                let query = self.rows_named_by(&args[0])?.expect("just seen");
+                self.evaluate_expression(document, &Expression::QueryExpression { query: query.with(name) })
+            }
             "median" | "percentile" | "product" => Err(OQLError::FunctionError {
                 message: format!(
                     "{name}() has no collection here; use it in select or having, or call it \
                      on a collection as in .orders.{name}(..)"
                 ),
             }),
+            // `sum(.items.qty)`: over the values a path through a list gives.
+            "sum" | "avg" | "min" | "max" if args.len() == 1 && self.gives_many(document, &args[0])? => {
+                let Value::List(values) = self.evaluate_expression(document, &args[0])? else {
+                    unreachable!("just seen to be a list");
+                };
+                Self::reduce_values(name, &values)
+            }
+            // An aggregate of one row's own value, as in
+            // `where { .total > avg(.total) }`, is that value: it says
+            // nothing, and what was meant is the average over a collection.
+            "sum" | "avg" | "min" | "max" if args.len() == 1 => Err(OQLError::FunctionError {
+                message: format!(
+                    "{name}(..) here is given one row, so there is nothing to take the {name} over. \
+                     Name the rows, as in {}.{name}(.field), or use it in a select",
+                    match document.schema.as_str() {
+                        "" => "collection",
+                        schema => schema,
+                    }
+                ),
+            }),
             "count" => self.evaluate_count_function(document, args),
-            "sum" if args.len() == 1 => self.evaluate_sum_function(document, args),
-            "avg" if args.len() == 1 => self.evaluate_avg_function(document, args),
-            "min" if args.len() == 1 => self.evaluate_min_function(document, args),
-            "max" if args.len() == 1 => self.evaluate_max_function(document, args),
             _ => {
                 // Check if it's a built-in function
                 if let Some(func) = self.functions.get_function(name) {
@@ -11216,6 +11706,80 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 }
             }
         }
+    }
+
+    /// The query an expression names the rows of: `orders.total` is the
+    /// totals of every order. `None` for anything that is about the row in
+    /// hand.
+    fn rows_named_by(&self, expression: &Expression) -> OQLResult<Option<NamedRows>> {
+        let mut path = Vec::new();
+        let mut at = expression;
+        loop {
+            match at {
+                Expression::ChainedAccess { base, field } => {
+                    path.push(field.clone());
+                    at = base;
+                }
+                Expression::Identifier(name)
+                    if CallFrame::value(name).is_none()
+                        && CallFrame::row(name).is_none()
+                        && CallFrame::collection(name).is_none()
+                        && !name.starts_with('$')
+                        && self.schema_of(name)?.is_some() =>
+                {
+                    path.reverse();
+                    return Ok(Some(NamedRows {
+                        collection: name.clone(),
+                        operations: Vec::new(),
+                        path,
+                    }));
+                }
+                Expression::QueryExpression { query } if !path.is_empty() => {
+                    path.reverse();
+                    return Ok(Some(NamedRows {
+                        collection: query.collection.clone(),
+                        operations: query.operations.clone(),
+                        path,
+                    }));
+                }
+                _ => return Ok(None),
+            }
+        }
+    }
+
+    /// Whether an expression gives a list for this row.
+    fn gives_many(&self, document: &Document, expression: &Expression) -> OQLResult<bool> {
+        Ok(match expression {
+            Expression::FieldAccess(_) | Expression::ChainedAccess { .. } => {
+                matches!(self.evaluate_expression(document, expression)?, Value::List(_))
+            }
+            _ => false,
+        })
+    }
+
+    /// The sum, average, least or greatest of a list of numbers.
+    fn reduce_values(name: &str, values: &[Value]) -> OQLResult<Value> {
+        let mut numbers = Vec::with_capacity(values.len());
+        let mut whole = true;
+        for value in values {
+            whole &= matches!(value, Value::Integer(_) | Value::Null);
+            if let Some(number) = Self::number_for_aggregate(value)? {
+                numbers.push(number);
+            }
+        }
+        if numbers.is_empty() {
+            return Ok(if name == "sum" { Value::Integer(0) } else { Value::Null });
+        }
+        let result = match name {
+            "sum" => numbers.iter().sum::<f64>(),
+            "avg" => return Ok(Value::Float(numbers.iter().sum::<f64>() / numbers.len() as f64)),
+            "min" => numbers.iter().copied().fold(f64::INFINITY, f64::min),
+            _ => numbers.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        };
+        Ok(match whole {
+            true => Value::Integer(result as i64),
+            false => Value::Float(result),
+        })
     }
 
     /// What an aggregate call such as `sum(.amount)` aggregates, or `None`
@@ -11321,6 +11885,24 @@ impl<S: DocumentStore> QueryExecutor<S> {
             }
             AggregateInput::Expression(expression) => self.evaluate_expression(row, expression),
         }
+    }
+
+    /// The value one row gives an aggregate that takes one value a row.
+    /// A list here means the path went through a list on each row, and a
+    /// total over lists is no number: say how each meaning is written.
+    fn one_value_to_aggregate(&self, name: &str, row: &Document, input: &AggregateInput) -> OQLResult<Value> {
+        let value = self.aggregate_input_value(row, input)?;
+        if let (Value::List(_), AggregateInput::Path(path)) = (&value, input) {
+            let (last, before) = path.split_last().map(|(last, before)| (last.as_str(), before.join("."))).unwrap_or(("", String::new()));
+            return Err(OQLError::FunctionError {
+                message: format!(
+                    "{name}(.{}) is over the rows, and each row holds a list there. \
+                     For each row's own {name} write .{before}.{name}(.{last})",
+                    path.join(".")
+                ),
+            });
+        }
+        Ok(value)
     }
 
     fn expression_contains_aggregate(expression: &Expression) -> bool {
@@ -11695,88 +12277,6 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
     }
 
-    /// Evaluate SUM function
-    fn evaluate_sum_function(&self, document: &Document, args: &[Expression]) -> OQLResult<Value> {
-        if args.len() != 1 {
-            return Err(OQLError::Generic {
-                message: "SUM function expects exactly 1 argument".to_string(),
-            });
-        }
-
-        let value = self.evaluate_expression(document, &args[0])?;
-        match value {
-            Value::Integer(i) => Ok(Value::Integer(i)),
-            Value::Float(f) => Ok(Value::Float(f)),
-            Value::Null => Ok(Value::Integer(0)),
-            _ => Err(OQLError::TypeError {
-                expected: "numeric type".to_string(),
-                actual: value.type_name().to_string(),
-            }),
-        }
-    }
-
-    /// Evaluate AVG function
-    fn evaluate_avg_function(&self, document: &Document, args: &[Expression]) -> OQLResult<Value> {
-        if args.len() != 1 {
-            return Err(OQLError::Generic {
-                message: "AVG function expects exactly 1 argument".to_string(),
-            });
-        }
-
-        let value = self.evaluate_expression(document, &args[0])?;
-        match value {
-            Value::Integer(i) => Ok(Value::Float(i as f64)),
-            Value::Float(f) => Ok(Value::Float(f)),
-            Value::Null => Ok(Value::Null),
-            _ => Err(OQLError::TypeError {
-                expected: "numeric type".to_string(),
-                actual: value.type_name().to_string(),
-            }),
-        }
-    }
-
-    /// Evaluate MIN function
-    fn evaluate_min_function(&self, document: &Document, args: &[Expression]) -> OQLResult<Value> {
-        if args.len() != 1 {
-            return Err(OQLError::Generic {
-                message: "MIN function expects exactly 1 argument".to_string(),
-            });
-        }
-
-        let value = self.evaluate_expression(document, &args[0])?;
-        match value {
-            Value::Integer(_) | Value::Float(_) | Value::String(_) | Value::DateTime(_) => {
-                Ok(value)
-            }
-            Value::Null => Ok(Value::Null),
-            _ => Err(OQLError::TypeError {
-                expected: "comparable type".to_string(),
-                actual: value.type_name().to_string(),
-            }),
-        }
-    }
-
-    /// Evaluate MAX function
-    fn evaluate_max_function(&self, document: &Document, args: &[Expression]) -> OQLResult<Value> {
-        if args.len() != 1 {
-            return Err(OQLError::Generic {
-                message: "MAX function expects exactly 1 argument".to_string(),
-            });
-        }
-
-        let value = self.evaluate_expression(document, &args[0])?;
-        match value {
-            Value::Integer(_) | Value::Float(_) | Value::String(_) | Value::DateTime(_) => {
-                Ok(value)
-            }
-            Value::Null => Ok(Value::Null),
-            _ => Err(OQLError::TypeError {
-                expected: "comparable type".to_string(),
-                actual: value.type_name().to_string(),
-            }),
-        }
-    }
-
     /// Execute aggregation over a collection of documents
     pub fn execute_aggregation(
         &self,
@@ -11825,7 +12325,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 let mut count = 0;
 
                 for doc in documents {
-                    let value = self.aggregate_input_value(doc, input)?;
+                    let value = self.one_value_to_aggregate(function_name, doc, input)?;
 
                     match value {
                         Value::Integer(i) => {
@@ -11872,7 +12372,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 let mut count = 0;
 
                 for doc in documents {
-                    let value = self.aggregate_input_value(doc, input)?;
+                    let value = self.one_value_to_aggregate(function_name, doc, input)?;
 
                     match value {
                         Value::Integer(i) => {
@@ -11903,7 +12403,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 let mut min_value: Option<Value> = None;
 
                 for doc in documents {
-                    let value = self.aggregate_input_value(doc, input)?;
+                    let value = self.one_value_to_aggregate(function_name, doc, input)?;
 
                     if value.is_null() {
                         continue;
@@ -11927,7 +12427,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 let mut max_value: Option<Value> = None;
 
                 for doc in documents {
-                    let value = self.aggregate_input_value(doc, input)?;
+                    let value = self.one_value_to_aggregate(function_name, doc, input)?;
 
                     if value.is_null() {
                         continue;
@@ -12005,7 +12505,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
             "median" => {
                 let mut numbers = Vec::with_capacity(documents.len());
                 for doc in documents {
-                    let value = self.aggregate_input_value(doc, input)?;
+                    let value = self.one_value_to_aggregate(function_name, doc, input)?;
                     numbers.extend(Self::number_for_aggregate(&value)?);
                 }
                 Self::percentile_of(numbers, 0.5)
@@ -12141,6 +12641,42 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
 
         Ok(grouped_documents)
+    }
+
+    /// The step in front of a grouping with subtotals: each row once for
+    /// every level, carrying the keys as that level sees them.
+    fn apply_subtotals(&self, documents: Vec<Document>, keys: &[Expression], cube: bool) -> OQLResult<Vec<Document>> {
+        use crate::parser::{SUBTOTAL_KEY, SUBTOTAL_LEVEL};
+        // A level is the set of keys it leaves out, one bit a key.
+        let levels: Vec<u32> = match cube {
+            true => (0..1u32 << keys.len()).collect(),
+            // A rollup leaves out the last key, then the last two, ...
+            false => (0..=keys.len()).map(|left_out| ((1u32 << left_out) - 1) << (keys.len() - left_out)).collect(),
+        };
+        let mut rows = Vec::with_capacity(documents.len() * levels.len());
+        for document in documents {
+            let mut values = Vec::with_capacity(keys.len());
+            for key in keys {
+                values.push(self.evaluate_expression(&document, key)?);
+            }
+            for level in &levels {
+                let mut row = document.clone();
+                for (at, value) in values.iter().enumerate() {
+                    let kept = level & (1 << at) == 0;
+                    row.fields.insert(
+                        format!("{SUBTOTAL_KEY}{at}"),
+                        if kept { value.clone() } else { Value::Null },
+                    );
+                }
+                let level = match cube {
+                    true => *level as i64,
+                    false => level.count_ones() as i64,
+                };
+                row.fields.insert(SUBTOTAL_LEVEL.to_string(), Value::Integer(level));
+                rows.push(row);
+            }
+        }
+        Ok(rows)
     }
 
     /// Apply HAVING operation to grouped documents
@@ -14085,11 +14621,39 @@ const SCALAR_ROW_FIELD: &str = "$value";
 /// The aggregate that `.field.distinct().count()` is run as. It has no
 /// spelling of its own in the language, so the name is one that cannot be
 /// written.
-const DISTINCT_COUNT: &str = "$distinct_count";
+const DISTINCT_COUNT: &str = crate::parser::DISTINCT_COUNT;
 
 /// Where `partition_by` notes a row's partition for the next `select`. Not
 /// a legal field name, so it cannot collide with data.
 const PARTITION_FIELD: &str = "$partition";
+
+/// The rows an expression names, and the path to the values wanted of them.
+struct NamedRows {
+    collection: String,
+    operations: Vec<Operation>,
+    path: Vec<String>,
+}
+
+impl NamedRows {
+    /// The query that takes `aggregate` over those values.
+    fn with(self, aggregate: &str) -> OQLQuery {
+        let mut operations = self.operations;
+        if !self.path.is_empty() {
+            operations.push(Operation::Step(FieldAccess { path: self.path }));
+        }
+        operations.push(match aggregate {
+            "count" => Operation::Count,
+            other => Operation::AggregateExpr {
+                function: other.to_string(),
+                input: Expression::FieldAccess(FieldAccess { path: Vec::new() }),
+            },
+        });
+        OQLQuery {
+            collection: self.collection,
+            operations,
+        }
+    }
+}
 
 /// What a path has reached, as far as the schemas say: used to tell a name
 /// that is misspelt from one that is merely absent.
@@ -14110,6 +14674,13 @@ enum Place {
     Shaped {
         names: Vec<String>,
         rows: Option<Arc<Schema>>,
+    },
+    /// A plain value: text, a number, a yes or no, a timestamp. It has no
+    /// fields, so a path that goes on past it is a mistake.
+    Value {
+        /// The path that led to it, as it would be written.
+        path: String,
+        kind: &'static str,
     },
     /// Anything whose fields are not declared: nothing can be ruled out.
     Any,
@@ -14380,6 +14951,9 @@ impl WindowFrame {
             "row_number"
                 | "rank"
                 | "dense_rank"
+                | "percent_rank"
+                | "cume_dist"
+                | "ntile"
                 | "prev"
                 | "next"
         )
@@ -14769,6 +15343,14 @@ impl Accumulator {
     }
 
     fn not_numeric(value: ProjectedValueRef<'_>) -> OQLError {
+        // `sum(.items.qty)`: the path goes through a list on every row.
+        if value.to_owned().type_name() == "List" {
+            return OQLError::FunctionError {
+                message: "this total is over the rows, and each row holds a list there. For each row's \
+                          own total, ask the list: .items.sum(.qty), not sum(.items.qty)"
+                    .to_string(),
+            };
+        }
         OQLError::TypeError {
             expected: "numeric type".to_string(),
             actual: value.to_owned().type_name().to_string(),
@@ -16157,8 +16739,19 @@ mod tests {
         let results = executor.scan_collection("empty_collection").unwrap();
         assert_eq!(results.len(), 0);
 
-        // Test query on empty collection
+        // A name nothing was ever written under is a mistake, not an
+        // empty collection.
         let query = parse_oql(r#"empty_collection.where { .name == "Alice" }"#).unwrap();
+        let error = executor.execute_query(&query).unwrap_err().to_string();
+        assert!(error.contains("'empty_collection' is not defined"), "{error}");
+
+        // A collection that was written to and then emptied still answers.
+        for text in [
+            r#"empty_collection.insert { id: "a", name: "Alice" }"#,
+            r#"empty_collection.where { .name == "Alice" }.delete()"#,
+        ] {
+            executor.execute_query(&parse_oql(text).unwrap()).unwrap();
+        }
         let results = executor.execute_query(&query).unwrap();
         assert_eq!(results.len(), 0);
     }

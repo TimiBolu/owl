@@ -661,8 +661,30 @@ r#"SELECT c.city, o.status,
        count(*) AS n
 FROM orders o
 JOIN customers c ON c.id = o.customer
-GROUP BY ROLLUP (c.city, o.status);"#,
-"(a $facet with one $group for each level of total)"),
+GROUP BY ROLLUP (c.city, o.status)
+ORDER BY c.city NULLS LAST,
+         o.status NULLS LAST;"#,
+r#"// one $group for each level
+db.orders.aggregate([
+  { $lookup: { from: "customers",
+      localField: "customer",
+      foreignField: "_id", as: "c" } },
+  { $unwind: "$c" },
+  { $facet: {
+      each: [{ $group: {
+        _id: { city: "$c.city",
+               status: "$status" },
+        n: { $sum: 1 } } }],
+      by_city: [{ $group: {
+        _id: { city: "$c.city" },
+        n: { $sum: 1 } } }],
+      all: [{ $group: {
+        _id: {}, n: { $sum: 1 } } }] } },
+  { $project: { rows: { $concatArrays:
+      ["$each", "$by_city", "$all"] } } },
+  { $unwind: "$rows" },
+  { $replaceRoot: { newRoot: "$rows" } }
+])"#),
 
         // Relationships and joins
         ("Row and the row it refers to",
@@ -1188,9 +1210,14 @@ r#"db.orders.aggregate([
       _id: { $first: "$top" } } }
 ])"#),
         ("Equal-sized buckets and relative rank",
-r#"SELECT id, ntile(4) OVER (
-  ORDER BY total) AS quarter
-FROM orders;"#,
+r#"SELECT id,
+  ntile(4) OVER w AS quarter,
+  percent_rank() OVER w AS rank,
+  round(cume_dist() OVER w
+    ::numeric, 2) AS within
+FROM orders
+WINDOW w AS (ORDER BY total)
+ORDER BY total;"#,
 "(no operator for it)"),
 
         // Documents and lists
@@ -1484,13 +1511,15 @@ r#"db.notes.insertMany([
     about: { any: [1, "two"] } }
 ])"#),
         ("Names of an object's fields as data",
-r#"SELECT jsonb_object_keys(address)
-  AS names
+r#"SELECT ARRAY(
+  SELECT jsonb_object_keys(address)
+  ORDER BY 1
+) AS names
 FROM customers
-LIMIT 1;"#,
+WHERE id = 'c1';"#,
 r#"db.customers.aggregate([
-  { $limit: 1 },
-  { $project: { names: { $map: {
+  { $match: { _id: "c1" } },
+  { $project: { _id: 0, names: { $map: {
       input: {
         $objectToArray: "$address" },
       in: "$$this.k" } } } }
@@ -1502,7 +1531,8 @@ r#"INSERT INTO products
   (id, name, price, stock, category)
 VALUES
   ('p6', 'Clip', 0.5, 900,
-   'stationery');"#,
+   'stationery')
+RETURNING name, stock;"#,
 r#"db.products.insertOne(
   { _id: "p6", name: "Clip",
     price: 0.5, stock: 900,
@@ -1514,7 +1544,8 @@ r#"INSERT INTO products
 VALUES
   ('p6', 'Clip', 0.5, 900,
    'stationery'),
-  ('p7', 'Rug', 80.0, 3, 'home');"#,
+  ('p7', 'Rug', 80.0, 3, 'home')
+RETURNING id, name;"#,
 r#"db.products.insertMany([
   { _id: "p6", name: "Clip",
     price: 0.5, stock: 900,
@@ -1526,7 +1557,8 @@ r#"db.products.insertMany([
         ("Update the rows a condition picks",
 r#"UPDATE orders
 SET status = 'paid'
-WHERE status = 'open';"#,
+WHERE status = 'open'
+RETURNING id, status;"#,
 r#"db.orders.updateMany(
   { status: "open" },
   { $set: { status: "paid" } }
@@ -1535,7 +1567,8 @@ r#"db.orders.updateMany(
 r#"UPDATE products
 SET stock = stock - 1,
     price = price * 2
-WHERE id = 'p2';"#,
+WHERE id = 'p2'
+RETURNING stock, price;"#,
 r#"db.products.updateOne(
   { _id: "p2" },
   { $inc: { stock: -1 },
@@ -1550,7 +1583,8 @@ SET total = (
   + (
     SELECT count(*) FROM orders
     WHERE customer = o.customer)
-WHERE o.id = 'o1';"#,
+WHERE o.id = 'o1'
+RETURNING total;"#,
 r#"// read, then write
 const o = db.orders.findOne(
   { _id: "o1" })
@@ -1566,7 +1600,8 @@ db.orders.updateOne(
 r#"UPDATE customers
 SET address = jsonb_set(
   address, '{zip}', '"100002"')
-WHERE id = 'c1';"#,
+WHERE id = 'c1'
+RETURNING address;"#,
 r#"db.customers.updateOne(
   { _id: "c1" },
   { $set: { "address.zip": "100002" } }
@@ -1574,7 +1609,8 @@ r#"db.customers.updateOne(
         ("Clear a field",
 r#"UPDATE customers
 SET email = NULL
-WHERE id = 'c1';"#,
+WHERE id = 'c1'
+RETURNING id, email;"#,
 r#"db.customers.updateOne(
   { _id: "c1" },
   { $set: { email: null } }
@@ -1588,7 +1624,8 @@ r#"db.customers.updateOne(
         ("Add to a list",
 r#"UPDATE customers
 SET tags = array_append(tags, 'back')
-WHERE id = 'c2';"#,
+WHERE id = 'c2'
+RETURNING tags;"#,
 r#"db.customers.updateOne(
   { _id: "c2" },
   { $push: { tags: "back" } }
@@ -1598,7 +1635,8 @@ r#"UPDATE customers
 SET tags = ARRAY(
   SELECT DISTINCT unnest(
     tags || ARRAY['vip', 'gold']))
-WHERE id = 'c1';"#,
+WHERE id = 'c1'
+RETURNING tags;"#,
 r#"db.customers.updateOne(
   { _id: "c1" },
   { $addToSet: { tags: {
@@ -1607,7 +1645,8 @@ r#"db.customers.updateOne(
         ("Take out of a list",
 r#"UPDATE customers
 SET tags = array_remove(tags, 'vip')
-WHERE id = 'c1';"#,
+WHERE id = 'c1'
+RETURNING tags;"#,
 r#"db.customers.updateOne(
   { _id: "c1" },
   { $pull: { tags: "vip" } }
@@ -1616,7 +1655,8 @@ r#"db.customers.updateOne(
 r#"UPDATE order_items
 SET qty = qty + 1
 WHERE order_id = 'o1'
-  AND price < 5;"#,
+  AND price < 5
+RETURNING qty;"#,
 r#"db.orders.updateOne(
   { _id: "o1" },
   { $inc: { "items.$[cheap].qty": 1 } },
@@ -1626,7 +1666,8 @@ r#"db.orders.updateOne(
 )"#),
         ("Delete the rows a condition picks",
 r#"DELETE FROM orders
-WHERE status = 'cancelled';"#,
+WHERE status = 'cancelled'
+RETURNING id;"#,
 r#"db.orders.deleteMany(
   { status: "cancelled" }
 )"#),
@@ -1678,7 +1719,8 @@ db.products.find(
         ("Insert the rows of a query",
 r#"INSERT INTO archive
 SELECT * FROM orders
-WHERE status = 'cancelled';"#,
+WHERE status = 'cancelled'
+RETURNING id, status;"#,
 r#"db.orders.aggregate([
   { $match: { status: "cancelled" } },
   { $merge: { into: "archive" } }
@@ -2009,6 +2051,9 @@ WHERE id = 'p1';
 UPDATE products
 SET stock = stock + 10
 WHERE id = 'p2';
+SELECT stock FROM products
+WHERE id IN ('p1', 'p2')
+ORDER BY id;
 COMMIT;"#,
 r#"const session =
   db.getMongo().startSession()
@@ -2021,6 +2066,10 @@ session.withTransaction(() => {
   products.updateOne(
     { _id: "p2" },
     { $inc: { stock: 10 } })
+  return products.find(
+    { _id: { $in: ["p1", "p2"] } },
+    { stock: 1 }
+  ).sort({ _id: 1 }).toArray()
 })"#),
         ("Partial rollback inside a transaction",
 r#"BEGIN;

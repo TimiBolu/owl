@@ -756,6 +756,13 @@ pub trait DocumentStore: Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Whether a collection of this name has ever been written to or
+    /// declared, even if it holds nothing now. A store that cannot say
+    /// answers no.
+    fn collection_was_made(&self, _schema: &str) -> OQLResult<bool> {
+        Ok(false)
+    }
+
     /// The first `limit` rows, in order of id, that pass `filters`, reading
     /// no further than the last of them. `None` asks the executor to scan.
     fn scan_first_documents(

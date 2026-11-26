@@ -128,11 +128,18 @@ pub const ROWS_SO_FAR: &str = "$so_far";
 /// The `$` names the parser writes into a query itself, as `Identifier`
 /// nodes. They are not query parameters: [`query_parameters`] leaves them
 /// out, and the tokenizer refuses a parameter spelled like one.
-const PARSER_NAMES: [&str; 3] = [CURRENT_ROWS, ROWS_SO_FAR, OMITTED_FIELD];
+const PARSER_NAMES: [&str; 6] =
+    [CURRENT_ROWS, ROWS_SO_FAR, OMITTED_FIELD, REMOVED_FIELD, SPREAD_FIELDS, TUPLE];
 
 /// Operations and aggregates that are words only where they are applied, so
 /// that data may still have fields called `median` or `union`.
-pub const STAGE_WORDS: [&str; 11] = [
+pub const STAGE_WORDS: [&str; 17] = [
+    "any",
+    "all",
+    "none",
+    "max_by",
+    "min_by",
+    "sample",
     "median",
     "percentile",
     "union",
@@ -154,6 +161,45 @@ fn is_aggregate_stage(word: &str) -> bool {
 /// The marker the parser gives a `select` entry written `-name`: the named
 /// field is left out of the result.
 pub const OMITTED_FIELD: &str = "$omit";
+
+/// The aggregate `count(distinct x)` is: how many different values.
+pub const DISTINCT_COUNT: &str = "$distinct_count";
+
+/// The marker the parser gives an `update` entry written `-name`: the
+/// field is taken off the row.
+/// The fields a subtotal step leaves on each row for the grouping after it:
+/// each key's value at that level, and the level itself, which counts the
+/// keys left out (in a cube, which of them, as bits).
+pub const SUBTOTAL_KEY: &str = "_subtotal_key_";
+pub const SUBTOTAL_LEVEL: &str = "_subtotal";
+
+/// Whether what is left of a query is only what may follow its end: `;`,
+/// space and comments.
+fn only_ends_a_statement(mut rest: &str) -> bool {
+    loop {
+        rest = rest.trim_start_matches([';', ' ', '\t', '\r', '\n']);
+        if rest.starts_with("//") || rest.starts_with("-- ") || rest == "--" {
+            rest = rest.split_once('\n').map_or("", |(_, after)| after);
+        } else if let Some(comment) = rest.strip_prefix("/*") {
+            match comment.split_once("*/") {
+                Some((_, after)) => rest = after,
+                None => return false,
+            }
+        } else {
+            return rest.is_empty();
+        }
+    }
+}
+
+pub const REMOVED_FIELD: &str = "$remove";
+
+/// The marker the parser gives a `select` entry written `...path`: the
+/// fields of the object the path leads to are put in the row.
+pub const SPREAD_FIELDS: &str = "$spread";
+
+/// `(a, b)` where a value is expected: values compared together, in order,
+/// as in `(.price, .id) > (12.5, "p2")`. It only has meaning in a comparison.
+pub const TUPLE: &str = "$tuple";
 
 impl Token {
     /// The source word of a keyword token.
@@ -276,7 +322,11 @@ impl Tokenizer {
                         .matches('\n')
                         .count()
                         + 1;
-                    if remaining.starts_with('"') {
+                    // A statement may end in `;`, as SQL's do.
+                    if only_ends_a_statement(remaining) {
+                        break;
+                    }
+                    if remaining.starts_with(['"', '\'']) {
                         return Err(TokenizeError::ParseError(format!(
                             "line {line}: string literal is unterminated or contains an \
                              unknown escape (use \\\\ for a backslash and \\\" for a quote)"
@@ -318,9 +368,22 @@ impl Tokenizer {
         map(multispace1, |_| Token::Whitespace)(input)
     }
 
+    /// A comment: `//` or `--` to the end of the line, or `/* .. */`.
+    /// `--` is a comment only with a space or the end of the line after
+    /// it, so that `a --1` is still arithmetic.
     fn parse_comment(input: &str) -> IResult<&str, Token> {
-        let (input, _) = tag("//")(input)?;
-        let (input, comment_text) = take_while(|c| c != '\n' && c != '\r')(input)?;
+        if let Some(rest) = input.strip_prefix("/*") {
+            return match rest.find("*/") {
+                Some(end) => Ok((&rest[end + 2..], Token::Comment(rest[..end].to_string()))),
+                None => Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag))),
+            };
+        }
+        let dashes = input.starts_with("--")
+            && input[2..].chars().next().is_none_or(|next| next.is_whitespace());
+        if !input.starts_with("//") && !dashes {
+            return Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)));
+        }
+        let (input, comment_text) = take_while(|c| c != '\n' && c != '\r')(&input[2..])?;
         Ok((input, Token::Comment(comment_text.to_string())))
     }
 
@@ -450,8 +513,12 @@ impl Tokenizer {
     /// `\"` and `\\` stand for themselves, `\n`, `\r`, `\t` and `\0` are
     /// the usual control characters, and `\u{1F989}` is a Unicode scalar.
     /// Any other escape is an error rather than a silent guess.
+    ///
+    /// A string may be written in single quotes instead, as SQL does. It
+    /// then ends at a single quote, and `\'` stands for one inside it.
     fn parse_string_literal(input: &str) -> IResult<&str, Token> {
-        let (body, _) = char('"')(input)?;
+        let quote = if input.starts_with('\'') { '\'' } else { '"' };
+        let (body, _) = char(quote)(input)?;
         let fail = |at: &'static str| {
             let _ = at;
             nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Escaped))
@@ -460,11 +527,12 @@ impl Tokenizer {
         let mut chars = body.char_indices();
         while let Some((offset, character)) = chars.next() {
             match character {
-                '"' => {
+                closing if closing == quote => {
                     return Ok((&body[offset + 1..], Token::StringLiteral(content)));
                 }
                 '\\' => match chars.next().map(|(_, escaped)| escaped) {
                     Some('"') => content.push('"'),
+                    Some('\'') => content.push('\''),
                     Some('\\') => content.push('\\'),
                     Some('/') => content.push('/'),
                     Some('n') => content.push('\n'),
@@ -850,6 +918,17 @@ pub enum Operation {
     Select(SelectBlock),
     Insert(InsertBlock),
     InsertMany(Vec<InsertBlock>), // Batch insert multiple documents
+    /// `archive.insert(orders.where { .. })`: insert the rows of a query.
+    InsertFrom(Box<Expression>),
+    /// `group_by { rollup(.city, .status) }`: the step in front of a
+    /// grouping that gives subtotals. Every row is repeated once for each
+    /// level of the grouping, with the keys that level leaves out set to
+    /// null, and the grouping that follows keys on those.
+    Subtotals {
+        keys: Vec<Expression>,
+        /// Every combination of the keys, not only each leading run.
+        cube: bool,
+    },
     Upsert(UpsertBlock),
     Update(UpdateBlock),
     Delete,
@@ -1160,6 +1239,11 @@ pub struct Parser {
     /// How many expressions and conditions are currently being parsed
     /// inside one another.
     depth: usize,
+    /// Operations that follow the one just parsed, where one written step
+    /// stands for several: `max_by { .price }` is a sort and then `first()`.
+    pending: Vec<Operation>,
+    /// The collection the query starts from, when it is known.
+    collection: Option<String>,
 }
 
 /// Nesting deeper than this is reported as an error. The parser is
@@ -1173,6 +1257,8 @@ impl Parser {
             position: 0,
             schema_registry: None,
             depth: 0,
+            pending: Vec::new(),
+            collection: None,
         }
     }
 
@@ -1186,6 +1272,8 @@ impl Parser {
             position: 0,
             schema_registry: Some(schema_registry),
             depth: 0,
+            pending: Vec::new(),
+            collection: None,
         }
     }
 
@@ -2177,6 +2265,7 @@ impl Parser {
             while matches!(self.current_token(), Some(Token::Dot)) {
                 self.advance();
                 operations.push(self.parse_operation()?);
+                operations.append(&mut self.pending);
             }
             if !matches!(self.current_token(), Some(Token::EOF) | None) {
                 return Err(ParseError::UnexpectedToken(format!(
@@ -2213,6 +2302,8 @@ impl Parser {
             }
             None => return Err(ParseError::UnexpectedEndOfInput),
         };
+
+        self.collection = Some(collection.clone());
 
         // Validate schema exists if registry is available
         if let Some(registry) = &self.schema_registry {
@@ -2269,6 +2360,7 @@ impl Parser {
                     self.advance(); // consume dot
                     let operation = self.parse_operation_with_validation(&collection)?;
                     operations.push(operation);
+                    operations.append(&mut self.pending);
                 }
                 // `orders.total.stddev()`: a path, then a function given the
                 // values it reaches. A function is the last name before `(`.
@@ -2406,7 +2498,10 @@ impl Parser {
                 | Operation::Explain => Some("an aggregate"),
                 Operation::Update(_) => Some("update"),
                 Operation::Delete => Some("delete()"),
-                Operation::Insert(_) | Operation::InsertMany(_) | Operation::Upsert(_) => {
+                Operation::Insert(_)
+                | Operation::InsertMany(_)
+                | Operation::InsertFrom(_)
+                | Operation::Upsert(_) => {
                     Some("an insert")
                 }
                 _ => None,
@@ -3177,6 +3272,8 @@ impl Parser {
                 }
                 Ok(())
             }
+            // The rows are checked against the schema as they are inserted.
+            Operation::InsertFrom(_) | Operation::Subtotals { .. } => Ok(()),
             Operation::Upsert(block) => {
                 let registry = self.schema_registry.as_ref().unwrap();
                 if registry
@@ -3297,6 +3394,9 @@ impl Parser {
             }
             Some(Token::GroupBy) => {
                 self.advance();
+                if let Some(subtotals) = self.parse_subtotals()? {
+                    return Ok(subtotals);
+                }
                 let group_by_block = self.parse_group_by_block()?;
                 Ok(Operation::GroupBy(group_by_block))
             }
@@ -3444,6 +3544,22 @@ impl Parser {
             Some(Token::Colon | Token::Comma | Token::RightBrace)
         ) {
             self.accept_keyword_as_name();
+        }
+        // `...address` puts the fields of the object in the row.
+        if matches!(self.current_token(), Some(Token::Dot))
+            && matches!(self.peek_token(), Some(Token::Dot))
+            && matches!(self.tokens.get(self.position + 2), Some(Token::FieldAccess(_)))
+        {
+            self.advance();
+            self.advance();
+            let of = self.parse_postfix_expression()?;
+            return Ok(SelectField {
+                alias: None,
+                expression: Expression::FunctionCall {
+                    name: SPREAD_FIELDS.to_string(),
+                    args: vec![of],
+                },
+            });
         }
         // `-name` drops a field that `*` brought in.
         if matches!(self.current_token(), Some(Token::Minus)) {
@@ -3628,6 +3744,11 @@ impl Parser {
     }
 
     fn parse_update_field(&mut self) -> Result<UpdateField, ParseError> {
+        // `-email`: take the field off the row.
+        let removing = matches!(self.current_token(), Some(Token::Minus));
+        if removing {
+            self.advance();
+        }
         self.accept_keyword_as_name();
         let first_name = match self.current_token() {
             Some(Token::Identifier(name)) => {
@@ -3649,19 +3770,43 @@ impl Parser {
             None => return Err(ParseError::UnexpectedEndOfInput),
         };
 
+        // The path to what is changed. It may pass through one element of
+        // a list, `items[0].qty`, or through the elements that meet a
+        // condition, `items.where { .price < 5 }.qty`. What follows either
+        // is a path inside the element.
         let mut path = vec![first_name];
+        let mut element: Option<Expression> = None;
+        let mut meeting: Option<Condition> = None;
+        let mut inside: Vec<String> = Vec::new();
         loop {
+            let within = element.is_some() || meeting.is_some();
             match self.current_token() {
                 Some(Token::FieldAccess(segments)) => {
-                    path.extend(segments.clone());
+                    match within {
+                        true => inside.extend(segments.clone()),
+                        false => path.extend(segments.clone()),
+                    }
                     self.advance();
+                }
+                Some(Token::LeftBracket) if !within => {
+                    self.advance();
+                    element = Some(self.parse_expression()?);
+                    self.expect_token(Token::RightBracket)?;
+                }
+                Some(Token::Dot) if !within && matches!(self.peek_token(), Some(Token::Where)) => {
+                    self.advance();
+                    self.advance();
+                    meeting = Some(self.parse_where_block()?.condition);
                 }
                 Some(Token::Dot) => {
                     self.advance();
                     self.accept_keyword_as_name();
                     match self.current_token() {
                         Some(Token::Identifier(name)) => {
-                            path.push(name.clone());
+                            match within {
+                                true => inside.push(name.clone()),
+                                false => path.push(name.clone()),
+                            }
                             self.advance();
                         }
                         token => {
@@ -3674,6 +3819,20 @@ impl Parser {
                 }
                 _ => break,
             }
+        }
+
+        if removing {
+            if element.is_some() || meeting.is_some() {
+                return Err(ParseError::InvalidSyntax(
+                    "a field is taken off a row, as in update { -email }; to drop elements of a list, \
+                     write the list without them, as in tags -= [\"old\"]"
+                        .to_string(),
+                ));
+            }
+            return Ok(UpdateField {
+                name: path.join("."),
+                value: Expression::Identifier(REMOVED_FIELD.to_string()),
+            });
         }
 
         let arithmetic_operator = match self.current_token() {
@@ -3710,14 +3869,81 @@ impl Parser {
         };
 
         let right = self.parse_expression()?;
-        let value = if let Some(operator) = arithmetic_operator {
-            Expression::BinaryOp {
-                left: Box::new(Expression::FieldAccess(FieldAccess { path: path.clone() })),
-                operator,
-                right: Box::new(right),
+        // `x += y` is `x: x + y`, where `x` is read where it is written.
+        let becomes = |current: Expression| match &arithmetic_operator {
+            Some(operator) => Expression::BinaryOp {
+                left: Box::new(current),
+                operator: operator.clone(),
+                right: Box::new(right.clone()),
+            },
+            None => right.clone(),
+        };
+        let list = Expression::FieldAccess(FieldAccess { path: path.clone() });
+
+        let value = if let Some(at) = element {
+            // One element: the list with that element, or one field of it,
+            // changed.
+            let current = inside.iter().fold(
+                Expression::ArrayAccess {
+                    array: Box::new(list.clone()),
+                    index: Box::new(at.clone()),
+                },
+                |base, field| Expression::ChainedAccess {
+                    base: Box::new(base),
+                    field: field.clone(),
+                },
+            );
+            Expression::FunctionCall {
+                name: "list_set".to_string(),
+                args: vec![
+                    list,
+                    at,
+                    Expression::ArrayLiteral(
+                        inside
+                            .iter()
+                            .map(|name| Expression::Literal(Literal::String(name.clone())))
+                            .collect(),
+                    ),
+                    becomes(current),
+                ],
+            }
+        } else if let Some(condition) = meeting {
+            // The elements that meet the condition: the list with each of
+            // them given the new value for the field, and the rest as they
+            // were.
+            let [field] = inside.as_slice() else {
+                return Err(ParseError::InvalidSyntax(
+                    "after where { .. } in an update comes the one field to change in each element \
+                     that meets it, as in items.where { .price < 5 }.qty += 1"
+                        .to_string(),
+                ));
+            };
+            let current = Expression::FieldAccess(FieldAccess {
+                path: vec![field.clone()],
+            });
+            Expression::CollectionExpression {
+                source: Box::new(list),
+                operations: vec![Operation::Select(SelectBlock {
+                    fields: vec![
+                        SelectField {
+                            alias: None,
+                            expression: Expression::FieldAccess(FieldAccess {
+                                path: vec!["*".to_string()],
+                            }),
+                        },
+                        SelectField {
+                            alias: Some(field.clone()),
+                            expression: Expression::IfThenElse {
+                                condition: Box::new(condition),
+                                then_expr: Box::new(becomes(current.clone())),
+                                else_expr: Box::new(current),
+                            },
+                        },
+                    ],
+                })],
             }
         } else {
-            right
+            becomes(list)
         };
 
         Ok(UpdateField {
@@ -3731,6 +3957,91 @@ impl Parser {
     /// A key is a path, or any expression given a name. A bare function
     /// call is named after the function, so `group_by { year(.placed) }`
     /// produces a `year` field.
+    /// `group_by { rollup(.city, .status) }` and `group_by { cube(..) }`:
+    /// the groups, then a subtotal for each coarser grouping, then the
+    /// grand total. A key a subtotal leaves out is null in its row.
+    fn parse_subtotals(&mut self) -> Result<Option<Operation>, ParseError> {
+        let cube = match (self.current_token(), self.peek_token(), self.tokens.get(self.position + 2)) {
+            (Some(Token::LeftBrace), Some(Token::Identifier(word)), Some(Token::LeftParen))
+                if word == "rollup" || word == "cube" =>
+            {
+                word == "cube"
+            }
+            _ => return Ok(None),
+        };
+        self.advance();
+        self.advance();
+        self.advance();
+        let mut keys = Vec::new();
+        let mut computed = Vec::new();
+        loop {
+            if matches!(self.peek_token(), Some(Token::Colon)) {
+                self.accept_keyword_as_name();
+            }
+            let name = match (self.current_token(), self.peek_token()) {
+                (Some(Token::Identifier(name)), Some(Token::Colon)) => {
+                    let name = name.clone();
+                    self.advance();
+                    self.advance();
+                    Some(name)
+                }
+                _ => None,
+            };
+            let key = self.parse_expression()?;
+            let name = match (name, &key) {
+                (Some(name), _) => name,
+                (None, Expression::FieldAccess(field)) if !field.path.is_empty() => {
+                    field.path[field.path.len() - 1].clone()
+                }
+                (None, Expression::Identifier(field)) => field.clone(),
+                (None, Expression::FunctionCall { name, .. }) => name.clone(),
+                (None, _) => {
+                    return Err(ParseError::InvalidSyntax(
+                        "a computed key needs a name, as in `rollup(month: .placed.month())`".to_string(),
+                    ))
+                }
+            };
+            if computed.iter().any(|key: &ComputedGroupKey| key.name == name) {
+                return Err(ParseError::InvalidSyntax(format!("group_by has two keys named '{name}'")));
+            }
+            computed.push(ComputedGroupKey {
+                name,
+                expression: Expression::FieldAccess(FieldAccess {
+                    path: vec![format!("{SUBTOTAL_KEY}{}", keys.len())],
+                }),
+            });
+            keys.push(key);
+            if !matches!(self.current_token(), Some(Token::Comma)) {
+                break;
+            }
+            self.advance();
+        }
+        self.expect_token(Token::RightParen)?;
+        if !matches!(self.current_token(), Some(Token::RightBrace)) {
+            return Err(ParseError::InvalidSyntax(
+                "rollup(..) and cube(..) take every key of the group_by: write the others inside the brackets"
+                    .to_string(),
+            ));
+        }
+        self.advance();
+        if cube && keys.len() > 8 {
+            return Err(ParseError::InvalidSyntax("cube(..) takes at most 8 keys".to_string()));
+        }
+        // Which keys a row's level left out, so that a subtotal is never
+        // mistaken for a group whose key is truly null.
+        computed.push(ComputedGroupKey {
+            name: SUBTOTAL_LEVEL.to_string(),
+            expression: Expression::FieldAccess(FieldAccess {
+                path: vec![SUBTOTAL_LEVEL.to_string()],
+            }),
+        });
+        self.pending.push(Operation::GroupBy(GroupByBlock {
+            fields: Vec::new(),
+            computed,
+        }));
+        Ok(Some(Operation::Subtotals { keys, cube }))
+    }
+
     fn parse_group_by_block(&mut self) -> Result<GroupByBlock, ParseError> {
         self.expect_token(Token::LeftBrace)?;
 
@@ -3972,14 +4283,12 @@ impl Parser {
         let mut fields = Vec::new();
 
         // Parse first sort field
-        let field = self.parse_sort_field()?;
-        fields.push(field);
+        fields.extend(self.parse_sort_key()?);
 
         // Parse additional fields separated by commas
         while matches!(self.current_token(), Some(Token::Comma)) {
             self.advance(); // consume comma
-            let field = self.parse_sort_field()?;
-            fields.push(field);
+            fields.extend(self.parse_sort_key()?);
         }
 
         // Expect closing brace
@@ -3988,10 +4297,81 @@ impl Parser {
         Ok(SortBlock { fields })
     }
 
+    /// One key of a sort as it is written, which may ask where absent
+    /// values go: `.email.asc.nulls_last`. Absent values sort before every
+    /// other, so placing them is a key of its own in front, on whether the
+    /// value is absent.
+    fn parse_sort_key(&mut self) -> Result<Vec<SortField>, ParseError> {
+        // `-.joined`: largest first.
+        let reversed = matches!(self.current_token(), Some(Token::Minus))
+            && matches!(self.peek_token(), Some(Token::FieldAccess(_) | Token::LeftParen | Token::Identifier(_)));
+        if reversed {
+            self.advance();
+        }
+        let mut field = self.parse_sort_field()?;
+        if reversed {
+            field.direction = match field.direction {
+                SortDirection::Asc => SortDirection::Desc,
+                SortDirection::Desc => SortDirection::Asc,
+            };
+        }
+        let mut placed = None;
+        loop {
+            let word = match (self.current_token(), self.peek_token()) {
+                (Some(Token::Dot), Some(Token::Identifier(word))) => {
+                    let word = word.clone();
+                    if !matches!(word.as_str(), "nulls_last" | "nulls_first") {
+                        break;
+                    }
+                    self.advance();
+                    word
+                }
+                (Some(Token::FieldAccess(path)), _)
+                    if matches!(path.as_slice(), [word] if word == "nulls_last" || word == "nulls_first") =>
+                {
+                    path[0].clone()
+                }
+                (Some(Token::Identifier(word)), _) if word == "nulls_last" || word == "nulls_first" => word.clone(),
+                _ => break,
+            };
+            self.advance();
+            placed = Some(word == "nulls_last");
+        }
+        let Some(last) = placed else {
+            return Ok(vec![field]);
+        };
+        let absent = Expression::ConditionExpr(Box::new(Condition::Comparison {
+            left: field.expression.clone(),
+            operator: ComparisonOperator::Equal,
+            right: Expression::Literal(Literal::Null),
+        }));
+        Ok(vec![
+            SortField {
+                expression: absent,
+                direction: match last {
+                    true => SortDirection::Asc,
+                    false => SortDirection::Desc,
+                },
+            },
+            field,
+        ])
+    }
+
     fn parse_sort_field(&mut self) -> Result<SortField, ParseError> {
         // Parse expression (which can include null coalescing)
         let mut expression = self.parse_expression()?;
         let mut direction = SortDirection::Asc;
+
+        // `.email.asc.nulls_last` arrives as one path. The placing of
+        // absent values is read by the caller; put it back for it.
+        let mut placing = None;
+        if let Expression::FieldAccess(field) = &mut expression {
+            if matches!(field.path.last().map(String::as_str), Some("nulls_last" | "nulls_first"))
+                && field.path.len() > 1
+            {
+                placing = field.path.pop();
+            }
+        }
 
         // The tokenizer represents `.created_at.desc` as one field-access
         // token. Treat the final path component as the documented direction
@@ -4058,6 +4438,12 @@ impl Parser {
                 }
                 _ => {}
             }
+        }
+
+        if let Some(placing) = placing {
+            // Hand the word back as a token of its own, where the caller
+            // looks for it.
+            self.tokens.insert(self.position, Token::Identifier(placing));
         }
 
         Ok(SortField {
@@ -4160,16 +4546,186 @@ impl Parser {
     /// stored in a binding, not only used inside `where`.
     fn parse_comparison_expression(&mut self) -> Result<Expression, ParseError> {
         let left = self.parse_additive_expression()?;
-        let Some(operator) = Self::comparison_operator(self.current_token()) else {
-            return Ok(left);
+        Ok(match self.comparison_after(left)? {
+            Ok(condition) => Expression::ConditionExpr(Box::new(condition)),
+            Err(left) => left,
+        })
+    }
+
+    /// What follows a value when it is being compared: an operator and a
+    /// second value, or one of the forms written in words. Gives the value
+    /// back when nothing of the kind follows.
+    ///
+    /// The forms in words are other ways of writing what the operators
+    /// already say, so the rest of the engine never sees them:
+    ///
+    /// - `.x between a and b` is `.x >= a && .x <= b`;
+    /// - `.x not in list` is `!(.x in list)`;
+    /// - `.x is null` and `.x is not null` are `== null` and `!= null`;
+    /// - `.x like "A%"`, `ilike`, `contains_all` and `contains_any` call
+    ///   the function of that name;
+    /// - `(.a, .b) > (1, 2)` compares the first of each, and where those
+    ///   are equal the second, and so on.
+    fn comparison_after(&mut self, left: Expression) -> Result<Result<Condition, Expression>, ParseError> {
+        let holds = |name: &str, args: Vec<Expression>| Condition::Comparison {
+            left: Expression::FunctionCall {
+                name: name.to_string(),
+                args,
+            },
+            operator: ComparisonOperator::Equal,
+            right: Expression::Literal(Literal::Boolean(true)),
         };
-        self.advance();
-        let right = self.parse_additive_expression()?;
-        Ok(Expression::ConditionExpr(Box::new(Condition::Comparison {
-            left,
+        // `not` before a form in words turns it round.
+        let negated = matches!(self.current_token(), Some(Token::Not))
+            && match self.peek_token() {
+                Some(Token::In) => true,
+                Some(Token::Identifier(word)) => {
+                    matches!(word.as_str(), "between" | "like" | "ilike" | "contains_all" | "contains_any")
+                }
+                _ => false,
+            };
+        if negated {
+            self.advance();
+        }
+        let word = match self.current_token() {
+            Some(Token::Identifier(word)) => Some(word.clone()),
+            _ => None,
+        };
+        let condition = match word.as_deref() {
+            Some("between") => {
+                self.advance();
+                let low = self.parse_additive_expression()?;
+                if !matches!(self.current_token(), Some(Token::And)) {
+                    return Err(ParseError::InvalidSyntax(
+                        "between takes two bounds, as in .total between 25 and 60".to_string(),
+                    ));
+                }
+                self.advance();
+                let high = self.parse_additive_expression()?;
+                Condition::And(
+                    Box::new(Condition::Comparison {
+                        left: left.clone(),
+                        operator: ComparisonOperator::GreaterEqual,
+                        right: low,
+                    }),
+                    Box::new(Condition::Comparison {
+                        left,
+                        operator: ComparisonOperator::LessEqual,
+                        right: high,
+                    }),
+                )
+            }
+            Some("is") => {
+                self.advance();
+                let not = matches!(self.current_token(), Some(Token::Not));
+                if not {
+                    self.advance();
+                }
+                if !matches!(self.current_token(), Some(Token::NullLiteral)) {
+                    return Err(ParseError::InvalidSyntax(
+                        "is asks whether a value is there: .email is null, or .email is not null".to_string(),
+                    ));
+                }
+                self.advance();
+                Condition::Comparison {
+                    left,
+                    operator: match not {
+                        true => ComparisonOperator::NotEqual,
+                        false => ComparisonOperator::Equal,
+                    },
+                    right: Expression::Literal(Literal::Null),
+                }
+            }
+            Some(name @ ("like" | "ilike" | "contains_all" | "contains_any")) => {
+                let name = name.to_string();
+                self.advance();
+                let right = self.parse_additive_expression()?;
+                holds(&name, vec![left, right])
+            }
+            _ => {
+                let Some(operator) = Self::comparison_operator(self.current_token()) else {
+                    return Ok(Err(left));
+                };
+                self.advance();
+                let right = self.parse_additive_expression()?;
+                match (Self::tuple_values(&left), Self::tuple_values(&right)) {
+                    (Some(lefts), Some(rights)) => Self::compare_in_order(lefts, &operator, rights)?,
+                    (None, None) => Condition::Comparison {
+                        left,
+                        operator,
+                        right,
+                    },
+                    _ => {
+                        return Err(ParseError::InvalidSyntax(
+                            "values in parentheses are compared with as many values in parentheses, \
+                             as in (.price, .id) > (12.5, \"p2\")"
+                                .to_string(),
+                        ))
+                    }
+                }
+            }
+        };
+        Ok(Ok(match negated {
+            true => Condition::Not(Box::new(condition)),
+            false => condition,
+        }))
+    }
+
+    /// The values of `(a, b)`, when an expression is one.
+    fn tuple_values(expression: &Expression) -> Option<&[Expression]> {
+        match expression {
+            Expression::FunctionCall { name, args } if name == TUPLE => Some(args),
+            _ => None,
+        }
+    }
+
+    /// `(a, b) > (x, y)`: `a > x`, or `a == x` and `b > y`.
+    fn compare_in_order(
+        lefts: &[Expression],
+        operator: &ComparisonOperator,
+        rights: &[Expression],
+    ) -> Result<Condition, ParseError> {
+        if lefts.len() != rights.len() {
+            return Err(ParseError::InvalidSyntax(format!(
+                "{} values are compared with {}; give as many on each side",
+                lefts.len(),
+                rights.len()
+            )));
+        }
+        let compare = |at: usize, operator: ComparisonOperator| Condition::Comparison {
+            left: lefts[at].clone(),
             operator,
-            right,
-        })))
+            right: rights[at].clone(),
+        };
+        let all_equal = || {
+            (1..lefts.len()).fold(compare(0, ComparisonOperator::Equal), |so_far, at| {
+                Condition::And(Box::new(so_far), Box::new(compare(at, ComparisonOperator::Equal)))
+            })
+        };
+        // Up to the last place only a strict difference decides.
+        let strict = match operator {
+            ComparisonOperator::Equal => return Ok(all_equal()),
+            ComparisonOperator::NotEqual => return Ok(Condition::Not(Box::new(all_equal()))),
+            ComparisonOperator::LessThan | ComparisonOperator::LessEqual => ComparisonOperator::LessThan,
+            ComparisonOperator::GreaterThan | ComparisonOperator::GreaterEqual => ComparisonOperator::GreaterThan,
+            _ => {
+                return Err(ParseError::InvalidSyntax(
+                    "values in parentheses are compared with ==, !=, <, <=, > or >=".to_string(),
+                ))
+            }
+        };
+        let last = lefts.len() - 1;
+        let mut decided = compare(last, operator.clone());
+        for at in (0..last).rev() {
+            decided = Condition::Or(
+                Box::new(compare(at, strict.clone())),
+                Box::new(Condition::And(
+                    Box::new(compare(at, ComparisonOperator::Equal)),
+                    Box::new(decided),
+                )),
+            );
+        }
+        Ok(decided)
     }
 
     fn parse_additive_expression(&mut self) -> Result<Expression, ParseError> {
@@ -4254,7 +4810,26 @@ impl Parser {
             match token {
                 Token::LeftBracket => {
                     self.advance(); // consume '['
-                    let index = self.parse_expression()?;
+                    // `[1:3]`, `[:2]`, `[1:]`: part of a list or a text.
+                    let null = || Expression::Literal(Literal::Null);
+                    let from = match self.current_token() {
+                        Some(Token::Colon) => None,
+                        _ => Some(self.parse_expression()?),
+                    };
+                    if matches!(self.current_token(), Some(Token::Colon)) {
+                        self.advance();
+                        let to = match self.current_token() {
+                            Some(Token::RightBracket) => null(),
+                            _ => self.parse_expression()?,
+                        };
+                        self.expect_token(Token::RightBracket)?;
+                        expr = Expression::FunctionCall {
+                            name: "slice".to_string(),
+                            args: vec![expr, from.unwrap_or_else(null), to],
+                        };
+                        continue;
+                    }
+                    let index = from.expect("without a colon there is an index");
                     self.expect_token(Token::RightBracket)?;
                     expr = Expression::ArrayAccess {
                         array: Box::new(expr),
@@ -4264,31 +4839,14 @@ impl Parser {
                 Token::Dot => {
                     // Handle chained field access like .field after array access
                     self.advance(); // consume '.'
-                    if self.is_operation_token(self.current_token()) {
-                        let operation = self.parse_operation()?;
-                        expr = match expr {
-                            Expression::Identifier(collection) => Expression::QueryExpression {
-                                query: OQLQuery {
-                                    collection,
-                                    operations: vec![operation],
-                                },
-                            },
-                            Expression::QueryExpression { mut query } => {
-                                query.operations.push(operation);
-                                Expression::QueryExpression { query }
-                            }
-                            Expression::CollectionExpression {
-                                source,
-                                mut operations,
-                            } => {
-                                operations.push(operation);
-                                Expression::CollectionExpression { source, operations }
-                            }
-                            source => Expression::CollectionExpression {
-                                source: Box::new(source),
-                                operations: vec![operation],
-                            },
-                        };
+                    if let Some(quantifier) = self.quantifier() {
+                        expr = self.parse_quantified(expr, &quantifier)?;
+                    } else if self.is_operation_token(self.current_token()) {
+                        let mut steps = vec![self.parse_operation()?];
+                        steps.append(&mut self.pending);
+                        for operation in steps {
+                            expr = Self::with_operation(expr, operation);
+                        }
                     } else if let Some(Token::Identifier(field_name)) = self.current_token() {
                         let field_name = field_name.clone();
                         self.advance();
@@ -4419,6 +4977,67 @@ impl Parser {
 
     fn is_operation_token(&self, token: Option<&Token>) -> bool {
         token.is_some_and(Token::is_operation_keyword)
+    }
+
+    /// An expression with one more collection operation applied to it.
+    fn with_operation(expr: Expression, operation: Operation) -> Expression {
+        match expr {
+            Expression::Identifier(collection) => Expression::QueryExpression {
+                query: OQLQuery {
+                    collection,
+                    operations: vec![operation],
+                },
+            },
+            Expression::QueryExpression { mut query } => {
+                query.operations.push(operation);
+                Expression::QueryExpression { query }
+            }
+            Expression::CollectionExpression {
+                source,
+                mut operations,
+            } => {
+                operations.push(operation);
+                Expression::CollectionExpression { source, operations }
+            }
+            source => Expression::CollectionExpression {
+                source: Box::new(source),
+                operations: vec![operation],
+            },
+        }
+    }
+
+    /// `any`, `all` or `none` when one of them is being applied next.
+    fn quantifier(&self) -> Option<String> {
+        match self.current_token() {
+            Some(Token::Stage(word))
+                if matches!(word.as_str(), "any" | "all" | "none")
+                    && matches!(self.peek_token(), Some(Token::LeftBrace)) =>
+            {
+                Some(word.clone())
+            }
+            _ => None,
+        }
+    }
+
+    /// `.orders.any { .. }`, `.orders.all { .. }`, `.orders.none { .. }`:
+    /// whether some, every, or no row of what precedes meets the condition.
+    /// Each is a `where` and an `exists()`: all of them do when none fails
+    /// to, and none does when there is not one that does.
+    fn parse_quantified(&mut self, rows: Expression, quantifier: &str) -> Result<Expression, ParseError> {
+        self.advance();
+        let block = self.parse_where_block()?;
+        let condition = match quantifier {
+            "all" => Condition::Not(Box::new(block.condition)),
+            _ => block.condition,
+        };
+        let some = Self::with_operation(
+            Self::with_operation(rows, Operation::Where(WhereBlock { condition })),
+            Operation::Exists,
+        );
+        Ok(match quantifier {
+            "any" => some,
+            _ => Expression::LogicalNot(Box::new(some)),
+        })
     }
 
     fn parse_if_then_else_expression(&mut self) -> Result<Expression, ParseError> {
@@ -4617,6 +5236,63 @@ impl Parser {
                     operations: Vec::new(),
                 })
             }
+            // `all { .total > 20 }` with no receiver asks it of the rows the
+            // expression is evaluated over, like any operation below.
+            Some(Token::Stage(_)) if self.quantifier().is_some() => {
+                let quantifier = self.quantifier().unwrap_or_default();
+                self.parse_quantified(Expression::Identifier(CURRENT_ROWS.to_string()), &quantifier)
+            }
+            // `case { .stock == 0 -> "out", .stock < 50 -> "low", _ -> "fine" }`:
+            // the value after the first condition that holds.
+            Some(Token::Identifier(word))
+                if word == "case" && matches!(self.peek_token(), Some(Token::LeftBrace)) =>
+            {
+                self.advance();
+                self.advance();
+                let mut arms = Vec::new();
+                let mut otherwise = Expression::Literal(Literal::Null);
+                loop {
+                    let fallback = matches!(self.current_token(), Some(Token::Identifier(name)) if name == "_")
+                        && matches!(self.peek_token(), Some(Token::Arrow));
+                    if fallback {
+                        self.advance();
+                        self.advance();
+                        otherwise = self.parse_expression()?;
+                    } else {
+                        let condition = self.parse_condition()?;
+                        if !matches!(self.current_token(), Some(Token::Arrow)) {
+                            return Err(ParseError::InvalidSyntax(
+                                "each line of a case is a condition, ->, and a value, \
+                                 as in case { .stock == 0 -> \"out\", _ -> \"fine\" }"
+                                    .to_string(),
+                            ));
+                        }
+                        self.advance();
+                        arms.push((condition, self.parse_expression()?));
+                    }
+                    if matches!(self.current_token(), Some(Token::Comma)) {
+                        self.advance();
+                        if matches!(self.current_token(), Some(Token::RightBrace)) {
+                            break;
+                        }
+                        if fallback {
+                            return Err(ParseError::InvalidSyntax(
+                                "_ is what a case gives when nothing else holds, so it comes last".to_string(),
+                            ));
+                        }
+                        continue;
+                    }
+                    break;
+                }
+                self.expect_token(Token::RightBrace)?;
+                Ok(arms.into_iter().rev().fold(otherwise, |otherwise, (condition, value)| {
+                    Expression::IfThenElse {
+                        condition: Box::new(condition),
+                        then_expr: Box::new(value),
+                        else_expr: Box::new(otherwise),
+                    }
+                }))
+            }
             // An operation with no receiver applies to the collection the
             // expression is evaluated over: the rows of the group in a
             // grouped select, or all rows in an aggregate select. So
@@ -4636,10 +5312,11 @@ impl Parser {
                 Some(Token::LeftBrace | Token::LeftParen)
             ) =>
             {
-                let operation = self.parse_operation()?;
+                let mut operations = vec![self.parse_operation()?];
+                operations.append(&mut self.pending);
                 Ok(Expression::CollectionExpression {
                     source: Box::new(Expression::Identifier(CURRENT_ROWS.to_string())),
-                    operations: vec![operation],
+                    operations,
                 })
             }
             // A keyword where a value is expected, not applied as a
@@ -4747,6 +5424,19 @@ impl Parser {
                 // Handle parenthesized expressions
                 self.advance(); // consume left paren
                 let expr = self.parse_expression()?;
+                // `(.price, .id)`: values to be compared together.
+                if matches!(self.current_token(), Some(Token::Comma)) {
+                    let mut values = vec![expr];
+                    while matches!(self.current_token(), Some(Token::Comma)) {
+                        self.advance();
+                        values.push(self.parse_expression()?);
+                    }
+                    self.expect_token(Token::RightParen)?;
+                    return Ok(Expression::FunctionCall {
+                        name: TUPLE.to_string(),
+                        args: values,
+                    });
+                }
                 self.expect_token(Token::RightParen)?;
                 Ok(expr)
             }
@@ -4768,6 +5458,36 @@ impl Parser {
     /// Operations whose form is the same with or without schema validation:
     /// `distinct()`, and an aggregate over a computed value.
     fn parse_computed_operation(&mut self) -> Result<Option<Operation>, ParseError> {
+        // `first(3)`: the first three rows, as `last(3)` is the last three.
+        if matches!(self.current_token(), Some(Token::First))
+            && matches!(self.peek_token(), Some(Token::LeftParen))
+            && !matches!(self.tokens.get(self.position + 2), Some(Token::RightParen))
+        {
+            self.advance();
+            return Ok(Some(match self.parse_row_count("first")? {
+                Expression::Literal(Literal::Integer(count)) => Operation::Limit(count as u64),
+                count => Operation::LimitExpr(count),
+            }));
+        }
+        // `delete { .status == "cancelled" }`: delete the rows that meet it.
+        if matches!(self.current_token(), Some(Token::Delete))
+            && matches!(self.peek_token(), Some(Token::LeftBrace))
+        {
+            self.advance();
+            let block = self.parse_where_block()?;
+            self.pending.push(Operation::Delete);
+            return Ok(Some(Operation::Where(block)));
+        }
+        // `insert(orders.where { .. })`: insert the rows of a query.
+        if matches!(self.current_token(), Some(Token::Insert))
+            && matches!(self.peek_token(), Some(Token::LeftParen))
+        {
+            self.advance();
+            self.advance();
+            let rows = self.parse_expression()?;
+            self.expect_token(Token::RightParen)?;
+            return Ok(Some(Operation::InsertFrom(Box::new(rows))));
+        }
         if matches!(self.current_token(), Some(Token::Distinct)) {
             self.advance();
             self.expect_token(Token::LeftParen)?;
@@ -4783,6 +5503,56 @@ impl Parser {
         if let Some(Token::Stage(name)) = self.current_token() {
             let name = name.clone();
             match name.as_str() {
+                // `any { .. }`: is there a row that meets it. One written
+                // step, and two that already exist.
+                "any" => {
+                    self.advance();
+                    let block = self.parse_where_block()?;
+                    self.pending.push(Operation::Exists);
+                    return Ok(Some(Operation::Where(block)));
+                }
+                "all" | "none" => {
+                    return Err(ParseError::InvalidSyntax(format!(
+                        "{name} {{ .. }} is asked of a row's list or of the rows it is related to, \
+                         as in where {{ .orders.{name} {{ .total > 20 }} }}"
+                    )));
+                }
+                // `max_by { .price }`: the row with the largest. A sort
+                // and then the first row.
+                "max_by" | "min_by" => {
+                    self.advance();
+                    self.expect_token(Token::LeftBrace)?;
+                    let expression = self.parse_expression()?;
+                    self.expect_token(Token::RightBrace)?;
+                    self.pending.push(Operation::First);
+                    return Ok(Some(Operation::Sort(SortBlock {
+                        fields: vec![SortField {
+                            expression,
+                            direction: match name.as_str() {
+                                "max_by" => SortDirection::Desc,
+                                _ => SortDirection::Asc,
+                            },
+                        }],
+                    })));
+                }
+                // `sample(3)`: that many rows, picked at random.
+                "sample" => {
+                    self.advance();
+                    let count = self.parse_row_count("sample")?;
+                    self.pending.push(match count {
+                        Expression::Literal(Literal::Integer(count)) => Operation::Limit(count as u64),
+                        count => Operation::LimitExpr(count),
+                    });
+                    return Ok(Some(Operation::Sort(SortBlock {
+                        fields: vec![SortField {
+                            expression: Expression::FunctionCall {
+                                name: "random".to_string(),
+                                args: Vec::new(),
+                            },
+                            direction: SortDirection::Asc,
+                        }],
+                    })));
+                }
                 "union" | "intersect" | "except" => {
                     self.advance();
                     self.expect_token(Token::LeftParen)?;
@@ -4822,10 +5592,12 @@ impl Parser {
                 }
                 "last" => {
                     self.advance();
+                    // `last()`: the last row, as `first()` is the first.
                     if matches!(self.peek_token(), Some(Token::RightParen)) {
-                        return Err(ParseError::InvalidSyntax(
-                            "last takes how many rows to keep, as in last(7)".to_string(),
-                        ));
+                        self.advance();
+                        self.advance();
+                        self.pending.push(Operation::First);
+                        return Ok(Some(Operation::Last(Expression::Literal(Literal::Integer(1)))));
                     }
                     return Ok(Some(Operation::Last(self.parse_row_count("last")?)));
                 }
@@ -4940,6 +5712,36 @@ impl Parser {
     fn parse_function_call(&mut self, name: String) -> Result<Expression, ParseError> {
         self.expect_token(Token::LeftParen)?;
 
+        // The rows an aggregate is taken over may be narrowed inside it:
+        // `count(where .status == "paid")`, `sum(.total where .status == "paid")`.
+        let aggregate = matches!(name.as_str(), "count" | "sum" | "avg" | "min" | "max") || is_aggregate_stage(&name);
+        let over = |operations: Vec<Operation>| Expression::CollectionExpression {
+            source: Box::new(Expression::Identifier(CURRENT_ROWS.to_string())),
+            operations,
+        };
+        if name == "count" {
+            // `count(distinct .customer)`: how many different values.
+            if matches!(self.current_token(), Some(Token::Distinct))
+                && !matches!(self.peek_token(), Some(Token::LeftParen | Token::RightParen))
+            {
+                self.advance();
+                let value = self.parse_expression()?;
+                self.expect_token(Token::RightParen)?;
+                return Ok(Expression::FunctionCall {
+                    name: DISTINCT_COUNT.to_string(),
+                    args: vec![value],
+                });
+            }
+            if matches!(self.current_token(), Some(Token::Where))
+                && !matches!(self.peek_token(), Some(Token::LeftBrace))
+            {
+                self.advance();
+                let condition = self.parse_condition()?;
+                self.expect_token(Token::RightParen)?;
+                return Ok(over(vec![Operation::Where(WhereBlock { condition }), Operation::Count]));
+            }
+        }
+
         let mut args = Vec::new();
 
         // Parse arguments if any
@@ -4954,7 +5756,45 @@ impl Parser {
             }
         }
 
+        // `sum(.total where .status == "paid")`.
+        if aggregate && args.len() == 1 && matches!(self.current_token(), Some(Token::Where)) {
+            self.advance();
+            let condition = self.parse_condition()?;
+            self.expect_token(Token::RightParen)?;
+            let narrowed = Operation::Where(WhereBlock { condition });
+            let value = args.remove(0);
+            return Ok(match name.as_str() {
+                // Rows that meet it and have the value.
+                "count" => over(vec![
+                    narrowed,
+                    Operation::Where(WhereBlock {
+                        condition: Condition::Comparison {
+                            left: value,
+                            operator: ComparisonOperator::NotEqual,
+                            right: Expression::Literal(Literal::Null),
+                        },
+                    }),
+                    Operation::Count,
+                ]),
+                _ => over(vec![narrowed, Operation::AggregateExpr { function: name, input: value }]),
+            });
+        }
+
         self.expect_token(Token::RightParen)?;
+
+        // `count(.total > 40)`: a comparison is never absent, so counting
+        // the rows that have one would count them all. It counts the rows
+        // it holds for.
+        if name == "count" && args.len() == 1 {
+            if let Expression::ConditionExpr(condition) = &args[0] {
+                return Ok(over(vec![
+                    Operation::Where(WhereBlock {
+                        condition: condition.as_ref().clone(),
+                    }),
+                    Operation::Count,
+                ]));
+            }
+        }
 
         Ok(Expression::FunctionCall { name, args })
     }
@@ -5115,26 +5955,50 @@ impl Parser {
         // Parse left side (simple expression without logical operators)
         let left = self.parse_simple_expression()?;
 
-        match Self::comparison_operator(self.current_token()) {
-            Some(operator) => {
-                self.advance();
-                let right = self.parse_simple_expression()?;
-                Ok(Condition::Comparison {
-                    left,
-                    operator,
-                    right,
-                })
-            }
+        match self.comparison_after(left)? {
+            Ok(condition) => Ok(condition),
             // No comparison operator: the expression itself is the condition,
             // as in `where { .active }` or `where { is_open(*) }`.
-            None => Ok(match left {
+            Err(left) => Ok(match left {
                 Expression::ConditionExpr(condition) => *condition,
+                // A value that is not a yes or no stands for whether it is
+                // there: `where { .email }` is the rows that have one, and
+                // `where { !.email }` the rows that have none. A field
+                // known to be a yes or no keeps the plain comparison.
+                left @ Expression::FieldAccess(_) if !self.is_boolean_field(&left) => Condition::Comparison {
+                    left: Expression::FunctionCall {
+                        name: "truthy".to_string(),
+                        args: vec![left],
+                    },
+                    operator: ComparisonOperator::Equal,
+                    right: Expression::Literal(Literal::Boolean(true)),
+                },
                 left => Condition::Comparison {
                     left,
                     operator: ComparisonOperator::Equal,
                     right: Expression::Literal(Literal::Boolean(true)),
                 },
             }),
+        }
+    }
+
+    /// Whether a path is a field the schema of the query's collection
+    /// declares as a yes or no.
+    fn is_boolean_field(&self, expression: &Expression) -> bool {
+        let (Expression::FieldAccess(field), Some(registry), Some(collection)) =
+            (expression, &self.schema_registry, &self.collection)
+        else {
+            return false;
+        };
+        match field.path.as_slice() {
+            [name] => match registry.get_field_type(collection, name) {
+                Ok(Some(crate::schema::FieldType::Boolean)) => true,
+                Ok(Some(crate::schema::FieldType::Optional(inner))) => {
+                    matches!(*inner, crate::schema::FieldType::Boolean)
+                }
+                _ => false,
+            },
+            _ => false,
         }
     }
 
@@ -5379,6 +6243,8 @@ fn operation_uses_legacy_outer(operation: &Operation) -> bool {
                 .iter()
                 .any(|field| expression_uses_legacy_outer(&field.value))
         }),
+        Operation::InsertFrom(rows) => expression_uses_legacy_outer(rows),
+        Operation::Subtotals { keys, .. } => keys.iter().any(expression_uses_legacy_outer),
         Operation::Upsert(block) => block
             .fields
             .iter()
@@ -7334,7 +8200,9 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
 
     // Third pass: Execute statements
     let mut not_run = 0usize;
+    let mut rows: Vec<crate::document::Document> = Vec::new();
     for statement in &file.statements {
+        rows.clear();
         // A script is a sequence: once a statement has failed, the ones
         // after it were written for a state that does not exist, so they
         // are not run.
@@ -7412,17 +8280,18 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
                             operations: resolved_query.operations.clone(),
                         })
                         .map(|value| match value {
-                            crate::document::Value::List(values) => values.len(),
-                            crate::document::Value::Null => 0,
-                            _ => 1,
+                            crate::document::Value::List(values) => (values.len(), Vec::new()),
+                            crate::document::Value::Null => (0, Vec::new()),
+                            _ => (1, Vec::new()),
                         })
                 } else {
                     script_executor
                         .execute_query(&resolved_query)
-                        .map(|documents| documents.len())
+                        .map(|documents| (documents.len(), documents))
                 };
                 match execution {
-                    Ok(document_count) => {
+                    Ok((document_count, documents)) => {
+                        rows = documents;
                         let elapsed = start_time.elapsed();
                         success_count += 1;
                         let query_str = format!(
@@ -7493,7 +8362,10 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
                 let mut tx_value_bindings = value_bindings.clone();
                 let mut tx_success = 0usize;
 
+                // What the block's last statement gave: the block's answer.
+                let mut tx_rows = Vec::new();
                 for tx_stmt in tx_statements {
+                    tx_rows.clear();
                     match tx_stmt {
                         OQLFileStatement::Schema(schema) => {
                             schema_count += 1;
@@ -7552,17 +8424,18 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
                                         operations: resolved_query.operations.clone(),
                                     })
                                     .map(|value| match value {
-                                        crate::document::Value::List(values) => values.len(),
-                                        crate::document::Value::Null => 0,
-                                        _ => 1,
+                                        crate::document::Value::List(values) => (values.len(), Vec::new()),
+                                        crate::document::Value::Null => (0, Vec::new()),
+                                        _ => (1, Vec::new()),
                                     })
                             } else {
                                 script_executor
                                     .execute_query(&resolved_query)
-                                    .map(|documents| documents.len())
+                                    .map(|documents| (documents.len(), documents))
                             };
                             match execution {
-                                Ok(document_count) => {
+                                Ok((document_count, documents)) => {
+                                    tx_rows = documents;
                                     tx_success += 1;
                                     tx_results.push(StatementResult::Query(document_count));
                                 }
@@ -7604,6 +8477,7 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
                     query_bindings = tx_bindings;
                     value_bindings = tx_value_bindings;
                     success_count += tx_success + 1;
+                    rows = tx_rows;
                     results.extend(tx_results);
                     results.push(StatementResult::Transaction("committed".to_string()));
                     println!(
@@ -7662,6 +8536,7 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
 
     Ok(OQLFileExecutionResult {
         results,
+        rows,
         schema_count,
         query_count,
         function_count,
@@ -7674,6 +8549,9 @@ pub fn execute_oql_file<S: crate::storage::DocumentStore>(
 #[derive(Debug, Clone)]
 pub struct OQLFileExecutionResult {
     pub results: Vec<StatementResult>,
+    /// The rows the last statement gave, when it was a query, or a
+    /// transaction block whose last statement was one and which was kept.
+    pub rows: Vec<crate::document::Document>,
     pub schema_count: usize,
     pub query_count: usize,
     pub function_count: usize,

@@ -81,10 +81,13 @@ impl QueryMetrics {
             crate::parser::Operation::Select(_) => "select".to_string(),
             crate::parser::Operation::Insert(_) => "insert".to_string(),
             crate::parser::Operation::InsertMany(_) => "batch_insert".to_string(),
+            crate::parser::Operation::InsertFrom(_) => "batch_insert".to_string(),
             crate::parser::Operation::Upsert(_) => "upsert".to_string(),
             crate::parser::Operation::Update(_) => "update".to_string(),
             crate::parser::Operation::Delete => "delete".to_string(),
-            crate::parser::Operation::GroupBy(_) => "aggregate".to_string(),
+            crate::parser::Operation::GroupBy(_) | crate::parser::Operation::Subtotals { .. } => {
+                "aggregate".to_string()
+            }
             crate::parser::Operation::Having(_) => "filter".to_string(),
             crate::parser::Operation::Count => "aggregate".to_string(),
             crate::parser::Operation::Sum(_) => "aggregate".to_string(),

@@ -86,6 +86,10 @@ pub fn compare(left: &Value, right: &Value) -> Option<Ordering> {
         (Value::DateTime(a), Value::DateTime(b)) => Some(a.cmp(b)),
         (Value::DateTime(a), Value::String(b)) => parse_instant(b).map(|b| a.cmp(&b)),
         (Value::String(a), Value::DateTime(b)) => parse_instant(a).map(|a| a.cmp(b)),
+        // Two lengths of time, by how long they are.
+        (Value::Object(_), Value::Object(_)) => Some(
+            crate::functions::duration_seconds_of(left)?.cmp(&crate::functions::duration_seconds_of(right)?),
+        ),
         _ => None,
     }
 }
@@ -140,8 +144,10 @@ pub fn matches(left: &Value, operator: &ComparisonOperator, right: &Value) -> bo
             (Value::String(text), Value::String(suffix)) => text.ends_with(suffix.as_str()),
             _ => false,
         },
-        ComparisonOperator::In => match right {
-            Value::List(items) => items.iter().any(|item| equal(left, item)),
+        ComparisonOperator::In => match (left, right) {
+            (_, Value::List(items)) => items.iter().any(|item| equal(left, item)),
+            // Text in text: `"rob" in .city` is `.city contains "rob"`.
+            (Value::String(part), Value::String(text)) => text.contains(part.as_str()),
             _ => false,
         },
     }
@@ -286,6 +292,8 @@ mod tests {
         assert!(matches(&text("three"), &In, &list));
         assert!(!matches(&int(3), &In, &list));
         assert!(!matches(&int(1), &In, &int(1)));
+        assert!(matches(&text("hre"), &In, &text("three")));
+        assert!(!matches(&text("four"), &In, &text("three")));
         assert!(matches(&list, &Contains, &int(1)));
         assert!(matches(&list, &Contains, &text("three")));
         assert!(!matches(&list, &Contains, &text("four")));
