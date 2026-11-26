@@ -583,6 +583,9 @@ async fn script(State(server): State<Server>, axum::Json(request): axum::Json<Sc
             ));
         }
         Ok(json!({
+            // What the last statement gave, when it was a query or a
+            // transaction block that ended in one.
+            "rows": rows_to_json(&server.executor(), &report.rows)?,
             "statements": report.results.len(),
             "schemas": report.schema_count,
             "queries": report.query_count,

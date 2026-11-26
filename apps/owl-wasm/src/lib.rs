@@ -125,21 +125,31 @@ impl Owl {
         };
         let mut errors = Vec::new();
         let mut ran = 0;
+        // A transaction block that ends in a query answers with its rows.
+        let mut answer = Vec::new();
         if !file.statements.is_empty() {
             match execute_oql_file(&OQLFile { statements: file.statements }, &self.executor) {
                 Ok(report) => {
                     ran += report.success_count;
                     errors.extend(report.errors);
+                    answer = report.rows;
                 }
                 Err(error) => errors.push(error.to_string()),
             }
         }
         let mut rows = Vec::new();
         let mut columns: Vec<String> = Vec::new();
-        if let (Some(OQLFileStatement::Query(query)), true) = (last, errors.is_empty()) {
-            match self.executor.execute_query(&query) {
+        let answer = match (last, errors.is_empty()) {
+            (Some(OQLFileStatement::Query(query)), true) => Some(self.executor.execute_query(&query).map(|rows| {
+                ran += 1;
+                rows
+            })),
+            (None, true) => Some(Ok(answer)),
+            _ => None,
+        };
+        if let Some(answer) = answer {
+            match answer {
                 Ok(documents) => {
-                    ran += 1;
                     for document in &documents {
                         for (name, _) in document.fields.iter().filter(|(name, _)| Self::shown(name)) {
                             if !columns.contains(name) {

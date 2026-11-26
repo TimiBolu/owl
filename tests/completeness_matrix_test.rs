@@ -252,13 +252,38 @@ impl Db {
     }
 
     fn script(&self, source: &str) -> Result<(), String> {
+        self.script_rows(source).map(|_| ())
+    }
+
+    /// Run a script for the rows its last statement gives.
+    fn script_rows(&self, source: &str) -> Result<String, String> {
         let file = parse_oql_file(source).map_err(|error| error.to_string())?;
         let report = execute_oql_file(&file, &self.executor).map_err(|error| error.to_string())?;
         if report.errors.is_empty() {
-            Ok(())
+            Ok(self.shown(&report.rows))
         } else {
             Err(report.errors.join("; "))
         }
+    }
+
+    /// Rows as the server and the browser show them: a reference is the id
+    /// of the row it points at, and the engine's own fields are left out.
+    fn shown(&self, rows: &[owl_db::Document]) -> String {
+        rows.iter()
+            .map(|row| {
+                let fields = row
+                    .fields
+                    .iter()
+                    .filter(|(name, _)| !name.starts_with('_'))
+                    .map(|(name, value)| {
+                        let value = self.executor.with_reference_ids(value).unwrap_or_else(|_| value.clone());
+                        (name.clone(), value.to_clean_json())
+                    })
+                    .collect::<serde_json::Map<_, _>>();
+                serde_json::Value::Object(fields).to_string()
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     fn rows(&self, query: &str) -> Result<String, String> {
@@ -267,11 +292,7 @@ impl Db {
             .executor
             .execute_query(&query)
             .map_err(|error| error.to_string())?;
-        Ok(rows
-            .iter()
-            .map(|row| row.fields_to_clean_json().to_string())
-            .collect::<Vec<_>>()
-            .join(" "))
+        Ok(self.shown(&rows))
     }
 }
 
@@ -280,8 +301,7 @@ fn run(oql: &str, check: &str) -> Result<String, String> {
     let db = Db::shop();
     if check.is_empty() {
         // A query if it is one, and otherwise a script.
-        db.rows(oql)
-            .or_else(|_| db.script(oql).map(|()| String::new()))
+        db.rows(oql).or_else(|_| db.script_rows(oql))
     } else {
         db.script(oql)?;
         db.rows(check)
@@ -569,7 +589,9 @@ fn tries_the_queries_in_a_file() {
             Some((script, check)) => db
                 .script(&script.replace(" ; ", "\n"))
                 .and_then(|()| db.rows(check)),
-            None => db.rows(query),
+            None => db.rows(query).or_else(|error| {
+                db.script_rows(&query.replace(" ; ", "\n")).map_err(|script| format!("{error} / as a script: {script}"))
+            }),
         };
         println!("TRY {query}\n    {found:?}");
     }

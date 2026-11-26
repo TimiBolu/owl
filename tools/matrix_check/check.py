@@ -51,6 +51,7 @@ SHAPED = {
     ("mongo", "First and last of a partition"): "the last row's id; Owl gives the last row as a list of one",
     ("mongo", "Ranges as groups"): "a bucket is named by its lower bound, and comes in that order",
     ("mongo", "Median and percentiles"): "MongoDB picks a value that is there; Owl and SQL go between two",
+    ("mongo", "Insert the rows of a query"): "$merge writes the rows and gives none back",
 }
 
 SKIP_MONGO = {

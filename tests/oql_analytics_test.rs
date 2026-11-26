@@ -1017,7 +1017,8 @@ fn the_rows_so_far_are_a_collection() {
     let error = db.try_rows("pings.where { so_far().count() > 1 }").unwrap_err();
     assert!(error.contains("select"), "{error}");
     assert!(db.try_rows("pings.select { v: so_far(3).count() }").is_err());
-    assert!(db.try_rows("pings.sort { .id.asc }.last()").is_err());
+    // `last()` with no count is the last row, as `first()` is the first.
+    assert_eq!(db.ids("pings.sort { .id.asc }.last()"), ["p5"]);
     // The words this replaced are gone.
     assert!(db.try_rows("pings.select { v: running_sum(.n) }").is_err());
 }

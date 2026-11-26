@@ -12539,6 +12539,14 @@ impl DocumentStore for RustStore {
         Ok(Some(logical_collection_count(&state, schema)))
     }
 
+    fn collection_was_made(&self, schema: &str) -> OQLResult<bool> {
+        let state = self
+            .state
+            .read()
+            .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+        Ok(state.collection_ids.contains_key(schema))
+    }
+
     fn scan_first_documents(
         &self,
         schema: &str,

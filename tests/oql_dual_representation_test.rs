@@ -330,12 +330,14 @@ fn a_name_that_is_never_defined_is_an_error_when_the_query_runs() {
     let result = execute_oql_file(&defined, &executor).unwrap();
     assert!(result.errors.is_empty(), "{:?}", result.errors);
 
-    // A collection nobody declared is still empty when it is the one
-    // being queried, not an error.
-    let rows = executor
+    // A collection nobody declared and nobody ever wrote to is a mistake
+    // when it is the one being queried too. It used to read as empty,
+    // which hid a misspelt name behind an answer of no rows.
+    let error = executor
         .execute_query(&parse_oql("nobody.where { .id == \"x\" }").unwrap())
-        .unwrap();
-    assert!(rows.is_empty());
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("'nobody' is not defined"), "{error}");
 }
 
 #[test]

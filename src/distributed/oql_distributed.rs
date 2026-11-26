@@ -452,6 +452,16 @@ impl DistributedOQLEngine {
                     affected_count += count;
                     object_refs.extend(refs);
                 }
+                Operation::InsertFrom(_) => {
+                    return Err(OQLError::generic(
+                        "inserting the rows of a query is not supported in a distributed OQL query",
+                    ));
+                }
+                Operation::Subtotals { .. } => {
+                    return Err(OQLError::generic(
+                        "rollup and cube are not supported in a distributed OQL query",
+                    ));
+                }
                 Operation::Upsert(_) => {
                     return Err(OQLError::generic(
                         "upsert is currently supported by the single-node executor only",
@@ -568,9 +578,11 @@ impl DistributedOQLEngine {
                 | Operation::Explain
                 | Operation::Step(_)
                 | Operation::First
+                | Operation::Subtotals { .. }
                 | Operation::Nearest(_) => selection_operations.push(operation.clone()),
                 Operation::Insert(_)
                 | Operation::InsertMany(_)
+                | Operation::InsertFrom(_)
                 | Operation::Upsert(_)
                 | Operation::Update(_)
                 | Operation::Delete

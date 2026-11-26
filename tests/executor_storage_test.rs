@@ -347,9 +347,11 @@ fn test_error_handling_with_zig_storage() {
     let (executor, _temp_dir) = create_test_executor();
 
     // Test query on non-existent collection
+    // A name nothing was ever written under is a mistake, not an empty
+    // collection.
     let query = parse_oql(r#"nonexistent.where { .id == 1 }"#).unwrap();
-    let results = executor.execute_query(&query).unwrap();
-    assert_eq!(results.len(), 0); // Should return empty, not error
+    let error = executor.execute_query(&query).unwrap_err().to_string();
+    assert!(error.contains("'nonexistent' is not defined"), "{error}");
 
     // Test invalid field access
     let mut fields = owl_db::Fields::default();
