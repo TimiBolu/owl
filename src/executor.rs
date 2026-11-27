@@ -5454,13 +5454,13 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 Err(OQLError::EnhancedQueryExecution {
                     message: "Function definitions cannot be executed as query operations"
                         .to_string(),
-                    context: Some(context),
+                    context: Some(Box::new(context)),
                     severity: crate::error::ErrorSeverity::Error,
-                    recovery: Some(crate::error::RecoverySuggestion {
+                    recovery: Some(Box::new(crate::error::RecoverySuggestion {
                         suggestion: "Define functions separately from queries".to_string(),
                         example: Some("fn my_function() { ... } then use in queries".to_string()),
                         auto_recoverable: false,
-                    }),
+                    })),
                 })
             }
         }
