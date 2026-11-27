@@ -646,7 +646,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 _ => None,
             };
             let mut documents = match (reached_back, &whole) {
-                (Some(rows), _) => rows,
+                (Some(reached), _) => reached.rows,
                 (None, Some(_)) => Vec::new(),
                 (None, None) => self.execute_general_query(&OQLQuery {
                     collection: query.collection.clone(),
@@ -2208,14 +2208,30 @@ impl<S: DocumentStore> QueryExecutor<S> {
         // The rows a few captured rows lead back to, when a condition
         // pins the captured end; otherwise the read described above.
         let reached_back = self.rows_reached_back(query, at)?;
-        let back = reached_back.is_some();
+        let mut from = String::new();
         let mut documents = match reached_back {
-            Some(rows) => rows,
+            Some(reached) => {
+                // What is read first is that capture's collection, so the
+                // account of the read is of that.
+                from = format!(", reached back from {}", reached.name);
+                let read = self.explain_query(&reached.reads)?.pop().map(|row| row.fields).unwrap_or_default();
+                if let Some(uses_index) = read.get("uses_index") {
+                    fields.insert("uses_index".to_string(), uses_index.clone());
+                }
+                let how = match read.get("plan") {
+                    Some(Value::String(plan)) => plan.trim_end().to_string(),
+                    _ => String::new(),
+                };
+                fields.insert(
+                    "plan".to_string(),
+                    Value::String(format!(
+                        "read the rows of {} that {} may be, and follow the block's path back from them to {}\n{how}",
+                        reached.reads.collection, reached.name, query.collection
+                    )),
+                );
+                reached.rows
+            }
             None => self.execute_general_query(&start)?,
-        };
-        let from = match (after.first(), back) {
-            (Some(Operation::Capture { name, .. }), true) => format!(", reached back from {name}"),
-            _ => String::new(),
         };
         let mut steps = vec![step(
             match before.len() {
@@ -13985,11 +14001,9 @@ impl<S: DocumentStore> QueryExecutor<S> {
     /// order a scan gives them, so the block's answer and its order are as
     /// written. `None` when the block is not of this shape, or too many
     /// rows pass the condition for this to be the cheaper end.
-    fn rows_reached_back(&self, query: &OQLQuery, at: usize) -> OQLResult<Option<Vec<Document>>> {
+    fn rows_reached_back(&self, query: &OQLQuery, at: usize) -> OQLResult<Option<ReachedBack>> {
         /// Past this many rows at the captured end, start as written.
         const FEW: usize = 64;
-        /// And past this many on the way back.
-        const MOST_BACK: usize = 20_000;
         if !CAPTURE_PLANNING.with(|flag| flag.get()) {
             return Ok(None);
         }
@@ -13997,49 +14011,117 @@ impl<S: DocumentStore> QueryExecutor<S> {
         if !before.iter().all(|operation| matches!(operation, Operation::Where(_))) {
             return Ok(None);
         }
-        let Some(Operation::Capture {
-            source: Expression::CollectionExpression { source, operations },
-            optional: false,
-            ..
-        }) = after.first()
-        else {
-            return Ok(None);
-        };
-        let Expression::FieldAccess(path) = source.as_ref() else {
-            return Ok(None);
-        };
-        if path.path.is_empty()
-            || path.path.iter().any(|name| name.starts_with(crate::parser::CAPTURE_PREFIX))
-            || !operations.iter().all(|operation| matches!(operation, Operation::Where(_)))
-        {
-            return Ok(None);
+        /// How a capture over a plain path is reached: from the block's
+        /// row or from an earlier capture, by these steps.
+        struct Link {
+            from: Option<String>,
+            way: Vec<BackStep>,
+            optional: bool,
         }
-        // The conditions that read nothing of the block's row hold for a
-        // captured row whichever row it was captured for.
-        let alone: Vec<Operation> = operations
-            .iter()
-            .filter(|operation| {
-                !Self::operation_names(operation, &query.collection)
-                    && serde_json::to_string(operation).is_ok_and(|text| {
-                        !text.contains(crate::parser::CAPTURE_PREFIX) && !text.contains(crate::parser::OUTER_VALUE)
-                    })
-            })
-            .cloned()
-            .collect();
-        if alone.is_empty() {
-            return Ok(None);
-        }
+        let mut known: HashMap<String, String> = HashMap::new();
+        let mut links: HashMap<String, Link> = HashMap::new();
+        for operation in after {
+            let (name, source, optional) = match operation {
+                Operation::Capture { name, source, optional } => (name, source, *optional),
+                Operation::Where(_) => continue,
+                // Past anything else, fewer starting rows could change
+                // which rows it keeps.
+                _ => break,
+            };
+            let Some(members) = self.captured_collection(&query.collection, source, &known)? else {
+                continue;
+            };
+            known.insert(name.clone(), members.clone());
+            let (path, filters): (&FieldAccess, &[Operation]) = match source {
+                Expression::FieldAccess(path) => (path, &[]),
+                Expression::CollectionExpression { source, operations }
+                    if operations.iter().all(|operation| matches!(operation, Operation::Where(_))) =>
+                {
+                    match source.as_ref() {
+                        Expression::FieldAccess(path) => (path, operations.as_slice()),
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            };
+            let (from, start, rest) = match path.path.first().and_then(|first| first.strip_prefix(crate::parser::CAPTURE_PREFIX)) {
+                Some(capture) => match known.get(capture) {
+                    Some(collection) => (Some(capture.to_string()), collection.clone(), &path.path[1..]),
+                    None => continue,
+                },
+                None => (None, query.collection.clone(), path.path.as_slice()),
+            };
+            let Some((_, way)) = self.collection_by_path(&start, rest)? else {
+                continue;
+            };
+            links.insert(name.clone(), Link { from, way, optional });
 
-        let Some((collection, way)) = self.collection_by_path(&query.collection, &path.path)? else {
-            return Ok(None);
-        };
+            // The conditions that read nothing of the block's row or of
+            // another capture hold for a captured row whichever row it was
+            // captured for.
+            let alone: Vec<Operation> = filters
+                .iter()
+                .filter(|operation| {
+                    !Self::operation_names(operation, &query.collection)
+                        && serde_json::to_string(operation).is_ok_and(|text| {
+                            !text.contains(crate::parser::CAPTURE_PREFIX)
+                                && !text.contains(crate::parser::OUTER_VALUE)
+                        })
+                })
+                .cloned()
+                .collect();
+            if alone.is_empty() {
+                continue;
+            }
+            // Every step from the block's row to this capture, through the
+            // captures it is reached from. A row with no member of any of
+            // them is not in the answer, unless one of them is optional.
+            let mut chain = Vec::new();
+            let mut link = Some(name.as_str());
+            let mut whole = true;
+            while let Some(capture) = link {
+                match links.get(capture) {
+                    Some(found) if !found.optional => {
+                        chain.push(found);
+                        link = found.from.as_deref();
+                    }
+                    _ => {
+                        whole = false;
+                        break;
+                    }
+                }
+            }
+            if !whole {
+                continue;
+            }
+            let way: Vec<&BackStep> = chain.iter().rev().flat_map(|link| link.way.iter()).collect();
 
-        let mut few = alone;
-        few.push(Operation::Limit(FEW as u64 + 1));
-        let mut rows = self.execute_query(&OQLQuery { collection, operations: few })?;
-        if rows.len() > FEW {
-            return Ok(None);
+            let reads = OQLQuery { collection: members, operations: alone };
+            let mut few = reads.clone();
+            few.operations.push(Operation::Limit(FEW as u64 + 1));
+            let rows = self.execute_query(&few)?;
+            if rows.len() > FEW {
+                continue;
+            }
+            let Some(mut rows) = self.rows_back_along(rows, &way)? else {
+                continue;
+            };
+            // As a scan gives them, then through what stands before the
+            // first capture.
+            rows.sort_by(|left, right| left.id.cmp(&right.id));
+            for operation in before {
+                rows = self.apply_operation(rows, operation, &query.collection)?;
+            }
+            return Ok(Some(ReachedBack { rows, name: name.clone(), reads }));
         }
+        Ok(None)
+    }
+
+    /// The rows that reach `rows` by the steps of `way`, found by taking
+    /// the steps backwards. `None` when there are too many to be worth it.
+    fn rows_back_along(&self, mut rows: Vec<Document>, way: &[&BackStep]) -> OQLResult<Option<Vec<Document>>> {
+        /// Past this many rows on the way back, start as written.
+        const MOST_BACK: usize = 20_000;
         for step in way.iter().rev() {
             let mut seen = HashSet::new();
             let mut reached = Vec::new();
@@ -14072,11 +14154,6 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 }
             }
             rows = reached;
-        }
-        // As a scan gives them, then through what stands before the capture.
-        rows.sort_by(|left, right| left.id.cmp(&right.id));
-        for operation in before {
-            rows = self.apply_operation(rows, operation, &query.collection)?;
         }
         Ok(Some(rows))
     }
@@ -16870,6 +16947,15 @@ enum ReverseRelationship {
     Unknowable,
     /// Neither a field nor a referencing collection: a mistake in the query.
     Unknown,
+}
+
+/// The rows a block starts from, found from one of its captures.
+struct ReachedBack {
+    rows: Vec<Document>,
+    /// The capture they were found from.
+    name: String,
+    /// The read of that capture's collection that found them.
+    reads: OQLQuery,
 }
 
 /// One step of a path, as it is taken backwards.

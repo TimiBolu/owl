@@ -571,6 +571,37 @@ fn a_condition_runs_where_its_names_first_exist() {
             "select { .. } | 1 | 1",
         ]
     );
+    // A condition that pins a later capture chooses the start too: the
+    // block comes back to its rows through every capture on the way.
+    assert_eq!(
+        steps(
+            &db,
+            "people { a in .assignments  j in a.project  o in j.owner  where { o.name == \"Lee\" }  select { name, j: j.name }  explain() }",
+        ),
+        [
+            "people, reached back from o | - | 1",
+            "a in .assignments | 1 | 2",
+            "j in a.project | 2 | 2",
+            "o in j.owner.where { .. } | 2 | 1",
+            "select { .. } | 1 | 1",
+        ]
+    );
+    // Not through an optional capture, whose rows with no member stay.
+    assert_eq!(
+        steps(&db, "people { a? in .assignments  t in a.project.tasks  where { t.id == \"t3\" }  count()  explain() }"),
+        ["people | - | 5", "a? in .assignments | 5 | 6", "t in a.project.tasks.where { .. } | 6 | 1", "count() | 1 | 1"]
+    );
+    // The plan then says what is read first, which is not the block's own
+    // collection.
+    let explained = db
+        .try_rows("people { a in .assignments  t in a.project.tasks  where { t.id == \"t3\" }  count()  explain() }")
+        .unwrap();
+    let Some(Value::String(plan)) = explained[0].get_field("plan") else { panic!("no plan") };
+    assert!(
+        plan.starts_with("read the rows of tasks that t may be, and follow the block's path back from them to people"),
+        "{plan}"
+    );
+    assert!(!plan.contains("scan people"), "{plan}");
     // Of two conditions on a row, the one that reads nothing of the
     // block's row chooses the start.
     assert_eq!(
@@ -629,6 +660,13 @@ fn planning_a_block_never_changes_its_answer() {
         "people { m in .manager  where { m.name == \"Kim\" }  select { name } }",
         "projects { o in .owner.reports  where { o.name == \"Ada\" }  select { name, o: o.id } }",
         "tasks { b in .blocked_by.blocker  where { b.id == \"nobody\" }  select { id } }",
+        // A condition that pins a later capture: the block starts from that one.
+        "tasks { b in .blocked_by.blocker  c in b.blocked_by.blocker  where { c.id == \"t1\" }  select { a: id, b: b.id, c: c.id } }",
+        "people { a in .assignments  t in a.project.tasks  where { t.id == \"t3\" && a.hours > 1 }  select { name, a: a.id, t: t.id } }",
+        "people { a in .assignments  j in a.project  o in j.owner  where { o.name == \"Lee\" }  select { name, j: j.name } }",
+        "people { x in .assignments  a in .assignments  t in a.project.tasks  where { t.id == \"t3\" }  select { name, x: x.id, a: a.id } }",
+        "people { a? in .assignments  t in a.project.tasks  where { t.id == \"t3\" }  select { name, t: t.id } }",
+        "people { a in .assignments  where { a.hours > 5 }  t in a.project.tasks  where { t.id == \"t1\" }  select { name, a: a.id } }",
         // Conditions on members of a list and of a walk.
         "tasks { n in .notes  where { n.mins > 2 }  select { id, kind: n.kind } }",
         "tasks { where { id == \"t4\" }  far in .walk(.blocked_by.blocker)  where { far._depth < 3 && far.id != \"t9\" }  select { far: far.id, steps: far._depth } }",

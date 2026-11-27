@@ -580,16 +580,16 @@ conditions, which never changes an answer or its order:
 | A filter's conditions joined by `&&` are taken apart, and each runs straight after the last capture it reads. `where { c.id != "x" && b.kind == "hard" }` written last tests `b` before `c` is captured | Works |
 | A condition that reads no capture runs ahead of the first one. It joins the read of the block's starting rows, where an index may serve it | Works |
 | A condition on a captured row becomes a filter of the collection it is captured from: a whole collection, a query on one, a path, a walk. `p in people` with `where { p.id == owner }` reads one person for each row, not every person; `explain()` shows it as `p in people.where { .. }`, and `far in near.walk(..)` with `where { far._depth < 3 }` as `far in near.walk(..).where { .. }` | Works. Not for an optional capture, whose rows with no match must stay; nor for a condition that compares the captured row itself (`p != q`) or holds a nested query; nor for the members of a list, which are not rows of a collection. The names such a condition reads of the row are checked first, so a misspelt field is still refused. |
-| The block starts from the captured end when that is the smaller one. When a condition on the first captured row reads nothing of the block's row and leaves at most 64 rows of that row's collection, those rows are read first and the path followed back to the rows that reach them. `tasks { b in .blocked_by.blocker  where { b.id == "t3" } .. }` reads `t3` and its links, not every task; `explain()` shows the first step as `tasks, reached back from b` | Works, for a first capture over a path of references and relationships, with only filters before it. The starting rows are still given in the order a scan gives them. |
-| A collection that reads nothing of an earlier capture is worked out once for each starting row, not once for each combination | Works |
-| Starting from a later capture than the first, or changing the order the captures run in | Not done. A condition that pins the second captured row filters its collection, but the block still starts as written. |
+| The block starts from a captured end when that is the smaller one. When a condition on a captured row reads nothing of the block's row or of another capture, and leaves at most 64 rows of that row's collection, those rows are read first and the block's path is followed back from them, through every capture on the way, to the rows that reach them. `tasks { b in .blocked_by.blocker  where { b.id == "t3" } .. }` reads `t3` and its links, not every task; so does a block that pins its third capture. `explain()` shows the first step as `tasks, reached back from b`, and its `plan` and `uses_index` are of the read that is made | Works, for captures over paths of references and relationships, with only filters before the first. Not through an optional capture, a walk or a list. The starting rows are still given in the order a scan gives them. |
+| Changing the order the captures run in | Not done, and not needed for the answer: a later capture may read an earlier one, and the order of the answer follows theirs. What a different order would save is saved by the arrangements above. |
 
 `explain()` shows the block as arranged, so a condition that moved is seen
 where it runs. On 100 projects and 2,000 people, `projects { p in people
 where { p.id == owner }  count() }` took 20 ms arranged and 327 ms as
 written. On 5,000 tasks and 10,000 links, `tasks { b in .blocked_by.blocker
 where { b.id == "t00042" }  count() }` took 1.5 ms arranged and 40 ms as
-written.
+written, and a block of two captures with the condition on the second took
+4.5 ms arranged and about 115 ms as written.
 
 ---
 
