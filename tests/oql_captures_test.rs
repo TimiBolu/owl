@@ -602,11 +602,33 @@ fn a_condition_runs_where_its_names_first_exist() {
         "{plan}"
     );
     assert!(!plan.contains("scan people"), "{plan}");
-    // Of two conditions on a row, the one that reads nothing of the
-    // block's row chooses the start.
+    // The start is chosen by counting. Three of the four assignments pass
+    // this condition, so starting from them would leave about three of the
+    // five people: a scan is as good, and the block starts as written.
     assert_eq!(
         steps(&db, "people { a in .assignments  where { a.hours > 5 && a.id != id }  count()  explain() }"),
-        ["people, reached back from a | - | 2", "a in .assignments.where { .. }.where { .. } | 2 | 3", "count() | 3 | 1"]
+        ["people | - | 5", "a in .assignments.where { .. }.where { .. } | 5 | 3", "count() | 3 | 1"]
+    );
+    // One assignment passes this one, which leaves about one person.
+    assert_eq!(
+        steps(&db, "people { a in .assignments  where { a.hours > 25 && a.id != id }  count()  explain() }"),
+        ["people, reached back from a | - | 1", "a in .assignments.where { .. }.where { .. } | 1 | 1", "count() | 1 | 1"]
+    );
+    // What was expected is said, beside what was found.
+    let explained = db
+        .try_rows("tasks { b in .blocked_by.blocker  where { b.id == \"t3\" }  select { id }  explain() }")
+        .unwrap();
+    let Some(Value::String(plan)) = explained[0].get_field("plan") else { panic!("no plan") };
+    assert!(plan.contains("about 1 of its 4 rows were expected"), "{plan}");
+    // Of two captures a condition pins, the one expected to leave fewer
+    // starting rows is where the block starts: one assignment leads back
+    // to one person, where one task leads back to the two on its project.
+    assert_eq!(
+        steps(
+            &db,
+            "people { a in .assignments  t in a.project.tasks  where { a.hours > 25 && t.id == \"t1\" }  count()  explain() }",
+        )[0],
+        "people, reached back from a | - | 1"
     );
     // A condition that reads the block's row as well cannot.
     assert_eq!(

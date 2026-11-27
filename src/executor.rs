@@ -664,6 +664,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 recorded.reached_back = reached_back
                     .as_ref()
                     .map(|reached| (reached.name.clone(), reached.reads.clone()));
+                recorded.expected = reached_back.as_ref().and_then(|reached| reached.expected);
             }
             let mut documents = match (reached_back, &whole) {
                 (Some(reached), _) => reached.rows,
@@ -2292,10 +2293,14 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 Some(Value::String(plan)) => plan.trim_end().to_string(),
                 _ => String::new(),
             };
+            let expected = match recorded.expected {
+                Some((expected, all)) => format!(": about {expected} of its {all} rows were expected"),
+                None => String::new(),
+            };
             fields.insert(
                 "plan".to_string(),
                 Value::String(format!(
-                    "read the rows of {} that {name} may be, and follow the block's path back from them to {}\n{how}",
+                    "read the rows of {} that {name} may be, and follow the block's path back from them to {}{expected}\n{how}",
                     reads.collection, query.collection
                 )),
             );
@@ -4629,11 +4634,14 @@ impl<S: DocumentStore> QueryExecutor<S> {
         })
     }
 
-    /// `where { .. }.sort { .id.asc }.limit(n)`: a collection is read in
-    /// order of id, so the first `n` rows that pass the filter are the
-    /// answer and the read can stop there. Returns those rows and how many
-    /// leading filters they already satisfy; the sort and limit still run.
-    /// `None` when the shape does not apply.
+    /// `where { .. }.limit(n)`: a collection is read in order of id and a
+    /// filter keeps that order, so the first `n` rows that pass the filter
+    /// are the answer and the read can stop there. The same with
+    /// `.sort { .id.asc }` written before the limit, which asks for the
+    /// order the rows already have, and with `first()`, which is one row.
+    /// Returns those rows and how many leading filters they already
+    /// satisfy; what follows the filters still runs. `None` when the shape
+    /// does not apply.
     fn first_rows_by_id(&self, query: &OQLQuery) -> OQLResult<Option<(Vec<Document>, usize)>> {
         if !COLUMN_AGGREGATION.with(|enabled| enabled.get()) {
             return Ok(None);
@@ -4643,20 +4651,26 @@ impl<S: DocumentStore> QueryExecutor<S> {
             .iter()
             .take_while(|operation| matches!(operation, Operation::Where(_)))
             .count();
-        let (Some(Operation::Sort(sort)), Some(Operation::Limit(limit))) = (
-            query.operations.get(leading),
-            query.operations.get(leading + 1),
-        ) else {
-            return Ok(None);
+        let limit = match (query.operations.get(leading), query.operations.get(leading + 1)) {
+            (Some(Operation::Limit(limit)), _) => *limit,
+            (Some(Operation::First), _) => 1,
+            (Some(Operation::Sort(sort)), Some(Operation::Limit(limit))) => {
+                let [key] = sort.fields.as_slice() else {
+                    return Ok(None);
+                };
+                let by_id = matches!(key.direction, crate::parser::SortDirection::Asc)
+                    && matches!(&key.expression, Expression::FieldAccess(field) if field.path == ["id"]);
+                if !by_id {
+                    return Ok(None);
+                }
+                *limit
+            }
+            _ => return Ok(None),
         };
-        let [key] = sort.fields.as_slice() else {
-            return Ok(None);
-        };
-        let by_id = matches!(key.direction, crate::parser::SortDirection::Asc)
-            && matches!(&key.expression, Expression::FieldAccess(field) if field.path == ["id"]);
-        if !by_id || *limit > 10_000 {
+        if limit > 10_000 {
             return Ok(None);
         }
+        let limit = &limit;
         let Some(schema) = self.schema_of(&query.collection)? else {
             return Ok(None);
         };
@@ -14004,7 +14018,11 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 let Some(target) = single(schema.fields.get(name)) else {
                     return Ok(None);
                 };
-                way.push(BackStep::Holders { source: collection.clone(), field: name.clone() });
+                way.push(BackStep::Holders {
+                    source: collection.clone(),
+                    field: name.clone(),
+                    target: target.clone(),
+                });
                 collection = target;
                 continue;
             }
@@ -14187,6 +14205,10 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
         let mut known: HashMap<String, String> = HashMap::new();
         let mut links: HashMap<String, Link> = HashMap::new();
+        // The capture that leaves the fewest starting rows, with its read,
+        // the rows it found, the way back and how many rows are expected.
+        #[allow(clippy::type_complexity)]
+        let mut best: Option<(String, OQLQuery, Vec<Document>, Vec<BackStep>, Option<f64>)> = None;
         for operation in after {
             let (name, source, optional) = match operation {
                 Operation::Capture { name, source, optional } => (name, source, *optional),
@@ -14261,7 +14283,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
             if !whole {
                 continue;
             }
-            let way: Vec<&BackStep> = chain.iter().rev().flat_map(|link| link.way.iter()).collect();
+            let way: Vec<BackStep> = chain.iter().rev().flat_map(|link| link.way.iter().cloned()).collect();
 
             let reads = OQLQuery { collection: members, operations: alone };
             let mut few = reads.clone();
@@ -14270,18 +14292,69 @@ impl<S: DocumentStore> QueryExecutor<S> {
             if rows.len() > FEW {
                 continue;
             }
-            let Some(mut rows) = self.rows_back_along(rows, &way)? else {
-                continue;
-            };
-            // As a scan gives them, then through what stands before the
-            // first capture.
-            rows.sort_by(|left, right| left.id.cmp(&right.id));
-            for operation in before {
-                rows = self.apply_operation(rows, operation, &query.collection)?;
+            // How many starting rows these lead back to, by the sizes of
+            // the collections on the way: a row is held by as many rows
+            // of a collection as that collection has for each row it
+            // refers to. Starting from the captured end is worth it only
+            // when it leaves a good deal fewer rows than the collection
+            // holds; when it would leave most of them, a scan is cheaper
+            // than the way back.
+            let expected = self.rows_expected_back(rows.len(), &way)?;
+            let all = self.store.collection_len(&query.collection)?.map(|all| all as u64);
+            if let (Some(expected), Some(all)) = (expected, all) {
+                if expected * 2.0 > all as f64 {
+                    continue;
+                }
             }
-            return Ok(Some(ReachedBack { rows, name: name.clone(), reads }));
+            let better = match (&best, expected) {
+                (None, _) => true,
+                (Some((_, _, _, _, Some(known))), Some(expected)) => expected < *known,
+                (Some((_, _, _, _, None)), Some(_)) => true,
+                (Some(_), None) => false,
+            };
+            if better {
+                best = Some((name.clone(), reads, rows, way, expected));
+            }
         }
-        Ok(None)
+        let Some((name, reads, rows, way, expected)) = best else {
+            return Ok(None);
+        };
+        let way: Vec<&BackStep> = way.iter().collect();
+        let Some(mut rows) = self.rows_back_along(rows, &way)? else {
+            return Ok(None);
+        };
+        // As a scan gives them, then through what stands before the first
+        // capture.
+        rows.sort_by(|left, right| left.id.cmp(&right.id));
+        for operation in before {
+            rows = self.apply_operation(rows, operation, &query.collection)?;
+        }
+        let all = self.store.collection_len(&query.collection)?.map(|all| all as u64);
+        let expected = expected.zip(all).map(|(expected, all)| (expected.ceil() as u64, all));
+        Ok(Some(ReachedBack { rows, name, reads, expected }))
+    }
+
+    /// How many rows `found` rows are expected to lead back to along
+    /// `way`, by the sizes of the collections it passes. `None` when the
+    /// store cannot count one of them.
+    fn rows_expected_back(&self, found: usize, way: &[BackStep]) -> OQLResult<Option<f64>> {
+        let mut expected = found as f64;
+        for step in way.iter().rev() {
+            // Back along a reference there is one row. Back to the rows
+            // that hold a reference there are, on average, as many as
+            // the holding collection has for each row it may refer to.
+            if let BackStep::Holders { source, target, .. } = step {
+                let (Some(holders), Some(held)) =
+                    (self.store.collection_len(source)?, self.store.collection_len(target)?)
+                else {
+                    return Ok(None);
+                };
+                if held > 0 {
+                    expected *= holders as f64 / held as f64;
+                }
+            }
+        }
+        Ok(Some(expected))
     }
 
     /// The rows that reach `rows` by the steps of `way`, found by taking
@@ -14303,7 +14376,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                             }
                         }
                     }
-                    BackStep::Holders { source, field } => {
+                    BackStep::Holders { source, field, .. } => {
                         for holder in self.store.scan_referencing_documents_shared(
                             &row.schema,
                             &row.id,
@@ -16461,6 +16534,8 @@ struct RecordedSteps {
     /// The capture the starting rows were reached back from, and the read
     /// of its collection that found them.
     reached_back: Option<(String, OQLQuery)>,
+    /// How many starting rows that was expected to leave, of how many.
+    expected: Option<(u64, u64)>,
     steps: Vec<crate::document::Fields>,
 }
 
@@ -17146,13 +17221,18 @@ struct ReachedBack {
     name: String,
     /// The read of that capture's collection that found them.
     reads: OQLQuery,
+    /// How many starting rows this was expected to leave, of how many the
+    /// collection holds, when the store could count them.
+    expected: Option<(u64, u64)>,
 }
 
 /// One step of a path, as it is taken backwards.
+#[derive(Clone)]
 enum BackStep {
-    /// The step followed `field` of a row of `source`: back from the row
-    /// reached, to the rows of `source` that hold it there.
-    Holders { source: String, field: String },
+    /// The step followed `field` of a row of `source` to a row of
+    /// `target`: back from the row reached, to the rows of `source` that
+    /// hold it there.
+    Holders { source: String, field: String, target: String },
     /// The step went to the rows that refer through `field`: back from
     /// such a row, along `field`.
     Along { field: String },
