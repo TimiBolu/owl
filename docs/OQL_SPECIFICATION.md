@@ -514,13 +514,67 @@ collide.
 | Feature | Status |
 |---|---|
 | `collection { where {..} sort {..} select {..} }` is the same query as the chained form | Works |
-| Block locals, visible from their definition onward, including inside nested queries | Works |
+| Block locals, visible from their definition onward, including inside nested queries | Works. Inside a nested query or the operations of a path, a local still means what it meant for the block's row: `people { mine = .assignments.project.id  select { n: projects.where { .id in mine }.count() } }`. A local written as a bare field name (`boss = manager`) is the exception and is read against the inner row; write it as a path (`boss = .manager`). |
 | A local may be a collection, an aggregate, or any value | Works |
 | No shadowing of the root name or of an earlier local | Works |
 | `group_by`, `limit`, `nearest` inside a block | Works |
 | Object-valued select on a local bound to a reference | Works |
 | A block ends in exactly one result entry | Works. The entry is a `select` or any terminal the chained form allows: `count()`, `first()`, `exists()`, an aggregate, `update {..}`, `delete()`. Nothing may follow it, and a block with no result entry is rejected. |
 | A block rooted in a binding, an array field or a reverse relationship | *(not probed)* |
+
+### 10.1 Captures: one row for every combination
+
+A block names things in two ways. `name = value` names a whole value: the
+block still has one row for each row it started from. `name in collection`
+names each member of the collection in turn: the block then has one row for
+every member, and the name is that member.
+
+```oql
+tasks {                                   -- three tasks that block one another in a ring
+  b in .blocked_by.blocker
+  c in b.blocked_by.blocker
+  where { c.blocked_by.blocker contains tasks.id }
+  select { a: id, b: b.id, c: c.id }
+}
+
+people {                                  -- the row between two others, named and read
+  a in .assignments
+  t in a.project.tasks
+  where { a.role == "dev" }
+  select { person: name, role: a.role, task: t.id }
+}
+
+tasks {                                   -- what blocks a task, and everything behind that
+  where { id == "t4" }
+  near in .blocked_by.blocker
+  far in near.walk(.blocked_by.blocker)
+  select { task: id, near: near.id, far: far.id, steps: far._depth }
+}
+```
+
+| Rule | Status |
+|---|---|
+| `name in collection` is an entry of a block, anywhere before the result entry. The name is visible from its line onward, as a local is; it may not be the root's name, an earlier name, or a name already used above it | Works |
+| The collection is anything collection-shaped, as it stands for the row in hand: a relationship or a path (`.assignments`, `b.blocked_by.blocker`), a list field (`tag in .tags`, `n in .notes`), a walk or routes (`near.walk(..)`), a path with operations (`.orders.where {..}`), a whole collection or a query on one (`p in people`). A single reference is one member, or none | Works |
+| The row in hand stays the row the block started from: `.field`, a bare field and the collection's name mean that row. A captured row is read by its name: `b.id`, `b.project.name`, `b.blocked_by.blocker`, `b.select {..}`, `b.walk(..)` | Works. A captured row that is a stored row is everything a row reached by a path is: its fields, its references, and the rows that refer to it. |
+| After a capture every entry works on combinations: `where`, `sort`, `limit`, `group_by`, `count()`, an aggregate and `select` mean what they always mean, over one row for every combination | Works. `group_by { a.role }` is keyed `role`. |
+| A `where` may sit between two captures, and filters before the next one multiplies the rows | Works |
+| A row with no member is not in the answer | Works. There is no form yet that keeps it with the name empty. |
+| Nothing is left out unasked: two captures may land on the same row. `x != y` says otherwise; two captured rows are compared by which row each is | Works |
+| Order: the rows the block started from in their order, and for each, its members in theirs | Works |
+| Inside a nested query the name is still the row captured for the block's row: `links.where { .blocker == b.id }` | Works |
+| What a walk notes on a row is read of the captured row: `far._depth`, `far._path` | Works |
+| A name the captured row's collection does not have (`b.nmae`) | Error, as on any declared row, for a captured row that is a stored row |
+| A write after a capture (`update`, `delete()`, an insert) | Error: there is one row for every combination, and a row would be written once for each |
+| A capture outside a block, in a chain | Not a form. As with locals, a name belongs to a block. |
+| A captured row in a `select` by its name alone (`select { b }`) | The reference to the row, as a reference field is. `b.select { .. }` gives its fields. |
+| `explain()` on a block with a capture | Runs, and says only that the general executor applies the entries in order. It does not yet show each capture with the rows in and out. |
+
+Captures run as written: each is a loop over the rows in hand, in the order
+the entries stand. A block is fast when it starts from the selective end and
+filters early. The engine does not yet move a filter ahead of a capture or
+choose which end to start from, and a capture of a whole collection is every
+pair until a later `where` narrows it.
 
 ---
 
@@ -537,7 +591,7 @@ collide.
 | Sort and limit groups by an aggregate | `.select {..}.sort { .total.desc }.limit(1)` | Works |
 | Aggregate arithmetic without grouping | `select { mean: sum(.amount) / count(.amount) }` | Works |
 | Group by a function call | `.group_by { year(.placed) }` | Works. The key is named after the function (`year`). |
-| Name a group key | `.group_by { month: format_date(.placed, "%Y-%m"), big: .amount > 100 }` | Works. Any other expression must be named. Two keys with one name are an error. |
+| Name a group key | `.group_by { month: format_date(.placed, "%Y-%m"), big: .amount > 100 }` | Works. Any other expression must be named, except a path from a named row (`a.role`, `orders.status`), which is keyed by its last name. Two keys with one name are an error. |
 | Count distinct | `.select { status }.distinct().count()` | Works |
 | An aggregate after a path of values | `.orders.total.sum()`, `people.salary.max()`, `.salary.median()`, `.salary.percentile(0.9)` | Works. With nothing named, an aggregate takes each value it follows: `.x.sum()` is `sum(.x)`. A path picks the values and a method reduces them, at the top level, through a relationship, in a filter and in a group. |
 | Count distinct | `.customer.distinct().count()`, `.orders.status.distinct().count()` | Works, by composition, in every position. There is no word for it: `count_distinct` was added and then removed once the chain worked everywhere and ran as fast. |

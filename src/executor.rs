@@ -785,9 +785,23 @@ impl<S: DocumentStore> QueryExecutor<S> {
                             self.apply_walk(documents, path, depth.as_ref(), None, *every, *paths)?
                         }
                     }
+                    Operation::Capture { name, source } => {
+                        let rows = self.apply_capture(documents, name, source)?;
+                        self.check_captured_names(&rows, name, &after[position + 1..])?;
+                        rows
+                    }
                     _ => self.apply_operation(documents, operation, &query.collection)?,
                 };
                 grouped |= matches!(operation, Operation::GroupBy(_));
+            }
+            // Rows that were not reshaped still hold the rows captured for
+            // them, which are not theirs to show.
+            if after.iter().any(|operation| matches!(operation, Operation::Capture { .. })) {
+                for document in &mut documents {
+                    document
+                        .fields
+                        .retain(|name, _| !name.starts_with(crate::parser::CAPTURE_PREFIX));
+                }
             }
             return Ok(documents);
         }
@@ -2022,7 +2036,10 @@ impl<S: DocumentStore> QueryExecutor<S> {
     /// hand, in the order written.
     fn runs_plainly(operation: &Operation) -> bool {
         match operation {
-            Operation::Combine { .. } | Operation::Walk { .. } | Operation::PartitionBy(_) => true,
+            Operation::Combine { .. }
+            | Operation::Walk { .. }
+            | Operation::PartitionBy(_)
+            | Operation::Capture { .. } => true,
             // A function written in OQL, anywhere in the chain.
             Operation::AggregateExpr { function, .. } => !Self::is_aggregate_name(function),
             Operation::Select(block) => block
@@ -5407,6 +5424,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 self.apply_walk(documents, path, depth.as_ref(), None, *every, *paths)
             }
             Operation::PartitionBy(block) => self.apply_partition_by(documents, block),
+            Operation::Capture { name, source } => self.apply_capture(documents, name, source),
             Operation::Call(_) => Err(OQLError::Generic {
                 message: "a function call gives a query its rows, so it must come first".to_string(),
             }),
@@ -7681,7 +7699,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
     /// list otherwise.
     fn run_collection_operations(
         &self,
-        mut documents: Vec<Document>,
+        documents: Vec<Document>,
         mut single: bool,
         operations: &[Operation],
         scope_document: &Document,
@@ -7693,6 +7711,20 @@ impl<S: DocumentStore> QueryExecutor<S> {
             .iter()
             .any(|operation| matches!(operation, Operation::First));
 
+        let documents =
+            self.collection_operation_rows(documents, operations, scope_document, collection_scope)?;
+        Self::shape_collection_rows(documents, single, operations)
+    }
+
+    /// Apply operations to rows already in hand, as rows: what a nested
+    /// expression's operations leave, before it is shaped as a value.
+    fn collection_operation_rows(
+        &self,
+        mut documents: Vec<Document>,
+        operations: &[Operation],
+        scope_document: &Document,
+        collection_scope: &str,
+    ) -> OQLResult<Vec<Document>> {
         for (position, operation) in operations.iter().enumerate() {
             // With no rows there is nothing for the enclosing row's values
             // to be compared with, so the operation is used as written.
@@ -7731,7 +7763,15 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 other => self.apply_operation(documents, other, collection_scope)?,
             };
         }
+        Ok(documents)
+    }
 
+    /// [`Self::collection_operation_rows`], shaped as a value.
+    fn shape_collection_rows(
+        documents: Vec<Document>,
+        single: bool,
+        operations: &[Operation],
+    ) -> OQLResult<Value> {
         let aggregate_field = operations.last().and_then(Self::scalar_result_field);
         if let Some(field) = aggregate_field {
             return Ok(documents
@@ -8336,6 +8376,23 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 if let Some(path) = Self::extract_scoped_path(expr, &scope_document.schema) {
                     return self.scoped_path_to_literal_expression(scope_document, &path);
                 }
+                // `users.orders.where { .. }.count()`: a collection of the
+                // enclosing row with operations on it is worked out for
+                // that row, and its answer is the constant. This is what a
+                // block's name for such a collection becomes in a nested
+                // query.
+                if let Expression::CollectionExpression { source, operations } = expr {
+                    if let Some(path) = Self::extract_scoped_path(source, &scope_document.schema)
+                        .filter(|path| !path.is_empty())
+                    {
+                        let value = self.evaluate_collection_expression(
+                            scope_document,
+                            &Expression::FieldAccess(FieldAccess { path }),
+                            operations,
+                        )?;
+                        return Self::value_as_expression(self.references_as_ids(value)?);
+                    }
+                }
             }
         }
 
@@ -8502,6 +8559,27 @@ impl<S: DocumentStore> QueryExecutor<S> {
             }
             other => Self::value_as_expression(other),
         }
+    }
+
+    /// A value with every reference in it carried as the id of its target,
+    /// which is what a reference compares equal to.
+    fn references_as_ids(&self, value: Value) -> OQLResult<Value> {
+        Ok(match value {
+            reference @ (Value::Reference(_) | Value::GlobalReference(_)) => self.reference_as_id(&reference)?,
+            Value::List(items) => Value::List(
+                items
+                    .into_iter()
+                    .map(|item| self.references_as_ids(item))
+                    .collect::<OQLResult<_>>()?,
+            ),
+            Value::Object(fields) => Value::Object(
+                fields
+                    .into_iter()
+                    .map(|(name, value)| Ok((name, self.references_as_ids(value)?)))
+                    .collect::<OQLResult<_>>()?,
+            ),
+            other => other,
+        })
     }
 
     /// The value of a whole row, as seen when a row parameter is used
@@ -13042,6 +13120,184 @@ impl<S: DocumentStore> QueryExecutor<S> {
             through = next_through;
         }
         Ok(reached)
+    }
+
+    /// `name in collection`: every row, once for each member of the
+    /// collection as it stands for that row, with the member kept on the
+    /// row under the name. A row with no member is dropped. Rows keep
+    /// their order, and each row's members theirs.
+    ///
+    /// A member that is a stored row is kept as a reference to it, so a
+    /// path from the name reads it, follows its references and finds the
+    /// rows that refer to it, as a path through any reference does. What a
+    /// walk noted on it is kept beside the reference. Anything else is
+    /// kept as it is: an object of a list, a row a `select` shaped, a
+    /// plain value.
+    fn apply_capture(
+        &self,
+        documents: Vec<Document>,
+        name: &str,
+        source: &Expression,
+    ) -> OQLResult<Vec<Document>> {
+        let field = crate::parser::capture_field(name);
+        let mut combined = Vec::new();
+        for document in documents {
+            let (members, whole) = self.capture_members(&document, source)?;
+            for member in members {
+                let mut row = document.clone();
+                for note in crate::parser::CAPTURE_NOTES {
+                    if let Some(noted) = member.fields.get(note) {
+                        row.fields
+                            .insert(crate::parser::capture_note_field(&field, note), noted.clone());
+                    }
+                }
+                let reference = match whole && !member.fields.contains_key(SCALAR_ROW_FIELD) {
+                    true if self.schema_of(&member.schema)?.is_some() => {
+                        self.store.object_ref_of(&member.schema, &member.id)?
+                    }
+                    _ => None,
+                };
+                let kept = match (reference, member.fields.get(SCALAR_ROW_FIELD)) {
+                    (Some(reference), _) => Value::Reference(reference),
+                    (None, Some(scalar)) => scalar.clone(),
+                    (None, None) if whole => Self::row_as_value(&member),
+                    (None, None) => Value::Object(member.fields),
+                };
+                row.fields.insert(field.clone(), kept);
+                combined.push(row);
+            }
+        }
+        Ok(combined)
+    }
+
+    /// A name read of a captured row that its collection does not have is
+    /// a slip, and would otherwise read as nothing: `b.nmae == "x"` would
+    /// quietly match no rows. Checked for a captured row that is a stored
+    /// row of a collection with a schema, against what follows the capture.
+    fn check_captured_names(&self, rows: &[Document], name: &str, following: &[Operation]) -> OQLResult<()> {
+        let field = crate::parser::capture_field(name);
+        let Some(Value::Reference(reference)) = rows.first().and_then(|row| row.fields.get(&field)) else {
+            return Ok(());
+        };
+        let Some(collection) = self.referenced_document(reference)?.map(|row| row.schema.clone()) else {
+            return Ok(());
+        };
+        let Some(schema) = self.schema_of(&collection)? else {
+            return Ok(());
+        };
+        // The first name after the captured row's own, wherever it is read:
+        // as a path from the row in hand, or inside a nested query, where
+        // the row in hand is named by its collection.
+        fn read(node: &serde_json::Value, field: &str, names: &mut Vec<String>) {
+            match node {
+                serde_json::Value::Object(fields) => {
+                    if let Some(path) = fields
+                        .get("FieldAccess")
+                        .and_then(|access| access.get("path"))
+                        .and_then(|path| path.as_array())
+                    {
+                        if path.first().and_then(|first| first.as_str()) == Some(field) {
+                            names.extend(path.get(1).and_then(|next| next.as_str()).map(str::to_string));
+                        }
+                    }
+                    if let Some(access) = fields.get("ChainedAccess") {
+                        let from = access.get("base").and_then(|base| base.get("ChainedAccess"));
+                        if from.and_then(|from| from.get("field")).and_then(|name| name.as_str()) == Some(field) {
+                            names.extend(access.get("field").and_then(|next| next.as_str()).map(str::to_string));
+                        }
+                    }
+                    fields.values().for_each(|value| read(value, field, names));
+                }
+                serde_json::Value::Array(items) => items.iter().for_each(|value| read(value, field, names)),
+                _ => {}
+            }
+        }
+        let mut names = Vec::new();
+        if let Ok(tree) = serde_json::to_value(following) {
+            read(&tree, &field, &mut names);
+        }
+        for read in names {
+            if schema.fields.contains_key(&read)
+                || read.starts_with('_')
+                || read == "*"
+                || DocumentSystemField::from_name(&read).is_some()
+                || self.is_relationship(&collection, &read)?
+            {
+                continue;
+            }
+            return Err(OQLError::SchemaValidation {
+                message: format!(
+                    "'{name}' is a row of '{collection}', which has no field '{read}', and no \
+                     collection named '{read}' references it"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// The rows a capture's collection holds for one row, and whether they
+    /// are whole rows of their collection rather than rows reshaped on the
+    /// way.
+    fn capture_members(&self, document: &Document, source: &Expression) -> OQLResult<(Vec<Document>, bool)> {
+        let reshapes = |operations: &[Operation]| {
+            operations.iter().any(|operation| {
+                !matches!(
+                    operation,
+                    Operation::Where(_)
+                        | Operation::Sort(_)
+                        | Operation::Limit(_)
+                        | Operation::LimitExpr(_)
+                        | Operation::Offset(_)
+                        | Operation::OffsetExpr(_)
+                        | Operation::First
+                        | Operation::Distinct
+                        | Operation::Step(_)
+                        | Operation::Walk { .. }
+                )
+            })
+        };
+        match source {
+            Expression::FieldAccess(path) => Ok((self.path_source_rows(document, &path.path)?.0, true)),
+            Expression::CollectionExpression { source: from, operations } => {
+                let (rows, scope) = match from.as_ref() {
+                    Expression::FieldAccess(path) => (
+                        self.path_source_rows(document, &path.path)?.0,
+                        path.path.last().cloned().unwrap_or_default(),
+                    ),
+                    other => {
+                        let mut rows = Vec::new();
+                        self.push_source_rows(self.evaluate_expression(document, other)?, "", &mut rows)?;
+                        (rows.into_iter().map(SourceRow::into_document).collect(), String::new())
+                    }
+                };
+                Ok((
+                    self.collection_operation_rows(rows, operations, document, &scope)?,
+                    !reshapes(operations),
+                ))
+            }
+            // A query on a collection, with what it reads of this row put
+            // in its place.
+            Expression::QueryExpression { query } => {
+                let query = self.materialize_query_with_scope(query, document)?;
+                Ok((self.execute_query(&query)?, !reshapes(&query.operations)))
+            }
+            // A bare name is a whole collection.
+            Expression::Identifier(name)
+                if CallFrame::value(name).is_none()
+                    && !document.fields.contains_key(name)
+                    && self.schema_of(name)?.is_some() =>
+            {
+                Ok((
+                    self.execute_query(&OQLQuery { collection: name.clone(), operations: Vec::new() })?,
+                    true,
+                ))
+            }
+            other => {
+                let mut rows = Vec::new();
+                self.push_source_rows(self.evaluate_expression(document, other)?, "", &mut rows)?;
+                Ok((rows.into_iter().map(SourceRow::into_document).collect(), false))
+            }
+        }
     }
 
     /// `partition_by { keys }`: note on each row which partition it is in.
