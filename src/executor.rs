@@ -648,10 +648,16 @@ impl<S: DocumentStore> QueryExecutor<S> {
             let mut documents = match (reached_back, &whole) {
                 (Some(reached), _) => reached.rows,
                 (None, Some(_)) => Vec::new(),
-                (None, None) => self.execute_general_query(&OQLQuery {
-                    collection: query.collection.clone(),
-                    operations: before.clone(),
-                })?,
+                (None, None) => {
+                    let mut rows = self.execute_general_query(&OQLQuery {
+                        collection: query.collection.clone(),
+                        operations: before.clone(),
+                    })?;
+                    if Self::starts_in_scan_order(written, query) {
+                        rows.sort_by(|left, right| left.id.cmp(&right.id));
+                    }
+                    rows
+                }
             };
             let mut grouped = before
                 .iter()
@@ -2231,7 +2237,13 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 );
                 reached.rows
             }
-            None => self.execute_general_query(&start)?,
+            None => {
+                let mut rows = self.execute_general_query(&start)?;
+                if Self::starts_in_scan_order(written, query) {
+                    rows.sort_by(|left, right| left.id.cmp(&right.id));
+                }
+                rows
+            }
         };
         let mut steps = vec![step(
             match before.len() {
@@ -7026,9 +7038,13 @@ impl<S: DocumentStore> QueryExecutor<S> {
         match expression {
             Expression::Identifier(name) => name == collection,
             Expression::FieldAccess(access) => access.path.len() == 1 && access.path[0] == collection,
-            // A nested query is given the enclosing row's values when it
-            // runs, not when the operation holding it is prepared.
-            Expression::Literal(_) | Expression::QueryExpression { .. } => false,
+            Expression::Literal(_) => false,
+            // A query inside reads the enclosing row when anything in it
+            // names the collection, however deep.
+            Expression::QueryExpression { query } => query
+                .operations
+                .iter()
+                .any(|operation| Self::operation_names(operation, collection)),
             Expression::CollectionExpression { source, operations } => {
                 names(source)
                     || operations
@@ -8382,14 +8398,21 @@ impl<S: DocumentStore> QueryExecutor<S> {
         query: &crate::parser::OQLQuery,
         scope_document: &Document,
     ) -> OQLResult<crate::parser::OQLQuery> {
+        // In a query on the enclosing row's own collection, the name means
+        // the enclosing row; but in a query inside that one, it means the
+        // nearer row of that collection, which is not known yet. Those are
+        // left for when it is.
+        let nearer = query.collection == scope_document.schema;
+        let outer = NAME_TAKEN_NEARER.with(|taken| taken.replace(taken.get() || nearer));
         let operations = query
             .operations
             .iter()
             .map(|op| self.materialize_operation_with_scope(op, scope_document))
-            .collect::<OQLResult<Vec<_>>>()?;
+            .collect::<OQLResult<Vec<_>>>();
+        NAME_TAKEN_NEARER.with(|taken| taken.set(outer));
         Ok(crate::parser::OQLQuery {
             collection: query.collection.clone(),
-            operations,
+            operations: operations?,
         })
     }
 
@@ -8626,10 +8649,19 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
 
         Ok(match expr {
-            Expression::Identifier(_)
-            | Expression::FieldAccess(_)
-            | Expression::Literal(_)
-            | Expression::QueryExpression { .. } => expr.clone(),
+            Expression::Identifier(_) | Expression::FieldAccess(_) | Expression::Literal(_) => expr.clone(),
+            // A query inside this one reads the enclosing row too, at any
+            // depth: `people.salary` two queries down is still this row's
+            // salary. Left alone, it would be read when the inner query
+            // runs, against a row of another collection, and mean every
+            // person's salary.
+            Expression::QueryExpression { query } => {
+                if NAME_TAKEN_NEARER.with(|taken| taken.get()) {
+                    expr.clone()
+                } else {
+                    Expression::QueryExpression { query: self.materialize_query_with_scope(query, scope_document)? }
+                }
+            }
             Expression::CollectionExpression { source, operations } => {
                 Expression::CollectionExpression {
                     source: Box::new(
@@ -13425,6 +13457,21 @@ impl<S: DocumentStore> QueryExecutor<S> {
         Ok(combined)
     }
 
+    /// Whether a block whose conditions were arranged must have its
+    /// starting rows put back in the order a scan gives them. As written,
+    /// nothing stood before its first capture, so its rows came from a
+    /// scan, by id. Arranged, conditions stand there, and an index that
+    /// serves them gives rows in the index's order.
+    fn starts_in_scan_order(written: &OQLQuery, planned: &OQLQuery) -> bool {
+        let first = |query: &OQLQuery| {
+            query
+                .operations
+                .iter()
+                .position(|operation| matches!(operation, Operation::Capture { .. }))
+        };
+        first(written) == Some(0) && first(planned).is_some_and(|at| at > 0)
+    }
+
     /// Whether the rows these operations leave are still the collection's
     /// own stored rows, each with its id, however many captures have
     /// multiplied them.
@@ -13507,14 +13554,22 @@ impl<S: DocumentStore> QueryExecutor<S> {
                         arranged.push(filter);
                         fixed = arranged.len();
                     }
-                    Some(names) if names.is_empty() && fixed == 0 => lifted.push(filter),
+                    // Ahead of the first capture only when nothing is
+                    // written there: the read of the starting rows is then
+                    // a scan, whose order can be given back (see
+                    // `starts_in_scan_order`). Joined to a read that is
+                    // already filtered, it could change which index serves
+                    // that read, and so the order of the rows.
+                    Some(names) if names.is_empty() && fixed == 0 && at == 0 => lifted.push(filter),
                     Some(names) => {
                         let after = arranged
                             .iter()
                             .rposition(|operation| {
                                 matches!(operation, Operation::Capture { name, .. } if names.contains(name))
                             })
-                            .map_or(0, |capture| capture + 1);
+                            // A condition on the block's row alone goes
+                            // straight after the first capture.
+                            .map_or(1, |capture| capture + 1);
                         let mut place = after.max(fixed);
                         while matches!(arranged.get(place), Some(Operation::Where(_))) {
                             place += 1;
@@ -16284,6 +16339,13 @@ thread_local! {
 
 thread_local! {
     static CAPTURE_PLANNING: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+thread_local! {
+    /// While a nested query on the enclosing row's own collection is given
+    /// that row's values: the name belongs to the nearer row in anything
+    /// nested deeper.
+    static NAME_TAKEN_NEARER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Turn the planning of a block's captures on or off for this thread. It

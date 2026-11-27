@@ -39,6 +39,39 @@ and the `.oql` file has to produce the same rows.
 An `.oql` file that holds only comments marks a query OQL cannot express; the
 run reports it as `NO OQL`. There are none at present.
 
+## Names and scope, at random
+
+The queries above ask hard questions, one each. `scope` asks one question in
+many shapes: what does a name mean here? It makes queries from a seed, writes
+each one twice from one description, as OQL and as SQL, and requires:
+
+- the same rows from Owl as from SQLite, in any order;
+- the same rows in the same order from Owl whether its planner arranges a
+  block's conditions or runs the block exactly as written.
+
+| Shape | What it holds the engine to |
+|---|---|
+| block of captures | one to three `name in path` captures, some optional, from the block's row or an earlier capture, with conditions written between them and after them, and the block's row written bare, with a dot and by its collection's name |
+| name read in a nested query | `n = value` read inside a query on another collection |
+| name for a collection | `mine = .path`, counted, filtered, and read inside a nested query |
+| captured row read in a nested query | `c.field` inside a query on another collection |
+| name read two queries deep | the block's row named inside a query inside a query, through a query, through a path, and where a nearer row of the same collection takes the name |
+| row a path began at | `people.events.select { from: people.id, .. }`, with filters between the steps and paths that come back to their own collection |
+| rows of a walk | every row a walk reaches, each once for the row it started from, in a block and in a chain |
+| grouping, and sort and limit, after captures | the operations a block applies to its combinations |
+
+```bash
+./target/release/gauntlet scope --count 400 --seed 2
+```
+
+It uses 120 people by default, about 4,500 rows: the questions are about
+meaning, and small data answers them quickly. A query that fails is printed
+with its SQL. `--verbose` prints every query.
+
+The first run of the harder shapes found one wrong answer, which is fixed:
+the block's row named two queries deep was read when the innermost query
+ran, against a row of another collection, and so meant every row's value.
+
 ## Running it
 
 ```bash

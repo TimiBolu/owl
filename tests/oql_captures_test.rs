@@ -686,3 +686,46 @@ fn planning_a_block_never_changes_its_answer() {
         );
     }
 }
+
+#[test]
+fn a_name_means_the_same_row_however_deep_it_is_read() {
+    let db = work();
+    // Two queries down, the collection's name is still the row the outer
+    // query is on: the projects are counted for an assignment that some
+    // other assignment has more hours than. Read when the innermost query
+    // ran, the name was every assignment's hours, and nothing matched.
+    assert_eq!(
+        db.table(
+            "assignments.select { id, k: projects.where { assignments.where { .hours > assignments.hours }.count() > 0 }.count() }",
+            &["id", "k"],
+        ),
+        rows(&[&["a1", "2"], &["a2", "2"], &["a3", "0"], &["a4", "2"]])
+    );
+    // The same through a name given with `=`: there are five people.
+    assert_eq!(
+        db.table(
+            "assignments { h = .hours  select { id, k: projects.where { people.where { .id != \"x\" }.count() < h }.count() } }",
+            &["id", "k"],
+        ),
+        rows(&[&["a1", "2"], &["a2", "2"], &["a3", "2"], &["a4", "0"]])
+    );
+    // And when the middle query is a path from the row: a person's
+    // assignments, counted if their manager owns a project.
+    assert_eq!(
+        db.table(
+            "people.select { id, k: .assignments.where { projects.where { .owner == people.manager }.count() > 0 }.count() }",
+            &["id", "k"],
+        ),
+        rows(&[&["ada", "2"], &["ben", "1"], &["cy", "1"], &["kim", "0"], &["lee", "0"]])
+    );
+    // In a query on the block's own collection the name is the outer row,
+    // and in a query inside that one it is the nearer row: the people
+    // after this one who own a project.
+    assert_eq!(
+        db.table(
+            "people.select { id, k: people.where { .id > people.id && projects.where { .owner == people.id }.count() > 0 }.count() }",
+            &["id", "k"],
+        ),
+        rows(&[&["ada", "2"], &["ben", "2"], &["cy", "2"], &["kim", "1"], &["lee", "0"]])
+    );
+}

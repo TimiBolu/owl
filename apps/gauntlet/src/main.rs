@@ -8,6 +8,7 @@
 
 mod columns;
 mod data;
+mod scope;
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
@@ -28,6 +29,22 @@ struct Arguments {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Make queries about names and scope at random, and require each to
+    /// give the same rows on both engines, and the same rows in the same
+    /// order on Owl whether its planner arranges a block or not.
+    Scope {
+        #[arg(long, default_value_t = 120)]
+        people: usize,
+        /// How many queries to make.
+        #[arg(long, default_value_t = 300)]
+        count: usize,
+        /// The same seed makes the same queries.
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// Print every query, not only those that fail.
+        #[arg(long)]
+        verbose: bool,
+    },
     /// Require every query to return the same rows on both engines.
     Check {
         #[arg(long, default_value_t = 2000)]
@@ -786,6 +803,38 @@ fn run(people: usize, only: Option<&str>, samples: Option<usize>) -> Result<()> 
     Ok(())
 }
 
+fn scope(people: usize, count: usize, seed: u64, verbose: bool) -> Result<()> {
+    let tables = data::generate(people);
+    let loaded = load(people)?;
+    let cases = scope::cases(seed, count, &tables);
+    let mut same: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    let mut wrong = 0;
+    for (number, case) in cases.iter().enumerate() {
+        let (mark, detail) = match scope::check(&loaded, case)? {
+            scope::Verdict::Same(rows) => {
+                *same.entry(case.shape).or_default() += 1;
+                if verbose {
+                    println!("  same    #{number} {} ({rows} row(s))\n{}\n", case.shape, case.oql);
+                }
+                continue;
+            }
+            scope::Verdict::Failed(problem) => ("FAILED", problem),
+            scope::Verdict::Differs(problem) => ("DIFFER", problem),
+            scope::Verdict::Rearranged(problem) => ("ORDER ", format!("arranged against as written: {problem}")),
+        };
+        wrong += 1;
+        println!("  {mark}  #{number} {}\n          {detail}\n{}\n-- sql\n{}\n", case.shape, case.oql, case.sql);
+    }
+    for (shape, count) in &same {
+        println!("  same    {count:>4}  {shape}");
+    }
+    println!("\n{} of {} the same (seed {seed}), {wrong} wrong or failing.", cases.len() - wrong, cases.len());
+    if wrong > 0 {
+        return Err(anyhow!("{wrong} queries are wrong or failing"));
+    }
+    Ok(())
+}
+
 fn show(people: usize, rows: usize, wanted: &[String]) -> Result<()> {
     let known = queries(None)?;
     let loaded = load(people)?;
@@ -859,6 +908,7 @@ fn export(people: usize, to: &std::path::Path, only: Option<&str>) -> Result<()>
 
 fn main() -> Result<()> {
     match Arguments::parse().command {
+        Command::Scope { people, count, seed, verbose } => scope(people, count, seed, verbose),
         Command::Check { people, only } => run(people, only.as_deref(), None),
         Command::Bench { people, only, samples } => run(people, only.as_deref(), Some(samples)),
         Command::Show { people, rows, queries } => show(people, rows, &queries),
