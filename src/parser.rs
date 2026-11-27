@@ -2518,7 +2518,10 @@ impl Parser {
                 continue;
             }
 
-            if let Some(entry) = result_entry {
+            // `explain()` may close a block after its result entry: it
+            // asks how the block above it runs.
+            let explains = matches!(self.current_token(), Some(Token::Explain)) && result_entry != Some("explain()");
+            if let Some(entry) = result_entry.filter(|_| !explains) {
                 return Err(ParseError::InvalidSyntax(format!(
                     "{entry} must be the final entry in a scoped query block"
                 )));
@@ -2605,8 +2608,8 @@ impl Parser {
                 | Operation::Avg(_)
                 | Operation::Min(_)
                 | Operation::Max(_)
-                | Operation::AggregateExpr { .. }
-                | Operation::Explain => Some("an aggregate"),
+                | Operation::AggregateExpr { .. } => Some("an aggregate"),
+                Operation::Explain => Some("explain()"),
                 Operation::Update(_) => Some("update"),
                 Operation::Delete => Some("delete()"),
                 Operation::Insert(_)

@@ -424,3 +424,70 @@ fn an_optional_capture_keeps_a_row_with_no_member() {
     // The mark belongs to a capture.
     assert!(db.try_rows("people { a? = .assignments  count() }").is_err());
 }
+
+#[test]
+fn explain_shows_each_capture_with_its_rows() {
+    let db = work();
+    let explained = db
+        .try_rows(
+            "tasks {
+               where { id != \"t4\" }
+               b in .blocked_by.blocker
+               c? in b.blocked_by.blocker
+               far in c.walk(.blocked_by.blocker)
+               where { far.id == tasks.id }
+               select { a: id, b: b.id, c: c.id }
+               explain()
+             }",
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+    let row = &explained[0];
+    assert_eq!(row.get_field("path"), Some(&Value::String("general executor".to_string())));
+    // One step for the rows the block starts from, then one for every
+    // entry from the first capture on, each with its rows in and out.
+    let Some(Value::List(steps)) = row.get_field("steps") else {
+        panic!("no steps in {:?}", row.fields);
+    };
+    let shown: Vec<(String, String, String)> = steps
+        .iter()
+        .map(|step| {
+            let Value::Object(step) = step else { panic!("a step is an object") };
+            let cell = |name: &str| match step.get(name) {
+                Some(Value::String(text)) => text.clone(),
+                Some(Value::Integer(number)) => number.to_string(),
+                _ => "-".to_string(),
+            };
+            assert!(matches!(step.get("ms"), Some(Value::Float(_))));
+            (cell("step"), cell("rows_in"), cell("rows_out"))
+        })
+        .collect();
+    let expected = [
+        ("tasks, 1 entry", "-", "3"),
+        ("b in .blocked_by.blocker", "3", "3"),
+        ("c? in b.blocked_by.blocker", "3", "3"),
+        ("far in c.walk(.blocked_by.blocker)", "3", "9"),
+        ("where { .. }", "9", "3"),
+        ("select { .. }", "3", "3"),
+    ];
+    assert_eq!(
+        shown,
+        expected.map(|(step, rows_in, rows_out)| (step.to_string(), rows_in.to_string(), rows_out.to_string()))
+    );
+    // The same, as lines of the plan.
+    let Some(Value::String(plan)) = row.get_field("plan") else { panic!("no plan") };
+    assert!(plan.contains("far in c.walk(.blocked_by.blocker): 3 rows in, 9 out"), "{plan}");
+    assert!(plan.contains("tasks, 1 entry: 3 rows"), "{plan}");
+
+    // A block that starts at its first capture, and one that only counts.
+    let counted = db.try_rows("tasks { tag in .tags  count()  explain() }").unwrap();
+    let Some(Value::String(plan)) = counted[0].get_field("plan") else { panic!("no plan") };
+    assert!(plan.contains("tasks: 4 rows"), "{plan}");
+    assert!(plan.contains("tag in .tags: 4 rows in, 3 out"), "{plan}");
+    assert!(plan.contains("count(): 3 rows in, 1 out"), "{plan}");
+    // With no other result entry, `explain()` is the one.
+    let inside = db.try_rows("tasks { tag in .tags  explain() }").unwrap();
+    assert!(matches!(inside[0].get_field("steps"), Some(Value::List(steps)) if steps.len() == 2));
+    // Nothing follows it, and it does not explain itself.
+    assert!(db.try_rows("tasks { tag in .tags  explain()  count() }").is_err());
+    assert!(db.try_rows("tasks { tag in .tags  explain()  explain() }").is_err());
+}
