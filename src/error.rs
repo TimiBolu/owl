@@ -119,15 +119,15 @@ pub enum OQLError {
     #[error("Enhanced storage error: {message}")]
     EnhancedStorage {
         message: String,
-        context: Option<ErrorContext>,
+        context: Option<Box<ErrorContext>>,
         severity: ErrorSeverity,
-        recovery: Option<RecoverySuggestion>,
+        recovery: Option<Box<RecoverySuggestion>>,
     },
 
     #[error("Enhanced serialization error: {message}")]
     EnhancedSerialization {
         message: String,
-        context: Option<ErrorContext>,
+        context: Option<Box<ErrorContext>>,
         severity: ErrorSeverity,
         #[source]
         source: Option<serde_json::Error>,
@@ -136,72 +136,72 @@ pub enum OQLError {
     #[error("Enhanced document not found: {id}")]
     EnhancedDocumentNotFound {
         id: String,
-        context: Option<ErrorContext>,
+        context: Option<Box<ErrorContext>>,
         severity: ErrorSeverity,
-        recovery: Option<RecoverySuggestion>,
+        recovery: Option<Box<RecoverySuggestion>>,
     },
 
     #[error("Enhanced schema validation error: {message}")]
     EnhancedSchemaValidation {
         message: String,
-        context: Option<ErrorContext>,
+        context: Option<Box<ErrorContext>>,
         severity: ErrorSeverity,
-        recovery: Option<RecoverySuggestion>,
+        recovery: Option<Box<RecoverySuggestion>>,
     },
 
     #[error("Enhanced type error: Expected {expected}, got {actual}")]
     EnhancedTypeError {
         expected: String,
         actual: String,
-        context: Option<ErrorContext>,
+        context: Option<Box<ErrorContext>>,
         severity: ErrorSeverity,
-        recovery: Option<RecoverySuggestion>,
+        recovery: Option<Box<RecoverySuggestion>>,
     },
 
     #[error("Enhanced reference error: {message}")]
     EnhancedReferenceError {
         message: String,
-        context: Option<ErrorContext>,
+        context: Option<Box<ErrorContext>>,
         severity: ErrorSeverity,
-        recovery: Option<RecoverySuggestion>,
+        recovery: Option<Box<RecoverySuggestion>>,
     },
 
     #[error("Enhanced parse error: {message}")]
     EnhancedParseError {
         message: String,
-        context: Option<ErrorContext>,
+        context: Option<Box<ErrorContext>>,
         severity: ErrorSeverity,
-        recovery: Option<RecoverySuggestion>,
+        recovery: Option<Box<RecoverySuggestion>>,
     },
 
     #[error("Enhanced function error: {message}")]
     EnhancedFunctionError {
         message: String,
-        context: Option<ErrorContext>,
+        context: Option<Box<ErrorContext>>,
         severity: ErrorSeverity,
-        recovery: Option<RecoverySuggestion>,
+        recovery: Option<Box<RecoverySuggestion>>,
     },
 
     #[error("Enhanced transaction error: {message}")]
     EnhancedTransactionError {
         message: String,
-        context: Option<ErrorContext>,
+        context: Option<Box<ErrorContext>>,
         severity: ErrorSeverity,
-        recovery: Option<RecoverySuggestion>,
+        recovery: Option<Box<RecoverySuggestion>>,
     },
 
     #[error("Enhanced concurrency error: {message}")]
     EnhancedConcurrencyError {
         message: String,
-        context: Option<ErrorContext>,
+        context: Option<Box<ErrorContext>>,
         severity: ErrorSeverity,
-        recovery: Option<RecoverySuggestion>,
+        recovery: Option<Box<RecoverySuggestion>>,
     },
 
     #[error("Enhanced IO error: {message}")]
     EnhancedIo {
         message: String,
-        context: Option<ErrorContext>,
+        context: Option<Box<ErrorContext>>,
         severity: ErrorSeverity,
         #[source]
         source: Option<std::io::Error>,
@@ -210,15 +210,15 @@ pub enum OQLError {
     #[error("Enhanced query execution error: {message}")]
     EnhancedQueryExecution {
         message: String,
-        context: Option<ErrorContext>,
+        context: Option<Box<ErrorContext>>,
         severity: ErrorSeverity,
-        recovery: Option<RecoverySuggestion>,
+        recovery: Option<Box<RecoverySuggestion>>,
     },
 
     #[error("Enhanced generic error: {message}")]
     EnhancedGeneric {
         message: String,
-        context: Option<ErrorContext>,
+        context: Option<Box<ErrorContext>>,
         severity: ErrorSeverity,
     },
 
@@ -424,19 +424,19 @@ impl OQLError {
             OQLError::RecoveryError(_) => None,
 
             // Enhanced variants - with context
-            OQLError::EnhancedStorage { context, .. } => context.as_ref(),
-            OQLError::EnhancedSerialization { context, .. } => context.as_ref(),
-            OQLError::EnhancedDocumentNotFound { context, .. } => context.as_ref(),
-            OQLError::EnhancedSchemaValidation { context, .. } => context.as_ref(),
-            OQLError::EnhancedTypeError { context, .. } => context.as_ref(),
-            OQLError::EnhancedReferenceError { context, .. } => context.as_ref(),
-            OQLError::EnhancedParseError { context, .. } => context.as_ref(),
-            OQLError::EnhancedFunctionError { context, .. } => context.as_ref(),
-            OQLError::EnhancedTransactionError { context, .. } => context.as_ref(),
-            OQLError::EnhancedConcurrencyError { context, .. } => context.as_ref(),
-            OQLError::EnhancedQueryExecution { context, .. } => context.as_ref(),
-            OQLError::EnhancedIo { context, .. } => context.as_ref(),
-            OQLError::EnhancedGeneric { context, .. } => context.as_ref(),
+            OQLError::EnhancedStorage { context, .. } => context.as_deref(),
+            OQLError::EnhancedSerialization { context, .. } => context.as_deref(),
+            OQLError::EnhancedDocumentNotFound { context, .. } => context.as_deref(),
+            OQLError::EnhancedSchemaValidation { context, .. } => context.as_deref(),
+            OQLError::EnhancedTypeError { context, .. } => context.as_deref(),
+            OQLError::EnhancedReferenceError { context, .. } => context.as_deref(),
+            OQLError::EnhancedParseError { context, .. } => context.as_deref(),
+            OQLError::EnhancedFunctionError { context, .. } => context.as_deref(),
+            OQLError::EnhancedTransactionError { context, .. } => context.as_deref(),
+            OQLError::EnhancedConcurrencyError { context, .. } => context.as_deref(),
+            OQLError::EnhancedQueryExecution { context, .. } => context.as_deref(),
+            OQLError::EnhancedIo { context, .. } => context.as_deref(),
+            OQLError::EnhancedGeneric { context, .. } => context.as_deref(),
         }
     }
 
@@ -460,16 +460,16 @@ impl OQLError {
             OQLError::Generic { .. } => None,
 
             // Enhanced variants - with recovery suggestions
-            OQLError::EnhancedStorage { recovery, .. } => recovery.as_ref(),
-            OQLError::EnhancedDocumentNotFound { recovery, .. } => recovery.as_ref(),
-            OQLError::EnhancedSchemaValidation { recovery, .. } => recovery.as_ref(),
-            OQLError::EnhancedTypeError { recovery, .. } => recovery.as_ref(),
-            OQLError::EnhancedReferenceError { recovery, .. } => recovery.as_ref(),
-            OQLError::EnhancedParseError { recovery, .. } => recovery.as_ref(),
-            OQLError::EnhancedFunctionError { recovery, .. } => recovery.as_ref(),
-            OQLError::EnhancedTransactionError { recovery, .. } => recovery.as_ref(),
-            OQLError::EnhancedConcurrencyError { recovery, .. } => recovery.as_ref(),
-            OQLError::EnhancedQueryExecution { recovery, .. } => recovery.as_ref(),
+            OQLError::EnhancedStorage { recovery, .. } => recovery.as_deref(),
+            OQLError::EnhancedDocumentNotFound { recovery, .. } => recovery.as_deref(),
+            OQLError::EnhancedSchemaValidation { recovery, .. } => recovery.as_deref(),
+            OQLError::EnhancedTypeError { recovery, .. } => recovery.as_deref(),
+            OQLError::EnhancedReferenceError { recovery, .. } => recovery.as_deref(),
+            OQLError::EnhancedParseError { recovery, .. } => recovery.as_deref(),
+            OQLError::EnhancedFunctionError { recovery, .. } => recovery.as_deref(),
+            OQLError::EnhancedTransactionError { recovery, .. } => recovery.as_deref(),
+            OQLError::EnhancedConcurrencyError { recovery, .. } => recovery.as_deref(),
+            OQLError::EnhancedQueryExecution { recovery, .. } => recovery.as_deref(),
             _ => None,
         }
     }
@@ -703,7 +703,7 @@ impl OQLError {
     pub fn storage_error(message: &str, context: Option<ErrorContext>) -> Self {
         OQLError::EnhancedStorage {
             message: message.to_string(),
-            context,
+            context: context.map(Box::new),
             severity: ErrorSeverity::Error,
             recovery: None,
         }
@@ -722,9 +722,9 @@ impl OQLError {
 
         OQLError::EnhancedDocumentNotFound {
             id: id.to_string(),
-            context,
+            context: context.map(Box::new),
             severity: ErrorSeverity::Warning,
-            recovery: Some(recovery),
+            recovery: Some(Box::new(recovery)),
         }
     }
 
@@ -741,9 +741,9 @@ impl OQLError {
         OQLError::EnhancedTypeError {
             expected: expected.to_string(),
             actual: actual.to_string(),
-            context,
+            context: context.map(Box::new),
             severity: ErrorSeverity::Error,
-            recovery: Some(recovery),
+            recovery: Some(Box::new(recovery)),
         }
     }
 
@@ -758,9 +758,9 @@ impl OQLError {
 
         OQLError::EnhancedReferenceError {
             message: message.to_string(),
-            context,
+            context: context.map(Box::new),
             severity: ErrorSeverity::Warning,
-            recovery: Some(recovery),
+            recovery: Some(Box::new(recovery)),
         }
     }
 
@@ -775,9 +775,9 @@ impl OQLError {
 
         OQLError::EnhancedParseError {
             message: message.to_string(),
-            context,
+            context: context.map(Box::new),
             severity: ErrorSeverity::Error,
-            recovery: Some(recovery),
+            recovery: Some(Box::new(recovery)),
         }
     }
 
@@ -794,9 +794,9 @@ impl OQLError {
 
         OQLError::EnhancedFunctionError {
             message: message.to_string(),
-            context,
+            context: context.map(Box::new),
             severity: ErrorSeverity::Error,
-            recovery: Some(recovery),
+            recovery: Some(Box::new(recovery)),
         }
     }
 
@@ -810,9 +810,9 @@ impl OQLError {
 
         OQLError::EnhancedTransactionError {
             message: message.to_string(),
-            context,
+            context: context.map(Box::new),
             severity: ErrorSeverity::Error,
-            recovery: Some(recovery),
+            recovery: Some(Box::new(recovery)),
         }
     }
 
@@ -826,9 +826,9 @@ impl OQLError {
 
         OQLError::EnhancedConcurrencyError {
             message: message.to_string(),
-            context,
+            context: context.map(Box::new),
             severity: ErrorSeverity::Warning,
-            recovery: Some(recovery),
+            recovery: Some(Box::new(recovery)),
         }
     }
 
@@ -843,7 +843,7 @@ impl OQLError {
     pub fn serialization_error(message: &str, context: Option<ErrorContext>) -> Self {
         OQLError::EnhancedSerialization {
             message: message.to_string(),
-            context,
+            context: context.map(Box::new),
             severity: ErrorSeverity::Error,
             source: None,
         }
