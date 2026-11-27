@@ -259,6 +259,7 @@ literal syntax, and reads and writes are symmetric.
 | Comparison `== != < <= > >=` | Works |
 | Numeric equality across `Integer` and `Float` | Works |
 | Null and mismatched types never order and never fail | Works |
+| An absent value is unequal to every value | Works: `.manager.level != 3` holds for a row with no manager, and `==`, `<` and `>` do not. SQL calls all four unknown and drops the row; its `IS NOT` is OQL's `!=`. The same holds for an empty optional capture. |
 | A reference equals the id of its target | Works for `==`, `!=` and `in`: `orders.where { .user == "u1" }`. Served by the reverse-reference index when it is the leading filter, as `.user.id == "u1"` already was. |
 | `&&`, `\|\|`, `!` with short-circuit | Works |
 | `a \|\| b` yields the first present, truthy operand | Works |
@@ -519,7 +520,8 @@ collide.
 | No shadowing of the root name or of an earlier local | Works |
 | `group_by`, `limit`, `nearest` inside a block | Works |
 | Object-valued select on a local bound to a reference | Works |
-| A block ends in exactly one result entry | Works. The entry is a `select` or any terminal the chained form allows: `count()`, `first()`, `exists()`, an aggregate, `update {..}`, `delete()`. Nothing may follow it, and a block with no result entry is rejected. |
+| A block ends in exactly one result entry | Works. The entry is a `select` or any terminal the chained form allows: `count()`, `first()`, `exists()`, an aggregate, `update {..}`, `delete()`. Nothing may follow it inside the block but `explain()`, and a block with no result entry is rejected. |
+| A chain after the closing brace carries on from the rows the block gave: `people { a in .assignments  group_by { a.role }  select { role, people: count() } }.sort { .people.desc }.limit(1)` | Works: it is a chain after `select`, with the block before it. This is how a block sorts or limits by what its `select` worked out. The block's names ended with the block, so one used after it is an error that says so; a write after a block with a capture is refused, as inside it. |
 | A block rooted in a binding, an array field or a reverse relationship | *(not probed)* |
 
 ### 10.1 Captures: one row for every combination
@@ -895,10 +897,12 @@ without running it:
 `explain()` must be the last operation. In a block it is the last entry, and
 may come after the block's result entry: `tasks { where {..}  select {..}  explain() }`.
 
-A block with a capture is the one query `explain()` runs. What such a block
-costs is decided by how many rows each capture makes, which cannot be known
-without making them, and nothing after a capture can write. The row then
-also holds `steps`, and `plan` ends with the same as lines:
+A query with a capture or a walk is the one kind `explain()` runs, when it
+writes nothing. What such a query costs is decided by how many rows each
+capture or walk makes, which cannot be known without making them. The steps
+are noted by the executor as it runs the query, so they are the steps it
+took. The row then also holds `steps`, and `plan` ends with the same as
+lines:
 
 | Field of a step | Meaning |
 |---|---|
@@ -906,6 +910,7 @@ also holds `steps`, and `plan` ends with the same as lines:
 | `rows_in` | the rows that went into the entry; null for the first step |
 | `rows_out` | the rows that came out |
 | `ms` | the time the entry took |
+| `depths` | for a walk: how many rows each depth reached, nearest first |
 
 ```
 tasks, 1 entry: 3 rows
@@ -916,8 +921,20 @@ where { .. }: 9 rows in, 3 out
 select { .. }: 3 rows in, 3 out
 ```
 
-`path`, `uses_index` and the start of `plan` say how the block's first rows
+`path`, `uses_index` and the start of `plan` say how the query's first rows
 are read, as for any other query.
+
+A walk in a chain is shown the same way:
+`tasks.where { .id == "t4" }.walk(.blocked_by.blocker).select { id }.explain()`
+gives
+
+```
+tasks, 1 entry: 1 rows
+walk(.blocked_by.blocker): 1 rows in, 3 out (depth 1: 1, depth 2: 1, depth 3: 1)
+select { .. }: 3 rows in, 3 out
+```
+
+A walk followed by a write is described and not run.
 
 ---
 

@@ -59,11 +59,17 @@ each one twice from one description, as OQL and as SQL, and requires:
 | row a path began at | `people.events.select { from: people.id, .. }`, with filters between the steps and paths that come back to their own collection |
 | rows of a walk | every row a walk reaches, each once for the row it started from, in a block and in a chain |
 | grouping, and sort and limit, after captures | the operations a block applies to its combinations |
+| members of a list | `x in .labels`, `w in .worklog`, optional or not, and the row a list member came from |
+| place in a partition | `row_number()` and a running total after `partition_by`, and the first places kept |
+| rows updated, rows deleted | a write made on both engines, through a filter on the row or on a row it refers to, and the collection read back after it |
 | filtered read, and sorted read, in order | a filter keeps the order of a scan, by id, whether or not an index serves it, and a sort keeps it among equal rows; these are held to SQLite row for row, not only as a set |
 
 ```bash
 ./target/release/gauntlet scope --count 400 --seed 2
 ```
+
+`!=` is written `IS NOT` in the SQL: in OQL an absent value is unequal to
+every value, where SQL calls the comparison unknown.
 
 It uses 120 people by default, about 4,500 rows: the questions are about
 meaning, and small data answers them quickly. A query that fails is printed

@@ -2384,6 +2384,32 @@ impl Parser {
             operations.push(Operation::Call(arguments));
         }
 
+        self.parse_chain(&collection, &mut operations, true)?;
+
+        // Expect EOF
+        if !matches!(self.current_token(), Some(Token::EOF) | None) {
+            return Err(ParseError::UnexpectedToken(format!(
+                "Expected end of query, found {:?}",
+                self.current_token()
+            )));
+        }
+
+        Ok(OQLQuery {
+            collection,
+            operations,
+        })
+    }
+
+    /// The operations chained after a collection, or after a block: each
+    /// `.operation`, function given the rows, or path step. `checked` asks
+    /// for each to be held to the collection's schema as it is read, which
+    /// a chain after a block is not: its rows are what the block gave.
+    fn parse_chain(
+        &mut self,
+        collection: &str,
+        operations: &mut Vec<Operation>,
+        checked: bool,
+    ) -> Result<(), ParseError> {
         loop {
             match self.current_token() {
                 // `orders.where { .. }.headcount()`: after an operation, a
@@ -2401,7 +2427,10 @@ impl Parser {
                 }
                 Some(Token::Dot) => {
                     self.advance(); // consume dot
-                    let operation = self.parse_operation_with_validation(&collection)?;
+                    let operation = match checked {
+                        true => self.parse_operation_with_validation(collection)?,
+                        false => self.parse_operation()?,
+                    };
                     operations.push(operation);
                     operations.append(&mut self.pending);
                 }
@@ -2427,19 +2456,7 @@ impl Parser {
                 _ => break,
             }
         }
-
-        // Expect EOF
-        if !matches!(self.current_token(), Some(Token::EOF) | None) {
-            return Err(ParseError::UnexpectedToken(format!(
-                "Expected end of query, found {:?}",
-                self.current_token()
-            )));
-        }
-
-        Ok(OQLQuery {
-            collection,
-            operations,
-        })
+        Ok(())
     }
 
     /// `(args)` after a function's name in a chain. The function is given
@@ -2636,6 +2653,42 @@ impl Parser {
                  count(), first() or update { .. }"
                     .to_string(),
             ));
+        }
+        // A block gives rows, and rows can be carried on with: a chain
+        // after the closing brace works on what the block gave, as a chain
+        // after `select` does. The block's names ended with the block.
+        let closed = self.position;
+        let before = operations.len();
+        self.parse_chain(&collection, &mut operations, false)?;
+        for name in locals.keys().filter(|name| name.as_str() != CAPTURE_ROOT) {
+            if self.scoped_name_is_used_between(name, closed, self.position) {
+                return Err(ParseError::InvalidSyntax(format!(
+                    "'{name}' is a name of the block, and the block has closed: what follows \
+                     it has only the rows the block gave. Give the value a name in the \
+                     block's select and read that"
+                )));
+            }
+        }
+        if captured {
+            let written = operations[before..].iter().any(|operation| {
+                matches!(
+                    operation,
+                    Operation::Update(_)
+                        | Operation::Delete
+                        | Operation::Insert(_)
+                        | Operation::InsertMany(_)
+                        | Operation::InsertFrom(_)
+                        | Operation::Upsert(_)
+                )
+            });
+            if written {
+                return Err(ParseError::InvalidSyntax(
+                    "a write cannot follow a block with a capture (`name in collection`): \
+                     there is one row for every combination, and a row would be written \
+                     once for each"
+                        .to_string(),
+                ));
+            }
         }
         if !matches!(self.current_token(), Some(Token::EOF) | None) {
             return Err(ParseError::UnexpectedToken(format!(

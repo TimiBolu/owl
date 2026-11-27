@@ -175,6 +175,17 @@ fn sql_literal(written: &str) -> String {
     }
 }
 
+/// An OQL comparison in SQL. In OQL an absent value is unequal to every
+/// value, where SQL calls the comparison unknown and drops the row; `IS
+/// NOT` is SQL's spelling of OQL's `!=`.
+fn sql_operator(operator: &str) -> &str {
+    match operator {
+        "==" => "=",
+        "!=" => "IS NOT",
+        other => other,
+    }
+}
+
 /// A name in a block: the row it starts from, or a captured row.
 struct Name {
     /// As OQL writes it; empty for the starting row.
@@ -212,18 +223,17 @@ fn condition(random: &mut Random, tables: &[Table], root: &str, names: &[Name]) 
             .filter(|other| *other != at && names[*other].collection == name.collection)
             .collect();
         if let Some(&other) = others.first() {
-            // `!=` of an empty name is not asked: SQL and OQL may differ
-            // on what nothing is unequal to, and that is not the question.
-            let sure = !name.may_be_empty && !names[other].may_be_empty;
-            let operator = *random.pick(if sure { &["<", ">", "!=", "=="][..] } else { &["<", ">", "=="][..] });
+            let operator = *random.pick(&["<", ">", "!=", "=="]);
             let field = match (fields.is_empty(), random.chance(50)) {
                 (false, true) => random.pick(&fields).name,
                 _ => "id",
             };
             let (left, left_sql) = read(random, root, name, field);
             let (right, right_sql) = read(random, root, &names[other], field);
-            let sql_operator = if operator == "==" { "=" } else { operator };
-            return Some((format!("{left} {operator} {right}"), format!("{left_sql} {sql_operator} {right_sql}")));
+            return Some((
+                format!("{left} {operator} {right}"),
+                format!("{left_sql} {} {right_sql}", sql_operator(operator)),
+            ));
         }
     }
     if fields.is_empty() {
@@ -232,13 +242,15 @@ fn condition(random: &mut Random, tables: &[Table], root: &str, names: &[Name]) 
     let field = *random.pick(&fields);
     let value = literal(random, tables, field)?;
     let operator = match field.kind {
-        Kind::Text => "==",
+        Kind::Text => *random.pick(&["==", "==", "!="]),
         // An exact match of a number is nearly always no rows.
-        _ => *random.pick(&["<", ">", "<", ">", "=="]),
+        _ => *random.pick(&["<", ">", "<", ">", "==", "!="]),
     };
     let (left, left_sql) = read(random, root, name, field.name);
-    let sql_operator = if operator == "==" { "=" } else { operator };
-    Some((format!("{left} {operator} {value}"), format!("{left_sql} {sql_operator} {}", sql_literal(&value))))
+    Some((
+        format!("{left} {operator} {value}"),
+        format!("{left_sql} {} {}", sql_operator(operator), sql_literal(&value)),
+    ))
 }
 
 pub struct Case {
@@ -248,6 +260,9 @@ pub struct Case {
     /// Whether the rows must also come in SQLite's order: the query's
     /// order is one the language defines and the SQL spells out.
     pub ordered: bool,
+    /// For a write: what to read afterwards, on each engine. The write is
+    /// made on both, and the two are then held to the same rows.
+    pub then: Option<(String, String)>,
 }
 
 /// A block of captures: each names the rows a path reaches from the
@@ -363,6 +378,7 @@ fn block(random: &mut Random, tables: &[Table]) -> Option<Case> {
     Some(Case {
         shape: "block of captures",
         ordered: false,
+        then: None,
         oql: format!("{root} {{\n{}\n{select}\n}}", entries.join("\n")),
         sql: format!("SELECT {columns}\nFROM {root} AS r0{joins}{filter}"),
     })
@@ -405,6 +421,7 @@ fn named_value(random: &mut Random, _tables: &[Table]) -> Option<Case> {
     Some(Case {
         shape: "name read in a nested query",
         ordered: false,
+        then: None,
         oql: format!(
             "{root} {{\n  n = {value}\n  select {{ id, k: {}.where {{ .{} {operator} n }}.count() }}\n}}",
             asked.collection, asked.name
@@ -431,6 +448,7 @@ fn capture_in_nested(random: &mut Random, _tables: &[Table]) -> Option<Case> {
     Some(Case {
         shape: "captured row read in a nested query",
         ordered: false,
+        then: None,
         oql: format!(
             "{root} {{\n  c in .{}\n  select {{ id, c: c.id, k: {}.where {{ .{} == c.{} }}.count() }}\n}}",
             edge.step, asked.collection, asked.name, field.name
@@ -500,6 +518,7 @@ fn anchor_after_steps(random: &mut Random, tables: &[Table]) -> Option<Case> {
     Some(Case {
         shape: "row a path began at",
         ordered: false,
+        then: None,
         oql: format!("{chain}.select {{ from: {root}.id, of: {root}.{}, id }}", field.name),
         sql: format!(
             "SELECT r0.id AS \"from\", r0.{} AS \"of\", {from}.id AS id\nFROM {root} AS r0{joins}{filter}",
@@ -588,7 +607,7 @@ fn walked(random: &mut Random, tables: &[Table]) -> Option<Case> {
             ids = listed('\''),
         ),
     };
-    Some(Case { shape: "rows of a walk", ordered: false, oql, sql })
+    Some(Case { shape: "rows of a walk", ordered: false, then: None, oql, sql })
 }
 
 /// The block's row named inside a query inside a query.
@@ -619,6 +638,7 @@ fn two_deep(random: &mut Random, _tables: &[Table]) -> Option<Case> {
     Some(Case {
         shape: "name read two queries deep",
         ordered: false,
+        then: None,
         oql: format!(
             "{root} {{\n{given}  select {{ id, k: {}.where {{ {}.where {{ .{} {operator} {named} }}.count() > 2 }}.count() }}\n}}",
             middle.collection, inner.collection, inner.name
@@ -660,6 +680,7 @@ fn two_deep_from_a_row(random: &mut Random, _tables: &[Table]) -> Option<Case> {
             Some(Case {
                 shape: "name read two deep, through a path",
                 ordered: false,
+                then: None,
                 oql: format!(
                     "{root} {{\n  select {{ id, k: .{}.where {{ {}.where {{ .{} {operator} {root}.{} }}.count() > 2 }}.count() }}\n}}",
                     edge.step, inner.collection, inner.name, field.name
@@ -678,6 +699,7 @@ fn two_deep_from_a_row(random: &mut Random, _tables: &[Table]) -> Option<Case> {
             Some(Case {
                 shape: "name taken by a nearer row",
                 ordered: false,
+                then: None,
                 oql: format!(
                     "{root} {{\n  select {{ id, k: {root}.where {{ .{0} {operator} {root}.{0} && {1}.where {{ .{2} == {root}.id }}.count() > 0 }}.count() }}\n}}",
                     field.name, edge.to, edge.column
@@ -713,6 +735,7 @@ fn named_collection(random: &mut Random, tables: &[Table]) -> Option<Case> {
     Some(Case {
         shape: "name for a collection",
         ordered: false,
+        then: None,
         oql: format!(
             "{root} {{\n  mine = .{}\n  select {{\n    id,\n    all: mine.count(),\n    some: mine.where {{ .{} {operator} {value} }}.count(),\n    like: {}.where {{ .{} in mine.{} }}.count()\n  }}\n}}",
             edge.step, field.name, asked.collection, asked.name, field.name
@@ -759,6 +782,7 @@ fn after_captures(random: &mut Random, tables: &[Table]) -> Option<Case> {
         true => Some(Case {
             shape: "grouping after captures",
             ordered: false,
+            then: None,
             oql: format!(
                 "{root} {{\n  a in .{}\n  b in a.{}\n{filter}  group_by {{ b.{} }}\n  select {{ {}, rows: count() }}\n}}",
                 first.step, second.step, key.name, key.name
@@ -773,6 +797,7 @@ fn after_captures(random: &mut Random, tables: &[Table]) -> Option<Case> {
             Some(Case {
                 shape: "sort and limit after captures",
                 ordered: false,
+                then: None,
                 oql: format!(
                     "{root} {{\n  a in .{}\n  b in a.{}\n{filter}  sort {{ b.id.desc, a.id.asc, id.asc }}\n  limit({keep})\n  select {{ id, a: a.id, b: b.id }}\n}}",
                     first.step, second.step
@@ -826,9 +851,189 @@ fn in_order(random: &mut Random, tables: &[Table]) -> Option<Case> {
     Some(Case {
         shape: if sorted { "sorted read, in order" } else { "filtered read, in order" },
         ordered: true,
+        then: None,
         oql: chain,
         sql: format!("SELECT r0.id AS id, r0.{} AS shown\nFROM {root} AS r0{filter}\nORDER BY {order}{taken}", shown.name),
     })
+}
+
+/// A list of text a row holds, and the SQLite table that holds it.
+const TEXT_LISTS: &[(&str, &str)] = &[("people", "skills"), ("projects", "tags"), ("tasks", "labels")];
+
+/// The members of a list a row holds, named one by one beside the row.
+fn list_members(random: &mut Random, tables: &[Table]) -> Option<Case> {
+    if random.chance(40) {
+        // A list of objects: each task's work log, whose entries hold a
+        // reference of their own.
+        let least = random.below(120);
+        let condition = format!("minutes > {least}");
+        let (oql, shape) = match random.below(3) {
+            0 => (
+                format!(
+                    "tasks {{\n  w in .worklog\n  where {{ w.{condition} }}\n  select {{ id, minutes: w.minutes, state: w.state, level: w.author.level }}\n}}"
+                ),
+                "members of a list of objects",
+            ),
+            1 => (
+                format!(
+                    "tasks {{\n  w? in .worklog.where {{ .{condition} }}\n  select {{ id, minutes: w.minutes, state: w.state, level: w.author.level }}\n}}"
+                ),
+                "members of a list of objects, or none",
+            ),
+            _ => (
+                format!(
+                    "tasks.worklog.where {{ .{condition} }}.select {{ id: tasks.id, minutes, state, level: .author.level }}"
+                ),
+                "row a list member came from",
+            ),
+        };
+        let join = if shape.ends_with("or none") { "LEFT JOIN" } else { "JOIN" };
+        let (on, filter) = match shape.ends_with("or none") {
+            true => (format!(" AND w.{condition}"), String::new()),
+            false => (String::new(), format!("\nWHERE w.{condition}")),
+        };
+        return Some(Case {
+            shape,
+            ordered: false,
+            then: None,
+            oql,
+            sql: format!(
+                "SELECT r0.id AS id, w.minutes AS minutes, w.state AS state, p.level AS level\nFROM tasks AS r0\n  {join} tasks_worklog AS w ON w.parent = r0.id{on}\n  LEFT JOIN people AS p ON p.id = w.author{filter}"
+            ),
+        });
+    }
+    let (root, list) = *random.pick(TEXT_LISTS);
+    let table = tables.iter().find(|table| table.name == root)?;
+    let value = (0..20).find_map(|_| {
+        let row = &table.rows[random.below(table.rows.len())];
+        match row.iter().find(|(name, _)| *name == list) {
+            Some((_, Cell::Texts(values))) if !values.is_empty() => Some(values[random.below(values.len())].clone()),
+            _ => None,
+        }
+    })?;
+    let field = *fields_of(root).first()?;
+    let (entry, join, filter) = match random.below(3) {
+        0 => (format!("  x in .{list}"), "JOIN", String::new()),
+        1 => (format!("  x? in .{list}"), "LEFT JOIN", String::new()),
+        _ => (
+            format!("  x in .{list}\n  where {{ x == \"{value}\" }}"),
+            "JOIN",
+            format!("\nWHERE l.value = '{value}'"),
+        ),
+    };
+    Some(Case {
+        shape: "members of a list of text",
+        ordered: false,
+        then: None,
+        oql: format!("{root} {{\n{entry}\n  select {{ id, of: {}, x }}\n}}", field.name),
+        sql: format!(
+            "SELECT r0.id AS id, r0.{} AS \"of\", l.value AS x\nFROM {root} AS r0\n  {join} {root}_{list} AS l ON l.parent = r0.id{filter}",
+            field.name
+        ),
+    })
+}
+
+/// A row's place among the rows of its partition, and a total that runs.
+fn placed(random: &mut Random, _tables: &[Table]) -> Option<Case> {
+    let (root, by, measure) = *random.pick(&[
+        ("people", "unit", "level"),
+        ("tasks", "project", "points"),
+        ("assignments", "person", "hours"),
+        ("assignments", "project", "hours"),
+        ("events", "person", "amount"),
+    ]);
+    let (direction, sql_direction) = *random.pick(&[("asc", "ASC"), ("desc", "DESC")]);
+    let window = format!("PARTITION BY r0.{by} ORDER BY r0.{measure} {sql_direction}, r0.id");
+    let inner = format!(
+        "SELECT r0.id AS id, row_number() OVER ({window}) AS place, sum(r0.{measure}) OVER ({window} ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running\nFROM {root} AS r0"
+    );
+    let chain = format!(
+        "{root}\n  .sort {{ .{measure}.{direction}, .id.asc }}\n  .partition_by {{ .{by} }}\n  .select {{ id, place: row_number(), running: so_far().{measure}.sum() }}"
+    );
+    let keep = 1 + random.below(3);
+    match random.chance(50) {
+        true => Some(Case { shape: "place in a partition", ordered: false, then: None, oql: chain, sql: inner }),
+        false => Some(Case {
+            shape: "first places in a partition",
+            ordered: false,
+            then: None,
+            oql: format!("{chain}\n  .where {{ .place <= {keep} }}"),
+            sql: format!("SELECT * FROM (\n{inner}\n) WHERE place <= {keep}"),
+        }),
+    }
+}
+
+/// A write, made on both engines, and what the collection holds after it.
+/// A row is updated through a filter on itself or on a row it refers to;
+/// rows nothing refers to are deleted.
+fn written(random: &mut Random, tables: &[Table]) -> Option<Case> {
+    let (root, measure) = *random.pick(&[("people", "level"), ("tasks", "points"), ("assignments", "hours"), ("events", "amount")]);
+    let fields = fields_of(root);
+    // Which rows: by a field of the row, or of a row it refers to.
+    let (filter, filter_sql) = match random.chance(60) {
+        true => {
+            let field = *random.pick(&fields);
+            let value = literal(random, tables, field)?;
+            let operator = match field.kind {
+                Kind::Text => "==",
+                _ => *random.pick(&["<", ">", "=="]),
+            };
+            (
+                format!(".{} {operator} {value}", field.name),
+                format!("{root}.{} {} {}", field.name, sql_operator(operator), sql_literal(&value)),
+            )
+        }
+        false => {
+            let edges: Vec<&Edge> = edges_from(root).into_iter().filter(|edge| edge.forward && !edge.optional).collect();
+            let edge = *random.pick(&edges);
+            let far = *random.pick(&fields_of(edge.to));
+            let value = literal(random, tables, far)?;
+            let operator = match far.kind {
+                Kind::Text => "==",
+                _ => *random.pick(&["<", ">"]),
+            };
+            (
+                format!(".{}.{} {operator} {value}", edge.step, far.name),
+                format!(
+                    "(SELECT f.{} FROM {} AS f WHERE f.id = {root}.{}) {} {}",
+                    far.name,
+                    edge.to,
+                    edge.column,
+                    sql_operator(operator),
+                    sql_literal(&value)
+                ),
+            )
+        }
+    };
+    let then = Some((
+        format!("{root}.select {{ id, {measure} }}"),
+        format!("SELECT id, {measure} FROM {root} ORDER BY id"),
+    ));
+    // Nothing refers to an event, an assignment or a link, so those may go.
+    let removable = matches!(root, "events" | "assignments");
+    match removable && random.chance(30) {
+        true => Some(Case {
+            shape: "rows deleted",
+            ordered: true,
+            then,
+            oql: format!("{root}.where {{ {filter} && .{measure} > 100000 || {filter} && .id > \"zz\" }}.delete()"),
+            sql: format!("DELETE FROM {root} WHERE ({filter_sql} AND {root}.{measure} > 100000) OR ({filter_sql} AND {root}.id > 'zz')"),
+        }),
+        false => {
+            let by = 1 + random.below(3);
+            let (set, set_sql) = match random.chance(50) {
+                true => (format!("{measure}: .{measure} + {by}"), format!("{measure} = {measure} + {by}")),
+                false => (format!("{measure} += {by}"), format!("{measure} = {measure} + {by}")),
+            };
+            Some(Case {
+                shape: "rows updated",
+                ordered: true,
+                then,
+                oql: format!("{root}.where {{ {filter} }}.update {{ {set} }}"),
+                sql: format!("UPDATE {root} SET {set_sql} WHERE {filter_sql}"),
+            })
+        }
+    }
 }
 
 /// The cases of one seed.
@@ -838,8 +1043,11 @@ pub fn cases(seed: u64, count: usize, tables: &[Table]) -> Vec<Case> {
     let mut tries = 0;
     while made.len() < count && tries < count * 20 {
         tries += 1;
-        let case = match random.below(21) {
+        let case = match random.below(28) {
             18..=20 => in_order(&mut random, tables),
+            21 | 22 => list_members(&mut random, tables),
+            23 | 24 => placed(&mut random, tables),
+            25..=27 => written(&mut random, tables),
             0..=5 => block(&mut random, tables),
             6 => named_value(&mut random, tables),
             7 => capture_in_nested(&mut random, tables),
@@ -872,6 +1080,22 @@ pub enum Verdict {
 }
 
 pub fn check(loaded: &Loaded, case: &Case) -> Result<Verdict> {
+    if let Some((read, read_sql)) = &case.then {
+        // The write on each engine, then the same read of both.
+        loaded.sqlite.query(&case.sql).map_err(|error| anyhow::anyhow!("{error}\n{}", case.sql))?;
+        if let Err(error) = loaded.owl.query(&case.oql) {
+            return Ok(Verdict::Failed(error.to_string()));
+        }
+        let sqlite = loaded.sqlite.query(read_sql).map_err(|error| anyhow::anyhow!("{error}\n{read_sql}"))?;
+        let owl = match loaded.owl.query(read) {
+            Ok(rows) => rows,
+            Err(error) => return Ok(Verdict::Failed(format!("reading after the write: {error}"))),
+        };
+        return Ok(match first_difference(&owl, &sqlite) {
+            None => Verdict::Same(owl.len()),
+            Some(difference) => Verdict::Differs(format!("after the write: {difference}")),
+        });
+    }
     let sqlite = loaded.sqlite.query(&case.sql).map_err(|error| anyhow::anyhow!("{error}\n{}", case.sql))?;
     owl_db::executor::set_capture_planning(true);
     let arranged = match loaded.owl.query(&case.oql) {
