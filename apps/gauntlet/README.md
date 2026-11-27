@@ -59,6 +59,7 @@ each one twice from one description, as OQL and as SQL, and requires:
 | row a path began at | `people.events.select { from: people.id, .. }`, with filters between the steps and paths that come back to their own collection |
 | rows of a walk | every row a walk reaches, each once for the row it started from, in a block and in a chain |
 | grouping, and sort and limit, after captures | the operations a block applies to its combinations |
+| filtered read, and sorted read, in order | a filter keeps the order of a scan, by id, whether or not an index serves it, and a sort keeps it among equal rows; these are held to SQLite row for row, not only as a set |
 
 ```bash
 ./target/release/gauntlet scope --count 400 --seed 2
@@ -68,9 +69,16 @@ It uses 120 people by default, about 4,500 rows: the questions are about
 meaning, and small data answers them quickly. A query that fails is printed
 with its SQL. `--verbose` prints every query.
 
-The first run of the harder shapes found one wrong answer, which is fixed:
-the block's row named two queries deep was read when the innermost query
-ran, against a row of another collection, and so meant every row's value.
+What it has found so far, all fixed:
+
+- The block's row named two queries deep was read when the innermost query
+  ran, against a row of another collection, and so meant every row's value.
+- Arranging a block's conditions could change the order of its answer.
+- Two filters and a `select`, with an index serving the first filter, lost
+  every row: the record was decoded without the field the index's own test
+  reads.
+- Rows a sort found equal came in the index's order when an index had read
+  them.
 
 ## Running it
 

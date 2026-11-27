@@ -4302,3 +4302,88 @@ fn what_the_matrix_found_stays_fixed() {
     assert_eq!(row.get_field("n"), Some(&int(2)));
     assert_eq!(row.get_field("host"), Some(&text("x.io")));
 }
+
+#[test]
+fn a_filter_keeps_the_order_of_a_scan_whether_or_not_an_index_serves_it() {
+    let db = Db::new();
+    // Inserted out of id order, with levels that put the index's order at
+    // odds with it.
+    db.script(
+        r#"
+        schema staff { id: String, name: String, level: Integer, pay: Integer, index(.level) }
+        staff.insert [
+          { id: "s07", name: "G", level: 1, pay: 10 }, { id: "s02", name: "B", level: 2, pay: 20 },
+          { id: "s09", name: "I", level: 1, pay: 30 }, { id: "s01", name: "A", level: 3, pay: 40 },
+          { id: "s05", name: "E", level: 2, pay: 50 }, { id: "s03", name: "C", level: 1, pay: 60 },
+          { id: "s08", name: "H", level: 4, pay: 70 }, { id: "s04", name: "D", level: 2, pay: 80 },
+          { id: "s06", name: "F", level: 1, pay: 90 }
+        ]
+        "#,
+    );
+    let names = |query: &str| -> Vec<String> {
+        db.rows(query)
+            .iter()
+            .map(|row| match row.get_field("name") {
+                Some(Value::String(name)) => name.clone(),
+                other => panic!("no name in {other:?}"),
+            })
+            .collect()
+    };
+    // The index is used, and the rows are as a scan gives them: by id.
+    let explained = &db.rows("staff.where { .level < 3 }.explain()")[0];
+    assert_eq!(explained.get_field("uses_index"), Some(&Value::Boolean(true)));
+    assert_eq!(db.ids("staff.where { .level < 3 }"), ["s02", "s03", "s04", "s05", "s06", "s07", "s09"]);
+    assert_eq!(db.ids("staff.where { .level == 1 }"), ["s03", "s06", "s07", "s09"]);
+    // Shaped rows too.
+    assert_eq!(names("staff.where { .level < 3 }.select { name }"), ["B", "C", "D", "E", "F", "G", "I"]);
+    // The same filter with another before it, which no index serves.
+    assert_eq!(
+        db.ids("staff.where { .pay > 0 }.where { .level < 3 }"),
+        db.ids("staff.where { .level < 3 }")
+    );
+    assert_eq!(db.ids("staff.where { .level < 3 && .pay > 25 }"), ["s03", "s04", "s05", "s06", "s09"]);
+    // Taking some of the rows takes the first by that order.
+    assert_eq!(db.ids("staff.where { .level < 3 }.limit(3)"), ["s02", "s03", "s04"]);
+    assert_eq!(db.ids("staff.where { .level < 3 }.offset(5)"), ["s07", "s09"]);
+    assert_eq!(db.ids("staff.where { .level < 3 }.first()"), ["s02"]);
+    assert_eq!(names("staff.where { .level < 3 }.limit(2).select { name }"), ["B", "C"]);
+    // A sort still decides the order when one is written.
+    assert_eq!(db.ids("staff.where { .level < 3 }.sort { .pay.desc }.limit(2)"), ["s06", "s04"]);
+    // One value has no order to keep.
+    assert_eq!(db.scalar("staff.where { .level < 3 }.count()", "count"), Value::Integer(7));
+
+    // A sort keeps that order among the rows it finds equal, whichever way
+    // the rows were read.
+    assert_eq!(db.ids("staff.where { .level == 1 }.sort { .level.desc }"), ["s03", "s06", "s07", "s09"]);
+    assert_eq!(db.ids("staff.where { .level < 3 }.sort { .level.asc }.limit(5)"), ["s03", "s06", "s07", "s09", "s02"]);
+    assert_eq!(db.ids("staff.sort { .level.asc }.limit(5)"), ["s03", "s06", "s07", "s09", "s02"]);
+    assert_eq!(db.ids("staff.sort { .level.desc }.limit(3)"), ["s08", "s01", "s02"]);
+}
+
+#[test]
+fn two_filters_and_a_select_keep_their_rows_when_an_index_serves_the_first() {
+    let db = Db::new();
+    db.script(
+        r#"
+        schema jobs { id: String, state: String, cost: Integer, name: String, index(.state) }
+        jobs.insert [
+          { id: "j1", state: "paused", cost: 30, name: "one" },
+          { id: "j2", state: "active", cost: 30, name: "two" },
+          { id: "j3", state: "paused", cost: 50, name: "three" }
+        ]
+        "#,
+    );
+    // The index reads the paused jobs, and each record is decoded only as
+    // far as the select asks. The record must still hold the state, or it
+    // fails the index's own test and every row is lost.
+    assert_eq!(db.ids("jobs.where { .state == \"paused\" }.where { .cost == 30 }.select { id }"), ["j1"]);
+    assert_eq!(db.ids("jobs.where { .state == \"paused\" }.where { .cost > 10 }.select { id, cost }"), ["j1", "j3"]);
+    assert_eq!(db.ids("jobs.where { .state == \"paused\" }.where { .name == \"three\" }.select { id, n: .name }"), ["j3"]);
+    assert_eq!(
+        db.ids("jobs.where { .state == \"paused\" }.where { .cost > 10 }.sort { .cost.desc }.limit(5).select { id }"),
+        ["j3", "j1"]
+    );
+    // The same written as one filter, and without the select.
+    assert_eq!(db.ids("jobs.where { .state == \"paused\" && .cost == 30 }.select { id }"), ["j1"]);
+    assert_eq!(db.ids("jobs.where { .state == \"paused\" }.where { .cost == 30 }"), ["j1"]);
+}
