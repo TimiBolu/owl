@@ -559,7 +559,8 @@ tasks {                                   -- what blocks a task, and everything 
 | The row in hand stays the row the block started from: `.field`, a bare field and the collection's name mean that row. A captured row is read by its name: `b.id`, `b.project.name`, `b.blocked_by.blocker`, `b.select {..}`, `b.walk(..)` | Works. A captured row that is a stored row is everything a row reached by a path is: its fields, its references, and the rows that refer to it. |
 | After a capture every entry works on combinations: `where`, `sort`, `limit`, `group_by`, `count()`, an aggregate and `select` mean what they always mean, over one row for every combination | Works. `group_by { a.role }` is keyed `role`. |
 | A `where` may sit between two captures, and filters before the next one multiplies the rows | Works |
-| A row with no member is not in the answer | Works. There is no form yet that keeps it with the name empty. |
+| A row with no member is not in the answer | Works |
+| `name? in collection` keeps a row with no member: it is in the answer once, and the name is null. The `?` is the one that marks an optional field in a schema | Works. Every path from an empty name is absent (`m.name` is null), a capture from it has no members, and an aggregate over it is what it is over nothing (`sum(a.hours)` is 0). `where { a == null }` is the rows that have none: `people { a? in .assignments  where { a == null }  select { name } }`. The mark belongs to a capture; `name? = value` is not a form. |
 | Nothing is left out unasked: two captures may land on the same row. `x != y` says otherwise; two captured rows are compared by which row each is | Works |
 | Order: the rows the block started from in their order, and for each, its members in theirs | Works |
 | Inside a nested query the name is still the row captured for the block's row: `links.where { .blocker == b.id }` | Works |

@@ -785,8 +785,8 @@ impl<S: DocumentStore> QueryExecutor<S> {
                             self.apply_walk(documents, path, depth.as_ref(), None, *every, *paths)?
                         }
                     }
-                    Operation::Capture { name, source } => {
-                        let rows = self.apply_capture(documents, name, source)?;
+                    Operation::Capture { name, source, optional } => {
+                        let rows = self.apply_capture(documents, name, source, *optional)?;
                         self.check_captured_names(&rows, name, &after[position + 1..])?;
                         rows
                     }
@@ -5424,7 +5424,9 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 self.apply_walk(documents, path, depth.as_ref(), None, *every, *paths)
             }
             Operation::PartitionBy(block) => self.apply_partition_by(documents, block),
-            Operation::Capture { name, source } => self.apply_capture(documents, name, source),
+            Operation::Capture { name, source, optional } => {
+                self.apply_capture(documents, name, source, *optional)
+            }
             Operation::Call(_) => Err(OQLError::Generic {
                 message: "a function call gives a query its rows, so it must come first".to_string(),
             }),
@@ -13124,8 +13126,9 @@ impl<S: DocumentStore> QueryExecutor<S> {
 
     /// `name in collection`: every row, once for each member of the
     /// collection as it stands for that row, with the member kept on the
-    /// row under the name. A row with no member is dropped. Rows keep
-    /// their order, and each row's members theirs.
+    /// row under the name. A row with no member is dropped, or kept once
+    /// with nothing under the name when the capture is `optional`. Rows
+    /// keep their order, and each row's members theirs.
     ///
     /// A member that is a stored row is kept as a reference to it, so a
     /// path from the name reads it, follows its references and finds the
@@ -13138,11 +13141,20 @@ impl<S: DocumentStore> QueryExecutor<S> {
         documents: Vec<Document>,
         name: &str,
         source: &Expression,
+        optional: bool,
     ) -> OQLResult<Vec<Document>> {
         let field = crate::parser::capture_field(name);
         let mut combined = Vec::new();
         for document in documents {
             let (members, whole) = self.capture_members(&document, source)?;
+            // `name? in ..`: a row with no member is kept, once, and the
+            // name is null: every path from it reads as absent.
+            if optional && members.is_empty() {
+                let mut row = document;
+                row.fields.insert(field.clone(), Value::Null);
+                combined.push(row);
+                continue;
+            }
             for member in members {
                 let mut row = document.clone();
                 for note in crate::parser::CAPTURE_NOTES {
@@ -13176,7 +13188,12 @@ impl<S: DocumentStore> QueryExecutor<S> {
     /// row of a collection with a schema, against what follows the capture.
     fn check_captured_names(&self, rows: &[Document], name: &str, following: &[Operation]) -> OQLResult<()> {
         let field = crate::parser::capture_field(name);
-        let Some(Value::Reference(reference)) = rows.first().and_then(|row| row.fields.get(&field)) else {
+        // The first row that has a member: an optional capture leaves the
+        // name empty on the rows that have none.
+        let Some(reference) = rows.iter().find_map(|row| match row.fields.get(&field) {
+            Some(Value::Reference(reference)) => Some(reference),
+            _ => None,
+        }) else {
             return Ok(());
         };
         let Some(collection) = self.referenced_document(reference)?.map(|row| row.schema.clone()) else {
