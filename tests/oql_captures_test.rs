@@ -376,3 +376,51 @@ fn a_name_given_with_equals_means_the_blocks_row_inside_a_nested_query() {
         rows(&[&["ada"]])
     );
 }
+
+#[test]
+fn an_optional_capture_keeps_a_row_with_no_member() {
+    let db = work();
+    // `name? in`: a row with no member stays, once, with the name empty.
+    assert_eq!(
+        db.table("tasks { tag? in .tags  select { id, tag } }", &["id", "tag"]),
+        rows(&[&["t1", "api"], &["t1", "db"], &["t2", "null"], &["t3", "ui"], &["t4", "null"]])
+    );
+    // Every path from an empty name is absent.
+    assert_eq!(
+        db.table("people { m? in .manager  select { name, boss: m.name } }", &["name", "boss"]),
+        rows(&[&["Ada", "Kim"], &["Ben", "Kim"], &["Cy", "Lee"], &["Kim", "null"], &["Lee", "null"]])
+    );
+    // The rows that have none are the ones whose name is null.
+    assert_eq!(
+        db.table("people { a? in .assignments  where { a == null }  select { name } }", &["name"]),
+        rows(&[&["Kim"], &["Lee"]])
+    );
+    assert_eq!(
+        db.table("people { a? in .assignments  where { a != null && a.hours > 10 }  select { name } }", &["name"]),
+        rows(&[&["Ada"], &["Ben"]])
+    );
+    // A capture from an empty name has no members, and may be optional too.
+    assert_eq!(
+        db.table("people { a? in .assignments  t? in a.project.tasks  count() }", &["count"]),
+        rows(&[&["10"]])
+    );
+    assert_eq!(
+        db.table("people { a? in .assignments  t in a.project.tasks  count() }", &["count"]),
+        rows(&[&["8"]])
+    );
+    // Counting what was captured, with the rows that have none at nought.
+    let mut hours = db.table(
+        "people { a? in .assignments  group_by { name }  select { name, hours: sum(a.hours) } }",
+        &["name", "hours"],
+    );
+    hours.sort();
+    assert_eq!(
+        hours,
+        rows(&[&["Ada", "30"], &["Ben", "30"], &["Cy", "5"], &["Kim", "0"], &["Lee", "0"]])
+    );
+    // A misspelt field is still refused, though the first row has no member.
+    let error = db.error("people { a? in .assignments  where { a.nope == 1 }  count() }");
+    assert!(error.contains("has no field 'nope'"), "{error}");
+    // The mark belongs to a capture.
+    assert!(db.try_rows("people { a? = .assignments  count() }").is_err());
+}

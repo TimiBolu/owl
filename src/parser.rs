@@ -93,6 +93,7 @@ pub enum Token {
     RightBracket, // ]
     Comma,        // ,
     Colon,        // :
+    Question,     // ?
     Dot,          // .
     Star,         // *
     Plus,         // +
@@ -752,6 +753,7 @@ impl Tokenizer {
             map(char(']'), |_| Token::RightBracket),
             map(char(','), |_| Token::Comma),
             map(char(':'), |_| Token::Colon),
+            map(char('?'), |_| Token::Question),
             map(char('.'), |_| Token::Dot),
             map(char('*'), |_| Token::Star),
         ))(input)
@@ -1030,8 +1032,15 @@ pub enum Operation {
     FunctionDef(FunctionDefinition),
     /// `name in collection` in a scoped block: every row in hand, once for
     /// each member of the collection, with the member kept under the name.
-    /// A row with no member is dropped.
-    Capture { name: String, source: Expression },
+    /// A row with no member is dropped, unless the capture is `optional`
+    /// (`name? in collection`): then the row is kept, once, with nothing
+    /// under the name.
+    Capture {
+        name: String,
+        source: Expression,
+        #[serde(default)]
+        optional: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2520,8 +2529,11 @@ impl Parser {
             // hand become one row for every member. The member is kept on
             // the row, and the name is a path to it from there on, so
             // everything a path can do, the name can.
+            // `name? in collection` keeps a row that has no member, with
+            // nothing under the name: the `?` of an optional field.
+            let optional = matches!(self.tokens.get(self.position + 1), Some(Token::Question));
             if let (Some(Token::Identifier(name)), Some(Token::In)) =
-                (self.current_token(), self.tokens.get(self.position + 1))
+                (self.current_token(), self.tokens.get(self.position + 1 + optional as usize))
             {
                 let name = name.clone();
                 if name == collection {
@@ -2542,6 +2554,9 @@ impl Parser {
                     )));
                 }
                 self.advance();
+                if optional {
+                    self.advance();
+                }
                 self.expect_token(Token::In)?;
                 let source = self.parse_expression()?;
                 let source = Self::substitute_scoped_locals_expression(&source, &locals);
@@ -2550,7 +2565,7 @@ impl Parser {
                     Expression::FieldAccess(FieldAccess { path: vec![capture_field(&name)] }),
                 );
                 captured = true;
-                operations.push(Operation::Capture { name, source });
+                operations.push(Operation::Capture { name, source, optional });
                 continue;
             }
 
