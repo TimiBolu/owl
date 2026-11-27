@@ -522,7 +522,10 @@ impl PhysicalOperatorExec for SortExec {
                     };
                 }
             }
-            Ordering::Equal
+            // A sort keeps the order of a scan among the rows it finds
+            // equal. The rows may have come through an index, in its
+            // order, so the scan's order is asked for by name: the id.
+            a.id.cmp(&b.id)
         });
         self.position = 0;
 

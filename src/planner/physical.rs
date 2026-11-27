@@ -1274,6 +1274,19 @@ impl PhysicalPlanner {
                         scan.key_conditions.push(filter.clone());
                     }
                 }
+                // With a filter from above to apply, the scan tests every
+                // one of its conditions on the record it decodes, the
+                // key's own among them. So the record must hold each
+                // field they read. Without the key's field, a record
+                // decoded for a `select` that does not name it failed the
+                // key's own test, and a query of two filters and a select
+                // lost every row.
+                let mut required_fields = required_fields;
+                if let (Some(required), false) = (&mut required_fields, filters.is_empty()) {
+                    for condition in &scan.key_conditions {
+                        Self::collect_condition_fields(condition, required);
+                    }
+                }
                 scan.pushed_projection = required_fields
                     .map(|fields| fields.into_iter().collect())
                     .unwrap_or_default();

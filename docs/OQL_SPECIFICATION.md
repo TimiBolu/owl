@@ -698,7 +698,10 @@ operation on; what precedes it still uses indexes and column reads.
 | Multi-key sort with per-key direction | Works |
 | A total, deterministic order: nulls first, then booleans, numbers, strings, timestamps | Works |
 | Nulls first in ascending order, last in descending | Works |
-| Stable sort | Works |
+| The order of a collection with no `sort` is the order of a scan: by id | Works |
+| A filter does not reorder rows. `people.where { .level < 3 }` gives its rows by id whether an index serves the filter or not, and gives the same rows in the same order as the filter written after another | Works. An index gives rows in its own order; they are put back by id. |
+| Stable sort: rows a sort finds equal stay in the order of a scan, whichever way they were read | Works, for a sort in the pipeline, a sort served by an index, and a top-k taken from an index |
+| `limit`, `offset` and `first` after a filter take the first rows by that order | Works. A `limit` after a filter an index serves therefore reads every row that passes: an index that stopped at its first entries would give other rows. With a `sort` before it, an index that supplies the order still reads only about as many rows as are asked for. |
 | `limit` and `offset` | Works, parameterisable (6.2) |
 | Keyset or cursor pagination | The engine has keyset cursors; the language has no form. Proposed: none needed. `where { .placed < $after }.sort {..}.limit($n)` is keyset pagination, and works today. |
 

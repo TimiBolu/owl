@@ -245,6 +245,9 @@ pub struct Case {
     pub shape: &'static str,
     pub oql: String,
     pub sql: String,
+    /// Whether the rows must also come in SQLite's order: the query's
+    /// order is one the language defines and the SQL spells out.
+    pub ordered: bool,
 }
 
 /// A block of captures: each names the rows a path reaches from the
@@ -359,6 +362,7 @@ fn block(random: &mut Random, tables: &[Table]) -> Option<Case> {
     };
     Some(Case {
         shape: "block of captures",
+        ordered: false,
         oql: format!("{root} {{\n{}\n{select}\n}}", entries.join("\n")),
         sql: format!("SELECT {columns}\nFROM {root} AS r0{joins}{filter}"),
     })
@@ -400,6 +404,7 @@ fn named_value(random: &mut Random, _tables: &[Table]) -> Option<Case> {
     let sql_operator = if operator == "==" { "=" } else { operator };
     Some(Case {
         shape: "name read in a nested query",
+        ordered: false,
         oql: format!(
             "{root} {{\n  n = {value}\n  select {{ id, k: {}.where {{ .{} {operator} n }}.count() }}\n}}",
             asked.collection, asked.name
@@ -425,6 +430,7 @@ fn capture_in_nested(random: &mut Random, _tables: &[Table]) -> Option<Case> {
     let asked = *random.pick(&asked);
     Some(Case {
         shape: "captured row read in a nested query",
+        ordered: false,
         oql: format!(
             "{root} {{\n  c in .{}\n  select {{ id, c: c.id, k: {}.where {{ .{} == c.{} }}.count() }}\n}}",
             edge.step, asked.collection, asked.name, field.name
@@ -493,6 +499,7 @@ fn anchor_after_steps(random: &mut Random, tables: &[Table]) -> Option<Case> {
     let field = fields.first()?;
     Some(Case {
         shape: "row a path began at",
+        ordered: false,
         oql: format!("{chain}.select {{ from: {root}.id, of: {root}.{}, id }}", field.name),
         sql: format!(
             "SELECT r0.id AS \"from\", r0.{} AS \"of\", {from}.id AS id\nFROM {root} AS r0{joins}{filter}",
@@ -581,7 +588,7 @@ fn walked(random: &mut Random, tables: &[Table]) -> Option<Case> {
             ids = listed('\''),
         ),
     };
-    Some(Case { shape: "rows of a walk", oql, sql })
+    Some(Case { shape: "rows of a walk", ordered: false, oql, sql })
 }
 
 /// The block's row named inside a query inside a query.
@@ -611,6 +618,7 @@ fn two_deep(random: &mut Random, _tables: &[Table]) -> Option<Case> {
     };
     Some(Case {
         shape: "name read two queries deep",
+        ordered: false,
         oql: format!(
             "{root} {{\n{given}  select {{ id, k: {}.where {{ {}.where {{ .{} {operator} {named} }}.count() > 2 }}.count() }}\n}}",
             middle.collection, inner.collection, inner.name
@@ -651,6 +659,7 @@ fn two_deep_from_a_row(random: &mut Random, _tables: &[Table]) -> Option<Case> {
             let inner = *random.pick(&inner);
             Some(Case {
                 shape: "name read two deep, through a path",
+                ordered: false,
                 oql: format!(
                     "{root} {{\n  select {{ id, k: .{}.where {{ {}.where {{ .{} {operator} {root}.{} }}.count() > 2 }}.count() }}\n}}",
                     edge.step, inner.collection, inner.name, field.name
@@ -668,6 +677,7 @@ fn two_deep_from_a_row(random: &mut Random, _tables: &[Table]) -> Option<Case> {
             }
             Some(Case {
                 shape: "name taken by a nearer row",
+                ordered: false,
                 oql: format!(
                     "{root} {{\n  select {{ id, k: {root}.where {{ .{0} {operator} {root}.{0} && {1}.where {{ .{2} == {root}.id }}.count() > 0 }}.count() }}\n}}",
                     field.name, edge.to, edge.column
@@ -702,6 +712,7 @@ fn named_collection(random: &mut Random, tables: &[Table]) -> Option<Case> {
     let mine = format!("{} AS m WHERE m.{} = r0.id", edge.to, edge.column);
     Some(Case {
         shape: "name for a collection",
+        ordered: false,
         oql: format!(
             "{root} {{\n  mine = .{}\n  select {{\n    id,\n    all: mine.count(),\n    some: mine.where {{ .{} {operator} {value} }}.count(),\n    like: {}.where {{ .{} in mine.{} }}.count()\n  }}\n}}",
             edge.step, field.name, asked.collection, asked.name, field.name
@@ -747,6 +758,7 @@ fn after_captures(random: &mut Random, tables: &[Table]) -> Option<Case> {
     match random.chance(50) {
         true => Some(Case {
             shape: "grouping after captures",
+            ordered: false,
             oql: format!(
                 "{root} {{\n  a in .{}\n  b in a.{}\n{filter}  group_by {{ b.{} }}\n  select {{ {}, rows: count() }}\n}}",
                 first.step, second.step, key.name, key.name
@@ -760,6 +772,7 @@ fn after_captures(random: &mut Random, tables: &[Table]) -> Option<Case> {
             let keep = 1 + random.below(40);
             Some(Case {
                 shape: "sort and limit after captures",
+                ordered: false,
                 oql: format!(
                     "{root} {{\n  a in .{}\n  b in a.{}\n{filter}  sort {{ b.id.desc, a.id.asc, id.asc }}\n  limit({keep})\n  select {{ id, a: a.id, b: b.id }}\n}}",
                     first.step, second.step
@@ -772,6 +785,52 @@ fn after_captures(random: &mut Random, tables: &[Table]) -> Option<Case> {
     }
 }
 
+/// A filtered read, and a sorted one, in the order the language gives them:
+/// a filter keeps the order of a scan, which is by id, whether or not an
+/// index serves it; a sort keeps that order among rows it finds equal.
+fn in_order(random: &mut Random, tables: &[Table]) -> Option<Case> {
+    let root = *random.pick(ROOTS);
+    let fields = fields_of(root);
+    let mut chain = root.to_string();
+    let mut filters: Vec<String> = Vec::new();
+    for _ in 0..random.below(3) {
+        let field = *random.pick(&fields);
+        let value = literal(random, tables, field)?;
+        let (operator, sql_operator) = match field.kind {
+            Kind::Text => ("==", "="),
+            _ => *random.pick(&[("<", "<"), (">", ">"), ("==", "=")]),
+        };
+        chain.push_str(&format!(".where {{ .{} {operator} {value} }}", field.name));
+        filters.push(format!("r0.{} {sql_operator} {}", field.name, sql_literal(&value)));
+    }
+    let shown = *random.pick(&fields);
+    let mut order = "r0.id".to_string();
+    let sorted = random.chance(40);
+    if sorted {
+        let by = *random.pick(&fields);
+        let (direction, sql_direction) = *random.pick(&[("asc", "ASC"), ("desc", "DESC")]);
+        chain.push_str(&format!(".sort {{ .{}.{direction} }}", by.name));
+        order = format!("r0.{} {sql_direction}, r0.id", by.name);
+    }
+    let mut taken = String::new();
+    if random.chance(50) {
+        let keep = 1 + random.below(30);
+        chain.push_str(&format!(".limit({keep})"));
+        taken = format!("\nLIMIT {keep}");
+    }
+    chain.push_str(&format!(".select {{ id, shown: .{} }}", shown.name));
+    let filter = match filters.is_empty() {
+        true => String::new(),
+        false => format!("\nWHERE {}", filters.join(" AND ")),
+    };
+    Some(Case {
+        shape: if sorted { "sorted read, in order" } else { "filtered read, in order" },
+        ordered: true,
+        oql: chain,
+        sql: format!("SELECT r0.id AS id, r0.{} AS shown\nFROM {root} AS r0{filter}\nORDER BY {order}{taken}", shown.name),
+    })
+}
+
 /// The cases of one seed.
 pub fn cases(seed: u64, count: usize, tables: &[Table]) -> Vec<Case> {
     let mut random = Random(seed);
@@ -779,7 +838,8 @@ pub fn cases(seed: u64, count: usize, tables: &[Table]) -> Vec<Case> {
     let mut tries = 0;
     while made.len() < count && tries < count * 20 {
         tries += 1;
-        let case = match random.below(18) {
+        let case = match random.below(21) {
+            18..=20 => in_order(&mut random, tables),
             0..=5 => block(&mut random, tables),
             6 => named_value(&mut random, tables),
             7 => capture_in_nested(&mut random, tables),
@@ -829,6 +889,12 @@ pub fn check(loaded: &Loaded, case: &Case) -> Result<Verdict> {
         return Ok(Verdict::Rearranged(difference));
     }
     let rows = arranged.len();
+    if case.ordered {
+        return Ok(match first_difference(&arranged, &sqlite) {
+            None => Verdict::Same(rows),
+            Some(difference) => Verdict::Differs(format!("in order: {difference}")),
+        });
+    }
     Ok(match first_difference(&sorted(arranged), &sorted(sqlite)) {
         None => Verdict::Same(rows),
         Some(difference) => Verdict::Differs(difference),

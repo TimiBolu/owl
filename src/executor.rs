@@ -420,9 +420,12 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 self.validate_declared_paths(query)?;
                 return Ok(documents);
             }
-            if let Some(plan) = self.try_plan_safe_read(query)? {
+            if let Some((plan, by_id)) = self.try_plan_ordered_read(query)? {
                 self.validate_declared_paths(query)?;
                 let mut rows = self.execute_read_plan(&plan)?;
+                if by_id {
+                    rows.sort_by(|left, right| left.id.cmp(&right.id));
+                }
                 Self::name_absent_selected_fields(query, &mut rows);
                 return Ok(rows);
             }
@@ -485,7 +488,11 @@ impl<S: DocumentStore> QueryExecutor<S> {
     fn execute_statement_batches(&self, query: &OQLQuery) -> OQLResult<BatchQueryExecution> {
         let _statement = StatementGuard::enter();
         let planning_started = Instant::now();
-        let plan = self.try_plan_safe_read(query)?;
+        // Batches are handed on as they are read, so a plan whose rows
+        // must be put back in order afterwards is not used for them.
+        let plan = self
+            .try_plan_ordered_read(query)?
+            .and_then(|(plan, by_id)| (!by_id).then_some(plan));
         let planning_elapsed = planning_started.elapsed();
 
         if let Some(plan) = plan {
@@ -524,14 +531,17 @@ impl<S: DocumentStore> QueryExecutor<S> {
         let _statement = StatementGuard::enter();
         profile_call!("execute_query_with_plan", {
             let planning_started = Instant::now();
-            let plan = self.try_plan_safe_read(query)?;
+            let plan = self.try_plan_ordered_read(query)?;
             let planning_elapsed = planning_started.elapsed();
 
-            if let Some(plan) = plan {
+            if let Some((plan, by_id)) = plan {
                 let physical_plan = plan.root.explain();
                 let execution_started = Instant::now();
-                let (documents, operator_profile, materialization_elapsed) =
+                let (mut documents, operator_profile, materialization_elapsed) =
                     self.execute_read_plan_profiled(&plan)?;
+                if by_id {
+                    documents.sort_by(|left, right| left.id.cmp(&right.id));
+                }
                 let total_execution = execution_started.elapsed();
                 return Ok(QueryExecution {
                     documents,
@@ -886,7 +896,14 @@ impl<S: DocumentStore> QueryExecutor<S> {
                         None => {
                             // Storage already applied the leading filters.
                             filters_applied = applied;
-                            self.execute_read_plan(&plan)?
+                            let mut rows = self.execute_read_plan(&plan)?;
+                            // An index gives rows in its own order. A
+                            // filter does not reorder rows, so they are
+                            // put back as a scan gives them: by id.
+                            if Self::contains_native_index_scan(&plan.root) {
+                                rows.sort_by(|left, right| left.id.cmp(&right.id));
+                            }
+                            rows
                         }
                     }
                 } else if let Some(documents) = self.select_from_columns(query)? {
@@ -2116,7 +2133,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
             return self.explain_captures(query, at);
         }
         self.validate_declared_paths(query)?;
-        let plan = self.try_plan_safe_read(query)?;
+        let plan = self.try_plan_ordered_read(query)?.map(|(plan, _)| plan);
         let mut fields = crate::document::Fields::default();
         match &plan {
             Some(plan) => {
@@ -4740,7 +4757,16 @@ impl<S: DocumentStore> QueryExecutor<S> {
     /// order: take the first `n` rows in index order, then settle the rows
     /// that tie on the last `.a` value by the remaining keys. This reads
     /// about `n` rows instead of every row that passes the filter.
+    ///
+    /// A sort keeps the order of a scan among the rows it finds equal, so
+    /// a sort on `.a` alone has a last key too: the id. The rows that tie
+    /// on the last `.a` value are settled by it, and so are the rows the
+    /// index gave together for any other value.
     fn tie_broken_top_k(&self, query: &OQLQuery) -> OQLResult<Option<Vec<Document>>> {
+        // `sort {..}.select {..}.limit(n)` takes the same rows as with the
+        // limit before the select.
+        let limited = Self::limit_before_select(query);
+        let query = limited.as_ref().unwrap_or(query);
         let Some(sort_at) = query
             .operations
             .iter()
@@ -4755,7 +4781,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
             return Ok(None);
         };
         let filters = &query.operations[..sort_at];
-        if sort.fields.len() < 2
+        if sort.fields.is_empty()
             || query
                 .operations
                 .iter()
@@ -4856,6 +4882,9 @@ impl<S: DocumentStore> QueryExecutor<S> {
             candidates = settled;
         }
 
+        // The sort keeps the order it is given among equal rows, and the
+        // order it must keep is a scan's.
+        candidates.sort_by(|left, right| left.id.cmp(&right.id));
         let mut documents = self.apply_sort_operation(candidates, sort)?;
         documents.truncate(*limit as usize);
         for operation in &query.operations[sort_at + 2..] {
@@ -5100,6 +5129,52 @@ impl<S: DocumentStore> QueryExecutor<S> {
             (Err(error), _) => Err(error),
             (Ok(_), Err(error)) => Err(error),
         }
+    }
+
+    /// [`Self::try_plan_safe_read`], held to the order a query's rows must
+    /// have: a filter does not reorder rows, so without a `sort` the answer
+    /// is in the order a scan gives, whether or not an index served it.
+    ///
+    /// An index gives rows in its own order. The second value says the
+    /// rows must be put back by id once they are read. That can be done
+    /// when the query only filters and then shapes its rows. When it also
+    /// takes some of them (`limit`, `first`, `distinct`), which rows those
+    /// are depends on the order, so the plan is not used and the general
+    /// executor answers.
+    fn try_plan_ordered_read(&self, query: &OQLQuery) -> OQLResult<Option<(PhysicalPlan, bool)>> {
+        let Some(plan) = self.try_plan_safe_read(query)? else {
+            return Ok(None);
+        };
+        if !Self::contains_native_index_scan(&plan.root) {
+            return Ok(Some((plan, false)));
+        }
+        let operations = &query.operations;
+        // One value has no order.
+        if operations.last().is_some_and(|operation| Self::scalar_result_field(operation).is_some()) {
+            return Ok(Some((plan, false)));
+        }
+        // A sort keeps the order of a scan among the rows it finds equal.
+        // The pipeline's own sort does, and so does a union of indexes,
+        // which orders equal rows by id. An index that supplies the order
+        // by itself gives equal rows in the index's order, so that plan is
+        // not used; `tie_broken_top_k` has already taken the case where
+        // only the first rows are wanted.
+        if operations.iter().any(|operation| matches!(operation, Operation::Sort(_))) {
+            let explained = plan.root.explain();
+            let settles_ties = explained.lines().any(|line| {
+                let line = line.trim_start();
+                line.starts_with("Sort") || line.starts_with("IndexUnion")
+            });
+            return Ok(settles_ties.then_some((plan, false)));
+        }
+        let shaped = match operations.split_last() {
+            Some((Operation::Select(_), filters)) => filters,
+            _ => operations.as_slice(),
+        };
+        Ok(shaped
+            .iter()
+            .all(|operation| matches!(operation, Operation::Where(_)))
+            .then_some((plan, true)))
     }
 
     fn try_plan_safe_read(&self, query: &OQLQuery) -> OQLResult<Option<PhysicalPlan>> {
@@ -17314,12 +17389,29 @@ mod tests {
         assert_eq!(pushed_results[0].fields.len(), 1);
         assert!(pushed_results[0].fields.contains_key("message"));
 
-        let profiled = executor.execute_query_with_plan(&pushed_query).unwrap();
+        // The row a limit takes is the first as a scan orders them, which
+        // an index that stops at its first entry cannot promise. So that
+        // plan describes a read the engine no longer makes for this query:
+        // the general executor answers it, and gives the first by id.
+        assert_eq!(pushed_results[0].id, "e1");
+        assert!(executor
+            .execute_query_with_plan(&pushed_query)
+            .unwrap()
+            .operator_profile
+            .is_none());
+
+        // Without the limit the index is read, and only what the select
+        // asks for is decoded.
+        let shaped_query =
+            parse_oql(r#"events.where { .level == "error" }.select { message }"#).unwrap();
+        let profiled = executor.execute_query_with_plan(&shaped_query).unwrap();
+        assert_eq!(
+            profiled.documents.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["e1", "e3"]
+        );
         let profile = profiled
             .operator_profile
             .expect("indexed execution profile");
-        assert_eq!(profile.operator, "IndexScan");
-        assert_eq!(profile.actual_rows, 1);
         fn find_operator<'a>(
             profile: &'a crate::execution::OperatorExecutionStats,
             name: &str,
@@ -17332,9 +17424,9 @@ mod tests {
             })
         }
         let index = find_operator(&profile, "IndexScan").expect("index profile");
-        assert_eq!(index.actual_rows, 1);
-        assert_eq!(index.metrics["records_decoded"], 1);
-        assert!(index.metrics["index_entries_examined"] >= 1);
+        assert_eq!(index.actual_rows, 2);
+        assert_eq!(index.metrics["records_decoded"], 2);
+        assert!(index.metrics["index_entries_examined"] >= 2);
     }
 
     #[test]
