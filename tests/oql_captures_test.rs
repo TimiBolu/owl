@@ -729,3 +729,72 @@ fn a_name_means_the_same_row_however_deep_it_is_read() {
         rows(&[&["ada", "2"], &["ben", "2"], &["cy", "2"], &["kim", "1"], &["lee", "0"]])
     );
 }
+
+#[test]
+fn a_blocks_answer_is_carried_on_by_a_chain() {
+    let db = work();
+    // A block gives rows, and a chain after its closing brace works on
+    // them, as a chain after `select` does. This is what lets a block
+    // group, shape, and then sort by what it worked out.
+    assert_eq!(
+        db.table(
+            "people { a in .assignments  group_by { a.role }  select { role, people: count() } }.sort { .people.desc }.limit(1)",
+            &["role", "people"],
+        ),
+        rows(&[&["dev", "3"]])
+    );
+    assert_eq!(
+        db.table(
+            "people { select { id, n: .assignments.count() } }.sort { .n.desc, .id.asc }.limit(2)",
+            &["id", "n"],
+        ),
+        rows(&[&["ada", "2"], &["ben", "1"]])
+    );
+    assert_eq!(
+        db.table("people { select { id, n: .assignments.count() } }.where { .n > 1 }", &["id", "n"]),
+        rows(&[&["ada", "2"]])
+    );
+    assert_eq!(
+        db.table("people { a in .assignments  select { name, hours: a.hours } }.where { .hours > 10 }.count()", &["count"]),
+        rows(&[&["2"]])
+    );
+    // A block that ends in one value has that to give.
+    assert_eq!(db.table("tasks { tag in .tags  count() }.explain()", &["path"]), rows(&[&["general executor"]]));
+
+    // The block's names ended with the block.
+    let error = db.error("people { mine = .assignments  select { id } }.where { mine.count() > 0 }");
+    assert!(error.contains("'mine' is a name of the block, and the block has closed"), "{error}");
+    let error = db.error("people { a in .assignments  select { id } }.where { a.hours > 1 }");
+    assert!(error.contains("'a' is a name of the block"), "{error}");
+    // And a write still cannot follow a capture.
+    let error = db.error("tasks { b in .blocked_by.blocker  select { id } }.delete()");
+    assert!(error.contains("a write cannot follow a block with a capture"), "{error}");
+}
+
+#[test]
+fn explain_shows_what_a_walk_reached_at_each_depth() {
+    let db = work();
+    // t4 is blocked by t3, t3 by t2, t2 by t1, and t1 by t3 again.
+    let query = "tasks.where { .id == \"t4\" }.walk(.blocked_by.blocker).select { id }.explain()";
+    assert_eq!(
+        steps(&db, query),
+        ["tasks, 1 entry | - | 1", "walk(.blocked_by.blocker) | 1 | 3", "select { .. } | 3 | 3"]
+    );
+    let explained = db.try_rows(query).unwrap();
+    let Some(Value::String(plan)) = explained[0].get_field("plan") else { panic!("no plan") };
+    assert!(
+        plan.contains("walk(.blocked_by.blocker): 1 rows in, 3 out (depth 1: 1, depth 2: 1, depth 3: 1)"),
+        "{plan}"
+    );
+    // From every task, with the row each was reached from named: one walk
+    // for each starting row.
+    assert_eq!(
+        steps(&db, "tasks.walk(.blocked_by.blocker).select { from: tasks.id, id }.explain()"),
+        ["tasks | - | 4", "walk(.blocked_by.blocker) | 4 | 12", "select { .. } | 12 | 12"]
+    );
+    // A walk that writes afterwards is described, not run.
+    let before = db.table("tasks.count()", &["count"]);
+    let described = db.try_rows("tasks.where { .id == \"t4\" }.walk(.blocked_by.blocker).delete().explain()").unwrap();
+    assert!(described[0].get_field("steps").is_none());
+    assert_eq!(db.table("tasks.count()", &["count"]), before);
+}

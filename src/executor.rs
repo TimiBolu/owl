@@ -651,10 +651,20 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     }));
                 }
             }
+            // For `explain()`: the steps as they are taken. Taken out
+            // while this query runs, so a query nested in it notes nothing.
+            let mut recording = EXPLAIN_STEPS.with(|steps| steps.borrow_mut().take());
+            let read_started = Instant::now();
             let reached_back = match after.first() {
                 Some(Operation::Capture { .. }) => self.rows_reached_back(query, at)?,
                 _ => None,
             };
+            if let Some(recorded) = &mut recording {
+                recorded.before = query.operations[..at].to_vec();
+                recorded.reached_back = reached_back
+                    .as_ref()
+                    .map(|reached| (reached.name.clone(), reached.reads.clone()));
+            }
             let mut documents = match (reached_back, &whole) {
                 (Some(reached), _) => reached.rows,
                 (None, Some(_)) => Vec::new(),
@@ -669,14 +679,37 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     rows
                 }
             };
+            if let Some(recorded) = &mut recording {
+                let from = match &recorded.reached_back {
+                    Some((name, _)) => format!(", reached back from {name}"),
+                    None => String::new(),
+                };
+                let name = match at {
+                    0 => format!("{}{from}", query.collection),
+                    entries => {
+                        format!("{}, {entries} entr{}{from}", query.collection, if entries == 1 { "y" } else { "ies" })
+                    }
+                };
+                recorded.steps.push(Self::explained_step(name, None, &documents, read_started));
+            }
             let mut grouped = before
                 .iter()
                 .any(|operation| matches!(operation, Operation::GroupBy(_)));
             for (position, operation) in after.iter().enumerate() {
+                let rows_in = documents.len();
+                let step_started = Instant::now();
                 if grouped
                     && documents.is_empty()
                     && matches!(operation, Operation::Select(_) | Operation::Having(_))
                 {
+                    if let Some(recorded) = &mut recording {
+                        recorded.steps.push(Self::explained_step(
+                            Self::entry_as_written(operation),
+                            Some(rows_in),
+                            &documents,
+                            step_started,
+                        ));
+                    }
                     continue;
                 }
                 documents = match operation {
@@ -819,8 +852,32 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     }
                     _ => self.apply_operation(documents, operation, &query.collection)?,
                 };
+                if let Some(recorded) = &mut recording {
+                    let mut step = Self::explained_step(
+                        Self::entry_as_written(operation),
+                        Some(rows_in),
+                        &documents,
+                        step_started,
+                    );
+                    // A walk: how many rows each depth reached.
+                    if matches!(operation, Operation::Walk { .. }) {
+                        let mut depths: Vec<i64> = Vec::new();
+                        for row in &documents {
+                            if let Some(Value::Integer(depth)) = row.fields.get(WALK_DEPTH_FIELD) {
+                                let at = (*depth).max(1) as usize - 1;
+                                if depths.len() <= at {
+                                    depths.resize(at + 1, 0);
+                                }
+                                depths[at] += 1;
+                            }
+                        }
+                        step.insert("depths".to_string(), Value::List(depths.into_iter().map(Value::Integer).collect()));
+                    }
+                    recorded.steps.push(step);
+                }
                 grouped |= matches!(operation, Operation::GroupBy(_));
             }
+            EXPLAIN_STEPS.with(|steps| *steps.borrow_mut() = recording);
             // Rows that were not reshaped still hold the rows captured for
             // them, which are not theirs to show.
             if after.iter().any(|operation| matches!(operation, Operation::Capture { .. })) {
@@ -2125,12 +2182,27 @@ impl<S: DocumentStore> QueryExecutor<S> {
     /// `query.explain()`: one row saying how the query would run, without
     /// running it.
     fn explain_query(&self, query: &OQLQuery) -> OQLResult<Vec<Document>> {
-        if let Some(at) = query
+        // A capture or a walk makes rows as it goes, and how many is the
+        // thing to know. Asked only of a query that writes nothing, since
+        // it is run to count them.
+        let makes_rows = query
             .operations
             .iter()
-            .position(|operation| matches!(operation, Operation::Capture { .. }))
-        {
-            return self.explain_captures(query, at);
+            .any(|operation| matches!(operation, Operation::Capture { .. } | Operation::Walk { .. }));
+        let writes = query.operations.iter().any(|operation| {
+            matches!(
+                operation,
+                Operation::Insert(_)
+                    | Operation::InsertMany(_)
+                    | Operation::InsertFrom(_)
+                    | Operation::Upsert(_)
+                    | Operation::Update(_)
+                    | Operation::Delete
+                    | Operation::FunctionDef(_)
+            )
+        });
+        if makes_rows && !writes {
+            return self.explain_steps(query);
         }
         self.validate_declared_paths(query)?;
         let plan = self.try_plan_ordered_read(query)?.map(|(plan, _)| plan);
@@ -2191,129 +2263,91 @@ impl<S: DocumentStore> QueryExecutor<S> {
         )])
     }
 
-    /// `explain()` on a block with a capture: how the block's first rows
-    /// are read, and then every entry from the first capture on with the
-    /// rows that went into it and the rows that came out.
+    /// `explain()` on a query with a capture or a walk: how its first rows
+    /// are read, and then every step from there on with the rows that went
+    /// into it and the rows that came out; for a walk, how many rows each
+    /// depth reached.
     ///
-    /// How many rows a capture makes is what decides what such a block
-    /// costs, and it cannot be known without making them. So unlike any
-    /// other `explain()`, this runs the block. It may: nothing after a
-    /// capture can write.
-    fn explain_captures(&self, query: &OQLQuery, at: usize) -> OQLResult<Vec<Document>> {
-        // The block as it will run: with each condition where its names
-        // first exist, which may be ahead of the first capture.
-        let written = query;
-        let planned = self.plan_captures(query)?;
-        let query = planned.as_ref().unwrap_or(query);
-        let at = query
-            .operations
-            .iter()
-            .position(|operation| matches!(operation, Operation::Capture { .. }))
-            .unwrap_or(at);
-        let (before, after) = query.operations.split_at(at);
-        let start = OQLQuery { collection: query.collection.clone(), operations: before.to_vec() };
-        let mut explained = self.explain_query(&start)?;
-        let mut fields = explained.pop().map(|row| row.fields).unwrap_or_default();
+    /// How many rows a capture or a walk makes is what decides what such a
+    /// query costs, and it cannot be known without making them. So unlike
+    /// any other `explain()`, this runs the query, which is why it is only
+    /// asked of one that writes nothing. The steps are noted by the
+    /// executor as it runs, so they are the steps it took.
+    fn explain_steps(&self, query: &OQLQuery) -> OQLResult<Vec<Document>> {
+        EXPLAIN_STEPS.with(|steps| *steps.borrow_mut() = Some(RecordedSteps::default()));
+        let ran = self.execute_general_query(query);
+        let recorded = EXPLAIN_STEPS.with(|steps| steps.borrow_mut().take()).unwrap_or_default();
+        ran?;
 
-        let step = |name: String, rows_in: Option<usize>, rows_out: usize, started: Instant| {
-            let mut entry = crate::document::Fields::default();
-            entry.insert("step".to_string(), Value::String(name));
-            entry.insert(
-                "rows_in".to_string(),
-                rows_in.map_or(Value::Null, |rows| Value::Integer(rows as i64)),
+        // How the first rows were read: as the query's own leading
+        // operations say, or from a capture's collection and back.
+        let start = OQLQuery { collection: query.collection.clone(), operations: recorded.before.clone() };
+        let mut fields = self.explain_query(&start)?.pop().map(|row| row.fields).unwrap_or_default();
+        if let Some((name, reads)) = &recorded.reached_back {
+            let read = self.explain_query(reads)?.pop().map(|row| row.fields).unwrap_or_default();
+            if let Some(uses_index) = read.get("uses_index") {
+                fields.insert("uses_index".to_string(), uses_index.clone());
+            }
+            let how = match read.get("plan") {
+                Some(Value::String(plan)) => plan.trim_end().to_string(),
+                _ => String::new(),
+            };
+            fields.insert(
+                "plan".to_string(),
+                Value::String(format!(
+                    "read the rows of {} that {name} may be, and follow the block's path back from them to {}\n{how}",
+                    reads.collection, query.collection
+                )),
             );
-            entry.insert("rows_out".to_string(), Value::Integer(rows_out as i64));
-            entry.insert("ms".to_string(), Value::Float(started.elapsed().as_secs_f64() * 1000.0));
-            entry
-        };
-
-        let started = Instant::now();
-        // The rows a few captured rows lead back to, when a condition
-        // pins the captured end; otherwise the read described above.
-        let reached_back = self.rows_reached_back(query, at)?;
-        let mut from = String::new();
-        let mut documents = match reached_back {
-            Some(reached) => {
-                // What is read first is that capture's collection, so the
-                // account of the read is of that.
-                from = format!(", reached back from {}", reached.name);
-                let read = self.explain_query(&reached.reads)?.pop().map(|row| row.fields).unwrap_or_default();
-                if let Some(uses_index) = read.get("uses_index") {
-                    fields.insert("uses_index".to_string(), uses_index.clone());
-                }
-                let how = match read.get("plan") {
-                    Some(Value::String(plan)) => plan.trim_end().to_string(),
-                    _ => String::new(),
-                };
-                fields.insert(
-                    "plan".to_string(),
-                    Value::String(format!(
-                        "read the rows of {} that {} may be, and follow the block's path back from them to {}\n{how}",
-                        reached.reads.collection, reached.name, query.collection
-                    )),
-                );
-                reached.rows
-            }
-            None => {
-                let mut rows = self.execute_general_query(&start)?;
-                if Self::starts_in_scan_order(written, query) {
-                    rows.sort_by(|left, right| left.id.cmp(&right.id));
-                }
-                rows
-            }
-        };
-        let mut steps = vec![step(
-            match before.len() {
-                0 => format!("{}{from}", query.collection),
-                entries => {
-                    format!("{}, {entries} entr{}{from}", query.collection, if entries == 1 { "y" } else { "ies" })
-                }
-            },
-            None,
-            documents.len(),
-            started,
-        )];
-        let mut grouped = false;
-        for (position, operation) in after.iter().enumerate() {
-            let rows_in = documents.len();
-            let started = Instant::now();
-            // As when the block runs: grouping no rows gives no groups.
-            if !(grouped && documents.is_empty() && matches!(operation, Operation::Select(_) | Operation::Having(_))) {
-                documents = match operation {
-                    Operation::Capture { name, source, optional } => {
-                        let stored = Self::rows_are_stored(&query.operations[..at + position]);
-                        let rows = self.apply_capture(documents, name, source, *optional, stored)?;
-                        self.check_captured_names(&rows, name, Self::written_after(written, name))?;
-                        rows
-                    }
-                    _ => self.apply_operation(documents, operation, &query.collection)?,
-                };
-            }
-            grouped |= matches!(operation, Operation::GroupBy(_));
-            steps.push(step(Self::entry_as_written(operation), Some(rows_in), documents.len(), started));
         }
 
         let mut plan = match fields.get("plan") {
-            Some(Value::String(plan)) => format!("{plan}\n"),
+            Some(Value::String(plan)) => format!("{}\n", plan.trim_end()),
             _ => String::new(),
         };
-        for entry in &steps {
+        for entry in &recorded.steps {
             let text = |name: &str| match entry.get(name) {
                 Some(Value::String(text)) => text.clone(),
                 Some(Value::Integer(number)) => number.to_string(),
                 _ => String::new(),
             };
             plan.push_str(&match entry.get("rows_in") {
-                Some(Value::Integer(_)) => {
-                    format!("{}: {} rows in, {} out\n", text("step"), text("rows_in"), text("rows_out"))
-                }
-                _ => format!("{}: {} rows\n", text("step"), text("rows_out")),
+                Some(Value::Integer(_)) => format!("{}: {} rows in, {} out", text("step"), text("rows_in"), text("rows_out")),
+                _ => format!("{}: {} rows", text("step"), text("rows_out")),
             });
+            if let Some(Value::List(depths)) = entry.get("depths") {
+                let each: Vec<String> = depths
+                    .iter()
+                    .enumerate()
+                    .map(|(depth, rows)| match rows {
+                        Value::Integer(rows) => format!("depth {}: {rows}", depth + 1),
+                        _ => String::new(),
+                    })
+                    .collect();
+                plan.push_str(&format!(" ({})", each.join(", ")));
+            }
+            plan.push('\n');
         }
         fields.insert("path".to_string(), Value::String("general executor".to_string()));
         fields.insert("plan".to_string(), Value::String(plan.trim_end().to_string()));
-        fields.insert("steps".to_string(), Value::List(steps.into_iter().map(Value::Object).collect()));
+        fields.insert(
+            "steps".to_string(),
+            Value::List(recorded.steps.into_iter().map(Value::Object).collect()),
+        );
         Ok(vec![Document::with_id("explain".to_string(), "explain".to_string(), fields)])
+    }
+
+    /// One step as `explain()` gives it.
+    fn explained_step(name: String, rows_in: Option<usize>, rows: &[Document], started: Instant) -> crate::document::Fields {
+        let mut entry = crate::document::Fields::default();
+        entry.insert("step".to_string(), Value::String(name));
+        entry.insert(
+            "rows_in".to_string(),
+            rows_in.map_or(Value::Null, |rows| Value::Integer(rows as i64)),
+        );
+        entry.insert("rows_out".to_string(), Value::Integer(rows.len() as i64));
+        entry.insert("ms".to_string(), Value::Float(started.elapsed().as_secs_f64() * 1000.0));
+        entry
     }
 
     /// An entry of a block as it is named in `explain()`: a capture with
@@ -2384,6 +2418,9 @@ impl<S: DocumentStore> QueryExecutor<S> {
         match operation {
             Operation::Capture { name, source: from, optional } => {
                 format!("{name}{} in {}", if *optional { "?" } else { "" }, source(from))
+            }
+            Operation::Walk { .. } | Operation::Step(_) => {
+                operations(std::slice::from_ref(operation)).trim_start_matches('.').to_string()
             }
             other => word(other),
         }
@@ -16414,6 +16451,22 @@ thread_local! {
 
 thread_local! {
     static CAPTURE_PLANNING: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// What the executor notes for `explain()` as it runs a query's steps.
+#[derive(Default)]
+struct RecordedSteps {
+    /// The operations before the first step that makes rows.
+    before: Vec<Operation>,
+    /// The capture the starting rows were reached back from, and the read
+    /// of its collection that found them.
+    reached_back: Option<(String, OQLQuery)>,
+    steps: Vec<crate::document::Fields>,
+}
+
+thread_local! {
+    /// Set by `explain()` for the query it is about to run.
+    static EXPLAIN_STEPS: std::cell::RefCell<Option<RecordedSteps>> = const { std::cell::RefCell::new(None) };
 }
 
 thread_local! {

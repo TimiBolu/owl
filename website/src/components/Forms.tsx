@@ -277,7 +277,7 @@ const RULES: { title: string; body: ReactNode; code: string; error?: string }[] 
     body: (
       <>
         A block finishes with <code>select</code>, or with a closing step such as <code>count()</code>. Nothing comes
-        after it.
+        after it inside the block.
       </>
     ),
     code: `customers {\n  ${k("select")} { name, country }\n  <span class="bad">${k("where")} { .country == <span class="s">"NG"</span> }</span>\n}`,
@@ -291,9 +291,14 @@ const RULES: { title: string; body: ReactNode; code: string; error?: string }[] 
   },
   {
     title: "Names stay inside",
-    body: <>A block is a whole query. Its names do not exist outside it, and nothing can be chained on after it closes.</>,
+    body: (
+      <>
+        A block gives rows, and a chain can carry on from them after it closes. Its names cannot: they ended with the
+        block. Put the value in the block's <code>select</code> and read that.
+      </>
+    ),
     code: `customers {\n  ${NAME} = ${REP}\n  ${k("select")} { name }\n}<span class="bad">.${k("where")} { ${NAME}.${k("count")}() > 0 }</span>`,
-    error: "Expected end of query, found '.'",
+    error: "'paid' is a name of the block, and the block has closed",
   },
   {
     title: "The collection's name means this row",
@@ -365,8 +370,8 @@ export function Forms() {
           <article>
             <span className="form-tag dark">Chain</span>
             <p>
-              For a short run of steps, and for anything that carries on after <code>select</code>, such as sorting by a
-              field the <code>select</code> just worked out.
+              For a short run of steps. A chain also carries on after a block closes, to sort or limit by a field its{" "}
+              <code>select</code> just worked out.
             </p>
           </article>
           <article>
