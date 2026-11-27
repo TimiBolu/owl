@@ -290,3 +290,58 @@ export function PlaceVisual({ stage }: Stage) {
     </Frame>
   );
 }
+
+/* ---------- 08 Pair: each customer's orders, paired with one another ---------- */
+
+// Every pair of one customer's orders, in the order the block makes them: customers, then
+// the first name's orders, then the second's.
+const PAIRS = CUSTOMERS.flatMap((c, group) => {
+  const mine = ORDERS.filter((o) => o.customer === c.id);
+  return mine.flatMap((a, first) => mine.map((b, second) => ({ c, group, a, b, first, second })));
+});
+
+export function PairsVisual({ stage }: Stage) {
+  const kept = PAIRS.filter((p) => p.a.total > p.b.total);
+  // Before a name is given, the rows it will make stand on one another: a customer's pairs on
+  // the customer, then an order's pairs on the order.
+  const withOrder = PAIRS.filter((p) => p.second === 0);
+  return (
+    <Frame label="Each customer's orders paired with one another, keeping the pairs where the first is larger">
+      <g className="tv-head">
+        <text x={46} y={30}>customer</text>
+        <text x={190} y={30} style={show(stage >= 1)}>a</text>
+        <text x={320} y={30} style={show(stage >= 2)}>b</text>
+      </g>
+      {PAIRS.map((p, i) => {
+        const passes = kept.includes(p);
+        const y =
+          stage === 0
+            ? 44 + p.group * 40
+            : stage === 1
+              ? 44 + withOrder.findIndex((q) => q.c === p.c && q.a === p.a) * 40
+              : stage >= 4 && passes
+                ? 44 + kept.indexOf(p) * 40
+                : 44 + i * 25;
+        const shown = stage === 0 ? p.first === 0 && p.second === 0 : stage === 1 ? p.second === 0 : true;
+        const opacity = !shown ? 0 : passes || stage < 3 ? 1 : stage >= 4 ? 0 : 0.2;
+        // Fourteen pairs need slim rows; the few rows before and after them have room.
+        const slim = stage === 2 || stage === 3 || (stage >= 4 && !passes);
+        const line = slim ? 16 : 22;
+        return (
+          <g key={`${p.a.id}-${p.b.id}`} className={stage >= 3 && passes ? "tv-row lit" : "tv-row"} style={at(30, y, opacity)}>
+            <rect width={416} height={34} rx={8} style={{ height: slim ? 22 : 34 }} />
+            <text x={16} y={line}>{p.c.name}</text>
+            <g style={show(stage >= 1)}>
+              <text x={160} y={line}>{p.a.id}</text>
+              <text x={250} y={line} textAnchor="end" className={stage === 3 ? "tv-strong" : "tv-note"}>{p.a.total}</text>
+            </g>
+            <g style={show(stage >= 2)}>
+              <text x={290} y={line}>{p.b.id}</text>
+              <text x={380} y={line} textAnchor="end" className={stage === 3 ? "tv-strong" : "tv-note"}>{p.b.total}</text>
+            </g>
+          </g>
+        );
+      })}
+    </Frame>
+  );
+}

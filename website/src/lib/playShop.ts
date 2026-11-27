@@ -100,6 +100,30 @@ export const SAMPLES: Sample[] = [
   .sort { .sold.desc }`,
   },
   {
+    name: "Pair",
+    says: "Name the rows you pass, and compare them.",
+    code: `customers {
+  a in .orders
+  b in .orders
+  where { a.total > b.total }
+  select { who: name, larger: a.id, smaller: b.id }
+}`,
+  },
+  {
+    name: "Each line",
+    says: "A name for each thing in a list, beside the row that holds it.",
+    code: `orders {
+  line in .items
+  where { line.qty > 1 }
+  select {
+    order: id,
+    who: .customer.name,
+    product: line.product.name,
+    qty: line.qty
+  }
+}`,
+  },
+  {
     name: "So far",
     says: "Each row can see the rows before it.",
     code: `orders

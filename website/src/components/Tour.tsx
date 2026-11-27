@@ -1,7 +1,7 @@
 import { Offstage } from "./Offstage";
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { BucketsVisual, LinksVisual, PipelineVisual, PlaceVisual, SchemaVisual, TreeVisual } from "./TourVisuals";
+import { BucketsVisual, LinksVisual, PairsVisual, PipelineVisual, PlaceVisual, SchemaVisual, TreeVisual } from "./TourVisuals";
 
 /**
  * A piece of a chapter's code. `from` is the step that introduces it: before that step it is
@@ -184,6 +184,34 @@ const CHAPTERS: Chapter[] = [
       `{ id: "o4", who: "Chen", total: 52.0, place: 1 }`,
     ],
     visual: (stage) => <PlaceVisual stage={stage} />,
+  },
+  {
+    name: "Pair",
+    title: "Name the rows you pass, and compare them.",
+    code: [
+      { from: 0, code: `customers {\n` },
+      { from: 1, code: `  a ${k("in")} .orders\n` },
+      { from: 2, code: `  b ${k("in")} .orders\n` },
+      { from: 3, code: `  ${k("where")} { a.total > b.total }\n` },
+      { from: 4, code: `  ${k("select")} { who: name, larger: a.id, smaller: b.id }\n` },
+      { from: 0, code: `}` },
+    ],
+    steps: [
+      <>Braces after a collection open a block. Each line inside works on its rows: three customers.</>,
+      <>
+        <code>a in .orders</code> names each order in turn. There is now one row for every customer and order.
+      </>,
+      <>A second name multiplies again: every pair of one customer's orders.</>,
+      <>A test reads each row by its name. Keep the pairs where the first order is the larger.</>,
+      <>The answer holds all three rows side by side. No join, and nothing nested.</>,
+    ],
+    answer: [
+      `{ who: "Ada", larger: "o1", smaller: "o3" }`,
+      `{ who: "Ada", larger: "o1", smaller: "o6" }`,
+      `{ who: "Ada", larger: "o6", smaller: "o3" }`,
+      `{ who: "Chen", larger: "o4", smaller: "o5" }`,
+    ],
+    visual: (stage) => <PairsVisual stage={stage} />,
   },
 ];
 
