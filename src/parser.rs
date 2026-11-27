@@ -127,6 +127,12 @@ pub const ROWS_OF: &str = "$of";
 /// collection can collide with it.
 pub const CAPTURE_PREFIX: &str = "$in:";
 
+/// A bare word in a block name's value, where it is read inside a nested
+/// query: `$outer(collection, word)` is the word as the block's row reads
+/// it. It cannot be written, and the executor puts the value in its place
+/// before the nested query runs.
+pub const OUTER_VALUE: &str = "$outer";
+
 /// In a block's names: the collection the block starts from. Not a name
 /// that can be written.
 const CAPTURE_ROOT: &str = "$root";
@@ -2942,9 +2948,22 @@ impl Parser {
                 array: boxed(array),
                 index: boxed(index),
             },
-            Expression::ChainedAccess { base, field } => Expression::ChainedAccess {
-                base: boxed(base),
-                field: field.clone(),
+            Expression::ChainedAccess { base, field } => {
+                // `people.id`, a path from a name, already says whose it is.
+                let mut from = base.as_ref();
+                while let Expression::ChainedAccess { base, .. } = from {
+                    from = base.as_ref();
+                }
+                match from {
+                    Expression::Identifier(_) => expression.clone(),
+                    _ => Expression::ChainedAccess { base: boxed(base), field: field.clone() },
+                }
+            }
+            // A bare word is read as the block's row reads it: a field
+            // of that row, most often.
+            Expression::Identifier(word) if !word.starts_with('$') && word != root => Expression::FunctionCall {
+                name: OUTER_VALUE.to_string(),
+                args: vec![Expression::Identifier(root.to_string()), expression.clone()],
             },
             Expression::Block(expressions) => Expression::Block(expressions.iter().map(read).collect()),
             Expression::ArrayLiteral(elements) => Expression::ArrayLiteral(elements.iter().map(read).collect()),

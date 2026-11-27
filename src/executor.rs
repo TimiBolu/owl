@@ -591,6 +591,9 @@ impl<S: DocumentStore> QueryExecutor<S> {
         let query = named.as_ref().unwrap_or(query);
         let filtered = Self::combined_as_one_filter(query);
         let query = filtered.as_ref().unwrap_or(query);
+        // A name read of a captured row is checked against the block as
+        // it was written, wherever its conditions then run.
+        let written = query;
         let planned = self.plan_captures(query)?;
         let query = planned.as_ref().unwrap_or(query);
         let origin = Self::step_keeping_origin(query);
@@ -638,9 +641,14 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     }));
                 }
             }
-            let mut documents = match whole {
-                Some(_) => Vec::new(),
-                None => self.execute_general_query(&OQLQuery {
+            let reached_back = match after.first() {
+                Some(Operation::Capture { .. }) => self.rows_reached_back(query, at)?,
+                _ => None,
+            };
+            let mut documents = match (reached_back, &whole) {
+                (Some(rows), _) => rows,
+                (None, Some(_)) => Vec::new(),
+                (None, None) => self.execute_general_query(&OQLQuery {
                     collection: query.collection.clone(),
                     operations: before.clone(),
                 })?,
@@ -790,7 +798,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     Operation::Capture { name, source, optional } => {
                         let stored = Self::rows_are_stored(&query.operations[..at + position]);
                         let rows = self.apply_capture(documents, name, source, *optional, stored)?;
-                        self.check_captured_names(&rows, name, &after[position + 1..])?;
+                        self.check_captured_names(&rows, name, Self::written_after(written, name))?;
                         rows
                     }
                     _ => self.apply_operation(documents, operation, &query.collection)?,
@@ -2171,6 +2179,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
     fn explain_captures(&self, query: &OQLQuery, at: usize) -> OQLResult<Vec<Document>> {
         // The block as it will run: with each condition where its names
         // first exist, which may be ahead of the first capture.
+        let written = query;
         let planned = self.plan_captures(query)?;
         let query = planned.as_ref().unwrap_or(query);
         let at = query
@@ -2196,11 +2205,24 @@ impl<S: DocumentStore> QueryExecutor<S> {
         };
 
         let started = Instant::now();
-        let mut documents = self.execute_general_query(&start)?;
+        // The rows a few captured rows lead back to, when a condition
+        // pins the captured end; otherwise the read described above.
+        let reached_back = self.rows_reached_back(query, at)?;
+        let back = reached_back.is_some();
+        let mut documents = match reached_back {
+            Some(rows) => rows,
+            None => self.execute_general_query(&start)?,
+        };
+        let from = match (after.first(), back) {
+            (Some(Operation::Capture { name, .. }), true) => format!(", reached back from {name}"),
+            _ => String::new(),
+        };
         let mut steps = vec![step(
             match before.len() {
-                0 => query.collection.clone(),
-                entries => format!("{}, {entries} entr{}", query.collection, if entries == 1 { "y" } else { "ies" }),
+                0 => format!("{}{from}", query.collection),
+                entries => {
+                    format!("{}, {entries} entr{}{from}", query.collection, if entries == 1 { "y" } else { "ies" })
+                }
             },
             None,
             documents.len(),
@@ -2216,7 +2238,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     Operation::Capture { name, source, optional } => {
                         let stored = Self::rows_are_stored(&query.operations[..at + position]);
                         let rows = self.apply_capture(documents, name, source, *optional, stored)?;
-                        self.check_captured_names(&rows, name, &after[position + 1..])?;
+                        self.check_captured_names(&rows, name, Self::written_after(written, name))?;
                         rows
                     }
                     _ => self.apply_operation(documents, operation, &query.collection)?,
@@ -8555,6 +8577,18 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 if let Some(path) = Self::extract_scoped_path(expr, &scope_document.schema) {
                     return self.scoped_path_to_literal_expression(scope_document, &path);
                 }
+                // A bare word of a block name's value: what it is for the
+                // block's row, which is this one.
+                if let Expression::FunctionCall { name, args } = expr {
+                    if let (true, [Expression::Identifier(root), word]) =
+                        (name == crate::parser::OUTER_VALUE, args.as_slice())
+                    {
+                        if *root == scope_document.schema {
+                            let value = self.evaluate_expression(scope_document, word)?;
+                            return Self::value_as_expression(self.references_as_ids(value)?);
+                        }
+                    }
+                }
                 // `users.orders.where { .. }.count()`: a collection of the
                 // enclosing row with operations on it is worked out for
                 // that row, and its answer is the constant. This is what a
@@ -13475,42 +13509,94 @@ impl<S: DocumentStore> QueryExecutor<S> {
             }
         }
 
-        // A condition on a row of a whole collection filters the collection.
+        // A condition on a captured row filters the collection it is
+        // captured from. Only when that collection can be told now: the
+        // names the condition reads of the row are checked against it
+        // here, since a filter inside the collection may leave no row to
+        // check them against later.
         let schema = self.schema_of(&query.collection)?;
+        let mut known: HashMap<String, String> = HashMap::new();
         let mut position = 0;
         while position < arranged.len() {
-            let Operation::Capture { name, source, optional: false } = &arranged[position] else {
+            let Operation::Capture { name, source, optional } = &arranged[position] else {
+                position += 1;
+                continue;
+            };
+            let members = self.captured_collection(&query.collection, source, &known)?;
+            if let Some(members) = &members {
+                known.insert(name.clone(), members.clone());
+            }
+            let (Some(members), false) = (members, *optional) else {
                 position += 1;
                 continue;
             };
             let name = name.clone();
-            let mut collection = match source {
+            // The collection as something a filter can be added to: a
+            // query on a whole collection, or a path with its operations.
+            // Its rows must still be whole rows when the filter is asked.
+            let whole = |operations: &[Operation]| {
+                operations.iter().all(|operation| {
+                    matches!(
+                        operation,
+                        Operation::Where(_)
+                            | Operation::Sort(_)
+                            | Operation::Limit(_)
+                            | Operation::LimitExpr(_)
+                            | Operation::Offset(_)
+                            | Operation::OffsetExpr(_)
+                            | Operation::Distinct
+                            | Operation::Step(_)
+                            | Operation::Walk { .. }
+                    )
+                })
+            };
+            let (from, mut filters): (Option<Expression>, Vec<Operation>) = match source {
                 Expression::Identifier(collection)
                     if CallFrame::value(collection).is_none()
                         && !schema.as_ref().is_some_and(|schema| schema.fields.contains_key(collection))
                         && self.schema_of(collection)?.is_some() =>
                 {
-                    OQLQuery { collection: collection.clone(), operations: Vec::new() }
+                    (None, Vec::new())
                 }
                 Expression::QueryExpression { query }
                     if query.operations.iter().all(|operation| matches!(operation, Operation::Where(_))) =>
                 {
-                    query.clone()
+                    (None, query.operations.clone())
+                }
+                Expression::FieldAccess(path) if !path.path.is_empty() => (Some(source.clone()), Vec::new()),
+                Expression::CollectionExpression { source: path, operations }
+                    if matches!(path.as_ref(), Expression::FieldAccess(path) if !path.path.is_empty())
+                        && whole(operations) =>
+                {
+                    (Some(path.as_ref().clone()), operations.clone())
                 }
                 _ => {
                     position += 1;
                     continue;
                 }
             };
+            let collection = match source {
+                Expression::Identifier(collection) => collection.clone(),
+                Expression::QueryExpression { query } => query.collection.clone(),
+                _ => String::new(),
+            };
+            // What a walk noted on a row is a field of it while it is
+            // still in the walk's hands.
+            let noted = filters.iter().any(|operation| matches!(operation, Operation::Walk { .. }));
             let mut next = position + 1;
             let mut filtered = false;
             while let Some(Operation::Where(block)) = arranged.get(next) {
                 if Self::captures_read(&block.condition).is_none() {
                     break;
                 }
-                match Self::condition_of_member(&block.condition, &name, &query.collection, schema.as_deref()) {
+                match Self::condition_of_member(&block.condition, &name, &query.collection, schema.as_deref(), noted) {
                     Some(condition) => {
-                        collection.operations.push(Operation::Where(WhereBlock { condition }));
+                        let mut names = Vec::new();
+                        if let Ok(tree) = serde_json::to_value(&block.condition) {
+                            Self::names_read_of(&tree, &crate::parser::capture_field(&name), &mut names);
+                        }
+                        self.check_names_of(&name, &members, &names)?;
+                        filters.push(Operation::Where(WhereBlock { condition }));
                         arranged.remove(next);
                         filtered = true;
                     }
@@ -13520,7 +13606,10 @@ impl<S: DocumentStore> QueryExecutor<S> {
             if filtered {
                 arranged[position] = Operation::Capture {
                     name,
-                    source: Expression::QueryExpression { query: collection },
+                    source: match from {
+                        Some(path) => Expression::CollectionExpression { source: Box::new(path), operations: filters },
+                        None => Expression::QueryExpression { query: OQLQuery { collection, operations: filters } },
+                    },
                     optional: false,
                 };
             }
@@ -13590,6 +13679,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
         name: &str,
         root: &str,
         schema: Option<&Schema>,
+        noted: bool,
     ) -> Option<Condition> {
         let field = crate::parser::capture_field(name);
         fn expression(
@@ -13597,9 +13687,10 @@ impl<S: DocumentStore> QueryExecutor<S> {
             field: &str,
             root: &str,
             schema: Option<&Schema>,
+            noted: bool,
             met: &mut bool,
         ) -> Option<Expression> {
-            let mut inner = |node: &Expression| expression(node, field, root, schema, met);
+            let mut inner = |node: &Expression| expression(node, field, root, schema, noted, met);
             Some(match node {
                 Expression::Literal(_) => node.clone(),
                 Expression::FieldAccess(access) => {
@@ -13612,8 +13703,15 @@ impl<S: DocumentStore> QueryExecutor<S> {
                         *met = true;
                         Expression::FieldAccess(FieldAccess { path: access.path[1..].to_vec() })
                     } else if first.starts_with(field) && first[field.len()..].starts_with(':') {
-                        // What a walk noted is not a field of the stored row.
-                        return None;
+                        // What a walk noted is a field of the row only
+                        // while the walk still holds it.
+                        if !noted {
+                            return None;
+                        }
+                        *met = true;
+                        let mut path = vec![first[field.len() + 1..].to_string()];
+                        path.extend_from_slice(&access.path[1..]);
+                        Expression::FieldAccess(FieldAccess { path })
                     } else {
                         access.path.iter().fold(Expression::Identifier(root.to_string()), |base, name| {
                             Expression::ChainedAccess { base: Box::new(base), field: name.clone() }
@@ -13671,28 +13769,316 @@ impl<S: DocumentStore> QueryExecutor<S> {
             field: &str,
             root: &str,
             schema: Option<&Schema>,
+            noted: bool,
             met: &mut bool,
         ) -> Option<Condition> {
             Some(match node {
                 Condition::Comparison { left, operator, right } => Condition::Comparison {
-                    left: expression(left, field, root, schema, met)?,
+                    left: expression(left, field, root, schema, noted, met)?,
                     operator: operator.clone(),
-                    right: expression(right, field, root, schema, met)?,
+                    right: expression(right, field, root, schema, noted, met)?,
                 },
                 Condition::And(left, right) => Condition::And(
-                    Box::new(rewritten(left, field, root, schema, met)?),
-                    Box::new(rewritten(right, field, root, schema, met)?),
+                    Box::new(rewritten(left, field, root, schema, noted, met)?),
+                    Box::new(rewritten(right, field, root, schema, noted, met)?),
                 ),
                 Condition::Or(left, right) => Condition::Or(
-                    Box::new(rewritten(left, field, root, schema, met)?),
-                    Box::new(rewritten(right, field, root, schema, met)?),
+                    Box::new(rewritten(left, field, root, schema, noted, met)?),
+                    Box::new(rewritten(right, field, root, schema, noted, met)?),
                 ),
-                Condition::Not(only) => Condition::Not(Box::new(rewritten(only, field, root, schema, met)?)),
+                Condition::Not(only) => {
+                    Condition::Not(Box::new(rewritten(only, field, root, schema, noted, met)?))
+                }
             })
         }
         let mut met = false;
-        let condition = rewritten(condition, &field, root, schema, &mut met)?;
+        let condition = rewritten(condition, &field, root, schema, noted, &mut met)?;
         met.then_some(condition)
+    }
+
+    /// The collection a path of references and relationships leads to
+    /// from a row of `start`, with each step as it is taken backwards.
+    /// `None` when a step is not one reference to follow or one field to
+    /// come back along: a list, an embedded object, an undeclared name.
+    fn collection_by_path(&self, start: &str, path: &[String]) -> OQLResult<Option<(String, Vec<BackStep>)>> {
+        let single = |declared: Option<&FieldType>| {
+            let mut declared = declared;
+            while let Some(FieldType::Optional(inner)) = declared {
+                declared = Some(inner);
+            }
+            match declared {
+                Some(FieldType::Reference(reference)) => Some(reference.target_schema.clone()),
+                _ => None,
+            }
+        };
+        let mut collection = start.to_string();
+        let mut way = Vec::with_capacity(path.len());
+        for name in path {
+            let Some(schema) = self.schema_of(&collection)? else {
+                return Ok(None);
+            };
+            if schema.fields.contains_key(name) {
+                let Some(target) = single(schema.fields.get(name)) else {
+                    return Ok(None);
+                };
+                way.push(BackStep::Holders { source: collection.clone(), field: name.clone() });
+                collection = target;
+                continue;
+            }
+            let ReverseRelationship::Declared { source, field } = self.reverse_relationship(&collection, name)? else {
+                return Ok(None);
+            };
+            let Some(holder) = self.schema_of(&source)? else {
+                return Ok(None);
+            };
+            // Reached by the referring collection's name: the one field
+            // of it that refers here.
+            let field = match field {
+                Some(field) => field,
+                None => {
+                    let mut fields = holder
+                        .fields
+                        .iter()
+                        .filter(|(_, declared)| single(Some(*declared)).as_deref() == Some(collection.as_str()))
+                        .map(|(field, _)| field.clone());
+                    match (fields.next(), fields.next()) {
+                        (Some(field), None) => field,
+                        _ => return Ok(None),
+                    }
+                }
+            };
+            if single(holder.fields.get(&field)).as_deref() != Some(collection.as_str()) {
+                return Ok(None);
+            }
+            way.push(BackStep::Along { field });
+            collection = source;
+        }
+        Ok(self.schema_of(&collection)?.is_some().then_some((collection, way)))
+    }
+
+    /// The collection whose rows a capture names, when its collection is
+    /// written so that this can be told before it runs. `known` are the
+    /// captures before it.
+    fn captured_collection(
+        &self,
+        root: &str,
+        source: &Expression,
+        known: &HashMap<String, String>,
+    ) -> OQLResult<Option<String>> {
+        let from_path = |path: &[String]| -> OQLResult<Option<String>> {
+            let Some(first) = path.first() else {
+                return Ok(None);
+            };
+            let (start, rest) = match first.strip_prefix(crate::parser::CAPTURE_PREFIX) {
+                Some(capture) => match known.get(capture) {
+                    Some(collection) => (collection.as_str(), &path[1..]),
+                    None => return Ok(None),
+                },
+                None => (root, path),
+            };
+            Ok(self.collection_by_path(start, rest)?.map(|(collection, _)| collection))
+        };
+        match source {
+            Expression::Identifier(collection) => Ok(self.schema_of(collection)?.map(|_| collection.clone())),
+            Expression::QueryExpression { query } => {
+                Ok(self.schema_of(&query.collection)?.map(|_| query.collection.clone()))
+            }
+            Expression::FieldAccess(path) => from_path(&path.path),
+            Expression::CollectionExpression { source, operations } => {
+                let Expression::FieldAccess(path) = source.as_ref() else {
+                    return Ok(None);
+                };
+                let Some(mut collection) = from_path(&path.path)? else {
+                    return Ok(None);
+                };
+                for operation in operations {
+                    let onward = match operation {
+                        Operation::Step(step) => &step.path,
+                        Operation::Walk { path, .. } => &path.path,
+                        _ => continue,
+                    };
+                    match self.collection_by_path(&collection, onward)? {
+                        Some((reached, _)) => collection = reached,
+                        None => return Ok(None),
+                    }
+                }
+                Ok(Some(collection))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Refuse a name read of the row captured as `name` that `collection`
+    /// does not have.
+    fn check_names_of(&self, name: &str, collection: &str, names: &[String]) -> OQLResult<()> {
+        let Some(schema) = self.schema_of(collection)? else {
+            return Ok(());
+        };
+        for read in names {
+            if schema.fields.contains_key(read)
+                || read.starts_with('_')
+                || read == "*"
+                || DocumentSystemField::from_name(read).is_some()
+                || self.is_relationship(collection, read)?
+            {
+                continue;
+            }
+            return Err(OQLError::SchemaValidation {
+                message: format!(
+                    "'{name}' is a row of '{collection}', which has no field '{read}', and no \
+                     collection named '{read}' references it"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// The first name after a captured row's own, wherever `node` reads
+    /// one: as a path from the row in hand, or inside a nested query,
+    /// where the row in hand is named by its collection.
+    fn names_read_of(node: &serde_json::Value, field: &str, names: &mut Vec<String>) {
+        match node {
+            serde_json::Value::Object(fields) => {
+                if let Some(path) = fields
+                    .get("FieldAccess")
+                    .and_then(|access| access.get("path"))
+                    .and_then(|path| path.as_array())
+                {
+                    if path.first().and_then(|first| first.as_str()) == Some(field) {
+                        names.extend(path.get(1).and_then(|next| next.as_str()).map(str::to_string));
+                    }
+                }
+                if let Some(access) = fields.get("ChainedAccess") {
+                    let from = access.get("base").and_then(|base| base.get("ChainedAccess"));
+                    if from.and_then(|from| from.get("field")).and_then(|name| name.as_str()) == Some(field) {
+                        names.extend(access.get("field").and_then(|next| next.as_str()).map(str::to_string));
+                    }
+                }
+                fields.values().for_each(|value| Self::names_read_of(value, field, names));
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|value| Self::names_read_of(value, field, names)),
+            _ => {}
+        }
+    }
+
+    /// What follows the capture of `name` in a block as it was written.
+    fn written_after<'a>(written: &'a OQLQuery, name: &str) -> &'a [Operation] {
+        let at = written
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Capture { name: captured, .. } if captured == name));
+        match at {
+            Some(at) => &written.operations[at + 1..],
+            None => &[],
+        }
+    }
+
+    /// The rows a block starts from, found from the other end: when its
+    /// first capture is over a path and a condition on the captured row
+    /// leaves only a few rows of that row's collection, those few are read
+    /// first and the path is followed back from them. A block that asks
+    /// for the tasks one named task blocks then reads that task and its
+    /// links, not every task.
+    ///
+    /// Only the starting rows change, and only by leaving out rows the
+    /// first capture would have found no member for. They are given in the
+    /// order a scan gives them, so the block's answer and its order are as
+    /// written. `None` when the block is not of this shape, or too many
+    /// rows pass the condition for this to be the cheaper end.
+    fn rows_reached_back(&self, query: &OQLQuery, at: usize) -> OQLResult<Option<Vec<Document>>> {
+        /// Past this many rows at the captured end, start as written.
+        const FEW: usize = 64;
+        /// And past this many on the way back.
+        const MOST_BACK: usize = 20_000;
+        if !CAPTURE_PLANNING.with(|flag| flag.get()) {
+            return Ok(None);
+        }
+        let (before, after) = query.operations.split_at(at);
+        if !before.iter().all(|operation| matches!(operation, Operation::Where(_))) {
+            return Ok(None);
+        }
+        let Some(Operation::Capture {
+            source: Expression::CollectionExpression { source, operations },
+            optional: false,
+            ..
+        }) = after.first()
+        else {
+            return Ok(None);
+        };
+        let Expression::FieldAccess(path) = source.as_ref() else {
+            return Ok(None);
+        };
+        if path.path.is_empty()
+            || path.path.iter().any(|name| name.starts_with(crate::parser::CAPTURE_PREFIX))
+            || !operations.iter().all(|operation| matches!(operation, Operation::Where(_)))
+        {
+            return Ok(None);
+        }
+        // The conditions that read nothing of the block's row hold for a
+        // captured row whichever row it was captured for.
+        let alone: Vec<Operation> = operations
+            .iter()
+            .filter(|operation| {
+                !Self::operation_names(operation, &query.collection)
+                    && serde_json::to_string(operation).is_ok_and(|text| {
+                        !text.contains(crate::parser::CAPTURE_PREFIX) && !text.contains(crate::parser::OUTER_VALUE)
+                    })
+            })
+            .cloned()
+            .collect();
+        if alone.is_empty() {
+            return Ok(None);
+        }
+
+        let Some((collection, way)) = self.collection_by_path(&query.collection, &path.path)? else {
+            return Ok(None);
+        };
+
+        let mut few = alone;
+        few.push(Operation::Limit(FEW as u64 + 1));
+        let mut rows = self.execute_query(&OQLQuery { collection, operations: few })?;
+        if rows.len() > FEW {
+            return Ok(None);
+        }
+        for step in way.iter().rev() {
+            let mut seen = HashSet::new();
+            let mut reached = Vec::new();
+            for row in &rows {
+                match step {
+                    BackStep::Along { field } => {
+                        if let Some(Value::Reference(reference)) = row.fields.get(field) {
+                            if let Some(target) = self.resolve_objref_target(reference)? {
+                                if seen.insert(target.id.clone()) {
+                                    reached.push(target);
+                                }
+                            }
+                        }
+                    }
+                    BackStep::Holders { source, field } => {
+                        for holder in self.store.scan_referencing_documents_shared(
+                            &row.schema,
+                            &row.id,
+                            Some(source),
+                            Some(field),
+                        )? {
+                            if seen.insert(holder.id.clone()) {
+                                reached.push(holder.as_ref().clone());
+                            }
+                        }
+                    }
+                }
+                if reached.len() > MOST_BACK {
+                    return Ok(None);
+                }
+            }
+            rows = reached;
+        }
+        // As a scan gives them, then through what stands before the capture.
+        rows.sort_by(|left, right| left.id.cmp(&right.id));
+        for operation in before {
+            rows = self.apply_operation(rows, operation, &query.collection)?;
+        }
+        Ok(Some(rows))
     }
 
     /// A name read of a captured row that its collection does not have is
@@ -13712,57 +14098,11 @@ impl<S: DocumentStore> QueryExecutor<S> {
         let Some(collection) = self.referenced_document(reference)?.map(|row| row.schema.clone()) else {
             return Ok(());
         };
-        let Some(schema) = self.schema_of(&collection)? else {
-            return Ok(());
-        };
-        // The first name after the captured row's own, wherever it is read:
-        // as a path from the row in hand, or inside a nested query, where
-        // the row in hand is named by its collection.
-        fn read(node: &serde_json::Value, field: &str, names: &mut Vec<String>) {
-            match node {
-                serde_json::Value::Object(fields) => {
-                    if let Some(path) = fields
-                        .get("FieldAccess")
-                        .and_then(|access| access.get("path"))
-                        .and_then(|path| path.as_array())
-                    {
-                        if path.first().and_then(|first| first.as_str()) == Some(field) {
-                            names.extend(path.get(1).and_then(|next| next.as_str()).map(str::to_string));
-                        }
-                    }
-                    if let Some(access) = fields.get("ChainedAccess") {
-                        let from = access.get("base").and_then(|base| base.get("ChainedAccess"));
-                        if from.and_then(|from| from.get("field")).and_then(|name| name.as_str()) == Some(field) {
-                            names.extend(access.get("field").and_then(|next| next.as_str()).map(str::to_string));
-                        }
-                    }
-                    fields.values().for_each(|value| read(value, field, names));
-                }
-                serde_json::Value::Array(items) => items.iter().for_each(|value| read(value, field, names)),
-                _ => {}
-            }
-        }
         let mut names = Vec::new();
         if let Ok(tree) = serde_json::to_value(following) {
-            read(&tree, &field, &mut names);
+            Self::names_read_of(&tree, &field, &mut names);
         }
-        for read in names {
-            if schema.fields.contains_key(&read)
-                || read.starts_with('_')
-                || read == "*"
-                || DocumentSystemField::from_name(&read).is_some()
-                || self.is_relationship(&collection, &read)?
-            {
-                continue;
-            }
-            return Err(OQLError::SchemaValidation {
-                message: format!(
-                    "'{name}' is a row of '{collection}', which has no field '{read}', and no \
-                     collection named '{read}' references it"
-                ),
-            });
-        }
-        Ok(())
+        self.check_names_of(name, &collection, &names)
     }
 
     /// The rows a capture's collection holds for one row, and whether they
@@ -16530,6 +16870,16 @@ enum ReverseRelationship {
     Unknowable,
     /// Neither a field nor a referencing collection: a mistake in the query.
     Unknown,
+}
+
+/// One step of a path, as it is taken backwards.
+enum BackStep {
+    /// The step followed `field` of a row of `source`: back from the row
+    /// reached, to the rows of `source` that hold it there.
+    Holders { source: String, field: String },
+    /// The step went to the rows that refer through `field`: back from
+    /// such a row, along `field`.
+    Along { field: String },
 }
 
 /// Parameter bindings of the user function currently being evaluated.
