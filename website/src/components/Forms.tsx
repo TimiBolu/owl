@@ -351,8 +351,9 @@ export function Forms() {
 
         <h3 className="forms-h">What a block adds: names</h3>
         <p className="forms-p">
-          A block can name something once and use it wherever it is needed. That is the one thing it has that a chain
-          does not.
+          A block can give things names, and a chain cannot. With <code>=</code> a name stands for a whole value: write
+          it once and use it wherever it is needed, as below. With <code>in</code> a name stands for each row of a
+          collection in turn, which the Pair chapter of the tour walks through.
         </p>
         <Names />
 
@@ -371,8 +372,8 @@ export function Forms() {
           <article>
             <span className="form-tag dark">Block</span>
             <p>
-              When the query uses the same fact more than once, or when naming the parts makes a long query easier to
-              read.
+              When the query uses the same fact more than once, when naming the parts makes a long query easier to
+              read, or when the answer puts several rows side by side, each named with <code>in</code>.
             </p>
           </article>
         </div>
