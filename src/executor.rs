@@ -591,6 +591,8 @@ impl<S: DocumentStore> QueryExecutor<S> {
         let query = named.as_ref().unwrap_or(query);
         let filtered = Self::combined_as_one_filter(query);
         let query = filtered.as_ref().unwrap_or(query);
+        let planned = self.plan_captures(query)?;
+        let query = planned.as_ref().unwrap_or(query);
         let origin = Self::step_keeping_origin(query);
         let plain = query.operations.iter().position(Self::runs_plainly);
         let split = match (plain, &origin) {
@@ -786,7 +788,8 @@ impl<S: DocumentStore> QueryExecutor<S> {
                         }
                     }
                     Operation::Capture { name, source, optional } => {
-                        let rows = self.apply_capture(documents, name, source, *optional)?;
+                        let stored = Self::rows_are_stored(&query.operations[..at + position]);
+                        let rows = self.apply_capture(documents, name, source, *optional, stored)?;
                         self.check_captured_names(&rows, name, &after[position + 1..])?;
                         rows
                     }
@@ -2166,6 +2169,15 @@ impl<S: DocumentStore> QueryExecutor<S> {
     /// other `explain()`, this runs the block. It may: nothing after a
     /// capture can write.
     fn explain_captures(&self, query: &OQLQuery, at: usize) -> OQLResult<Vec<Document>> {
+        // The block as it will run: with each condition where its names
+        // first exist, which may be ahead of the first capture.
+        let planned = self.plan_captures(query)?;
+        let query = planned.as_ref().unwrap_or(query);
+        let at = query
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Capture { .. }))
+            .unwrap_or(at);
         let (before, after) = query.operations.split_at(at);
         let start = OQLQuery { collection: query.collection.clone(), operations: before.to_vec() };
         let mut explained = self.explain_query(&start)?;
@@ -2202,7 +2214,8 @@ impl<S: DocumentStore> QueryExecutor<S> {
             if !(grouped && documents.is_empty() && matches!(operation, Operation::Select(_) | Operation::Having(_))) {
                 documents = match operation {
                     Operation::Capture { name, source, optional } => {
-                        let rows = self.apply_capture(documents, name, source, *optional)?;
+                        let stored = Self::rows_are_stored(&query.operations[..at + position]);
+                        let rows = self.apply_capture(documents, name, source, *optional, stored)?;
                         self.check_captured_names(&rows, name, &after[position + 1..])?;
                         rows
                     }
@@ -5347,7 +5360,12 @@ impl<S: DocumentStore> QueryExecutor<S> {
             }
         }
 
-        Ok(candidate_documents)
+        // The rows were gathered by id in no order. A scan yields them by
+        // id, and so must this: a filter does not reorder rows.
+        Ok(candidate_documents.map(|mut documents| {
+            documents.sort_by(|left, right| left.id.cmp(&right.id));
+            documents
+        }))
     }
 
     fn resolve_reverse_reference_clause_documents(
@@ -5584,7 +5602,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
             }
             Operation::PartitionBy(block) => self.apply_partition_by(documents, block),
             Operation::Capture { name, source, optional } => {
-                self.apply_capture(documents, name, source, *optional)
+                self.apply_capture(documents, name, source, *optional, false)
             }
             Operation::Call(_) => Err(OQLError::Generic {
                 message: "a function call gives a query its rows, so it must come first".to_string(),
@@ -13301,11 +13319,27 @@ impl<S: DocumentStore> QueryExecutor<S> {
         name: &str,
         source: &Expression,
         optional: bool,
+        stored: bool,
     ) -> OQLResult<Vec<Document>> {
         let field = crate::parser::capture_field(name);
         let mut combined = Vec::new();
+        // A collection that reads nothing of an earlier capture is the
+        // same for every combination of one starting row, and those stand
+        // together. It is worked out for the first and kept for the rest.
+        let once = stored
+            && serde_json::to_string(source).is_ok_and(|text| !text.contains(crate::parser::CAPTURE_PREFIX));
+        let mut held: Option<(String, Vec<Document>, bool)> = None;
         for document in documents {
-            let (members, whole) = self.capture_members(&document, source)?;
+            let (members, whole) = match &held {
+                Some((id, members, whole)) if once && *id == document.id => (members.clone(), *whole),
+                _ => {
+                    let (members, whole) = self.capture_members(&document, source)?;
+                    if once {
+                        held = Some((document.id.clone(), members.clone(), whole));
+                    }
+                    (members, whole)
+                }
+            };
             // `name? in ..`: a row with no member is kept, once, and the
             // name is null: every path from it reads as absent.
             if optional && members.is_empty() {
@@ -13339,6 +13373,326 @@ impl<S: DocumentStore> QueryExecutor<S> {
             }
         }
         Ok(combined)
+    }
+
+    /// Whether the rows these operations leave are still the collection's
+    /// own stored rows, each with its id, however many captures have
+    /// multiplied them.
+    fn rows_are_stored(operations: &[Operation]) -> bool {
+        operations.iter().all(|operation| {
+            matches!(
+                operation,
+                Operation::Where(_)
+                    | Operation::Sort(_)
+                    | Operation::Limit(_)
+                    | Operation::LimitExpr(_)
+                    | Operation::Offset(_)
+                    | Operation::OffsetExpr(_)
+                    | Operation::Capture { .. }
+            )
+        })
+    }
+
+    /// A block's captures and the filters among them, arranged to do less
+    /// work for the same answer in the same order. `None` when there is
+    /// nothing to arrange.
+    ///
+    /// Captures stay in the order written, since a later one may read an
+    /// earlier one and the order of the answer follows theirs. What moves
+    /// is each condition:
+    ///
+    /// - A filter's conditions that must all hold are taken apart, and
+    ///   each goes straight after the last capture it reads. A condition
+    ///   that reads none goes ahead of the first capture, where it joins
+    ///   the read of the starting rows and an index may serve it.
+    /// - A condition on a row captured from a whole collection, or from a
+    ///   query on one, becomes a filter of that collection: `p in people`
+    ///   with `p.id == owner` reads the one person, not every person for
+    ///   every row.
+    ///
+    /// A filter never reorders rows, so the answer is as it was.
+    fn plan_captures(&self, query: &OQLQuery) -> OQLResult<Option<OQLQuery>> {
+        if !CAPTURE_PLANNING.with(|flag| flag.get()) {
+            return Ok(None);
+        }
+        let operations = &query.operations;
+        let Some(at) = operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Capture { .. }))
+        else {
+            return Ok(None);
+        };
+        let end = at
+            + operations[at..]
+                .iter()
+                .take_while(|operation| matches!(operation, Operation::Capture { .. } | Operation::Where(_)))
+                .count();
+        fn conjuncts(condition: &Condition, parts: &mut Vec<Condition>) {
+            match condition {
+                Condition::And(left, right) => {
+                    conjuncts(left, parts);
+                    conjuncts(right, parts);
+                }
+                other => parts.push(other.clone()),
+            }
+        }
+        // Ahead of the first capture, and the captures with their filters.
+        let mut lifted: Vec<Operation> = Vec::new();
+        let mut arranged: Vec<Operation> = Vec::new();
+        // Nothing moves to before a condition that must stay where it is.
+        let mut fixed = 0;
+        for operation in &operations[at..end] {
+            let Operation::Where(block) = operation else {
+                arranged.push(operation.clone());
+                continue;
+            };
+            let mut parts = Vec::new();
+            conjuncts(&block.condition, &mut parts);
+            for part in parts {
+                let filter = Operation::Where(WhereBlock { condition: part });
+                let Operation::Where(WhereBlock { condition: part }) = &filter else { unreachable!() };
+                match Self::captures_read(part) {
+                    // It depends on the rows around a row, so it stays.
+                    None => {
+                        arranged.push(filter);
+                        fixed = arranged.len();
+                    }
+                    Some(names) if names.is_empty() && fixed == 0 => lifted.push(filter),
+                    Some(names) => {
+                        let after = arranged
+                            .iter()
+                            .rposition(|operation| {
+                                matches!(operation, Operation::Capture { name, .. } if names.contains(name))
+                            })
+                            .map_or(0, |capture| capture + 1);
+                        let mut place = after.max(fixed);
+                        while matches!(arranged.get(place), Some(Operation::Where(_))) {
+                            place += 1;
+                        }
+                        arranged.insert(place, filter);
+                    }
+                }
+            }
+        }
+
+        // A condition on a row of a whole collection filters the collection.
+        let schema = self.schema_of(&query.collection)?;
+        let mut position = 0;
+        while position < arranged.len() {
+            let Operation::Capture { name, source, optional: false } = &arranged[position] else {
+                position += 1;
+                continue;
+            };
+            let name = name.clone();
+            let mut collection = match source {
+                Expression::Identifier(collection)
+                    if CallFrame::value(collection).is_none()
+                        && !schema.as_ref().is_some_and(|schema| schema.fields.contains_key(collection))
+                        && self.schema_of(collection)?.is_some() =>
+                {
+                    OQLQuery { collection: collection.clone(), operations: Vec::new() }
+                }
+                Expression::QueryExpression { query }
+                    if query.operations.iter().all(|operation| matches!(operation, Operation::Where(_))) =>
+                {
+                    query.clone()
+                }
+                _ => {
+                    position += 1;
+                    continue;
+                }
+            };
+            let mut next = position + 1;
+            let mut filtered = false;
+            while let Some(Operation::Where(block)) = arranged.get(next) {
+                if Self::captures_read(&block.condition).is_none() {
+                    break;
+                }
+                match Self::condition_of_member(&block.condition, &name, &query.collection, schema.as_deref()) {
+                    Some(condition) => {
+                        collection.operations.push(Operation::Where(WhereBlock { condition }));
+                        arranged.remove(next);
+                        filtered = true;
+                    }
+                    None => next += 1,
+                }
+            }
+            if filtered {
+                arranged[position] = Operation::Capture {
+                    name,
+                    source: Expression::QueryExpression { query: collection },
+                    optional: false,
+                };
+            }
+            position += 1;
+        }
+
+        let mut planned = operations[..at].to_vec();
+        planned.extend(lifted);
+        planned.extend(arranged);
+        planned.extend_from_slice(&operations[end..]);
+        Ok((planned != *operations).then(|| OQLQuery {
+            collection: query.collection.clone(),
+            operations: planned,
+        }))
+    }
+
+    /// The captured names a condition reads. `None` when the condition
+    /// depends on more than its own row, and so on which rows are there
+    /// when it is asked: an aggregate, or a function of a row's position.
+    fn captures_read(condition: &Condition) -> Option<Vec<String>> {
+        fn read(node: &serde_json::Value, names: &mut Vec<String>) -> bool {
+            match node {
+                serde_json::Value::String(text) => {
+                    if let Some(rest) = text.strip_prefix(crate::parser::CAPTURE_PREFIX) {
+                        let name = rest.split(':').next().unwrap_or(rest).to_string();
+                        if !names.contains(&name) {
+                            names.push(name);
+                        }
+                    }
+                    true
+                }
+                serde_json::Value::Object(fields) => {
+                    if let Some(name) = fields
+                        .get("FunctionCall")
+                        .and_then(|call| call.get("name"))
+                        .and_then(|name| name.as_str())
+                    {
+                        if QueryExecutor::<crate::storage::RustStore>::moves_with_rows(name) {
+                            return false;
+                        }
+                    }
+                    fields.values().all(|value| read(value, names))
+                }
+                serde_json::Value::Array(items) => items.iter().all(|value| read(value, names)),
+                _ => true,
+            }
+        }
+        let mut names = Vec::new();
+        let tree = serde_json::to_value(condition).ok()?;
+        read(&tree, &mut names).then_some(names)
+    }
+
+    /// Whether a function's answer for a row depends on the rows around it.
+    fn moves_with_rows(name: &str) -> bool {
+        Self::is_aggregate_name(name)
+            || WindowFrame::is_position_function(name)
+            || name == crate::parser::LOCAL_VALUE
+    }
+
+    /// A condition on the row captured as `name`, written as a filter of
+    /// the collection it is captured from: what was `p.id` is `.id`, and
+    /// what was read of the block's row is read of it by the name of its
+    /// collection, as in any nested query. `None` when the condition
+    /// cannot be said that way.
+    fn condition_of_member(
+        condition: &Condition,
+        name: &str,
+        root: &str,
+        schema: Option<&Schema>,
+    ) -> Option<Condition> {
+        let field = crate::parser::capture_field(name);
+        fn expression(
+            node: &Expression,
+            field: &str,
+            root: &str,
+            schema: Option<&Schema>,
+            met: &mut bool,
+        ) -> Option<Expression> {
+            let mut inner = |node: &Expression| expression(node, field, root, schema, met);
+            Some(match node {
+                Expression::Literal(_) => node.clone(),
+                Expression::FieldAccess(access) => {
+                    let first = access.path.first()?;
+                    if first == field {
+                        // The row itself has no spelling inside its own filter.
+                        if access.path.len() == 1 {
+                            return None;
+                        }
+                        *met = true;
+                        Expression::FieldAccess(FieldAccess { path: access.path[1..].to_vec() })
+                    } else if first.starts_with(field) && first[field.len()..].starts_with(':') {
+                        // What a walk noted is not a field of the stored row.
+                        return None;
+                    } else {
+                        access.path.iter().fold(Expression::Identifier(root.to_string()), |base, name| {
+                            Expression::ChainedAccess { base: Box::new(base), field: name.clone() }
+                        })
+                    }
+                }
+                // A bare word is a field of the block's row when its
+                // collection declares one; anything else is left unmoved.
+                Expression::Identifier(word) if word.starts_with('$') => node.clone(),
+                Expression::Identifier(word) => {
+                    if word == root || !schema?.fields.contains_key(word) {
+                        return None;
+                    }
+                    Expression::ChainedAccess {
+                        base: Box::new(Expression::Identifier(root.to_string())),
+                        field: word.clone(),
+                    }
+                }
+                Expression::ChainedAccess { base, field: last } => {
+                    let mut from = base.as_ref();
+                    while let Expression::ChainedAccess { base, .. } = from {
+                        from = base.as_ref();
+                    }
+                    match from {
+                        // Already read of the block's row by name.
+                        Expression::Identifier(word) if word == root => node.clone(),
+                        Expression::Identifier(_) => return None,
+                        _ => Expression::ChainedAccess { base: Box::new(inner(base)?), field: last.clone() },
+                    }
+                }
+                Expression::BinaryOp { left, operator, right } => Expression::BinaryOp {
+                    left: Box::new(inner(left)?),
+                    operator: operator.clone(),
+                    right: Box::new(inner(right)?),
+                },
+                Expression::LogicalAnd(left, right) => {
+                    Expression::LogicalAnd(Box::new(inner(left)?), Box::new(inner(right)?))
+                }
+                Expression::LogicalOr(left, right) => {
+                    Expression::LogicalOr(Box::new(inner(left)?), Box::new(inner(right)?))
+                }
+                Expression::LogicalNot(only) => Expression::LogicalNot(Box::new(inner(only)?)),
+                Expression::ArrayLiteral(items) => {
+                    Expression::ArrayLiteral(items.iter().map(&mut inner).collect::<Option<_>>()?)
+                }
+                Expression::FunctionCall { name, args } => Expression::FunctionCall {
+                    name: name.clone(),
+                    args: args.iter().map(&mut inner).collect::<Option<_>>()?,
+                },
+                _ => return None,
+            })
+        }
+        fn rewritten(
+            node: &Condition,
+            field: &str,
+            root: &str,
+            schema: Option<&Schema>,
+            met: &mut bool,
+        ) -> Option<Condition> {
+            Some(match node {
+                Condition::Comparison { left, operator, right } => Condition::Comparison {
+                    left: expression(left, field, root, schema, met)?,
+                    operator: operator.clone(),
+                    right: expression(right, field, root, schema, met)?,
+                },
+                Condition::And(left, right) => Condition::And(
+                    Box::new(rewritten(left, field, root, schema, met)?),
+                    Box::new(rewritten(right, field, root, schema, met)?),
+                ),
+                Condition::Or(left, right) => Condition::Or(
+                    Box::new(rewritten(left, field, root, schema, met)?),
+                    Box::new(rewritten(right, field, root, schema, met)?),
+                ),
+                Condition::Not(only) => Condition::Not(Box::new(rewritten(only, field, root, schema, met)?)),
+            })
+        }
+        let mut met = false;
+        let condition = rewritten(condition, &field, root, schema, &mut met)?;
+        met.then_some(condition)
     }
 
     /// A name read of a captured row that its collection does not have is
@@ -15509,6 +15863,18 @@ thread_local! {
 
 thread_local! {
     static COLUMN_AGGREGATION: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+thread_local! {
+    static CAPTURE_PLANNING: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Turn the planning of a block's captures on or off for this thread. It
+/// changes how a block runs and never what it answers, so tests switch it
+/// off to get the answer of the block exactly as written.
+#[doc(hidden)]
+pub fn set_capture_planning(enabled: bool) {
+    CAPTURE_PLANNING.with(|flag| flag.set(enabled));
 }
 
 thread_local! {

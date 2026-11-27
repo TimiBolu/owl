@@ -571,11 +571,22 @@ tasks {                                   -- what blocks a task, and everything 
 | A captured row in a `select` by its name alone (`select { b }`) | The reference to the row, as a reference field is. `b.select { .. }` gives its fields. |
 | `explain()` on a block with a capture | Works: every entry from the first capture on, with the rows that went into it and the rows that came out (section 20). This is where a block that multiplies too far shows it. |
 
-Captures run as written: each is a loop over the rows in hand, in the order
-the entries stand. A block is fast when it starts from the selective end and
-filters early. The engine does not yet move a filter ahead of a capture or
-choose which end to start from, and a capture of a whole collection is every
-pair until a later `where` narrows it.
+Captures run in the order written: a later one may read an earlier one, and
+the order of the answer follows theirs. What the engine arranges is the
+conditions, which never changes an answer or its order:
+
+| Arrangement | Status |
+|---|---|
+| A filter's conditions joined by `&&` are taken apart, and each runs straight after the last capture it reads. `where { c.id != "x" && b.kind == "hard" }` written last tests `b` before `c` is captured | Works |
+| A condition that reads no capture runs ahead of the first one. It joins the read of the block's starting rows, where an index may serve it | Works |
+| A condition on a row captured from a whole collection, or from a query on one, becomes a filter of that collection. `p in people` with `where { p.id == owner }` reads one person for each row, not every person; `explain()` shows it as `p in people.where { .. }` | Works. Not for an optional capture, whose rows with no match must stay; nor for a condition that compares the captured row itself (`p != q`) or holds a nested query. |
+| A collection that reads nothing of an earlier capture is worked out once for each starting row, not once for each combination | Works |
+| Reordering the captures themselves, or starting from another collection than the one written | Not done. It would need the row counts of each relationship, and the answer put back in the written order. |
+
+`explain()` shows the block as arranged, so a condition that moved is seen
+where it runs. On 100 projects and 2,000 people, `projects { p in people
+where { p.id == owner }  count() }` took 20 ms arranged and 327 ms as
+written.
 
 ---
 
