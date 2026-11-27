@@ -514,7 +514,7 @@ collide.
 | Feature | Status |
 |---|---|
 | `collection { where {..} sort {..} select {..} }` is the same query as the chained form | Works |
-| Block locals, visible from their definition onward, including inside nested queries | Works. Inside a nested query or the operations of a path, a local still means what it meant for the block's row: `people { mine = .assignments.project.id  select { n: projects.where { .id in mine }.count() } }`. A local written as a bare field name (`boss = manager`) is the exception and is read against the inner row; write it as a path (`boss = .manager`). |
+| Block locals, visible from their definition onward, including inside nested queries | Works. Inside a nested query or the operations of a path, a local still means what it meant for the block's row: `people { mine = .assignments.project.id  select { n: projects.where { .id in mine }.count() } }`. A bare field name in a local's value (`boss = manager`, `double = hours * 2`) is read of the block's row too. |
 | A local may be a collection, an aggregate, or any value | Works |
 | No shadowing of the root name or of an earlier local | Works |
 | `group_by`, `limit`, `nearest` inside a block | Works |
@@ -579,13 +579,16 @@ conditions, which never changes an answer or its order:
 |---|---|
 | A filter's conditions joined by `&&` are taken apart, and each runs straight after the last capture it reads. `where { c.id != "x" && b.kind == "hard" }` written last tests `b` before `c` is captured | Works |
 | A condition that reads no capture runs ahead of the first one. It joins the read of the block's starting rows, where an index may serve it | Works |
-| A condition on a row captured from a whole collection, or from a query on one, becomes a filter of that collection. `p in people` with `where { p.id == owner }` reads one person for each row, not every person; `explain()` shows it as `p in people.where { .. }` | Works. Not for an optional capture, whose rows with no match must stay; nor for a condition that compares the captured row itself (`p != q`) or holds a nested query. |
+| A condition on a captured row becomes a filter of the collection it is captured from: a whole collection, a query on one, a path, a walk. `p in people` with `where { p.id == owner }` reads one person for each row, not every person; `explain()` shows it as `p in people.where { .. }`, and `far in near.walk(..)` with `where { far._depth < 3 }` as `far in near.walk(..).where { .. }` | Works. Not for an optional capture, whose rows with no match must stay; nor for a condition that compares the captured row itself (`p != q`) or holds a nested query; nor for the members of a list, which are not rows of a collection. The names such a condition reads of the row are checked first, so a misspelt field is still refused. |
+| The block starts from the captured end when that is the smaller one. When a condition on the first captured row reads nothing of the block's row and leaves at most 64 rows of that row's collection, those rows are read first and the path followed back to the rows that reach them. `tasks { b in .blocked_by.blocker  where { b.id == "t3" } .. }` reads `t3` and its links, not every task; `explain()` shows the first step as `tasks, reached back from b` | Works, for a first capture over a path of references and relationships, with only filters before it. The starting rows are still given in the order a scan gives them. |
 | A collection that reads nothing of an earlier capture is worked out once for each starting row, not once for each combination | Works |
-| Reordering the captures themselves, or starting from another collection than the one written | Not done. It would need the row counts of each relationship, and the answer put back in the written order. |
+| Starting from a later capture than the first, or changing the order the captures run in | Not done. A condition that pins the second captured row filters its collection, but the block still starts as written. |
 
 `explain()` shows the block as arranged, so a condition that moved is seen
 where it runs. On 100 projects and 2,000 people, `projects { p in people
 where { p.id == owner }  count() }` took 20 ms arranged and 327 ms as
+written. On 5,000 tasks and 10,000 links, `tasks { b in .blocked_by.blocker
+where { b.id == "t00042" }  count() }` took 1.5 ms arranged and 40 ms as
 written.
 
 ---

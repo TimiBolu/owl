@@ -367,6 +367,21 @@ fn a_name_given_with_equals_means_the_blocks_row_inside_a_nested_query() {
         ),
         rows(&[&["ada", "1"], &["ben", "1"], &["cy", "1"], &["kim", "0"], &["lee", "0"]])
     );
+    // A value written as a bare field name, with no dot.
+    assert_eq!(
+        db.table(
+            "people { boss = manager  select { id, peers: people.where { .manager == boss && .id != people.id }.count() } }",
+            &["id", "peers"],
+        ),
+        rows(&[&["ada", "1"], &["ben", "1"], &["cy", "0"], &["kim", "1"], &["lee", "1"]])
+    );
+    assert_eq!(
+        db.table(
+            "assignments { double = hours * 2  select { id, over: assignments.where { .hours > double }.count() } }",
+            &["id", "over"],
+        ),
+        rows(&[&["a1", "0"], &["a2", "1"], &["a3", "0"], &["a4", "2"]])
+    );
     // And in a filter.
     assert_eq!(
         db.table(
@@ -465,8 +480,7 @@ fn explain_shows_each_capture_with_its_rows() {
         ("tasks, 1 entry", "-", "3"),
         ("b in .blocked_by.blocker", "3", "3"),
         ("c? in b.blocked_by.blocker", "3", "3"),
-        ("far in c.walk(.blocked_by.blocker)", "3", "9"),
-        ("where { .. }", "9", "3"),
+        ("far in c.walk(.blocked_by.blocker).where { .. }", "3", "3"),
         ("select { .. }", "3", "3"),
     ];
     assert_eq!(
@@ -475,7 +489,7 @@ fn explain_shows_each_capture_with_its_rows() {
     );
     // The same, as lines of the plan.
     let Some(Value::String(plan)) = row.get_field("plan") else { panic!("no plan") };
-    assert!(plan.contains("far in c.walk(.blocked_by.blocker): 3 rows in, 9 out"), "{plan}");
+    assert!(plan.contains("far in c.walk(.blocked_by.blocker).where { .. }: 3 rows in, 3 out"), "{plan}");
     assert!(plan.contains("tasks, 1 entry: 3 rows"), "{plan}");
 
     // A block that starts at its first capture, and one that only counts.
@@ -516,8 +530,10 @@ fn steps(db: &Db, block: &str) -> Vec<String> {
 fn a_condition_runs_where_its_names_first_exist() {
     let db = work();
     // Written last, the three conditions are about three different things.
-    // One reads only the task, so it joins the read of the tasks; one reads
-    // `b`, so it runs before `c` is captured; one reads `c`.
+    // One reads only the task, so it joins the read of the tasks. One reads
+    // `b` and one reads `c`: each filters the collection its row is
+    // captured from. And since the one on `b` leaves few tasks to be `b`,
+    // the block starts from those and comes back to the tasks they block.
     assert_eq!(
         steps(
             &db,
@@ -530,13 +546,47 @@ fn a_condition_runs_where_its_names_first_exist() {
              }",
         ),
         [
-            "tasks, 1 entry | - | 3",
-            "b in .blocked_by.blocker | 3 | 3",
-            "where { .. } | 3 | 2",
-            "c in b.blocked_by.blocker | 2 | 2",
-            "where { .. } | 2 | 2",
+            "tasks, 1 entry, reached back from b | - | 2",
+            "b in .blocked_by.blocker.where { .. } | 2 | 2",
+            "c in b.blocked_by.blocker.where { .. } | 2 | 2",
             "select { .. } | 2 | 2",
         ]
+    );
+    // The tasks one named task blocks: that task is read, and its links
+    // followed back, not every task.
+    assert_eq!(
+        steps(&db, "tasks { b in .blocked_by.blocker  where { b.id == \"t3\" }  select { id }  explain() }"),
+        [
+            "tasks, reached back from b | - | 2",
+            "b in .blocked_by.blocker.where { .. } | 2 | 2",
+            "select { .. } | 2 | 2",
+        ]
+    );
+    // Back through a relationship reached by its collection's name.
+    assert_eq!(
+        steps(&db, "people { j in .assignments.project  where { j.name == \"Gemini\" }  select { name }  explain() }"),
+        [
+            "people, reached back from j | - | 1",
+            "j in .assignments.project.where { .. } | 1 | 1",
+            "select { .. } | 1 | 1",
+        ]
+    );
+    // Of two conditions on a row, the one that reads nothing of the
+    // block's row chooses the start.
+    assert_eq!(
+        steps(&db, "people { a in .assignments  where { a.hours > 5 && a.id != id }  count()  explain() }"),
+        ["people, reached back from a | - | 2", "a in .assignments.where { .. }.where { .. } | 2 | 3", "count() | 3 | 1"]
+    );
+    // A condition that reads the block's row as well cannot.
+    assert_eq!(
+        steps(&db, "people { a in .assignments  where { a.hours > 5 || a.id == id }  count()  explain() }"),
+        ["people | - | 5", "a in .assignments.where { .. } | 5 | 3", "count() | 3 | 1"]
+    );
+    // The members of a list are not rows of a collection, so a condition
+    // on one is asked after it is captured.
+    assert_eq!(
+        steps(&db, "tasks { n in .notes  where { n.mins > 2 }  count()  explain() }"),
+        ["tasks | - | 4", "n in .notes | 4 | 3", "where { .. } | 3 | 2", "count() | 2 | 1"]
     );
     // A condition on a row of a whole collection filters the collection:
     // one person is read for each project, not every person.
@@ -570,6 +620,19 @@ fn planning_a_block_never_changes_its_answer() {
         "people { a in .assignments  where { a.hours > 5 }  t in tasks  where { t.project == a.project && name != \"Cy\" }  select { name, a: a.id, t: t.id } }",
         "tasks { b in .blocked_by.blocker  where { links.where { .blocker == b.id && .blocked == tasks.id && .kind == \"soft\" }.exists() }  select { id, b: b.id } }",
         "people { a in .assignments  sort { a.hours.desc }  limit(2)  select { name, hours: a.hours } }",
+        // A condition that pins the captured end: the block starts there.
+        "tasks { b in .blocked_by.blocker  where { b.id == \"t3\" }  select { id, b: b.id } }",
+        "tasks { where { id != \"t1\" }  b in .blocked_by.blocker  where { b.id == \"t3\" && tasks.id != \"t9\" }  select { id, b: b.id } }",
+        "people { a in .assignments  where { a.role == \"lead\" }  select { name, a: a.id } }",
+        "people { a in .assignments  where { a.role == \"dev\" }  t in a.project.tasks  select { name, t: t.id } }",
+        "people { j in .assignments.project  where { j.name == \"Gemini\" }  select { name, j: j.id } }",
+        "people { m in .manager  where { m.name == \"Kim\" }  select { name } }",
+        "projects { o in .owner.reports  where { o.name == \"Ada\" }  select { name, o: o.id } }",
+        "tasks { b in .blocked_by.blocker  where { b.id == \"nobody\" }  select { id } }",
+        // Conditions on members of a list and of a walk.
+        "tasks { n in .notes  where { n.mins > 2 }  select { id, kind: n.kind } }",
+        "tasks { where { id == \"t4\" }  far in .walk(.blocked_by.blocker)  where { far._depth < 3 && far.id != \"t9\" }  select { far: far.id, steps: far._depth } }",
+        "people { boss = manager  a in .assignments  where { a.hours > 5 }  select { name, peers: people.where { .manager == boss && .id != people.id }.count() } }",
     ];
     for block in blocks {
         let shown = |rows: Vec<owl_db::Document>| rows.iter().map(|row| format!("{:?}", row.fields)).collect::<Vec<_>>();
@@ -579,6 +642,9 @@ fn planning_a_block_never_changes_its_answer() {
         owl_db::executor::set_capture_planning(true);
         let written = shown(written.unwrap_or_else(|error| panic!("{error}\n{block}")));
         assert_eq!(planned, written, "{block}");
-        assert!(!planned.is_empty() || block.contains("a == null"), "nothing to compare for {block}");
+        assert!(
+            !planned.is_empty() || block.contains("a == null") || block.contains("nobody"),
+            "nothing to compare for {block}"
+        );
     }
 }
