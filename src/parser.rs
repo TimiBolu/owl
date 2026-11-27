@@ -121,6 +121,30 @@ pub const LOCAL_VALUE: &str = "$local";
 /// parentheses. It cannot be written, so it cannot collide with a name.
 pub const ROWS_OF: &str = "$of";
 
+/// Where a row keeps the row a block captured under a name: `b in .blockers`
+/// is kept as the field `$in:b`. It cannot be written, so no field of a
+/// collection can collide with it.
+pub const CAPTURE_PREFIX: &str = "$in:";
+
+/// In a block's names: the collection the block starts from. Not a name
+/// that can be written.
+const CAPTURE_ROOT: &str = "$root";
+
+/// The field that keeps the row captured as `name`.
+pub fn capture_field(name: &str) -> String {
+    format!("{CAPTURE_PREFIX}{name}")
+}
+
+/// What a walk notes on the rows it reaches. A captured row is kept as a
+/// reference to the stored row, which has no such notes, so they are kept
+/// beside it.
+pub const CAPTURE_NOTES: [&str; 2] = ["_depth", "_path"];
+
+/// The field that keeps one of [`CAPTURE_NOTES`] of a captured row.
+pub fn capture_note_field(capture: &str, note: &str) -> String {
+    format!("{capture}:{note}")
+}
+
 /// The source of `so_far()` in a select: the rows of the partition from its
 /// first row to the row being shaped, in order.
 pub const ROWS_SO_FAR: &str = "$so_far";
@@ -1004,6 +1028,10 @@ pub enum Operation {
     Min(FieldAccess),
     Max(FieldAccess),
     FunctionDef(FunctionDefinition),
+    /// `name in collection` in a scoped block: every row in hand, once for
+    /// each member of the collection, with the member kept under the name.
+    /// A row with no member is dropped.
+    Capture { name: String, source: Expression },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2433,6 +2461,11 @@ impl Parser {
         // terminal the chained form allows (`count()`, `first()`, an
         // aggregate, `update { .. }`, `delete()`).
         let mut result_entry: Option<&'static str> = None;
+        // Whether a capture has been met: `name in collection`.
+        let mut captured = false;
+        // Inside a nested query a captured row is reached from the block's
+        // row, which is named there by its collection.
+        locals.insert(CAPTURE_ROOT.to_string(), Expression::Identifier(collection.clone()));
 
         while !matches!(self.current_token(), Some(Token::RightBrace)) {
             if matches!(self.current_token(), Some(Token::EOF) | None) {
@@ -2482,9 +2515,72 @@ impl Parser {
                 )));
             }
 
+            // A capture is `name in collection`. Where `name = value` names
+            // the whole value, this names each member in turn: the rows in
+            // hand become one row for every member. The member is kept on
+            // the row, and the name is a path to it from there on, so
+            // everything a path can do, the name can.
+            if let (Some(Token::Identifier(name)), Some(Token::In)) =
+                (self.current_token(), self.tokens.get(self.position + 1))
+            {
+                let name = name.clone();
+                if name == collection {
+                    return Err(ParseError::InvalidSyntax(format!(
+                        "'{name}' is the row the block starts from, so it cannot also name a captured row"
+                    )));
+                }
+                if locals.contains_key(&name) {
+                    return Err(ParseError::InvalidSyntax(format!(
+                        "Scoped binding '{}' is already defined",
+                        name
+                    )));
+                }
+                if self.scoped_name_is_used_between(&name, block_start, self.position) {
+                    return Err(ParseError::InvalidSyntax(format!(
+                        "Scoped binding '{}' is used before it is defined",
+                        name
+                    )));
+                }
+                self.advance();
+                self.expect_token(Token::In)?;
+                let source = self.parse_expression()?;
+                let source = Self::substitute_scoped_locals_expression(&source, &locals);
+                locals.insert(
+                    name.clone(),
+                    Expression::FieldAccess(FieldAccess { path: vec![capture_field(&name)] }),
+                );
+                captured = true;
+                operations.push(Operation::Capture { name, source });
+                continue;
+            }
+
             let operation = self.parse_operation()?;
             let operation = Self::substitute_scoped_locals_operation(&operation, &locals);
-            self.validate_parsed_operation(&operation, &collection)?;
+            // After a capture a row holds more than its collection declares,
+            // so its paths are checked when they are followed.
+            if !captured {
+                self.validate_parsed_operation(&operation, &collection)?;
+            }
+            // A write would be made once for every combination, and so more
+            // than once to a row with several members.
+            if captured {
+                let write = match &operation {
+                    Operation::Update(_) => Some("update"),
+                    Operation::Delete => Some("delete()"),
+                    Operation::Insert(_)
+                    | Operation::InsertMany(_)
+                    | Operation::InsertFrom(_)
+                    | Operation::Upsert(_) => Some("an insert"),
+                    _ => None,
+                };
+                if let Some(write) = write {
+                    return Err(ParseError::InvalidSyntax(format!(
+                        "{write} cannot follow a capture (`name in collection`): after it there \
+                         is one row for every combination, and a row would be written once for \
+                         each. Choose the rows with where {{ .. }} and a path instead"
+                    )));
+                }
+            }
             result_entry = match operation {
                 Operation::Select(_) => Some("select"),
                 Operation::Count => Some("count()"),
@@ -2748,6 +2844,127 @@ impl Parser {
         }
     }
 
+    /// A block's names as they stand inside a nested query or collection,
+    /// whose own rows are what `.` means there. A name's value was written
+    /// about the block's row, so every path in it is reached from that row
+    /// by the name of its collection: `.orders.total` becomes
+    /// `users.orders.total`, which a nested query is given the value of as
+    /// it is of `users.id`. Without this a name would be read against the
+    /// nested query's rows, and quietly mean something else.
+    fn scoped_locals_when_nested(
+        locals: &std::collections::HashMap<String, Expression>,
+    ) -> std::borrow::Cow<'_, std::collections::HashMap<String, Expression>> {
+        let Some(Expression::Identifier(root)) = locals.get(CAPTURE_ROOT) else {
+            return std::borrow::Cow::Borrowed(locals);
+        };
+        std::borrow::Cow::Owned(
+            locals
+                .iter()
+                .map(|(name, value)| {
+                    let value = match name.as_str() {
+                        CAPTURE_ROOT => value.clone(),
+                        _ => Self::read_from_root(value, root),
+                    };
+                    (name.clone(), value)
+                })
+                .collect(),
+        )
+    }
+
+    /// `expression` with each path from the row in hand written as a path
+    /// from `root` by name. What is inside a nested query or the operations
+    /// of a collection is about their rows, and is left as it is.
+    fn read_from_root(expression: &Expression, root: &str) -> Expression {
+        let read = |inner: &Expression| Self::read_from_root(inner, root);
+        let boxed = |inner: &Expression| Box::new(Self::read_from_root(inner, root));
+        match expression {
+            Expression::FieldAccess(access) if !access.path.is_empty() => {
+                access.path.iter().fold(Expression::Identifier(root.to_string()), |base, field| {
+                    Expression::ChainedAccess { base: Box::new(base), field: field.clone() }
+                })
+            }
+            Expression::CollectionExpression { source, operations } => Expression::CollectionExpression {
+                source: boxed(source),
+                operations: operations.clone(),
+            },
+            Expression::FunctionCall { name, args } => Expression::FunctionCall {
+                name: name.clone(),
+                args: args.iter().map(read).collect(),
+            },
+            Expression::IfThenElse { condition, then_expr, else_expr } => Expression::IfThenElse {
+                condition: Box::new(Self::condition_read_from_root(condition, root)),
+                then_expr: boxed(then_expr),
+                else_expr: boxed(else_expr),
+            },
+            Expression::Match { expr, arms } => Expression::Match {
+                expr: boxed(expr),
+                arms: arms
+                    .iter()
+                    .map(|arm| MatchArm {
+                        pattern: match &arm.pattern {
+                            MatchPattern::Guard(guard) => {
+                                MatchPattern::Guard(Box::new(Self::condition_read_from_root(guard, root)))
+                            }
+                            other => other.clone(),
+                        },
+                        guard: arm.guard.as_ref().map(|guard| Self::condition_read_from_root(guard, root)),
+                        body: read(&arm.body),
+                    })
+                    .collect(),
+            },
+            Expression::LogicalAnd(left, right) => Expression::LogicalAnd(boxed(left), boxed(right)),
+            Expression::LogicalOr(left, right) => Expression::LogicalOr(boxed(left), boxed(right)),
+            Expression::LogicalNot(inner) => Expression::LogicalNot(boxed(inner)),
+            Expression::BinaryOp { left, operator, right } => Expression::BinaryOp {
+                left: boxed(left),
+                operator: operator.clone(),
+                right: boxed(right),
+            },
+            Expression::ArrayAccess { array, index } => Expression::ArrayAccess {
+                array: boxed(array),
+                index: boxed(index),
+            },
+            Expression::ChainedAccess { base, field } => Expression::ChainedAccess {
+                base: boxed(base),
+                field: field.clone(),
+            },
+            Expression::Block(expressions) => Expression::Block(expressions.iter().map(read).collect()),
+            Expression::ArrayLiteral(elements) => Expression::ArrayLiteral(elements.iter().map(read).collect()),
+            Expression::ObjectLiteral(fields) => Expression::ObjectLiteral(
+                fields
+                    .iter()
+                    .map(|field| ObjectField { name: field.name.clone(), value: read(&field.value) })
+                    .collect(),
+            ),
+            Expression::ConditionExpr(condition) => {
+                Expression::ConditionExpr(Box::new(Self::condition_read_from_root(condition, root)))
+            }
+            Expression::Identifier(_)
+            | Expression::FieldAccess(_)
+            | Expression::Literal(_)
+            | Expression::QueryExpression { .. } => expression.clone(),
+        }
+    }
+
+    fn condition_read_from_root(condition: &Condition, root: &str) -> Condition {
+        match condition {
+            Condition::Comparison { left, operator, right } => Condition::Comparison {
+                left: Self::read_from_root(left, root),
+                operator: operator.clone(),
+                right: Self::read_from_root(right, root),
+            },
+            Condition::And(left, right) => Condition::And(
+                Box::new(Self::condition_read_from_root(left, root)),
+                Box::new(Self::condition_read_from_root(right, root)),
+            ),
+            Condition::Or(left, right) => Condition::Or(
+                Box::new(Self::condition_read_from_root(left, root)),
+                Box::new(Self::condition_read_from_root(right, root)),
+            ),
+            Condition::Not(inner) => Condition::Not(Box::new(Self::condition_read_from_root(inner, root))),
+        }
+    }
+
     fn substitute_scoped_locals_expression(
         expression: &Expression,
         locals: &std::collections::HashMap<String, Expression>,
@@ -2760,7 +2977,10 @@ impl Parser {
                 locals[&field.path[0]].clone()
             }
             Expression::QueryExpression { query } => {
-                if let Some(bound) = locals.get(&query.collection) {
+                let outer = locals;
+                let nested = Self::scoped_locals_when_nested(locals);
+                let locals = nested.as_ref();
+                if let Some(bound) = outer.get(&query.collection) {
                     let appended_operations = query
                         .operations
                         .iter()
@@ -2804,12 +3024,13 @@ impl Parser {
                 }
             }
             Expression::CollectionExpression { source, operations } => {
+                let nested = Self::scoped_locals_when_nested(locals);
                 Expression::CollectionExpression {
                     source: Box::new(Self::substitute_scoped_locals_expression(source, locals)),
                     operations: operations
                         .iter()
                         .map(|operation| {
-                            Self::substitute_scoped_locals_operation(operation, locals)
+                            Self::substitute_scoped_locals_operation(operation, nested.as_ref())
                         })
                         .collect(),
                 }
@@ -2868,10 +3089,64 @@ impl Parser {
                 array: Box::new(Self::substitute_scoped_locals_expression(array, locals)),
                 index: Box::new(Self::substitute_scoped_locals_expression(index, locals)),
             },
-            Expression::ChainedAccess { base, field } => Expression::ChainedAccess {
-                base: Box::new(Self::substitute_scoped_locals_expression(base, locals)),
-                field: field.clone(),
-            },
+            Expression::ChainedAccess { base, field } => {
+                match Self::substitute_scoped_locals_expression(base, locals) {
+                    // `b.id` where `b` is a captured row: a path from the
+                    // row in hand through the row it keeps as `b`.
+                    Expression::FieldAccess(FieldAccess { mut path })
+                        if path.first().is_some_and(|first| first.starts_with(CAPTURE_PREFIX)) =>
+                    {
+                        if path.len() == 1 && CAPTURE_NOTES.contains(&field.as_str()) {
+                            path[0] = capture_note_field(&path[0], field);
+                        } else {
+                            path.push(field.clone());
+                        }
+                        Expression::FieldAccess(FieldAccess { path })
+                    }
+                    // The same inside a nested query, where the row
+                    // is reached by its collection's name.
+                    Expression::ChainedAccess { base: root, field: capture }
+                        if capture.starts_with(CAPTURE_PREFIX)
+                            && CAPTURE_NOTES.contains(&field.as_str())
+                            && matches!(root.as_ref(), Expression::Identifier(_)) =>
+                    {
+                        Expression::ChainedAccess {
+                            base: root,
+                            field: capture_note_field(&capture, field),
+                        }
+                    }
+                    // `devs.project` where `devs` names a collection: a
+                    // step on from its rows, as it would be if the
+                    // collection were written out. A collection that ends
+                    // in one value has no rows to step from.
+                    Expression::CollectionExpression { source, mut operations }
+                        if !matches!(
+                            operations.last(),
+                            None | Some(
+                                Operation::Count
+                                    | Operation::Exists
+                                    | Operation::Sum(_)
+                                    | Operation::Avg(_)
+                                    | Operation::Min(_)
+                                    | Operation::Max(_)
+                                    | Operation::AggregateExpr { .. }
+                                    | Operation::Select(_)
+                                    | Operation::GroupBy(_)
+                            )
+                        ) =>
+                    {
+                        match operations.last_mut() {
+                            Some(Operation::Step(path)) => path.path.push(field.clone()),
+                            _ => operations.push(Operation::Step(FieldAccess { path: vec![field.clone()] })),
+                        }
+                        Expression::CollectionExpression { source, operations }
+                    }
+                    base => Expression::ChainedAccess {
+                        base: Box::new(base),
+                        field: field.clone(),
+                    },
+                }
+            }
             Expression::Block(expressions) => Expression::Block(
                 expressions
                     .iter()
@@ -3327,6 +3602,7 @@ impl Parser {
             | Operation::Call(_)
             | Operation::Combine { .. }
             | Operation::Walk { .. }
+            | Operation::Capture { .. }
             | Operation::Last(_)
             | Operation::PartitionBy(_)
             | Operation::AggregateExpr { .. }
@@ -4072,6 +4348,22 @@ impl Parser {
                     })
                 }
                 (Some(name), expression) => computed.push(ComputedGroupKey { name, expression }),
+                // `a.role`, a path from a named row: keyed by its last
+                // name, as `.role` is.
+                (None, Expression::ChainedAccess { base, field })
+                    if {
+                        let mut from = base.as_ref();
+                        while let Expression::ChainedAccess { base, .. } = from {
+                            from = base.as_ref();
+                        }
+                        matches!(from, Expression::Identifier(_))
+                    } =>
+                {
+                    computed.push(ComputedGroupKey {
+                        name: field.clone(),
+                        expression: Expression::ChainedAccess { base, field },
+                    })
+                }
                 (None, _) => {
                     return Err(ParseError::InvalidSyntax(
                         "a computed group_by key needs a name, as in `group_by { total: .a + .b }`"
@@ -6285,6 +6577,7 @@ fn operation_uses_legacy_outer(operation: &Operation) -> bool {
         | Operation::Call(_)
         | Operation::Combine { .. }
         | Operation::Walk { .. }
+        | Operation::Capture { .. }
         | Operation::Last(_)
         | Operation::PartitionBy(_)
         | Operation::AggregateExpr { .. }

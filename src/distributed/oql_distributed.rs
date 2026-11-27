@@ -490,6 +490,7 @@ impl DistributedOQLEngine {
                 | Operation::Call(_)
                 | Operation::Combine { .. }
                 | Operation::Walk { .. }
+                | Operation::Capture { .. }
                 | Operation::Last(_)
                 | Operation::PartitionBy(_)
                 | Operation::AggregateExpr { .. }
@@ -572,6 +573,7 @@ impl DistributedOQLEngine {
                 | Operation::Call(_)
                 | Operation::Combine { .. }
                 | Operation::Walk { .. }
+                | Operation::Capture { .. }
                 | Operation::Last(_)
                 | Operation::PartitionBy(_)
                 | Operation::AggregateExpr { .. }
