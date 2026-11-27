@@ -569,7 +569,7 @@ tasks {                                   -- what blocks a task, and everything 
 | A write after a capture (`update`, `delete()`, an insert) | Error: there is one row for every combination, and a row would be written once for each |
 | A capture outside a block, in a chain | Not a form. As with locals, a name belongs to a block. |
 | A captured row in a `select` by its name alone (`select { b }`) | The reference to the row, as a reference field is. `b.select { .. }` gives its fields. |
-| `explain()` on a block with a capture | Runs, and says only that the general executor applies the entries in order. It does not yet show each capture with the rows in and out. |
+| `explain()` on a block with a capture | Works: every entry from the first capture on, with the rows that went into it and the rows that came out (section 20). This is where a block that multiplies too far shows it. |
 
 Captures run as written: each is a loop over the rows in hand, in the order
 the entries stand. A block is fast when it starts from the selective end and
@@ -875,7 +875,32 @@ without running it:
 | `uses_index` | whether an index serves the read |
 | `plan` | the physical plan as text |
 
-`explain()` must be the last operation.
+`explain()` must be the last operation. In a block it is the last entry, and
+may come after the block's result entry: `tasks { where {..}  select {..}  explain() }`.
+
+A block with a capture is the one query `explain()` runs. What such a block
+costs is decided by how many rows each capture makes, which cannot be known
+without making them, and nothing after a capture can write. The row then
+also holds `steps`, and `plan` ends with the same as lines:
+
+| Field of a step | Meaning |
+|---|---|
+| `step` | the entry as written: `b in .blocked_by.blocker`, `c? in b.blocked_by.blocker`, `far in c.walk(.blocked_by.blocker)`, `where { .. }`, `select { .. }`. The first step is the rows the block starts from, with how many entries stand before the first capture: `tasks, 1 entry` |
+| `rows_in` | the rows that went into the entry; null for the first step |
+| `rows_out` | the rows that came out |
+| `ms` | the time the entry took |
+
+```
+tasks, 1 entry: 3 rows
+b in .blocked_by.blocker: 3 rows in, 3 out
+c? in b.blocked_by.blocker: 3 rows in, 3 out
+far in c.walk(.blocked_by.blocker): 3 rows in, 9 out
+where { .. }: 9 rows in, 3 out
+select { .. }: 3 rows in, 3 out
+```
+
+`path`, `uses_index` and the start of `plan` say how the block's first rows
+are read, as for any other query.
 
 ---
 

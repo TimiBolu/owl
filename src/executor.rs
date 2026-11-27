@@ -2091,6 +2091,13 @@ impl<S: DocumentStore> QueryExecutor<S> {
     /// `query.explain()`: one row saying how the query would run, without
     /// running it.
     fn explain_query(&self, query: &OQLQuery) -> OQLResult<Vec<Document>> {
+        if let Some(at) = query
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, Operation::Capture { .. }))
+        {
+            return self.explain_captures(query, at);
+        }
         self.validate_declared_paths(query)?;
         let plan = self.try_plan_safe_read(query)?;
         let mut fields = crate::document::Fields::default();
@@ -2148,6 +2155,158 @@ impl<S: DocumentStore> QueryExecutor<S> {
             "explain".to_string(),
             fields,
         )])
+    }
+
+    /// `explain()` on a block with a capture: how the block's first rows
+    /// are read, and then every entry from the first capture on with the
+    /// rows that went into it and the rows that came out.
+    ///
+    /// How many rows a capture makes is what decides what such a block
+    /// costs, and it cannot be known without making them. So unlike any
+    /// other `explain()`, this runs the block. It may: nothing after a
+    /// capture can write.
+    fn explain_captures(&self, query: &OQLQuery, at: usize) -> OQLResult<Vec<Document>> {
+        let (before, after) = query.operations.split_at(at);
+        let start = OQLQuery { collection: query.collection.clone(), operations: before.to_vec() };
+        let mut explained = self.explain_query(&start)?;
+        let mut fields = explained.pop().map(|row| row.fields).unwrap_or_default();
+
+        let step = |name: String, rows_in: Option<usize>, rows_out: usize, started: Instant| {
+            let mut entry = crate::document::Fields::default();
+            entry.insert("step".to_string(), Value::String(name));
+            entry.insert(
+                "rows_in".to_string(),
+                rows_in.map_or(Value::Null, |rows| Value::Integer(rows as i64)),
+            );
+            entry.insert("rows_out".to_string(), Value::Integer(rows_out as i64));
+            entry.insert("ms".to_string(), Value::Float(started.elapsed().as_secs_f64() * 1000.0));
+            entry
+        };
+
+        let started = Instant::now();
+        let mut documents = self.execute_general_query(&start)?;
+        let mut steps = vec![step(
+            match before.len() {
+                0 => query.collection.clone(),
+                entries => format!("{}, {entries} entr{}", query.collection, if entries == 1 { "y" } else { "ies" }),
+            },
+            None,
+            documents.len(),
+            started,
+        )];
+        let mut grouped = false;
+        for (position, operation) in after.iter().enumerate() {
+            let rows_in = documents.len();
+            let started = Instant::now();
+            // As when the block runs: grouping no rows gives no groups.
+            if !(grouped && documents.is_empty() && matches!(operation, Operation::Select(_) | Operation::Having(_))) {
+                documents = match operation {
+                    Operation::Capture { name, source, optional } => {
+                        let rows = self.apply_capture(documents, name, source, *optional)?;
+                        self.check_captured_names(&rows, name, &after[position + 1..])?;
+                        rows
+                    }
+                    _ => self.apply_operation(documents, operation, &query.collection)?,
+                };
+            }
+            grouped |= matches!(operation, Operation::GroupBy(_));
+            steps.push(step(Self::entry_as_written(operation), Some(rows_in), documents.len(), started));
+        }
+
+        let mut plan = match fields.get("plan") {
+            Some(Value::String(plan)) => format!("{plan}\n"),
+            _ => String::new(),
+        };
+        for entry in &steps {
+            let text = |name: &str| match entry.get(name) {
+                Some(Value::String(text)) => text.clone(),
+                Some(Value::Integer(number)) => number.to_string(),
+                _ => String::new(),
+            };
+            plan.push_str(&match entry.get("rows_in") {
+                Some(Value::Integer(_)) => {
+                    format!("{}: {} rows in, {} out\n", text("step"), text("rows_in"), text("rows_out"))
+                }
+                _ => format!("{}: {} rows\n", text("step"), text("rows_out")),
+            });
+        }
+        fields.insert("path".to_string(), Value::String("general executor".to_string()));
+        fields.insert("plan".to_string(), Value::String(plan.trim_end().to_string()));
+        fields.insert("steps".to_string(), Value::List(steps.into_iter().map(Value::Object).collect()));
+        Ok(vec![Document::with_id("explain".to_string(), "explain".to_string(), fields)])
+    }
+
+    /// An entry of a block as it is named in `explain()`: a capture with
+    /// its collection, anything else by its word.
+    fn entry_as_written(operation: &Operation) -> String {
+        // A name kept on the row, as it was written: `$in:b` is `b`.
+        fn path(names: &[String]) -> String {
+            let mut written = String::new();
+            for (position, name) in names.iter().enumerate() {
+                match name.strip_prefix(crate::parser::CAPTURE_PREFIX) {
+                    Some(capture) if position == 0 => written.push_str(&capture.replacen(':', ".", 1)),
+                    _ => {
+                        written.push('.');
+                        written.push_str(name);
+                    }
+                }
+            }
+            written
+        }
+        fn operations(operations: &[Operation]) -> String {
+            operations
+                .iter()
+                .map(|operation| match operation {
+                    Operation::Step(step) => path(&step.path),
+                    Operation::Walk { path: along, every, .. } => {
+                        format!(".{}({})", if *every { "routes" } else { "walk" }, path(&along.path))
+                    }
+                    other => format!(".{}", word(other)),
+                })
+                .collect()
+        }
+        fn source(expression: &Expression) -> String {
+            match expression {
+                Expression::FieldAccess(access) => path(&access.path),
+                Expression::Identifier(name) => name.clone(),
+                Expression::CollectionExpression { source: from, operations: then } => {
+                    format!("{}{}", source(from), operations(then))
+                }
+                Expression::QueryExpression { query } => {
+                    format!("{}{}", query.collection, operations(&query.operations))
+                }
+                _ => "..".to_string(),
+            }
+        }
+        fn word(operation: &Operation) -> String {
+            match operation {
+                Operation::Where(_) => "where { .. }".to_string(),
+                Operation::Select(_) => "select { .. }".to_string(),
+                Operation::Sort(_) => "sort { .. }".to_string(),
+                Operation::GroupBy(_) => "group_by { .. }".to_string(),
+                Operation::Having(_) => "having { .. }".to_string(),
+                Operation::Limit(count) => format!("limit({count})"),
+                Operation::LimitExpr(_) => "limit(..)".to_string(),
+                Operation::Offset(count) => format!("offset({count})"),
+                Operation::Count => "count()".to_string(),
+                Operation::First => "first()".to_string(),
+                Operation::Exists => "exists()".to_string(),
+                Operation::Distinct => "distinct()".to_string(),
+                Operation::Sum(_) => "sum(..)".to_string(),
+                Operation::Avg(_) => "avg(..)".to_string(),
+                Operation::Min(_) => "min(..)".to_string(),
+                Operation::Max(_) => "max(..)".to_string(),
+                Operation::AggregateExpr { function, .. } => format!("{function}(..)"),
+                Operation::PartitionBy(_) => "partition_by { .. }".to_string(),
+                _ => "..".to_string(),
+            }
+        }
+        match operation {
+            Operation::Capture { name, source: from, optional } => {
+                format!("{name}{} in {}", if *optional { "?" } else { "" }, source(from))
+            }
+            other => word(other),
+        }
     }
 
     /// Reject a path whose first name the collection's schema does not
