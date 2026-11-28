@@ -89,7 +89,7 @@ What it has found so far, all fixed:
 ## Can a program learn OQL from one page?
 
 A language model has read a great deal of SQL and almost no OQL. `ask`
-measures what that costs. It holds 30 questions in plain English over this
+measures what that costs. It holds 35 questions in plain English over this
 data, from a filter to a walk down the management chain, each with the
 answer SQLite gives to a reference query. A model is handed
 `docs/OQL_CARD.md`, the catalogue of this database and the questions, and
@@ -109,7 +109,7 @@ SQLite's answer.
 ```
 
 With no file named, the questions are held to their own reference OQL,
-which must give SQLite's answers: 30 of 30. `--prompt` writes what the
+which must give the key's answers: 35 of 35. `--prompt` writes what the
 model is given. `--answers` scores a JSON object from question id to OQL,
 and `--feedback` writes what the database said about each answer it did
 not accept, to give the model once. A wrong answer earns no hint, because
@@ -134,10 +134,27 @@ group's rows written with a dot before it, and `.hired.year` for
 said only that a literal was expected; it now says how the operation is
 written, and that is the message the model was given.
 
-What this does not show: both models are Claude, each sat once, and the
-questions and the card have one author, so the card may suit the
-questions better than it would suit a stranger's. Harder questions and
-other models are the next sitting.
+A second sitting, on 2026-11-29, after vectors were added to the card and
+five questions about them to the set: the nearest notes to a vector, the
+nearest among those of one topic, each person's nearest note, a count by
+similarity within each topic, and the notes within a distance. SQLite has
+no vectors, so the key to those five is worked out in the harness in plain
+arithmetic, from the same notes, and the reference OQL must agree with it.
+
+| Model | Right at the first try | Refused by the check | Wrong | The five on vectors |
+|---|---|---|---|---|
+| Claude Sonnet | 34 of 35 | 0 | 1 | 5 of 5 |
+| Claude Haiku | 35 of 35 | 0 | 0 | 5 of 5 |
+
+The one wrong answer named a field `id` where the question asked for
+`org`: a slip in reading the question, in a query that was otherwise
+right.
+
+What this does not show: both models are Claude, each sat once at each
+sitting, and the questions and the card have one author, so the card may
+suit the questions better than it would suit a stranger's. At 34 and 35 of
+35 the questions no longer tell models apart. Harder questions and other
+models are the next sitting.
 
 Both checkers now also hold the check to its promise: every query `check`
 and `scope` run must pass it, since it must refuse nothing that runs.

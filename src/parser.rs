@@ -324,6 +324,16 @@ impl Tokenizer {
         let mut remaining = input;
 
         while !remaining.is_empty() {
+            // A number written with an exponent that is too large to hold
+            // is said to be that, not read as a smaller number and a name.
+            if let Ok((_, text)) = Self::float_text(remaining) {
+                if text.parse::<f64>().map_or(true, |value| !value.is_finite()) {
+                    let line = input[..input.len() - remaining.len()].matches('\n').count() + 1;
+                    return Err(TokenizeError::ParseError(format!(
+                        "line {line}: {text} is too large a number to hold; the largest is about 1.8e308"
+                    )));
+                }
+            }
             match Self::next_token(remaining) {
                 Ok((rest, token)) => {
                     // A parameter may not take a name the parser uses for
@@ -602,10 +612,9 @@ impl Tokenizer {
         alt((Self::parse_float, Self::parse_integer))(input)
     }
 
-    /// `3.14`, and a number with an exponent: `1.6e-5`, `2E3`, `1e+10`.
-    /// An `e` is an exponent only with a digit after it, or a sign and a
-    /// digit, so `1.exp()` is still a call on a number.
-    fn parse_float(input: &str) -> IResult<&str, Token> {
+    /// The text of a float at the start of `input`: digits, a point and
+    /// digits, or either form with an exponent.
+    fn float_text(input: &str) -> IResult<&str, &str> {
         fn exponent(input: &str) -> IResult<&str, &str> {
             recognize(tuple((
                 nom::character::complete::one_of("eE"),
@@ -613,10 +622,17 @@ impl Tokenizer {
                 digit1,
             )))(input)
         }
-        let (input, number_str) = alt((
+        alt((
             recognize(tuple((digit1, char('.'), digit1, nom::combinator::opt(exponent)))),
             recognize(tuple((digit1, exponent))),
-        ))(input)?;
+        ))(input)
+    }
+
+    /// `3.14`, and a number with an exponent: `1.6e-5`, `2E3`, `1e+10`.
+    /// An `e` is an exponent only with a digit after it, or a sign and a
+    /// digit, so `1.exp()` is still a call on a number.
+    fn parse_float(input: &str) -> IResult<&str, Token> {
+        let (input, number_str) = Self::float_text(input)?;
 
         // A number too large for a float is not one, written either way.
         let value = number_str.parse::<f64>().ok().filter(|value| value.is_finite()).ok_or_else(|| {

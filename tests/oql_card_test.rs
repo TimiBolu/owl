@@ -52,9 +52,9 @@ fn database() -> (TempDir, QueryExecutor<RustStore>) {
           { id: "a4", person: "cy", project: "apollo", role: "dev", hours: 5 }
         ]
         tasks.insert [
-          { id: "t1", project: "apollo", state: "open", tags: ["api", "db"], notes: [{ kind: "call", mins: 5 }] },
-          { id: "t2", project: "apollo", state: "done", tags: [], notes: [] },
-          { id: "t3", project: "gemini", state: "open", tags: ["ui"], notes: [{ kind: "call", mins: 7 }, { kind: "mail", mins: 2 }] },
+          { id: "t1", project: "apollo", state: "open", tags: ["api", "db"], notes: [{ kind: "call", mins: 5 }], about: [1.0, 0.0, 0.0] },
+          { id: "t2", project: "apollo", state: "done", tags: [], notes: [], about: [0.9, 0.1, 0.0] },
+          { id: "t3", project: "gemini", state: "open", tags: ["ui"], notes: [{ kind: "call", mins: 7 }, { kind: "mail", mins: 2 }], about: [0.0, 1.0, 0.0] },
           { id: "t4", project: "gemini", state: "open", tags: [], notes: [] }
         ]
         links.insert [

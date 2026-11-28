@@ -18,8 +18,14 @@
 //! (k-means) once there are enough to be worth dividing, and again each
 //! time the collection has doubled. Until then there is one list.
 //!
-//! It is built from the rows and never stored: a database opened afresh
-//! builds it on the first search that wants it.
+//! The vectors themselves are never stored twice: a database opened afresh
+//! reads them from the rows on the first search that wants the index.
+//! What is kept beside the database is what was costly to work out: the
+//! centres, and which list each row was put in. Those are a hint and no
+//! more. A row the hint does not name is given its list by comparing it
+//! with the centres, and a hint that no longer suits the rows is thrown
+//! away, so a wrong or stale hint can make a search slower or miss more,
+//! and can never make it give a row that should not be given.
 
 use super::ObjRef;
 use crate::vector::{dot, norm, squared_distance, Metric};
@@ -37,8 +43,24 @@ const MOST_LISTS: usize = 4_096;
 const SAMPLE_FOR_EACH_CENTRE: usize = 24;
 /// Lists for each one the square root of the number of vectors gives.
 const LISTS_FOR_EACH_ROOT: usize = 4;
+/// How a kept hint begins.
+const HINT_MAGIC: &[u8; 8] = b"OWLVHNT1";
+/// Rows looked at to tell whether a kept hint still suits the rows.
+const HINT_SAMPLE: usize = 64;
 /// Rounds of moving each centre to the middle of its vectors.
 const ROUNDS: usize = 6;
+
+thread_local! {
+    /// How many times this thread has worked an index's centres out.
+    static DIVISIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times this thread has worked out the centres of a vector
+/// index, which is the costly part of making one. For tests.
+#[doc(hidden)]
+pub fn divisions() -> u64 {
+    DIVISIONS.with(std::cell::Cell::get)
+}
 
 #[derive(Clone, Default)]
 struct List {
@@ -162,12 +184,21 @@ impl VectorIndex {
     /// length than the index's is not one of its vectors: the row is taken
     /// out.
     pub(crate) fn put(&mut self, row: ObjRef, vector: &[f32]) {
+        self.put_in(row, vector, None);
+    }
+
+    /// [`Self::put`], into the list a hint names when it names one that
+    /// exists, and otherwise into the list of the nearest centre.
+    fn put_in(&mut self, row: ObjRef, vector: &[f32], hinted: Option<u32>) {
         self.remove(row);
         if vector.len() != self.dimension {
             return;
         }
         let kept = self.kept(vector);
-        let list = self.list_of(&kept);
+        let list = match hinted.map(|list| list as usize).filter(|list| *list < self.lists.len()) {
+            Some(list) => list,
+            None => self.list_of(&kept),
+        };
         let held = &mut self.lists[list];
         self.place.insert(row, (list as u32, held.rows.len() as u32));
         held.rows.push(row);
@@ -193,6 +224,101 @@ impl VectorIndex {
         held.vectors.truncate(last * dimension);
     }
 
+    /// What is worth keeping of the index beside the database: its
+    /// centres, and which list each row is in. `None` while there is one
+    /// list, when there is nothing that was costly to work out.
+    pub(crate) fn hint(&self) -> Option<Vec<u8>> {
+        if self.centres.is_empty() {
+            return None;
+        }
+        let mut bytes = Vec::with_capacity(32 + self.centres.len() * 4 + self.place.len() * 12);
+        bytes.extend_from_slice(HINT_MAGIC);
+        bytes.extend_from_slice(&(self.dimension as u32).to_le_bytes());
+        bytes.push(u8::from(self.metric == Metric::L2));
+        bytes.extend_from_slice(&(self.divided_at as u64).to_le_bytes());
+        bytes.extend_from_slice(&(self.lists.len() as u32).to_le_bytes());
+        for number in &self.centres {
+            bytes.extend_from_slice(&number.to_le_bytes());
+        }
+        bytes.extend_from_slice(&(self.place.len() as u64).to_le_bytes());
+        for (row, (list, _)) in &self.place {
+            bytes.extend_from_slice(&row.packed().to_le_bytes());
+            bytes.extend_from_slice(&list.to_le_bytes());
+        }
+        let checksum = crc32fast::hash(&bytes);
+        bytes.extend_from_slice(&checksum.to_le_bytes());
+        Some(bytes)
+    }
+
+    /// An index of `rows`, each with its vector, made with the help of a
+    /// hint kept from an earlier one: its centres are taken as they are,
+    /// and a row it names goes to the list it names. `None` when the hint
+    /// is damaged, is for another length or metric, or no longer suits
+    /// the rows: of a sample of the rows it names, too few are in the
+    /// list of their nearest centre.
+    pub(crate) fn from_hint(
+        dimension: usize,
+        metric: Metric,
+        hint: &[u8],
+        rows: &[(ObjRef, Vec<f32>)],
+    ) -> Option<Self> {
+        let (body, checksum) = hint.split_at_checked(hint.len().checked_sub(4)?)?;
+        if crc32fast::hash(body) != u32::from_le_bytes(checksum.try_into().ok()?) {
+            return None;
+        }
+        let mut at = 0usize;
+        let mut take = |length: usize| -> Option<&[u8]> {
+            let bytes = body.get(at..at.checked_add(length)?)?;
+            at += length;
+            Some(bytes)
+        };
+        if take(HINT_MAGIC.len())? != HINT_MAGIC {
+            return None;
+        }
+        let kept_dimension = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
+        let by_distance = take(1)?[0] == 1;
+        let divided_at = u64::from_le_bytes(take(8)?.try_into().ok()?) as usize;
+        let lists = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
+        if kept_dimension != dimension || by_distance != (metric == Metric::L2) || !(2..=MOST_LISTS).contains(&lists) {
+            return None;
+        }
+        let centres: Vec<f32> = take(lists.checked_mul(dimension)?.checked_mul(4)?)?
+            .chunks_exact(4)
+            .map(|number| f32::from_le_bytes(number.try_into().unwrap()))
+            .collect();
+        let named = u64::from_le_bytes(take(8)?.try_into().ok()?) as usize;
+        let mut hinted: HashMap<ObjRef, u32> = HashMap::with_capacity(named);
+        for pair in take(named.checked_mul(12)?)?.chunks_exact(12) {
+            hinted.insert(
+                ObjRef::new(u64::from_le_bytes(pair[..8].try_into().unwrap())),
+                u32::from_le_bytes(pair[8..].try_into().unwrap()),
+            );
+        }
+        let mut index = Self::new(dimension, metric)?;
+        index.centres = centres;
+        index.lists = vec![List::default(); lists];
+        index.divided_at = divided_at;
+        // Does the hint still suit these rows? Of a sample of the rows it
+        // names, most should be where their nearest centre is. A hint
+        // kept by another database at the same place, or from before the
+        // vectors were all rewritten, fails this.
+        let known: Vec<&(ObjRef, Vec<f32>)> =
+            rows.iter().filter(|(row, vector)| hinted.contains_key(row) && vector.len() == dimension).collect();
+        let step = (known.len() / HINT_SAMPLE).max(1);
+        let sampled: Vec<&&(ObjRef, Vec<f32>)> = known.iter().step_by(step).collect();
+        let suited = sampled
+            .iter()
+            .filter(|(row, vector)| index.list_of(&index.kept(vector)) as u32 == hinted[row])
+            .count();
+        if suited * 4 < sampled.len() * 3 {
+            return None;
+        }
+        for (row, vector) in rows {
+            index.put_in(*row, vector, hinted.get(row).copied());
+        }
+        Some(index)
+    }
+
     /// Whether the centres should be worked out again before the next
     /// search: there are now enough vectors to divide, or twice as many
     /// as when they last were.
@@ -204,6 +330,7 @@ impl VectorIndex {
     /// Work out the centres from the vectors held, and put each vector in
     /// the list of its nearest centre.
     pub(crate) fn divide(&mut self) {
+        DIVISIONS.with(|count| count.set(count.get() + 1));
         let dimension = self.dimension;
         let mut rows: Vec<ObjRef> = Vec::with_capacity(self.len());
         let mut vectors: Vec<f32> = Vec::with_capacity(self.len() * dimension);
@@ -593,6 +720,66 @@ mod tests {
             assert_eq!(searched.compared, 2_000);
         }
         assert!(index.nearest_among(std::iter::empty(), &vectors[0], 10).0.is_empty());
+    }
+
+    #[test]
+    fn a_kept_hint_gives_the_same_lists_back_without_working_them_out() {
+        // Three hundred more of the same clumps than the index is first
+        // made of: the rows written after the hint was kept.
+        let all = clumped(6_300, 24, 30, 11);
+        let vectors = &all[..6_000];
+        let rows: Vec<(ObjRef, Vec<f32>)> =
+            vectors.iter().enumerate().map(|(at, vector)| (row(at as u32 + 1), vector.clone())).collect();
+        let mut index = VectorIndex::new(24, Metric::Cosine).unwrap();
+        assert!(index.hint().is_none(), "one list is nothing to keep");
+        for (row, vector) in &rows {
+            index.put(*row, vector);
+        }
+        index.divide();
+        let hint = index.hint().unwrap();
+
+        // The same rows, with some gone and some new since the hint.
+        let mut later: Vec<(ObjRef, Vec<f32>)> = rows[500..].to_vec();
+        later.extend(all[6_000..].iter().enumerate().map(|(at, vector)| (row(at as u32 + 7_000), vector.clone())));
+        let again = VectorIndex::from_hint(24, Metric::Cosine, &hint, &later).expect("the hint suits these rows");
+        assert_eq!(again.len(), later.len());
+        assert!(!again.wants_dividing(), "the centres are taken as they are");
+        let mut right = 0;
+        for query in clumped(20, 24, 30, 99) {
+            let found: Vec<ObjRef> = again.search(&query, 10, true, None).0.into_iter().take(10).map(|(row, _)| row).collect();
+            assert_eq!(found, exact(&later, &query, Metric::Cosine, 10));
+            let (near, searched) = again.search(&query, 10, false, None);
+            assert!(searched.compared < later.len() / 4);
+            let near: Vec<ObjRef> = near.into_iter().take(10).map(|(row, _)| row).collect();
+            right += found.iter().filter(|row| near.contains(row)).count();
+        }
+        // Left to itself it finds about what an index divided afresh from
+        // the same rows finds.
+        let mut afresh = VectorIndex::new(24, Metric::Cosine).unwrap();
+        for (row, vector) in &later {
+            afresh.put(*row, vector);
+        }
+        afresh.divide();
+        let mut right_afresh = 0;
+        for query in clumped(20, 24, 30, 99) {
+            let truth = exact(&later, &query, Metric::Cosine, 10);
+            let near: Vec<ObjRef> = afresh.search(&query, 10, false, None).0.into_iter().take(10).map(|(row, _)| row).collect();
+            right_afresh += truth.iter().filter(|row| near.contains(row)).count();
+        }
+        assert!(right + 10 >= right_afresh, "from the hint {right} of 200, afresh {right_afresh}");
+        assert!(right >= 150, "from the hint {right} of 200");
+
+        // A hint is refused when it is damaged, is for another length or
+        // metric, or names rows whose vectors are no longer what they were.
+        let mut damaged = hint.clone();
+        damaged[40] ^= 1;
+        assert!(VectorIndex::from_hint(24, Metric::Cosine, &damaged, &later).is_none());
+        assert!(VectorIndex::from_hint(24, Metric::L2, &hint, &later).is_none());
+        assert!(VectorIndex::from_hint(16, Metric::Cosine, &hint, &later).is_none());
+        assert!(VectorIndex::from_hint(24, Metric::Cosine, &hint[..hint.len() / 2], &later).is_none());
+        let shuffled: Vec<(ObjRef, Vec<f32>)> =
+            rows.iter().enumerate().map(|(at, (row, _))| (*row, vectors[(at * 7 + 13) % vectors.len()].clone())).collect();
+        assert!(VectorIndex::from_hint(24, Metric::Cosine, &hint, &shuffled).is_none());
     }
 
     #[test]
