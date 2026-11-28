@@ -10,7 +10,7 @@ language is in `OQL_SPECIFICATION.md`.
 schema people { id: String, name: String, level: Integer, manager: Optional(Ref(people)) as reports }
 schema projects { id: String, name: String, owner: Ref(people) as owned }
 schema assignments { id: String, person: Ref(people), project: Ref(projects), role: String, hours: Integer }
-schema tasks { id: String, project: Ref(projects), state: String, tags: List(String), notes: List({ kind: String, mins: Integer }) }
+schema tasks { id: String, project: Ref(projects), state: String, tags: List(String), notes: List({ kind: String, mins: Integer }), about: Optional(Vector(3)) }
 schema links { id: String, blocker: Ref(tasks) as blocking, blocked: Ref(tasks) as blocked_by, kind: String }
 ```
 
@@ -187,6 +187,41 @@ tasks.where { .id == "t1" }.walk(.blocked_by.blocker, 2).select { id }
 `walk(path)` gives every row reached by following the path one or more
 times, each once, nearest first. A second argument limits the steps.
 
+## Vectors: find rows by what they are about
+
+A `Vector(n)` field holds `n` numbers, such as an embedding. A vector is
+written as a list of numbers. `nearest` gives the `k` rows whose vector is
+nearest the one asked about, nearest first, each with `._score`.
+
+```oql
+tasks.nearest { field: .about, query: [1.0, 0.0, 0.0], metric: "cosine", k: 2 }.select { id, score: ._score }
+
+tasks.where { .state == "open" }.nearest { field: .about, query: [1.0, 0.0, 0.0], k: 2 }.select { id }
+
+projects.select { name, near: .tasks.nearest { field: .about, query: [0.0, 1.0, 0.0], k: 1 }.select { id } }
+```
+
+- `metric` is `"cosine"` (the default: by direction), `"l2"` (by
+  straight-line distance) or `"dot"`. A higher `._score` is nearer.
+- A filter before `nearest` searches only the rows that pass it. After a
+  relationship, it searches only that row's related rows.
+- A row with no vector is never found.
+
+Vectors are also values, with functions of their own: `similarity(a, b)`
+(the cosine: 1 the same way, 0 unrelated), `distance(a, b)`, `dot(a, b)`,
+`norm(a)`, and `centroid(vectors)` for the mean of several. With no vector
+on one side they give `null`.
+
+```oql
+tasks.where { similarity(.about, [1.0, 0.0, 0.0]) > 0.9 }.select { id }
+
+tasks.sort { distance(.about, [0.0, 1.0, 0.0]) }.limit(2).select { id }
+
+projects.select { name, middle: centroid(.tasks.about) }
+
+tasks.group_by { .state }.select { state, near: where { similarity(.about, [1.0, 0.0, 0.0]) > 0.5 }.count() }
+```
+
 ## Writes
 
 ```oql
@@ -220,6 +255,7 @@ into it: `people.where { .level >= $level }.limit($n)`.
 | `IS NULL`, `LIKE 'A%'`, `BETWEEN` | `is null`, `like "A%"`, `between a and b` |
 | `LIMIT n OFFSET m` | `.offset(m).limit(n)` |
 | recursive CTE | `.walk(.relationship)` |
+| `ORDER BY embedding <=> $q LIMIT k` | `.nearest { field: .embedding, query: $q, k: k }` |
 
 ## Mistakes the database refuses
 

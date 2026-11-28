@@ -68,7 +68,7 @@ principles document, but everything else depends on it:
 | A closing `;` | `orders.count();` | Works: allowed after a statement, and ignored |
 | Identifier | `[A-Za-z_][A-Za-z0-9_]*` | Works |
 | Integer, float | `42`, `-7`, `3.14`, `-0.5` | Works |
-| A float with an exponent | `1.6e-5`, `2E3`, `1e+10` | Works. An `e` is an exponent only with a digit after it, or a sign and a digit, so `e5` is still a name. A number too large to hold is refused. |
+| A float with an exponent | `1.6e-5`, `2E3`, `1e+10` | Works. An `e` is an exponent only with a digit after it, or a sign and a digit, so `e5` is still a name. A number too large to hold is refused, and the refusal says so: `1e999 is too large a number to hold`. |
 | String with escapes | `"a \"b\" \n \u{1F989}"` | Works |
 | Boolean, null | `true`, `false`, `null` | Works |
 | Query parameter | `$name` | Works |
@@ -892,7 +892,7 @@ these have 3 and 2 numbers`.
 | `num_candidates: n` | Compare about `n` vectors: the nearest lists, until that many have been. More finds more and takes longer. |
 | The score | From the row's own vector, as a search that reads every row gives it, whichever way the row was found. Rows equally near are in order of id. |
 | Kept in step | A row written, changed or deleted moves one vector in the index, at the cost of comparing it with the centres. No search waits for anything to be rebuilt after a commit. The centres are worked out again each time the collection has doubled, by the first search after. |
-| Not stored | The index is built from the rows, in memory, by the first search that wants it after the database is opened, and takes about as much memory as the vectors themselves. |
+| Across a reopen | The vectors are not stored twice: the first search after a database is opened reads them from the rows. What is kept, in a file beside the database, is what was costly to work out: the centres, and which list each row was put in. It is written each time the index is divided, and it is a hint and no more. A row it does not name is given its list by comparing it with the centres. A file that is missing, damaged, for another length or metric, or kept for vectors that have since changed is not used, and the index is divided afresh. So a bad hint can cost time and can never change an answer. The index takes about as much memory as the vectors themselves. |
 | After a filter | `docs.where { .kind == "note" }.nearest { .. }`: when the filters compare plain fields with values, which rows pass is read off their columns and the index ranks exactly those rows. Every one of them is compared, so the answer is exact: the nearest of the rows that pass, never fewer because of rows the filter dropped. No row is read but the ones found. A filter of another kind (through a path, on the id, with a function) reads each row, as before. |
 | Through a relationship | `owners.select { near: .docs.nearest { .. }.select { id } }`: the store knows which rows refer to a row without reading them, and the index ranks exactly those, for each row in turn. Exact, as after a filter. Also `.docs.nearest { .. }.first()`, and as a capture in a block. |
 | Where it is not used | A search by the dot product or by a metric other than the index's, after a path step in a chain (`owners.where { .. }.docs.nearest { .. }`), and in a transaction that has written. Those compare every candidate, as below. |

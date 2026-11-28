@@ -41,7 +41,7 @@ pub use backup::{BackupFile, BackupInfo};
 pub use s3::{Request, Response, S3Config, S3Faults, S3ObjectStore, SimulatedS3, Transport};
 #[cfg(feature = "s3")]
 pub use s3::HttpTransport;
-pub use vector_index::Searched as VectorSearched;
+pub use vector_index::{divisions as vector_index_divisions, Searched as VectorSearched};
 pub(crate) use vector_index::VectorIndex;
 pub use store::{
     AutoCheckpointPolicy, IntegrityReport, MaintenanceStatus, ReclamationReport, RustStore,

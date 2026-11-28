@@ -603,6 +603,23 @@ fn what_twenty_thousand_vectors_cost() {
     }
     after_write.sort_by(f64::total_cmp);
     println!("  the same by distance, with no index: {:.1} ms", after_write[2]);
+
+    // Opened again: the lists are read back, and only the vectors are
+    // read from the rows.
+    let question = format!("docs.{}", near(&query, "cosine", ""));
+    store.checkpoint().unwrap();
+    drop(executor);
+    drop(store);
+    let store = Arc::new(RustStore::new(directory.path().join("db.owl"), 4 << 30).unwrap());
+    let executor = QueryExecutor::new_with_real_clock(store);
+    let divisions = owl_db::storage_engine::vector_index_divisions();
+    let started = Instant::now();
+    let found = executor.execute_query(&parse_oql(&question).unwrap()).unwrap().len();
+    println!(
+        "the first search after the database is opened again: {:.0} ms, {found} rows, the centres worked out {} times",
+        started.elapsed().as_secs_f64() * 1000.0,
+        owl_db::storage_engine::vector_index_divisions() - divisions
+    );
 }
 
 /// Six thousand vectors of sixteen numbers in sixty clumps: enough for an
@@ -1050,6 +1067,75 @@ fn a_number_may_be_written_with_an_exponent() {
     assert_eq!(one("2"), Value::Integer(2));
     assert_eq!(one("2.5"), Value::Float(2.5));
     assert_eq!(db.column("docs.limit(2).select { id }", "id").len(), 2);
-    // A number too large to hold is refused, not read as something else.
-    assert!(db.try_rows("docs.limit(1).select { v: 1e999 }").is_err());
+    // A number too large to hold is refused, and the refusal says so.
+    let large = db.error("docs.limit(1).select { v: 1e999 }");
+    assert!(large.contains("1e999 is too large a number to hold"), "{large}");
+    assert!(db.error("docs.limit(1)\n.select { v: 2.5E400 }").contains("line 2: 2.5E400 is too large"));
+}
+
+#[test]
+fn an_index_s_lists_are_kept_across_a_reopen_and_only_as_a_hint() {
+    use owl_db::executor::last_vector_index_search;
+    use owl_db::storage_engine::vector_index_divisions;
+    let db = clumps();
+    let query = written(&clump_vector(100_041));
+    let exact = format!(r#"nearest {{ field: .embedding, query: {query}, metric: "cosine", k: 10, exact: true }}.select {{ id }}"#);
+    // The index against a search that reads every row, and what it did.
+    let same = |db: &Db| {
+        last_vector_index_search();
+        let by_row = db.column(&format!(r#"docs.where {{ .id != "" }}.{exact}"#), "id");
+        let by_index = db.column(&format!("docs.{exact}"), "id");
+        assert_eq!(by_index, by_row);
+        last_vector_index_search().expect("answered from the index")
+    };
+    let kept = db.directory.path().join("db.owl.vectors.docs.embedding");
+
+    // The first search divides the index into lists and keeps them.
+    let before = vector_index_divisions();
+    let first = same(&db);
+    assert!(first.lists > 1);
+    assert_eq!(vector_index_divisions() - before, 1);
+    assert!(kept.exists(), "the lists are kept beside the database");
+
+    // Rows written since: some gone, some changed, some new.
+    db.rows(r#"docs.where { .id in ["d00001", "d00002", "d00003"] }.delete()"#);
+    db.rows(r#"docs.where { .id == "d00010" }.update { embedding: .embedding * -1 }"#);
+    db.executor.insert_documents("docs", (6000..6200).map(clump_row).collect()).unwrap();
+    same(&db);
+
+    // Opened again, the lists are read back, not worked out again, and
+    // the rows written since the lists were kept are all found.
+    let db = db.reopened();
+    let before = vector_index_divisions();
+    let again = same(&db);
+    assert_eq!(vector_index_divisions() - before, 0, "the centres were not worked out again");
+    assert_eq!(again.lists, first.lists);
+    assert_eq!(again.held, 6000 - 3 + 200);
+    // Left to itself it still compares a fraction.
+    db.rows(&format!(r#"docs.nearest {{ field: .embedding, query: {query}, metric: "cosine", k: 10 }}"#));
+    let did = last_vector_index_search().unwrap();
+    assert!(did.probed < did.lists && did.compared < did.held / 4);
+
+    // A damaged file is as if there were none: the index is made afresh,
+    // and answers the same.
+    let mut bytes = std::fs::read(&kept).unwrap();
+    let middle = bytes.len() / 2;
+    bytes[middle] ^= 0xFF;
+    std::fs::write(&kept, &bytes).unwrap();
+    let db = db.reopened();
+    let before = vector_index_divisions();
+    same(&db);
+    assert_eq!(vector_index_divisions() - before, 1, "worked out afresh");
+
+    // So is a missing one, and one kept for vectors that have all changed.
+    std::fs::remove_file(&kept).unwrap();
+    let db = db.reopened();
+    let before = vector_index_divisions();
+    same(&db);
+    assert_eq!(vector_index_divisions() - before, 1);
+    db.rows("docs.update { embedding: [.embedding[15], .embedding[14], .embedding[13], .embedding[12], .embedding[11], .embedding[10], .embedding[9], .embedding[8], .embedding[7], .embedding[6], .embedding[5], .embedding[4], .embedding[3], .embedding[2], .embedding[1], .embedding[0]] }");
+    let db = db.reopened();
+    let before = vector_index_divisions();
+    same(&db);
+    assert_eq!(vector_index_divisions() - before, 1, "the kept lists no longer suit the rows");
 }

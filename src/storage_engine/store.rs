@@ -9175,6 +9175,7 @@ fn current_vector_index(
     field: &str,
     query_len: usize,
     metric: crate::vector::Metric,
+    kept: &KeptHints<'_>,
 ) -> OQLResult<Option<Arc<crate::storage_engine::VectorIndex>>> {
     use crate::storage::{VectorIndexState, VectorMetricType};
     use crate::vector::Metric;
@@ -9221,13 +9222,17 @@ fn current_vector_index(
     // Another search may have built or divided it meanwhile.
     let mut index = match built.get(&key).filter(|index| good(index)).cloned() {
         Some(index) => index,
-        None => match build_vector_index(state, schema, field, dimension, metric, stamps)? {
+        None => match build_vector_index(state, schema, field, dimension, metric, stamps, kept)? {
             Some(index) => Arc::new(index),
             None => return Ok(None),
         },
     };
     if index.wants_dividing() {
-        Arc::make_mut(&mut index).divide();
+        let divided = Arc::make_mut(&mut index);
+        divided.divide();
+        // What was just worked out is kept for the next time the
+        // database is opened.
+        kept.keep(schema, field, divided);
     }
     built.insert(key, index.clone());
     Ok(Some(index))
@@ -9308,21 +9313,101 @@ fn build_vector_index(
     dimension: usize,
     metric: crate::vector::Metric,
     stamps: (u64, u64),
+    kept: &KeptHints<'_>,
 ) -> OQLResult<Option<crate::storage_engine::VectorIndex>> {
-    let Some(mut index) = crate::storage_engine::VectorIndex::new(dimension, metric) else {
+    use crate::storage_engine::VectorIndex;
+    let Some(mut index) = VectorIndex::new(dimension, metric) else {
         return Ok(None);
     };
     let wanted: HashSet<String> = HashSet::from([field.to_string()]);
+    let mut rows: Vec<(ObjRef, Vec<f32>)> = Vec::new();
     for object_ref in logical_collection_object_refs(state, schema)? {
         let Some(document) = sourced_document_reading(state, object_ref, Some(&wanted))? else {
             continue;
         };
         if let Some(vector) = document.fields.get(field).and_then(Value::as_vector) {
-            index.put(object_ref, &vector);
+            rows.push((object_ref, vector.into_owned()));
+        }
+    }
+    // With the lists an earlier index kept, when they still suit these
+    // rows; otherwise in one list, to be divided if there are enough.
+    let hinted = kept
+        .read(schema, field)
+        .and_then(|hint| VectorIndex::from_hint(dimension, metric, &hint, &rows));
+    match hinted {
+        Some(from_hint) => index = from_hint,
+        None => {
+            for (object_ref, vector) in &rows {
+                index.put(*object_ref, vector);
+            }
         }
     }
     index.stamps = stamps;
     Ok(Some(index))
+}
+
+/// Where the lists of vector indexes are kept beside a database, so that
+/// one opened again need not work them out again. Each is a hint: see
+/// [`crate::storage_engine::VectorIndex::hint`]. A file that cannot be
+/// read or written is as if there were none.
+struct KeptHints<'a> {
+    filesystem: &'a dyn FileSystem,
+    database: &'a Path,
+    /// A copy that takes no writes keeps nothing new.
+    read_only: bool,
+}
+
+impl KeptHints<'_> {
+    fn path(&self, schema: &str, field: &str) -> PathBuf {
+        sidecar_path(self.database, &format!("vectors.{schema}.{field}"))
+    }
+
+    fn read(&self, schema: &str, field: &str) -> Option<Vec<u8>> {
+        let path = self.path(schema, field);
+        if !self.filesystem.exists(&path) {
+            return None;
+        }
+        let length = usize::try_from(self.filesystem.file_size(&path).ok()?).ok()?;
+        let file = self.filesystem.open(&path).ok()?;
+        let mut bytes = vec![0u8; length];
+        let mut read = 0;
+        while read < length {
+            match file.read_at(&mut bytes[read..], read as u64).ok()? {
+                0 => return None,
+                more => read += more,
+            }
+        }
+        Some(bytes)
+    }
+
+    fn keep(&self, schema: &str, field: &str, index: &crate::storage_engine::VectorIndex) {
+        if self.read_only {
+            return;
+        }
+        let Some(bytes) = index.hint() else {
+            return;
+        };
+        let path = self.path(schema, field);
+        let being_written = PathBuf::from(format!("{}.new", path.display()));
+        // Written whole beside it and then moved into place, so that a
+        // crash part way leaves the old one or none, never half of one.
+        let written = (|| -> std::io::Result<()> {
+            let mut file = self.filesystem.create(&being_written)?;
+            let mut at = 0;
+            while at < bytes.len() {
+                match file.write(&bytes[at..])? {
+                    0 => return Err(std::io::Error::new(ErrorKind::WriteZero, "nothing written")),
+                    more => at += more,
+                }
+            }
+            file.sync()?;
+            drop(file);
+            self.filesystem.rename(&being_written, &path)
+        })();
+        if written.is_err() {
+            let _ = self.filesystem.remove(&being_written);
+        }
+    }
 }
 
 fn logical_collection_object_refs(state: &State, schema: &str) -> OQLResult<Vec<ObjRef>> {
@@ -13222,7 +13307,12 @@ impl DocumentStore for RustStore {
             .state
             .read()
             .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
-        let Some(index) = current_vector_index(&state, schema, field, query.len(), metric)? else {
+        let kept = KeptHints {
+            filesystem: self.filesystem.as_ref(),
+            database: &self.wal_path,
+            read_only: self.read_only.load(Ordering::Acquire),
+        };
+        let Some(index) = current_vector_index(&state, schema, field, query.len(), metric, &kept)? else {
             return Ok(None);
         };
         let (found, searched) = index.search(query, k, exact, compare);
@@ -13246,7 +13336,12 @@ impl DocumentStore for RustStore {
             .state
             .read()
             .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
-        let Some(index) = current_vector_index(&state, schema, field, query.len(), metric)? else {
+        let kept = KeptHints {
+            filesystem: self.filesystem.as_ref(),
+            database: &self.wal_path,
+            read_only: self.read_only.load(Ordering::Acquire),
+        };
+        let Some(index) = current_vector_index(&state, schema, field, query.len(), metric, &kept)? else {
             return Ok(None);
         };
         let chosen: Vec<ObjRef> = match among {
