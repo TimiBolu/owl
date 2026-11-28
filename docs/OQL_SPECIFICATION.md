@@ -874,7 +874,7 @@ these have 3 and 2 numbers`.
 |---|---|
 | `.nearest { field: .embedding, query: [...], metric: "cosine" \| "l2" \| "dot", k: n }` | Works. The rows come nearest first, and rows that score the same keep the order they were in. |
 | `._score` in the following `select` | Works: the similarity for `cosine`, the dot product for `dot`, and the negated square of the distance for `l2`, so that higher is nearer in every one. |
-| The same rows by sorting | `docs.sort { similarity(.embedding, $q) desc }.limit(k)` gives the rows `nearest` gives. |
+| The same rows by sorting | `docs.sort { similarity(.embedding, $q) desc }.limit(k)` gives the rows `nearest` gives, and is answered as a search, exactly: so are `distance(..)` ascending and `dot(..)` descending, with or without `.id` as the key after, and after filters. The rows come as they are, with no `_score`. When fewer than `k` rows have a vector the sort goes on to the rows with none, which a search does not give, and is then sorted as any sort is. |
 | After a filter | Works: the nearest of the rows that passed it, never fewer than `k` because of rows the filter dropped. |
 | Through a relationship, for each row | Works: `owners.select { near: .docs.nearest { .. }.select { id } }` |
 | After a path step, and as a capture in a block | Works: `owners.where { .. }.docs.nearest { .. }`, `owners { d in .docs.nearest { .. }  select { .. } }` |
@@ -882,7 +882,7 @@ these have 3 and 2 numbers`.
 | The query vector computed | Works: `query: centroid(owners.docs.embedding)` |
 | The query vector's length differs from the field's | An error |
 | A field declared `Optional(Vector(n))` | Works, searched and indexed. It was refused. Rows with no vector are not candidates. |
-| `k` as a `$parameter` or an expression | Not yet: `k` is a whole number written in the query. |
+| `k` as a `$parameter` or an expression | Works: `k: $k`, `k: $page * 10`. It must come to a whole number above zero. |
 | An index | `index(.embedding, metric: "cosine")` or `"l2"`, on a `Vector(n)` or `Optional(Vector(n))` field. A search of the whole collection by that metric is answered from it. |
 | What an index does | It keeps the field's vectors in lists, each around a centre, and a search compares the query with the centres and then with the vectors of the nearest lists only. Vectors that are alike are in the same few lists, so the nearest are found among a fraction of all. Under 4,096 vectors there is one list, and the search is exact. |
 | Approximate by default | With lists, a search compares the nearest lists until it has compared an eighth of the vectors, and at least a hundred for each row asked for. A near vector in a list not reached is missed. How much is found depends on the data: nearly all when vectors fall in clumps, as embeddings of text do, and less when they have no structure at all. |
@@ -891,7 +891,9 @@ these have 3 and 2 numbers`.
 | The score | From the row's own vector, as a search that reads every row gives it, whichever way the row was found. Rows equally near are in order of id. |
 | Kept in step | A row written, changed or deleted moves one vector in the index, at the cost of comparing it with the centres. No search waits for anything to be rebuilt after a commit. The centres are worked out again each time the collection has doubled, by the first search after. |
 | Not stored | The index is built from the rows, in memory, by the first search that wants it after the database is opened, and takes about as much memory as the vectors themselves. |
-| Where it is not used | A search by the dot product, by a metric other than the index's, after a filter, through a relationship, or in a transaction that has written. Those compare every candidate, as below. |
+| After a filter | `docs.where { .kind == "note" }.nearest { .. }`: when the filters compare plain fields with values, which rows pass is read off their columns and the index ranks exactly those rows. Every one of them is compared, so the answer is exact: the nearest of the rows that pass, never fewer because of rows the filter dropped. No row is read but the ones found. A filter of another kind (through a path, on the id, with a function) reads each row, as before. |
+| Through a relationship | `owners.select { near: .docs.nearest { .. }.select { id } }`: the store knows which rows refer to a row without reading them, and the index ranks exactly those, for each row in turn. Exact, as after a filter. Also `.docs.nearest { .. }.first()`, and as a capture in a block. |
+| Where it is not used | A search by the dot product or by a metric other than the index's, after a path step in a chain (`owners.where { .. }.docs.nearest { .. }`), and in a transaction that has written. Those compare every candidate, as below. |
 | A search of a whole collection with no index for it | Compares the vectors where the store keeps them packed, one after another, and reads only the rows it finds. The packed vectors are made on the collection's second search and kept until its next commit, up to what the store may keep in memory (256 MB by default, about 170,000 vectors of 384 numbers); past that they are made for each search. The first search after a commit makes them again. A search after a filter, through a relationship, or inside a transaction that has written reads each row, as before. The answers are the same either way, in the same order. |
 
 A row written before vectors were packed holds its vector as a list. Search,

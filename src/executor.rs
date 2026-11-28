@@ -1050,9 +1050,13 @@ impl<S: DocumentStore> QueryExecutor<S> {
         // For non-INSERT operations, start by scanning the collection
         if !is_insert_only {
             let scanned_docs =
-                if let Some(rows) = self.nearest_from_column(query)? {
-                    // The search is done: only the rows it found were read.
-                    filters_applied = 1;
+                if let Some((rows, applied)) = self.nearest_from_column(query)? {
+                    // The filters and the search are done: only the rows
+                    // found were read.
+                    filters_applied = applied;
+                    rows
+                } else if let Some((rows, applied)) = self.sort_as_search(query)? {
+                    filters_applied = applied;
                     rows
                 } else if let Some((rows, applied)) = self.first_rows_by_id(query)? {
                     filters_applied = applied;
@@ -6103,18 +6107,130 @@ impl<S: DocumentStore> QueryExecutor<S> {
     /// packed, one after another, and only the rows found are read.
     /// `None` when the store has no such column to give, and for anything
     /// the row-by-row search would refuse, so that it is the one to say so.
-    fn nearest_from_column(&self, query: &OQLQuery) -> OQLResult<Option<Vec<Document>>> {
-        let Some(Operation::Nearest(block)) = query.operations.first() else {
+    fn nearest_from_column(&self, query: &OQLQuery) -> OQLResult<Option<(Vec<Document>, usize)>> {
+        // Filters first, then the search: the nearest of the rows that
+        // pass them.
+        let filters = query
+            .operations
+            .iter()
+            .take_while(|operation| matches!(operation, Operation::Where(_)))
+            .count();
+        let Some(Operation::Nearest(block)) = query.operations.get(filters) else {
             return Ok(None);
         };
+        if filters > 0 {
+            return self.nearest_of_filtered(query, filters, block);
+        }
+        Ok(self.nearest_of_all(query, block)?.map(|rows| (rows, 1)))
+    }
+
+    /// `sort { similarity(.embedding, q) desc }.limit(k)` is a search for
+    /// the `k` nearest, and is answered as one: exactly, since a sort is,
+    /// and without reading the rows that are not among them. So are a sort
+    /// by `distance(..)` ascending and by `dot(..)` descending, with or
+    /// without the row's id as the key after.
+    ///
+    /// `None` when it is not of this shape, when there is nothing to
+    /// answer it from, and when fewer than `k` rows have a vector: the
+    /// sort would then go on to rows with none, which a search never
+    /// gives.
+    fn sort_as_search(&self, query: &OQLQuery) -> OQLResult<Option<(Vec<Document>, usize)>> {
+        let filters = query
+            .operations
+            .iter()
+            .take_while(|operation| matches!(operation, Operation::Where(_)))
+            .count();
+        let (Some(Operation::Sort(sort)), Some(Operation::Limit(k))) =
+            (query.operations.get(filters), query.operations.get(filters + 1))
+        else {
+            return Ok(None);
+        };
+        let by_id = |field: &crate::parser::SortField| {
+            matches!(&field.expression, Expression::FieldAccess(access) if access.path == ["id"])
+                && matches!(field.direction, crate::parser::SortDirection::Asc)
+        };
+        let key = match sort.fields.as_slice() {
+            [key] => key,
+            [key, then] if by_id(then) => key,
+            _ => return Ok(None),
+        };
+        let Expression::FunctionCall { name, args } = &key.expression else {
+            return Ok(None);
+        };
+        use crate::parser::SortDirection::{Asc, Desc};
+        let metric = match (name.as_str(), &key.direction) {
+            ("similarity", Desc) => VectorMetric::Cosine,
+            ("dot", Desc) => VectorMetric::Dot,
+            ("distance", Asc) => VectorMetric::L2,
+            _ => return Ok(None),
+        };
+        let (field, other) = match args.as_slice() {
+            [Expression::FieldAccess(field), other] | [other, Expression::FieldAccess(field)]
+                if field.path.len() == 1 =>
+            {
+                (field, other)
+            }
+            _ => return Ok(None),
+        };
+        // The other vector must be one vector for every row: nothing in it
+        // may read the row being sorted.
+        let reads_a_row = serde_json::to_string(other).map_or(true, |text| {
+            ["FieldAccess", "ChainedAccess", "Identifier", "QueryExpression", "CollectionExpression"]
+                .iter()
+                .any(|reading| text.contains(reading))
+        });
+        if reads_a_row || *k == 0 {
+            return Ok(None);
+        }
+        let mut operations = query.operations[..filters].to_vec();
+        operations.push(Operation::Nearest(NearestBlock {
+            field: field.clone(),
+            query: other.clone(),
+            metric,
+            k: *k,
+            num_candidates: None,
+            // A sort is exact.
+            exact: Some(true),
+            k_expression: None,
+        }));
+        let searched = OQLQuery { collection: query.collection.clone(), operations };
+        let Some((mut rows, _)) = self.nearest_from_column(&searched)? else {
+            return Ok(None);
+        };
+        if rows.len() < *k as usize {
+            return Ok(None);
+        }
+        // A sort gives rows as they are; the score is a search's to give.
+        for row in &mut rows {
+            row.fields.remove("_score");
+        }
+        Ok(Some((rows, filters + 2)))
+    }
+
+    /// A row found by a search, as the search gives it: with its score.
+    fn found_row(row: &Document, score: f32) -> Document {
+        let mut document = row.clone();
+        document
+            .fields
+            .insert("_score".to_string(), Value::Float(f64::from(score)));
+        document
+    }
+
+    /// What a search of a collection's own rows needs before it can ask
+    /// the store: the field's name, the query vector, and the metric.
+    /// `None` for anything the row-by-row search would refuse or answer
+    /// with nothing, so that it is the one to say so.
+    fn search_asked(
+        &self,
+        collection: &str,
+        block: &NearestBlock,
+    ) -> OQLResult<Option<(String, Vec<f32>, crate::vector::Metric, usize)>> {
         let [field] = block.field.path.as_slice() else {
             return Ok(None);
         };
-        if block.k == 0 {
-            return Ok(None);
-        }
+        let k = self.rows_asked_for(block)?;
         let declared = self
-            .schema_of(&query.collection)?
+            .schema_of(collection)?
             .and_then(|schema| schema.fields.get(field).and_then(FieldType::vector_dimension));
         let Some(declared) = declared else {
             return Ok(None);
@@ -6128,13 +6244,173 @@ impl<S: DocumentStore> QueryExecutor<S> {
             VectorMetric::L2 => crate::vector::Metric::L2,
             VectorMetric::Dot => crate::vector::Metric::Dot,
         };
+        Ok(Some((field.clone(), wanted, metric, k)))
+    }
+
+    /// How many rows a search is to find: the number written, or what its
+    /// `$parameter` or expression comes to.
+    fn rows_asked_for(&self, block: &NearestBlock) -> OQLResult<usize> {
+        let Some(computed) = &block.k_expression else {
+            return Ok(block.k as usize);
+        };
+        let nothing = Document::new("__nearest_k__".to_string(), crate::document::Fields::default());
+        match self.evaluate_expression(&nothing, computed)? {
+            Value::Integer(k) if k > 0 => Ok(k as usize),
+            other => Err(OQLError::FunctionError {
+                message: format!(
+                    "nearest.k is how many rows to find, a whole number above zero, and it was given {}",
+                    other.to_string_repr()
+                ),
+            }),
+        }
+    }
+
+    /// `collection.where { .. }.nearest { .. }`: the nearest of the rows
+    /// that pass the filters. When the filters compare plain fields with
+    /// values, which rows pass is read off their columns, and the field's
+    /// index ranks exactly those: no row is read but the ones found.
+    fn nearest_of_filtered(
+        &self,
+        query: &OQLQuery,
+        filters: usize,
+        block: &NearestBlock,
+    ) -> OQLResult<Option<(Vec<Document>, usize)>> {
+        let Some((field, wanted, metric, k)) = self.search_asked(&query.collection, block)? else {
+            return Ok(None);
+        };
+        // Each part: which field is asked of, the comparison, the value.
+        let mut pending: Vec<&Condition> = Vec::new();
+        for operation in query.operations[..filters].iter().rev() {
+            if let Operation::Where(block) = operation {
+                pending.push(&block.condition);
+            }
+        }
+        let mut names: Vec<String> = Vec::new();
+        let mut parts: Vec<(usize, &ComparisonOperator, Value)> = Vec::new();
+        while let Some(next) = pending.pop() {
+            match next {
+                Condition::And(left, right) => {
+                    pending.push(right);
+                    pending.push(left);
+                }
+                Condition::Comparison {
+                    left: Expression::FieldAccess(access),
+                    operator,
+                    right: Expression::Literal(literal),
+                } => {
+                    let [name] = access.path.as_slice() else {
+                        return Ok(None);
+                    };
+                    if DocumentSystemField::from_name(name).is_some() {
+                        return Ok(None);
+                    }
+                    let at = match names.iter().position(|known| known == name) {
+                        Some(at) => at,
+                        None => {
+                            names.push(name.clone());
+                            names.len() - 1
+                        }
+                    };
+                    parts.push((at, operator, self.literal_to_value(literal)));
+                }
+                _ => return Ok(None),
+            }
+        }
+        let Some(batches) = self.store.scan_columns(&query.collection, &names)? else {
+            return Ok(None);
+        };
+        let [batch] = batches.as_slice() else {
+            return Ok(None);
+        };
+        let mut chosen: Vec<u32> = Vec::new();
+        let mut whole = true;
+        for (at, operator, value) in &parts {
+            if !Self::narrow_by_column(batch.column(*at), operator, value, batch.rows(), whole, &mut chosen) {
+                return Ok(None);
+            }
+            whole = false;
+            if chosen.is_empty() {
+                break;
+            }
+        }
+        let among = crate::storage::VectorCandidates::Positions { stamp: batch.stamp(), positions: &chosen };
+        let Some((rows, searched)) = self.store.search_vector_index_among(
+            &query.collection,
+            &field,
+            &wanted,
+            metric,
+            k,
+            among,
+        )?
+        else {
+            return Ok(None);
+        };
+        VECTOR_INDEX_SEARCHES.with(|last| last.set(Some(searched)));
+        Ok(Some((
+            rows.iter().map(|(row, score)| Self::found_row(row, *score)).collect(),
+            filters + 1,
+        )))
+    }
+
+    /// `.documents.nearest { .. }` on a row: the nearest of the rows that
+    /// refer to it. The store knows which rows those are without reading
+    /// them, and the field's index ranks exactly those. `None` when it is
+    /// not of this shape or there is no index to ask.
+    fn related_nearest(
+        &self,
+        scope_document: &Document,
+        path: &[String],
+        operations: &[Operation],
+        collection_scope: &str,
+    ) -> OQLResult<Option<Value>> {
+        let ([relationship], Some(Operation::Nearest(block))) = (path, operations.first()) else {
+            return Ok(None);
+        };
+        if scope_document.id.is_empty() || scope_document.fields.contains_key(relationship) {
+            return Ok(None);
+        }
+        let ReverseRelationship::Declared { source, field: through } =
+            self.reverse_relationship(&scope_document.schema, relationship)?
+        else {
+            return Ok(None);
+        };
+        let Some((field, wanted, metric, k)) = self.search_asked(&source, block)? else {
+            return Ok(None);
+        };
+        let among = crate::storage::VectorCandidates::Referring {
+            target_schema: &scope_document.schema,
+            target_id: &scope_document.id,
+            field: through.as_deref(),
+        };
+        let Some((rows, searched)) =
+            self.store
+                .search_vector_index_among(&source, &field, &wanted, metric, k, among)?
+        else {
+            return Ok(None);
+        };
+        VECTOR_INDEX_SEARCHES.with(|last| last.set(Some(searched)));
+        let documents: Vec<Document> = rows.iter().map(|(row, score)| Self::found_row(row, *score)).collect();
+        let single = operations.iter().any(|operation| matches!(operation, Operation::First));
+        let documents =
+            self.collection_operation_rows(documents, &operations[1..], scope_document, collection_scope)?;
+        Self::shape_collection_rows(documents, single, operations).map(Some)
+    }
+
+    /// `collection.nearest { .. }` over a whole collection: from the
+    /// field's index when it has one, and otherwise by comparing every
+    /// vector where the store keeps them packed.
+    fn nearest_of_all(&self, query: &OQLQuery, block: &NearestBlock) -> OQLResult<Option<Vec<Document>>> {
+        let Some((field, wanted, metric, k)) = self.search_asked(&query.collection, block)? else {
+            return Ok(None);
+        };
+        let field = &field;
         // An index declared for the field, when the store keeps one.
         if let Some((rows, searched)) = self.store.search_vector_index(
             &query.collection,
             field,
             &wanted,
             metric,
-            block.k as usize,
+            k,
             block.exact.unwrap_or(false),
             block.num_candidates.map(|compare| compare as usize),
         )? {
@@ -6162,7 +6438,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
             return Ok(None);
         }
         // A row with no vector is not a candidate.
-        let hits = crate::vector::nearest_among(values, &wanted, metric, block.k as usize, |row| {
+        let hits = crate::vector::nearest_among(values, &wanted, metric, k, |row| {
             column.has_value(row)
         });
         let positions: Vec<u32> = hits.iter().map(|(row, _)| *row as u32).collect();
@@ -6267,7 +6543,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
         // Exact: every candidate is compared. `exact` and `num_candidates`
         // are accepted and change nothing until there is an index to
         // approximate with.
-        let hits = crate::vector::nearest(&packed, &query_vector, metric, nearest_block.k as usize);
+        let hits = crate::vector::nearest(&packed, &query_vector, metric, self.rows_asked_for(nearest_block)?);
         let mut documents: Vec<Option<Document>> = documents.into_iter().map(Some).collect();
         let mut output = Vec::with_capacity(hits.len());
         for (position, score) in hits {
@@ -7359,6 +7635,11 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 return Ok(answer);
             }
             if let Some(answer) = self.related_directly(scope_document, &field.path, operations)? {
+                return Ok(answer);
+            }
+            if let Some(answer) =
+                self.related_nearest(scope_document, &field.path, operations, &collection_scope)?
+            {
                 return Ok(answer);
             }
         }
@@ -8750,6 +9031,11 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 k: block.k,
                 num_candidates: block.num_candidates,
                 exact: block.exact,
+                k_expression: block
+                    .k_expression
+                    .as_ref()
+                    .map(|k| self.materialize_expression_with_scope(k, scope_document))
+                    .transpose()?,
             }),
             Operation::Combine { how, other } => Operation::Combine {
                 how: how.clone(),

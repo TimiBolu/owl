@@ -355,15 +355,54 @@ impl VectorIndex {
                     .map(|(row, vector)| (*row, self.nearness(&query, vector))),
             );
         }
+        (Self::nearest_of(found, k), searched)
+    }
+
+    /// The `k` nearest of `found`, nearest first, with whatever is as near
+    /// as the last of them, give or take what rounding can account for.
+    /// The index compares vectors as it keeps them, and the caller scores
+    /// the rows it is given from their own vectors, which can differ in
+    /// the last place: a row that close to the last is the caller's to
+    /// put in or leave out.
+    fn nearest_of(mut found: Vec<(ObjRef, f32)>, k: usize) -> Vec<(ObjRef, f32)> {
         let nearer = |a: &(ObjRef, f32), b: &(ObjRef, f32)| b.1.total_cmp(&a.1);
         if found.len() > k {
             found.select_nth_unstable_by(k - 1, nearer);
             let last = found[k - 1].1;
-            // Keep what is as near as the last of the k.
-            found.retain(|(_, nearness)| *nearness >= last);
+            let within = last - last.abs().max(1.0) * 1e-5;
+            found.retain(|(_, nearness)| *nearness >= within);
         }
         found.sort_by(nearer);
-        (found, searched)
+        found
+    }
+
+    /// The `k` nearest `query` of `rows` only, every one of them compared:
+    /// for a search confined to rows chosen some other way, by a filter or
+    /// by a relationship. A row the index does not hold has no vector and
+    /// is passed over. As [`Self::search`] gives them, with how many were
+    /// compared.
+    pub(crate) fn nearest_among(
+        &self,
+        rows: impl Iterator<Item = ObjRef>,
+        query: &[f32],
+        k: usize,
+    ) -> (Vec<(ObjRef, f32)>, Searched) {
+        let mut searched = Searched { lists: self.lists.len(), held: self.len(), ..Searched::default() };
+        if query.len() != self.dimension || k == 0 {
+            return (Vec::new(), searched);
+        }
+        let dimension = self.dimension;
+        let query = self.kept(query);
+        let found: Vec<(ObjRef, f32)> = rows
+            .filter_map(|row| {
+                let (list, at) = *self.place.get(&row)?;
+                let at = at as usize;
+                let vector = &self.lists[list as usize].vectors[at * dimension..(at + 1) * dimension];
+                Some((row, self.nearness(&query, vector)))
+            })
+            .collect();
+        searched.compared = found.len();
+        (Self::nearest_of(found, k), searched)
     }
 }
 
@@ -532,6 +571,28 @@ mod tests {
                 index.search(&query, 5, true, None).0.into_iter().take(5).map(|(row, _)| row).collect();
             assert_eq!(found, exact(&held, &query, Metric::Cosine, 5));
         }
+    }
+
+    #[test]
+    fn confined_to_some_rows_it_finds_the_nearest_of_those() {
+        let vectors = clumped(6_000, 24, 30, 11);
+        let mut index = VectorIndex::new(24, Metric::Cosine).unwrap();
+        for (at, vector) in vectors.iter().enumerate() {
+            index.put(row(at as u32 + 1), vector);
+        }
+        index.divide();
+        // Every third row, and some rows the index has never heard of.
+        let chosen: Vec<ObjRef> = (1..=6_000u32).filter(|number| number % 3 == 0).map(row).collect();
+        let held: Vec<(ObjRef, Vec<f32>)> =
+            chosen.iter().map(|row| (*row, vectors[row.object_id() as usize - 1].clone())).collect();
+        for query in clumped(20, 24, 30, 99) {
+            let asked = chosen.iter().copied().chain([row(900_000), row(900_001)]);
+            let (found, searched) = index.nearest_among(asked, &query, 10);
+            let found: Vec<ObjRef> = found.into_iter().take(10).map(|(row, _)| row).collect();
+            assert_eq!(found, exact(&held, &query, Metric::Cosine, 10));
+            assert_eq!(searched.compared, 2_000);
+        }
+        assert!(index.nearest_among(std::iter::empty(), &vectors[0], 10).0.is_empty());
     }
 
     #[test]

@@ -325,6 +325,21 @@ impl<'a> Column<'a> {
     }
 }
 
+/// The rows a search is confined to.
+#[derive(Clone, Copy, Debug)]
+pub enum VectorCandidates<'a> {
+    /// The rows at these positions of the columns stamped `stamp`: what a
+    /// filter judged from columns chose.
+    Positions { stamp: u64, positions: &'a [u32] },
+    /// The rows of the collection searched that refer to this row, through
+    /// `field` when one is named and through any field otherwise.
+    Referring {
+        target_schema: &'a str,
+        target_id: &'a str,
+        field: Option<&'a str>,
+    },
+}
+
 static STATEMENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Told by the executor that a statement is starting. A store that builds
@@ -827,6 +842,21 @@ pub trait DocumentStore: Send + Sync + 'static {
         _k: usize,
         _exact: bool,
         _compare: Option<usize>,
+    ) -> OQLResult<Option<(Vec<(Arc<Document>, f32)>, crate::storage_engine::VectorSearched)>> {
+        Ok(None)
+    }
+    /// [`Self::search_vector_index`], confined to rows chosen some other
+    /// way. Every one of those rows that has a vector is compared, so the
+    /// answer is exact: the `k` nearest of them. `None` as there, and when
+    /// the rows chosen are no longer what they were chosen from.
+    fn search_vector_index_among(
+        &self,
+        _schema: &str,
+        _field: &str,
+        _query: &[f32],
+        _metric: crate::vector::Metric,
+        _k: usize,
+        _among: VectorCandidates<'_>,
     ) -> OQLResult<Option<(Vec<(Arc<Document>, f32)>, crate::storage_engine::VectorSearched)>> {
         Ok(None)
     }
