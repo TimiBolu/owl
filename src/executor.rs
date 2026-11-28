@@ -22,7 +22,6 @@ use crate::schema::SchemaRegistry;
 use crate::schema::{CheckOperator, FieldType, Schema, SchemaConstraint};
 use crate::simulation::Clock;
 use crate::storage::{DocumentStore, ProjectedRowRef, ProjectedValueRef, ScanPredicate};
-use crate::storage::{VectorIndexState, VectorIndexType, VectorMetricType};
 use crate::streaming::{
     PaginatedResult, QueryStream, StreamConfig, StreamCursor, StreamingExecutor,
 };
@@ -179,6 +178,14 @@ impl<S: DocumentStore> QueryExecutor<S> {
             Some(reason) => OQLError::Generic {
                 message: format!(
                     "Function '{name}' is stored in this database but cannot be used: {reason}. Define it again."
+                ),
+            },
+            // A function of values, written where only a function of rows
+            // can stand: at the end of a chain.
+            None if self.functions.get_function(name).is_some() => OQLError::Generic {
+                message: format!(
+                    "{name}() is given its values in brackets and cannot end a chain: write {name}(..), \
+                     as in {name}(.field) or {name}(collection.field)"
                 ),
             },
             None => {
@@ -6113,16 +6120,16 @@ impl<S: DocumentStore> QueryExecutor<S> {
         if let Some(schema_name) = documents.first().map(|d| d.schema.clone()) {
             if let Ok(Some(schema)) = self.store.get_schema(&schema_name) {
                 if let Some(field_type) = schema.get_field_type(field_name) {
-                    match field_type {
-                        crate::schema::FieldType::Vector { dim } => {
-                            if query_vector.len() != *dim as usize {
+                    match (field_type.vector_dimension(), field_type) {
+                        (Some(dim), _) => {
+                            if query_vector.len() != dim as usize {
                                 return Err(OQLError::TypeError {
                                     expected: format!("Vector({})", dim),
                                     actual: format!("Vector({})", query_vector.len()),
                                 });
                             }
                         }
-                        other => {
+                        (None, other) => {
                             return Err(OQLError::TypeError {
                                 expected: "Vector".to_string(),
                                 actual: other.type_name().to_string(),
@@ -6133,279 +6140,64 @@ impl<S: DocumentStore> QueryExecutor<S> {
             }
         }
 
-        let mut full_vectors: Vec<Vec<f32>> = Vec::new();
-        let mut row_to_doc_idx: Vec<usize> = Vec::new();
-        full_vectors.reserve(documents.len());
-        row_to_doc_idx.reserve(documents.len());
-
-        for (doc_idx, document) in documents.iter().enumerate() {
-            let value = self.get_field_value(document, &nearest_block.field)?;
-            if let Some(vector) = Self::value_to_numeric_vector(&value) {
-                if vector.len() == query_vector.len() {
-                    full_vectors.push(vector);
-                    row_to_doc_idx.push(doc_idx);
+        // Every row's vector, one after another, and which row each is.
+        // A row with no vector there, or one of another length, is not a
+        // candidate.
+        let dimension = query_vector.len();
+        let mut packed: Vec<f32> = Vec::with_capacity(documents.len() * dimension);
+        let mut row_of: Vec<usize> = Vec::with_capacity(documents.len());
+        let single = (nearest_block.field.path.len() == 1).then(|| nearest_block.field.path[0].as_str());
+        for (at, document) in documents.iter().enumerate() {
+            // A field the row holds is read where it is; a path through a
+            // reference is followed.
+            let followed;
+            let value = match single.and_then(|name| document.fields.get(name)) {
+                Some(value) => value,
+                None => {
+                    followed = self.get_field_value(document, &nearest_block.field)?;
+                    &followed
+                }
+            };
+            if let Some(vector) = value.as_vector() {
+                if vector.len() == dimension {
+                    packed.extend_from_slice(&vector);
+                    row_of.push(at);
                 }
             }
         }
-
-        if full_vectors.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let k = (nearest_block.k as usize).min(full_vectors.len());
-        if k == 0 {
-            return Ok(Vec::new());
-        }
-
-        let schema_name = documents
-            .first()
-            .map(|d| d.schema.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let field_name = field_name.to_string();
-        let index_catalog = self
-            .store
-            .list_vector_indexes(Some(&schema_name))
-            .unwrap_or_default();
-        let matched_index = index_catalog.into_iter().find(|idx| {
-            idx.schema == schema_name
-                && idx.field == field_name
-                && idx.state == VectorIndexState::Ready
-                && Self::metric_matches(&nearest_block.metric, idx.metric)
-        });
-
-        let ann_enabled = nearest_block.exact.unwrap_or(false) == false
-            && matched_index
-                .as_ref()
-                .map(|idx| idx.index_type == VectorIndexType::Hnsw)
-                .unwrap_or(false);
-        let num_candidates = nearest_block
-            .num_candidates
-            .map(|v| v as usize)
-            .unwrap_or_else(|| (k * 8).max(k))
-            .min(full_vectors.len());
-
-        let topk = if ann_enabled {
-            if let Some(index_def) = matched_index.as_ref() {
-                match self.store.vector_ann_search(
-                    index_def,
-                    &documents,
-                    &query_vector,
-                    k,
-                    num_candidates,
-                ) {
-                    Ok(Some(hits)) => hits
-                        .into_iter()
-                        .map(|h| crate::storage_engine::vector::VectorHit {
-                            index: h.index as u32,
-                            score: h.score,
-                        })
-                        .collect(),
-                    Ok(None) => {
-                        let candidate_indices = if num_candidates < full_vectors.len() {
-                            self.approximate_candidate_indices(
-                                &full_vectors,
-                                &query_vector,
-                                &nearest_block.metric,
-                                num_candidates,
-                            )?
-                        } else {
-                            (0..full_vectors.len()).collect()
-                        };
-                        self.exact_rerank_on_candidates(
-                            &full_vectors,
-                            &query_vector,
-                            &nearest_block.metric,
-                            &candidate_indices,
-                            k,
-                        )?
-                    }
-                    Err(_) => {
-                        let candidate_indices = if num_candidates < full_vectors.len() {
-                            self.approximate_candidate_indices(
-                                &full_vectors,
-                                &query_vector,
-                                &nearest_block.metric,
-                                num_candidates,
-                            )?
-                        } else {
-                            (0..full_vectors.len()).collect()
-                        };
-                        self.exact_rerank_on_candidates(
-                            &full_vectors,
-                            &query_vector,
-                            &nearest_block.metric,
-                            &candidate_indices,
-                            k,
-                        )?
-                    }
-                }
-            } else {
-                let candidate_indices = if num_candidates < full_vectors.len() {
-                    self.approximate_candidate_indices(
-                        &full_vectors,
-                        &query_vector,
-                        &nearest_block.metric,
-                        num_candidates,
-                    )?
-                } else {
-                    (0..full_vectors.len()).collect()
-                };
-                self.exact_rerank_on_candidates(
-                    &full_vectors,
-                    &query_vector,
-                    &nearest_block.metric,
-                    &candidate_indices,
-                    k,
-                )?
-            }
-        } else {
-            let candidate_indices: Vec<usize> = (0..full_vectors.len()).collect();
-            self.exact_rerank_on_candidates(
-                &full_vectors,
-                &query_vector,
-                &nearest_block.metric,
-                &candidate_indices,
-                k,
-            )?
+        let metric = match nearest_block.metric {
+            VectorMetric::Cosine => crate::vector::Metric::Cosine,
+            VectorMetric::L2 => crate::vector::Metric::L2,
+            VectorMetric::Dot => crate::vector::Metric::Dot,
         };
-
-        let mut output = Vec::with_capacity(topk.len());
-        for hit in topk {
-            let source_idx = *row_to_doc_idx
-                .get(hit.index as usize)
-                .ok_or_else(|| OQLError::generic("vector top-k returned invalid index"))?;
-            let mut document = documents[source_idx].clone();
+        // Exact: every candidate is compared. `exact` and `num_candidates`
+        // are accepted and change nothing until there is an index to
+        // approximate with.
+        let hits = crate::vector::nearest(&packed, &query_vector, metric, nearest_block.k as usize);
+        let mut documents: Vec<Option<Document>> = documents.into_iter().map(Some).collect();
+        let mut output = Vec::with_capacity(hits.len());
+        for (position, score) in hits {
+            let Some(mut document) = documents[row_of[position]].take() else {
+                continue;
+            };
             document
                 .fields
-                .insert("_score".to_string(), Value::Float(hit.score as f64));
+                .insert("_score".to_string(), Value::Float(f64::from(score)));
             output.push(document);
         }
-
         Ok(output)
     }
 
     fn resolve_query_vector(&self, query_expression: &Expression) -> OQLResult<Vec<f32>> {
         let temp_doc = Document::new("__vector_query__".to_string(), crate::document::Fields::default());
         let query_value = self.evaluate_expression(&temp_doc, query_expression)?;
-        Self::value_to_numeric_vector(&query_value).ok_or_else(|| OQLError::TypeError {
-            expected: "numeric list".to_string(),
-            actual: query_value.type_name().to_string(),
-        })
-    }
-
-    fn value_to_numeric_vector(value: &Value) -> Option<Vec<f32>> {
-        match value {
-            Value::List(items) => {
-                let mut out = Vec::with_capacity(items.len());
-                for item in items {
-                    match item {
-                        Value::Float(v) => out.push(*v as f32),
-                        Value::Integer(v) => out.push(*v as f32),
-                        _ => return None,
-                    }
-                }
-                Some(out)
-            }
-            _ => None,
-        }
-    }
-
-    fn metric_to_ffi(metric: &VectorMetric) -> crate::storage_engine::vector::VectorMetric {
-        match metric {
-            VectorMetric::Cosine => crate::storage_engine::vector::VectorMetric::Cosine,
-            VectorMetric::L2 => crate::storage_engine::vector::VectorMetric::L2,
-            VectorMetric::Dot => crate::storage_engine::vector::VectorMetric::Dot,
-        }
-    }
-
-    fn metric_matches(metric: &VectorMetric, index_metric: VectorMetricType) -> bool {
-        matches!(
-            (metric, index_metric),
-            (VectorMetric::Cosine, VectorMetricType::Cosine)
-                | (VectorMetric::L2, VectorMetricType::L2)
-                | (VectorMetric::Dot, VectorMetricType::Dot)
-        )
-    }
-
-    fn approximate_candidate_indices(
-        &self,
-        full_vectors: &[Vec<f32>],
-        query_vector: &[f32],
-        metric: &VectorMetric,
-        num_candidates: usize,
-    ) -> OQLResult<Vec<usize>> {
-        let projection_dim = full_vectors.first().map(|v| v.len().min(8)).unwrap_or(0);
-        if projection_dim == 0 {
-            return Ok(Vec::new());
-        }
-
-        let mut projected_rows = Vec::with_capacity(full_vectors.len() * projection_dim);
-        for vec in full_vectors {
-            projected_rows.extend_from_slice(&vec[..projection_dim]);
-        }
-        let projected_query = query_vector[..projection_dim].to_vec();
-        let coarse = crate::storage_engine::vector::vector_topk_f32(
-            &projected_rows,
-            full_vectors.len(),
-            projection_dim,
-            &projected_query,
-            Self::metric_to_ffi(metric),
-            num_candidates,
-        )
-        .map_err(|e| {
-            OQLError::storage_error(&format!("vector coarse top-k failed: {}", e), None)
-        })?;
-
-        let mut candidate_indices = Vec::with_capacity(coarse.len());
-        for hit in coarse {
-            candidate_indices.push(hit.index as usize);
-        }
-        Ok(candidate_indices)
-    }
-
-    fn exact_rerank_on_candidates(
-        &self,
-        full_vectors: &[Vec<f32>],
-        query_vector: &[f32],
-        metric: &VectorMetric,
-        candidate_indices: &[usize],
-        k: usize,
-    ) -> OQLResult<Vec<crate::storage_engine::vector::VectorHit>> {
-        if candidate_indices.is_empty() {
-            return Ok(Vec::new());
-        }
-        let dim = query_vector.len();
-        let mut candidate_rows = Vec::with_capacity(candidate_indices.len() * dim);
-        for &idx in candidate_indices {
-            let vec = full_vectors
-                .get(idx)
-                .ok_or_else(|| OQLError::generic("invalid candidate index"))?;
-            candidate_rows.extend_from_slice(vec);
-        }
-        let reranked = crate::storage_engine::vector::vector_topk_f32(
-            &candidate_rows,
-            candidate_indices.len(),
-            dim,
-            query_vector,
-            Self::metric_to_ffi(metric),
-            k.min(candidate_indices.len()),
-        )
-        .map_err(|e| {
-            OQLError::storage_error(&format!("vector exact rerank failed: {}", e), None)
-        })?;
-
-        let mut remapped = Vec::with_capacity(reranked.len());
-        for hit in reranked {
-            let original = *candidate_indices
-                .get(hit.index as usize)
-                .ok_or_else(|| OQLError::generic("invalid rerank index"))?;
-            remapped.push(crate::storage_engine::vector::VectorHit {
-                index: original as u32,
-                score: hit.score,
-            });
-        }
-        Ok(remapped)
+        query_value
+            .as_vector()
+            .map(std::borrow::Cow::into_owned)
+            .ok_or_else(|| OQLError::TypeError {
+                expected: "a vector: a list of numbers".to_string(),
+                actual: query_value.type_name().to_string(),
+            })
     }
 
     /// Evaluate a condition against a document
@@ -6878,7 +6670,8 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 self.evaluate_arithmetic(document, left, operator, right)
             }
             Expression::ArrayAccess { array, index } => {
-                let array_value = self.evaluate_expression(document, array)?;
+                // A vector is indexed as the list of numbers it is.
+                let array_value = self.evaluate_expression(document, array)?.vector_as_list();
                 let index_value = self.evaluate_expression(document, index)?;
                 self.evaluate_array_access(&array_value, &index_value)
             }
@@ -9258,6 +9051,9 @@ impl<S: DocumentStore> QueryExecutor<S> {
     ) -> OQLResult<Value> {
         use crate::parser::BinaryOperator;
 
+        if let Some(outcome) = crate::vector::arithmetic(left, operator, right) {
+            return outcome;
+        }
         match (left, right) {
             (Value::Integer(a), Value::Integer(b)) => {
                 // Integer arithmetic is checked: a result outside the 64-bit
@@ -11768,6 +11564,20 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     .map(|item| self.convert_to_schema_type(item, inner_type, _current_collection))
                     .collect::<OQLResult<_>>()?,
             )),
+            // A vector is written as a list of numbers and kept packed. A
+            // list that is not one is left for validation to refuse, with
+            // the name of the field.
+            (value @ Value::List(_), FieldType::Vector { dim }) => {
+                Ok(match value.as_vector() {
+                    Some(numbers)
+                        if numbers.len() == *dim as usize
+                            && numbers.iter().all(|number| number.is_finite()) =>
+                    {
+                        Value::Vector(numbers.into_owned())
+                    }
+                    _ => value,
+                })
+            }
             // Handle optional types
             (v, FieldType::Optional(inner_type)) => {
                 if v.is_null() {
@@ -12418,9 +12228,13 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 // Check if it's a built-in function
                 if let Some(func) = self.functions.get_function(name) {
                     // Evaluate arguments first
+                    // The vector functions take a vector as it is; every
+                    // other function is given the list of its numbers.
+                    let packed = crate::vector::is_vector_function(name) || name == "type_of";
                     let mut arg_values = Vec::new();
                     for arg in args {
-                        arg_values.push(self.evaluate_expression(document, arg)?);
+                        let value = self.evaluate_expression(document, arg)?;
+                        arg_values.push(if packed { value } else { value.vector_as_list() });
                     }
 
                     // Call the built-in function
@@ -12942,6 +12756,14 @@ impl<S: DocumentStore> QueryExecutor<S> {
 
     fn value_as_expression(value: Value) -> OQLResult<Expression> {
         match value {
+            // A vector is written as the list of its numbers, and is taken
+            // for a vector again wherever one is wanted.
+            Value::Vector(numbers) => Ok(Expression::ArrayLiteral(
+                numbers
+                    .into_iter()
+                    .map(|number| Expression::Literal(Literal::Float(f64::from(number))))
+                    .collect(),
+            )),
             Value::String(value) => Ok(Expression::Literal(Literal::String(value))),
             Value::Integer(value) => Ok(Expression::Literal(Literal::Integer(value))),
             Value::Float(value) => Ok(Expression::Literal(Literal::Float(value))),
@@ -19771,7 +19593,7 @@ mod tests {
     }
 
     #[test]
-    fn test_nearest_hnsw_mode_uses_ann_candidates_and_rerank() {
+    fn test_nearest_under_an_index_declared_approximate_still_answers_exactly() {
         let (executor, _temp_dir) = create_test_executor();
 
         let mut fields = HashMap::new();

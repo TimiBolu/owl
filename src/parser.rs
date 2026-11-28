@@ -2867,6 +2867,13 @@ impl Parser {
                 how: how.clone(),
                 other: Self::substitute_scoped_locals_expression(other, locals),
             },
+            // The collection a capture takes its members from may read a
+            // `$parameter`, as any other expression may.
+            Operation::Capture { name, source, optional } => Operation::Capture {
+                name: name.clone(),
+                source: Self::substitute_scoped_locals_expression(source, locals),
+                optional: *optional,
+            },
             Operation::Walk { path, depth, every, paths } => Operation::Walk {
                 path: path.clone(),
                 depth: depth
@@ -8035,6 +8042,12 @@ pub fn bind_parameters(
             Value::List(items) => {
                 Expression::ArrayLiteral(items.iter().map(literal).collect::<Result<_, _>>()?)
             }
+            Value::Vector(numbers) => Expression::ArrayLiteral(
+                numbers
+                    .iter()
+                    .map(|number| Expression::Literal(Literal::Float(f64::from(*number))))
+                    .collect(),
+            ),
             Value::Object(fields) => Expression::ObjectLiteral(
                 fields
                     .iter()
@@ -9187,9 +9200,9 @@ pub fn schema_definition_indexes(
             SchemaDeclaration::Index(names) => scalars.push(scalar(names, false)),
             SchemaDeclaration::Check(_) => {}
             SchemaDeclaration::VectorIndex { field, metric } => {
-                let dimension = match schema.fields.get(field) {
-                    Some(crate::schema::FieldType::Vector { dim }) => *dim,
-                    _ => {
+                let dimension = match schema.fields.get(field).and_then(|declared| declared.vector_dimension()) {
+                    Some(dimension) => dimension,
+                    None => {
                         return Err(crate::error::OQLError::SchemaValidation {
                             message: format!(
                                 "'{}.{}' is not a Vector field, so it cannot have a vector index",

@@ -885,7 +885,7 @@ impl IndexManager {
             Value::Reference(r) => Some(r.offset()),
             Value::GlobalReference(r) => Some(r.local_offset()),
             Value::Null => None,
-            Value::List(_) | Value::Object(_) => {
+            Value::List(_) | Value::Object(_) | Value::Vector(_) => {
                 let repr = value.to_string_repr();
                 Some(wyhash::wyhash(repr.as_bytes(), 0))
             }

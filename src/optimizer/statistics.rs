@@ -550,6 +550,7 @@ impl StatisticsManager {
             Value::DateTime(_) => 8,
             Value::Reference(_) => 8,
             Value::GlobalReference(_) => 16,
+            Value::Vector(numbers) => numbers.len() as u64 * 4,
             Value::List(items) => items.iter().map(|v| self.estimate_value_size(v)).sum(),
             Value::Object(fields) => fields
                 .iter()

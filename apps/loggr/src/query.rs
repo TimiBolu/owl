@@ -347,6 +347,13 @@ impl Serialize for CleanValue<'_> {
                 }
                 sequence.end()
             }
+            Value::Vector(numbers) => {
+                let mut sequence = serializer.serialize_seq(Some(numbers.len()))?;
+                for number in numbers {
+                    sequence.serialize_element(number)?;
+                }
+                sequence.end()
+            }
             Value::Object(values) => {
                 let mut map = serializer.serialize_map(Some(values.len()))?;
                 for (name, value) in values {
@@ -490,6 +497,7 @@ fn value_json(value: Value) -> serde_json::Value {
                 .collect(),
         ),
         Value::Null => serde_json::Value::Null,
+        Value::Vector(_) => value.to_clean_json(),
     }
 }
 

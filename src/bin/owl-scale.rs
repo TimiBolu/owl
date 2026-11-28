@@ -492,6 +492,7 @@ fn touch_value(value: &Value) -> (u64, u64) {
         Value::DateTime(value) => (12, value.timestamp() as u64),
         Value::Reference(value) => (8, value.packed()),
         Value::GlobalReference(value) => touch_bytes(value.to_string_id().as_bytes()),
+        Value::Vector(numbers) => (numbers.len() as u64 * 4, numbers.first().map_or(0, |n| u64::from(n.to_bits()))),
         Value::List(values) => values.iter().fold((0u64, 0u64), |total, value| {
             let next = touch_value(value);
             (total.0.saturating_add(next.0), total.1.wrapping_add(next.1))

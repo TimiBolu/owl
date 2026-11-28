@@ -279,6 +279,7 @@ fn owl_json(value: &Value) -> Json {
                 .collect(),
         ),
         Value::Reference(_) | Value::GlobalReference(_) => json!("<reference>"),
+        Value::Vector(_) => value.to_clean_json(),
     }
 }
 

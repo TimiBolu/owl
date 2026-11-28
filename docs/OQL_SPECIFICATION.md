@@ -177,7 +177,7 @@ schema accounts {
 | Check | `check(.age >= 0 && .ends > .starts)` | Works: any condition over the document, enforced on insert and update |
 | Default | `plan: String = "free"`, `joined: DateTime = now()`, `label: String = upper(.handle)` | Works. A default is an expression evaluated against the fields the insert wrote; a written value wins. |
 | Index | `index(.status, .placed)` | Works. Reads that match use it. |
-| Vector index | `index(.embedding, metric: "cosine")` | Works. Declares an exact index; approximate search remains an engine task. |
+| Vector index | `index(.embedding, metric: "cosine")` | Recorded, on a `Vector(n)` or `Optional(Vector(n))` field. Nothing is built from it yet: every search compares every candidate, exactly (18.2). |
 | The declared set is the set | | Works. An index or unique rule dropped from the block is removed on redeclaration. |
 
 Field modifiers are written in this order after the type:
@@ -836,22 +836,63 @@ query that reads a function's parameters is never shared.
 | Unbound parameter is an error | Works |
 | A script value satisfies the parameter of the same name | Works |
 | `limit($n)`, `offset($n)` | Works |
-| A parameter as the query vector of `nearest` | *(not probed)* |
+| A parameter as the query vector of `nearest` | Works (18.2) |
 
 ---
 
-## 18. Vector search
+## 18. Vectors
+
+A `Vector(n)` field holds a vector: `n` 32-bit numbers. It is written as a
+list of numbers, kept and stored packed, and given to a client as a list of
+numbers. `Optional(Vector(n))` is a vector that may be absent.
+
+### 18.1 The value
+
+| Feature | Form | Status |
+|---|---|---|
+| Add, subtract | `.embedding + .other`, `.embedding - [0.1, 0.2, 0.3]` | Works: number by number. The two must have the same length. A list of numbers written in the query is taken for a vector when the other side is one; two lists are still joined (5.3). |
+| Scale | `.embedding * 2`, `2 * .embedding`, `.embedding / 2` | Works |
+| Sum of products | `dot(a, b)` | Works |
+| Length | `norm(a)`, `normalize(a)` | Works. A vector of no length normalises to itself. |
+| Likeness by direction | `similarity(a, b)` | Works: the cosine of the angle between, 1 the same way, 0 unrelated, -1 opposite. 0 when either has no length. |
+| Straight-line distance | `distance(a, b)` | Works |
+| Mean of several | `centroid(.documents.embedding)`, `centroid(.embedding)` in a grouped `select`, `centroid(docs.embedding)` | Works: number by number, nulls left out, null of none. There is no form at the end of a chain: `docs.embedding.centroid()` is refused. |
+| A list as a vector | `vector([1, 2, 3])` | Works |
+| Method form | `.embedding.similarity($q)` | Works (5.6) |
+| Null in place of a vector | | Null from every function: a row with no embedding has no similarity and is not an error. |
+| As a list | `.embedding[0]`, `.embedding[0:2]`, `length(.embedding)`, `.embedding contains 1.0` | Works: a vector reads as the list of its numbers. `type_of` says `Vector`. |
+| Equality | `.embedding == [0.9, 0.1, 0.0]` | Works: equal when the numbers are the same at the 32-bit width a vector holds. |
+| A value of the wrong length, or not all numbers | | Refused on write, with the field named. A number that is not finite is refused. |
+| A `$parameter` as a vector | | Works: a list of numbers. |
+
+Errors say what was given: `similarity needs two vectors of one length, and
+these have 3 and 2 numbers`.
+
+### 18.2 Search
 
 | Feature | Status |
 |---|---|
-| `Vector(n)` fields | Works |
-| `.nearest { field: .embedding, query: [...], metric: "cosine" \| "l2" \| "dot", k: n }` | Works |
-| `._score` in the following `select` | Works |
-| `nearest` after `where` (filtered search) and inside a scoped block | Works |
-| Options `num_candidates`, `exact` | Works *(per existing tests)* |
-| Dimension mismatch is an error | Works |
-| `nearest` on a reverse relationship or array field (search within a parent's related rows) | *(not probed)* |
-| The index behind it | Exact brute force in the storage engine. An approximate index is an engine task, not a language one. |
+| `.nearest { field: .embedding, query: [...], metric: "cosine" \| "l2" \| "dot", k: n }` | Works. The rows come nearest first, and rows that score the same keep the order they were in. |
+| `._score` in the following `select` | Works: the similarity for `cosine`, the dot product for `dot`, and the negated square of the distance for `l2`, so that higher is nearer in every one. |
+| The same rows by sorting | `docs.sort { similarity(.embedding, $q) desc }.limit(k)` gives the rows `nearest` gives. |
+| After a filter | Works: the nearest of the rows that passed it, never fewer than `k` because of rows the filter dropped. |
+| Through a relationship, for each row | Works: `owners.select { near: .docs.nearest { .. }.select { id } }` |
+| After a path step, and as a capture in a block | Works: `owners.where { .. }.docs.nearest { .. }`, `owners { d in .docs.nearest { .. }  select { .. } }` |
+| The rows most like each row | Works: `docs.select { id, like: docs.nearest { field: .embedding, query: docs.embedding, k: 5 }.select { id } }` |
+| The query vector computed | Works: `query: centroid(owners.docs.embedding)` |
+| The query vector's length differs from the field's | An error |
+| A field declared `Optional(Vector(n))` | Works, searched and indexed. It was refused. Rows with no vector are not candidates. |
+| `k` as a `$parameter` or an expression | Not yet: `k` is a whole number written in the query. |
+| The index behind it | None. `index(.embedding, metric: ..)` is recorded and every search compares every candidate, exactly. `exact` and `num_candidates` are accepted and change nothing. |
+
+A row written before vectors were packed holds its vector as a list. Search,
+every vector function and equality take it as the vector it is. Arithmetic
+and a path step read it as the list it is stored as, until the row is
+written again: `docs.update { embedding: vector(.embedding) }` packs every
+row. An older build cannot open a database that holds a packed vector.
+
+A `$parameter` in the collection a capture takes its members from is now
+bound; it was left unbound, and the statement failed.
 
 ---
 

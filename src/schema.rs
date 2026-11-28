@@ -79,6 +79,26 @@ impl Schema {
             (FieldType::Boolean, Value::Boolean(_)) => Ok(()),
             (FieldType::DateTime, Value::DateTime(_)) => Ok(()),
             (FieldType::Object, Value::Object(_)) => Ok(()),
+            (FieldType::Vector { dim }, Value::Vector(numbers)) => {
+                if numbers.len() != *dim as usize {
+                    return Err(OQLError::SchemaValidation {
+                        message: format!(
+                            "Vector field '{}' expects {} dimensions, got {}",
+                            field_name,
+                            dim,
+                            numbers.len()
+                        ),
+                    });
+                }
+                if numbers.iter().any(|number| !number.is_finite()) {
+                    return Err(OQLError::SchemaValidation {
+                        message: format!(
+                            "Vector field '{field_name}' holds a number that is not finite"
+                        ),
+                    });
+                }
+                Ok(())
+            }
             (FieldType::Vector { dim }, Value::List(values)) => {
                 if values.len() != *dim as usize {
                     return Err(OQLError::SchemaValidation {
@@ -92,6 +112,15 @@ impl Schema {
                 }
                 for (i, val) in values.iter().enumerate() {
                     match val {
+                        // A vector holds 32-bit numbers, so one too large
+                        // for that width is not finite there.
+                        Value::Float(number) if !(*number as f32).is_finite() => {
+                            return Err(OQLError::SchemaValidation {
+                                message: format!(
+                                    "Vector field '{field_name}[{i}]' holds a number that is not finite"
+                                ),
+                            })
+                        }
                         Value::Float(_) | Value::Integer(_) => {}
                         _ => {
                             return Err(OQLError::SchemaValidation {
@@ -486,6 +515,16 @@ impl ReferenceType {
 }
 
 impl FieldType {
+    /// How many numbers a vector field holds, whether or not the field is
+    /// optional. `None` for a field that is not a vector.
+    pub fn vector_dimension(&self) -> Option<u32> {
+        match self {
+            FieldType::Vector { dim } => Some(*dim),
+            FieldType::Optional(inner) => inner.vector_dimension(),
+            _ => None,
+        }
+    }
+
     /// Get the type name as a string
     pub fn type_name(&self) -> &'static str {
         match self {

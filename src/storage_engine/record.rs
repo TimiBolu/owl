@@ -22,6 +22,9 @@ const TAG_REFERENCE: u8 = 6;
 const TAG_GLOBAL_REFERENCE: u8 = 7;
 const TAG_LIST: u8 = 8;
 const TAG_OBJECT: u8 = 9;
+/// A vector: a count, then that many 32-bit numbers, least significant
+/// byte first. Records written before this tag hold a vector as a list.
+const TAG_VECTOR: u8 = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct CompiledField {
@@ -221,7 +224,7 @@ impl<'a> RecordView<'a> {
                 }
                 Ok(BorrowedRecordValue::String(value))
             }
-            TAG_GLOBAL_REFERENCE | TAG_LIST | TAG_OBJECT => Ok(BorrowedRecordValue::Owned(
+            TAG_GLOBAL_REFERENCE | TAG_LIST | TAG_OBJECT | TAG_VECTOR => Ok(BorrowedRecordValue::Owned(
                 decode_slot(slot, regions.variable)?,
             )),
             _ => Err(OQLError::storage_error("unknown record slot tag", None)),
@@ -549,7 +552,7 @@ fn dynamic_slot_payload<'a>(slot: &[u8], variable: &'a [u8]) -> OQLResult<&'a [u
 
 fn encode_slot(value: &Value, slot: &mut [u8], variable: &mut Vec<u8>) -> OQLResult<()> {
     match value {
-        Value::String(_) | Value::GlobalReference(_) | Value::List(_) | Value::Object(_) => {
+        Value::String(_) | Value::GlobalReference(_) | Value::List(_) | Value::Object(_) | Value::Vector(_) => {
             let tag = value_tag(value)?;
             let offset = variable.len();
             encode_dynamic(value, variable, 0)?;
@@ -596,7 +599,7 @@ fn decode_slot(slot: &[u8], variable: &[u8]) -> OQLResult<Value> {
         },
         TAG_DATETIME => Ok(Value::DateTime(timestamp(get_i64(slot, 8)?)?)),
         TAG_REFERENCE => Ok(Value::Reference(ObjRef::new(get_u64(slot, 8)?))),
-        TAG_STRING | TAG_GLOBAL_REFERENCE | TAG_LIST | TAG_OBJECT => {
+        TAG_STRING | TAG_GLOBAL_REFERENCE | TAG_LIST | TAG_OBJECT | TAG_VECTOR => {
             let len = get_u32(slot, 4)? as usize;
             let offset = usize::try_from(get_u64(slot, 8)?)
                 .map_err(|_| OQLError::storage_error("variable offset overflow", None))?;
@@ -636,6 +639,13 @@ fn encode_dynamic(value: &Value, output: &mut Vec<u8>, depth: usize) -> OQLResul
             put_count(output, values.len())?;
             for value in values {
                 encode_dynamic(value, output, depth + 1)?;
+            }
+        }
+        Value::Vector(numbers) => {
+            put_count(output, numbers.len())?;
+            output.reserve(numbers.len() * 4);
+            for number in numbers {
+                output.extend_from_slice(&number.to_le_bytes());
             }
         }
         Value::Object(fields) => {
@@ -696,6 +706,18 @@ fn decode_dynamic(input: &[u8], cursor: &mut usize, depth: usize) -> OQLResult<V
             }
             Ok(Value::List(values))
         }
+        TAG_VECTOR => {
+            let count = take_count(input, cursor)?;
+            let bytes = take(input, cursor, count.checked_mul(4).ok_or_else(|| {
+                OQLError::storage_error("vector length overflow", None)
+            })?)?;
+            Ok(Value::Vector(
+                bytes
+                    .chunks_exact(4)
+                    .map(|number| f32::from_le_bytes(number.try_into().unwrap()))
+                    .collect(),
+            ))
+        }
         TAG_OBJECT => {
             let count = take_count(input, cursor)?;
             let mut fields = crate::document::Fields::with_capacity_and_hasher(count.min(1024), Default::default());
@@ -728,6 +750,7 @@ fn value_tag(value: &Value) -> OQLResult<u8> {
         Value::GlobalReference(_) => TAG_GLOBAL_REFERENCE,
         Value::List(_) => TAG_LIST,
         Value::Object(_) => TAG_OBJECT,
+        Value::Vector(_) => TAG_VECTOR,
     })
 }
 
