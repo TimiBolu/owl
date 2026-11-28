@@ -244,6 +244,7 @@ impl BatchExecutor {
             Value::Integer(_) => 8,
             Value::Float(_) => 8,
             Value::String(s) => s.len(),
+            Value::Vector(numbers) => numbers.len() * 4,
             Value::List(arr) => arr.iter().map(|v| self.estimate_value_size(v)).sum(),
             Value::Object(obj) => obj
                 .iter()

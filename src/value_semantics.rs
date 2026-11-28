@@ -97,6 +97,11 @@ pub fn compare(left: &Value, right: &Value) -> Option<Ordering> {
 /// OQL equality.
 pub fn equal(left: &Value, right: &Value) -> bool {
     match (left, right) {
+        // A vector holds 32-bit numbers, so a list of numbers written in a
+        // query equals it when its numbers are the same at that width.
+        (Value::Vector(a), other) | (other, Value::Vector(a)) => {
+            other.as_vector().is_some_and(|b| a.as_slice() == b.as_ref())
+        }
         (Value::Null, Value::Null) => true,
         (Value::Reference(a), Value::Reference(b)) => a == b,
         (Value::GlobalReference(a), Value::GlobalReference(b)) => a == b,
@@ -115,6 +120,12 @@ pub fn equal(left: &Value, right: &Value) -> bool {
 /// Decide `left <operator> right`. Never fails: an undecidable comparison is
 /// a non-match.
 pub fn matches(left: &Value, operator: &ComparisonOperator, right: &Value) -> bool {
+    // Membership asks a vector as the list of numbers it is.
+    if matches!(operator, ComparisonOperator::Contains | ComparisonOperator::In)
+        && (matches!(left, Value::Vector(_)) || matches!(right, Value::Vector(_)))
+    {
+        return matches(&left.clone().vector_as_list(), operator, &right.clone().vector_as_list());
+    }
     match operator {
         ComparisonOperator::Equal => equal(left, right),
         ComparisonOperator::NotEqual => !equal(left, right),
@@ -163,7 +174,7 @@ fn sort_rank(value: &Value) -> u8 {
         Value::String(_) => 3,
         Value::DateTime(_) => 4,
         Value::Reference(_) | Value::GlobalReference(_) => 5,
-        Value::List(_) => 6,
+        Value::List(_) | Value::Vector(_) => 6,
         Value::Object(_) => 7,
     }
 }
@@ -177,6 +188,9 @@ pub fn sort_order(left: &Value, right: &Value) -> Ordering {
         return ranks;
     }
     match (left, right) {
+        (Value::Vector(_), _) | (_, Value::Vector(_)) => {
+            sort_order(&left.clone().vector_as_list(), &right.clone().vector_as_list())
+        }
         (Value::Float(a), Value::Float(b)) => a.total_cmp(b),
         // NaN sorts after every number, matching `f64::total_cmp` for the
         // positive NaN that arithmetic produces.

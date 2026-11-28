@@ -106,6 +106,7 @@ fn value_to_json(v: &Value) -> serde_json::Value {
             serde_json::Value::Object(out)
         }
         Value::Null => serde_json::Value::Null,
+        Value::Vector(_) => v.to_clean_json(),
     }
 }
 

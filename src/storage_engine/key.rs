@@ -363,9 +363,9 @@ fn encode_component(value: &Value, output: &mut Vec<u8>) -> OQLResult<()> {
             output.extend_from_slice(&value.local_offset.to_be_bytes());
             output.extend_from_slice(&value.flags.to_be_bytes());
         }
-        Value::List(_) | Value::Object(_) => {
+        Value::List(_) | Value::Object(_) | Value::Vector(_) => {
             return Err(OQLError::storage_error(
-                "lists and objects cannot be used as ordered index keys",
+                "lists, vectors and objects cannot be used as ordered index keys",
                 None,
             ));
         }

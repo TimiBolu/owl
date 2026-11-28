@@ -20,7 +20,6 @@ mod parts;
 mod record;
 mod s3;
 mod store;
-pub mod vector;
 
 pub(crate) use arena::Arena;
 pub use btree::BTreeIndex;

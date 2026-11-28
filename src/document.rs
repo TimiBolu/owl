@@ -118,6 +118,10 @@ pub enum Value {
     List(Vec<Value>),
     Object(Fields), // Nested objects for schema evolution
     Null,
+    /// A vector: a fixed number of 32-bit numbers, held and stored packed.
+    /// It is what a `Vector(n)` field holds. Added last, so that values
+    /// serialized before it existed keep their meaning.
+    Vector(Vec<f32>),
 }
 
 impl Value {
@@ -157,6 +161,38 @@ impl Value {
             Value::List(_) => "List",
             Value::Object(_) => "Object",
             Value::Null => "Null",
+            Value::Vector(_) => "Vector",
+        }
+    }
+
+    /// The numbers of a vector, or of a list of numbers, which is how a
+    /// vector is written in a query and how one was stored before vectors
+    /// were packed. `None` for anything else, an empty list included.
+    pub fn as_vector(&self) -> Option<std::borrow::Cow<'_, [f32]>> {
+        match self {
+            Value::Vector(numbers) => Some(std::borrow::Cow::Borrowed(numbers)),
+            Value::List(items) if !items.is_empty() => items
+                .iter()
+                .map(|item| match item {
+                    Value::Float(number) => Some(*number as f32),
+                    Value::Integer(number) => Some(*number as f32),
+                    _ => None,
+                })
+                .collect::<Option<Vec<f32>>>()
+                .map(std::borrow::Cow::Owned),
+            _ => None,
+        }
+    }
+
+    /// A vector as the list of numbers it is, for everything that reads a
+    /// list: an index, a slice, a length, a comparison. Any other value is
+    /// returned as it is.
+    pub fn vector_as_list(self) -> Value {
+        match self {
+            Value::Vector(numbers) => {
+                Value::List(numbers.into_iter().map(|number| Value::Float(f64::from(number))).collect())
+            }
+            other => other,
         }
     }
 
@@ -185,6 +221,10 @@ impl Value {
                 format!("{{{}}}", pairs.join(", "))
             }
             Value::Null => "null".to_string(),
+            Value::Vector(numbers) => format!(
+                "[{}]",
+                numbers.iter().map(|number| number.to_string()).collect::<Vec<_>>().join(", ")
+            ),
         }
     }
 
@@ -360,6 +400,15 @@ impl Value {
                 }
                 serde_json::Value::Object(json_obj)
             }
+            Value::Vector(numbers) => serde_json::Value::Array(
+                numbers
+                    .iter()
+                    .map(|number| {
+                        serde_json::Number::from_f64(f64::from(*number))
+                            .map_or(serde_json::Value::Null, serde_json::Value::Number)
+                    })
+                    .collect(),
+            ),
         }
     }
 }

@@ -101,6 +101,9 @@ impl FunctionRegistry {
         registry.register_math_functions();
         registry.register_datetime_functions();
         registry.register_utility_functions();
+        for (name, function) in crate::vector::FUNCTIONS {
+            registry.register(name, function);
+        }
         // The standard library is OQL, registered as any function a user
         // defines is, so a user may replace any of it.
         for definition in standard_library() {

@@ -28,6 +28,7 @@ pub mod streaming;
 pub mod performance;
 pub mod type_syntax;
 pub mod value_semantics;
+pub mod vector;
 
 // Task 13: Observability and monitoring
 pub mod logging;

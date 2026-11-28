@@ -316,6 +316,7 @@ fn to_json(value: &Value) -> Json {
             Json::Object(fields.iter().map(|(name, value)| (name.clone(), to_json(value))).collect())
         }
         Value::Reference(_) | Value::GlobalReference(_) => json!("<reference>"),
+        Value::Vector(_) => value.to_clean_json(),
     }
 }
 

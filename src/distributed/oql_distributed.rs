@@ -1012,6 +1012,10 @@ impl DistributedOQLEngine {
             )),
             Value::Null => Ok("null".to_string()),
             Value::DateTime(dt) => Ok(format!("\"{}\"", dt.to_rfc3339())),
+            Value::Vector(numbers) => Ok(format!(
+                "[{}]",
+                numbers.iter().map(|number| format!("{number:?}")).collect::<Vec<_>>().join(", ")
+            )),
         }
     }
 

@@ -861,6 +861,7 @@ fn to_json(value: &Value) -> Json {
         ),
         // Replaced by ids before this is reached.
         Value::Reference(_) | Value::GlobalReference(_) => Json::Null,
+        Value::Vector(numbers) => Json::Array(numbers.iter().map(|number| serde_json::Number::from_f64(f64::from(*number)).map_or(Json::Null, Json::Number)).collect()),
     }
 }
 

@@ -255,6 +255,7 @@ impl MigrationScript {
                     Value::Boolean(b) => b.to_string(),
                     Value::Null => "null".to_string(),
                     Value::List(_) => "[list]".to_string(),
+                    Value::Vector(_) => "[vector]".to_string(),
                     Value::DateTime(dt) => dt.to_rfc3339(),
                     Value::Reference(_) => "[reference]".to_string(),
                     Value::GlobalReference(_) => "[reference]".to_string(),
