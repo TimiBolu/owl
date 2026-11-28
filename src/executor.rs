@@ -6212,7 +6212,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
         let mut document = row.clone();
         document
             .fields
-            .insert("_score".to_string(), Value::Float(f64::from(score)));
+            .insert("_score".to_string(), Value::Float(crate::vector::widened(score)));
         document
     }
 
@@ -6421,7 +6421,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                         let mut document = row.as_ref().clone();
                         document
                             .fields
-                            .insert("_score".to_string(), Value::Float(f64::from(score)));
+                            .insert("_score".to_string(), Value::Float(crate::vector::widened(score)));
                         document
                     })
                     .collect(),
@@ -6453,7 +6453,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     let mut document = row.as_ref().clone();
                     document
                         .fields
-                        .insert("_score".to_string(), Value::Float(f64::from(*score)));
+                        .insert("_score".to_string(), Value::Float(crate::vector::widened(*score)));
                     document
                 })
                 .collect(),
@@ -6552,7 +6552,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
             };
             document
                 .fields
-                .insert("_score".to_string(), Value::Float(f64::from(score)));
+                .insert("_score".to_string(), Value::Float(crate::vector::widened(score)));
             output.push(document);
         }
         Ok(output)
@@ -13141,7 +13141,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
             Value::Vector(numbers) => Ok(Expression::ArrayLiteral(
                 numbers
                     .into_iter()
-                    .map(|number| Expression::Literal(Literal::Float(f64::from(number))))
+                    .map(|number| Expression::Literal(Literal::Float(crate::vector::widened(number))))
                     .collect(),
             )),
             Value::String(value) => Ok(Expression::Literal(Literal::String(value))),

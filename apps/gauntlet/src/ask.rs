@@ -287,7 +287,7 @@ fn rows_as_served(executor: &QueryExecutor<RustStore>, oql: &str) -> Result<Vec<
         use owl_db::Value;
         match value {
             Value::Null | Value::Reference(_) | Value::GlobalReference(_) => Json::Null,
-            Value::Vector(numbers) => Json::Array(numbers.iter().map(|number| serde_json::Number::from_f64(f64::from(*number)).map_or(Json::Null, Json::Number)).collect()),
+            Value::Vector(numbers) => Json::Array(numbers.iter().map(|number| serde_json::Number::from_f64(owl_db::vector::widened(*number)).map_or(Json::Null, Json::Number)).collect()),
             Value::Boolean(value) => Json::from(*value),
             Value::Integer(value) => Json::from(*value),
             Value::Float(value) => Json::from(*value),

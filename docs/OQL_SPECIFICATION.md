@@ -68,6 +68,7 @@ principles document, but everything else depends on it:
 | A closing `;` | `orders.count();` | Works: allowed after a statement, and ignored |
 | Identifier | `[A-Za-z_][A-Za-z0-9_]*` | Works |
 | Integer, float | `42`, `-7`, `3.14`, `-0.5` | Works |
+| A float with an exponent | `1.6e-5`, `2E3`, `1e+10` | Works. An `e` is an exponent only with a digit after it, or a sign and a digit, so `e5` is still a name. A number too large to hold is refused. |
 | String with escapes | `"a \"b\" \n \u{1F989}"` | Works |
 | Boolean, null | `true`, `false`, `null` | Works |
 | Query parameter | `$name` | Works |
@@ -861,6 +862,7 @@ numbers. `Optional(Vector(n))` is a vector that may be absent.
 | Method form | `.embedding.similarity($q)` | Works (5.6) |
 | Null in place of a vector | | Null from every function: a row with no embedding has no similarity and is not an error. |
 | As a list | `.embedding[0]`, `.embedding[0:2]`, `length(.embedding)`, `.embedding contains 1.0` | Works: a vector reads as the list of its numbers. `type_of` says `Vector`. |
+| A number read back | `.embedding[0]` of a vector written `[0.9, ..]` is `0.9` | Works. A vector holds 32-bit numbers, and `0.9` at that width is not exactly `0.9`; read back, in a list, to a client, or as a score, it is the number its shortest form names, so it is shown as it was written and equals it: `.embedding[0] == 0.9`, `.embedding contains 0.9`. It was `0.8999999761581421`. Written back, it is the number it was. |
 | Equality | `.embedding == [0.9, 0.1, 0.0]` | Works: equal when the numbers are the same at the 32-bit width a vector holds. |
 | A value of the wrong length, or not all numbers | | Refused on write, with the field named. A number that is not finite is refused. |
 | A `$parameter` as a vector | | Works: a list of numbers. |

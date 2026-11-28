@@ -602,10 +602,24 @@ impl Tokenizer {
         alt((Self::parse_float, Self::parse_integer))(input)
     }
 
+    /// `3.14`, and a number with an exponent: `1.6e-5`, `2E3`, `1e+10`.
+    /// An `e` is an exponent only with a digit after it, or a sign and a
+    /// digit, so `1.exp()` is still a call on a number.
     fn parse_float(input: &str) -> IResult<&str, Token> {
-        let (input, number_str) = recognize(tuple((digit1, char('.'), digit1)))(input)?;
+        fn exponent(input: &str) -> IResult<&str, &str> {
+            recognize(tuple((
+                nom::character::complete::one_of("eE"),
+                nom::combinator::opt(nom::character::complete::one_of("+-")),
+                digit1,
+            )))(input)
+        }
+        let (input, number_str) = alt((
+            recognize(tuple((digit1, char('.'), digit1, nom::combinator::opt(exponent)))),
+            recognize(tuple((digit1, exponent))),
+        ))(input)?;
 
-        let value = number_str.parse::<f64>().map_err(|_| {
+        // A number too large for a float is not one, written either way.
+        let value = number_str.parse::<f64>().ok().filter(|value| value.is_finite()).ok_or_else(|| {
             nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Float))
         })?;
 
@@ -8069,7 +8083,7 @@ pub fn bind_parameters(
             Value::Vector(numbers) => Expression::ArrayLiteral(
                 numbers
                     .iter()
-                    .map(|number| Expression::Literal(Literal::Float(f64::from(*number))))
+                    .map(|number| Expression::Literal(Literal::Float(crate::vector::widened(*number))))
                     .collect(),
             ),
             Value::Object(fields) => Expression::ObjectLiteral(
