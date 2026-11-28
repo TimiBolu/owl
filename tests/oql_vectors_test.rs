@@ -993,3 +993,63 @@ fn a_sort_by_how_near_cut_to_a_few_is_answered_as_a_search() {
         ["d1", "d2", "d4"]
     );
 }
+
+#[test]
+fn a_vector_s_numbers_read_as_they_were_written() {
+    let db = library();
+    let d2 = |expression: &str| db.value(&format!(r#"docs.where {{ .id == "d2" }}.select {{ v: {expression} }}"#));
+    // d2 is (0.9, 0.1, 0). Kept in 32 bits, 0.9 is 0.89999997615814208984375;
+    // read back it is 0.9, not 0.8999999761581421.
+    assert_eq!(d2(".embedding[0]"), Value::Float(0.9));
+    assert_eq!(d2(".embedding[1]"), Value::Float(0.1));
+    assert_eq!(
+        d2(".embedding[0:2]"),
+        Value::List(vec![Value::Float(0.9), Value::Float(0.1)])
+    );
+    assert_eq!(vector(&[0.9, 0.1, 0.0]).to_clean_json(), serde_json::json!([0.9, 0.1, 0.0]));
+    assert_eq!(vector(&[0.6, 0.6]).to_string_repr(), "[0.6, 0.6]");
+    // So a number of a vector equals the number written, and is found.
+    assert_eq!(db.column("docs.where { .embedding[0] == 0.9 }.select { id }", "id"), ["d2"]);
+    assert_eq!(db.column("docs.where { .embedding contains 0.9 }.select { id }", "id"), ["d2"]);
+    assert_eq!(db.column("docs.where { .embedding contains 0.8 }.select { id }", "id"), ["d4"]);
+    // What is worked out from vectors is given at the width it was worked
+    // out at: a score, a length, a dot product.
+    assert_eq!(d2("dot(.embedding, $q)"), Value::Float(0.9));
+    assert_eq!(d2("(.embedding * 2)[0]"), Value::Float(1.8));
+    let scores = db.rows(r#"docs.nearest { field: .embedding, query: $q, metric: "cosine", k: 2 }.select { id, score: ._score, same: similarity(.embedding, $q) }"#);
+    assert_eq!(scores[0].get_field("score"), Some(&Value::Float(1.0)));
+    assert_eq!(scores[1].get_field("score"), scores[1].get_field("same"));
+    let Some(Value::Float(score)) = scores[1].get_field("score") else {
+        panic!("{:?}", scores[1].fields);
+    };
+    assert!(score.to_string().len() <= 10, "{score} is written in the digits a 32-bit number has");
+    // Narrowed again it is the number it was: a vector read and written
+    // back is unchanged.
+    db.rows("docs.update { embedding: vector(.embedding[0:3]) }");
+    assert_eq!(db.value(r#"docs.where { .id == "d2" }.select { embedding }"#), vector(&[0.9, 0.1, 0.0]));
+}
+
+#[test]
+fn a_number_may_be_written_with_an_exponent() {
+    let db = library();
+    let one = |expression: &str| db.value(&format!("docs.limit(1).select {{ v: {expression} }}"));
+    assert_eq!(one("1.6e-5"), Value::Float(0.000016));
+    assert_eq!(one("2E3"), Value::Float(2000.0));
+    assert_eq!(one("1e+2"), Value::Float(100.0));
+    assert_eq!(one("1.5e2 + 1"), Value::Float(151.0));
+    assert_eq!(one("-2.5e-1"), Value::Float(-0.25));
+    // In a vector, which is where a very small number is most often met.
+    assert_eq!(
+        db.column(r#"docs.nearest { field: .embedding, query: [1.0, 1e-9, 0.0e0], metric: "cosine", k: 2 }.select { id }"#, "id"),
+        ["d1", "d2"]
+    );
+    assert_eq!(db.column("docs.where { .embedding[0] >= 9e-1 }.select { id }", "id"), ["d1", "d2"]);
+    // An `e` with no digit after it is not an exponent: a name that
+    // begins with one is still a name, and a number is still a number.
+    assert_eq!(db.value("docs.limit(1).select { e5: 7 }"), Value::Integer(7));
+    assert_eq!(one("2"), Value::Integer(2));
+    assert_eq!(one("2.5"), Value::Float(2.5));
+    assert_eq!(db.column("docs.limit(2).select { id }", "id").len(), 2);
+    // A number too large to hold is refused, not read as something else.
+    assert!(db.try_rows("docs.limit(1).select { v: 1e999 }").is_err());
+}

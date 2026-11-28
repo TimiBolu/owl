@@ -173,7 +173,16 @@ pub const FUNCTIONS: [(&str, fn(&[Value]) -> OQLResult<Value>); 7] = [
 ];
 
 fn number(value: f32) -> Value {
-    Value::Float(f64::from(value))
+    Value::Float(widened(value))
+}
+
+/// A 32-bit number as the 64-bit number a reader expects of it: the one
+/// its shortest decimal form names. `0.6` kept in 32 bits is
+/// 0.60000002384185791015625, and widened as it stands it would be shown
+/// as `0.6000000238418579` and would not equal a `0.6` written in a
+/// query. Narrowed again it is the number it was, so nothing is lost.
+pub fn widened(number: f32) -> f64 {
+    number.to_string().parse().unwrap_or_else(|_| f64::from(number))
 }
 
 fn failed(message: String) -> OQLError {

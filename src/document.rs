@@ -190,7 +190,7 @@ impl Value {
     pub fn vector_as_list(self) -> Value {
         match self {
             Value::Vector(numbers) => {
-                Value::List(numbers.into_iter().map(|number| Value::Float(f64::from(number))).collect())
+                Value::List(numbers.into_iter().map(|number| Value::Float(crate::vector::widened(number))).collect())
             }
             other => other,
         }
@@ -404,7 +404,7 @@ impl Value {
                 numbers
                     .iter()
                     .map(|number| {
-                        serde_json::Number::from_f64(f64::from(*number))
+                        serde_json::Number::from_f64(crate::vector::widened(*number))
                             .map_or(serde_json::Value::Null, serde_json::Value::Number)
                     })
                     .collect(),
