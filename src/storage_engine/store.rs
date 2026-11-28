@@ -9164,6 +9164,106 @@ fn logical_collection_identities(
 /// The live rows of a collection in id order, which is the order a scan
 /// yields them. Rows held in memory are already kept in that order, so only
 /// a collection with rows in typed segments needs the ids to merge by.
+/// The index declared for `field` of `schema` by `metric`, up to date:
+/// built now if no search has wanted it yet, or if what it was built to
+/// has changed in a way no commit told it of, and divided into lists if
+/// the collection has grown enough since it last was. `None` when no such
+/// index is declared, or `query_len` is not the field's length.
+fn current_vector_index(
+    state: &State,
+    schema: &str,
+    field: &str,
+    query_len: usize,
+    metric: crate::vector::Metric,
+) -> OQLResult<Option<Arc<crate::storage_engine::VectorIndex>>> {
+    use crate::storage::{VectorIndexState, VectorMetricType};
+    use crate::vector::Metric;
+    let declared_as = match metric {
+        Metric::Cosine => VectorMetricType::Cosine,
+        Metric::L2 => VectorMetricType::L2,
+        // No index serves the dot product; every vector is compared.
+        Metric::Dot => return Ok(None),
+    };
+    let declared = state.vector_indexes.get(schema).is_some_and(|indexes| {
+        indexes.iter().any(|index| {
+            index.field == field && index.metric == declared_as && index.state == VectorIndexState::Ready
+        })
+    });
+    let dimension = state
+        .schemas
+        .get(schema)
+        .and_then(|declared| declared.fields.get(field))
+        .and_then(|field| field.vector_dimension())
+        .map(|dimension| dimension as usize);
+    let Some(dimension) = dimension.filter(|dimension| declared && *dimension == query_len) else {
+        return Ok(None);
+    };
+    let stamps = (
+        state.collection_stamps.get(schema).copied().unwrap_or(0),
+        state.catalog_stamp,
+    );
+    let key = (schema.to_string(), field.to_string());
+    let good = |index: &Arc<crate::storage_engine::VectorIndex>| {
+        index.stamps == stamps && index.metric() == metric && index.dimension() == dimension
+    };
+    let lock = || OQLError::generic("vector index lock poisoned");
+    let ready = state
+        .built_vectors
+        .read()
+        .map_err(|_| lock())?
+        .get(&key)
+        .filter(|index| good(index) && !index.wants_dividing())
+        .cloned();
+    if let Some(index) = ready {
+        return Ok(Some(index));
+    }
+    let mut built = state.built_vectors.write().map_err(|_| lock())?;
+    // Another search may have built or divided it meanwhile.
+    let mut index = match built.get(&key).filter(|index| good(index)).cloned() {
+        Some(index) => index,
+        None => match build_vector_index(state, schema, field, dimension, metric, stamps)? {
+            Some(index) => Arc::new(index),
+            None => return Ok(None),
+        },
+    };
+    if index.wants_dividing() {
+        Arc::make_mut(&mut index).divide();
+    }
+    built.insert(key, index.clone());
+    Ok(Some(index))
+}
+
+/// The rows an index found, each scored from its own vector as a search
+/// that reads every row scores it, in that search's order: nearest first,
+/// rows equally near by id. The first `k`.
+fn rows_scored(
+    state: &State,
+    field: &str,
+    metric: crate::vector::Metric,
+    query: &[f32],
+    found: Vec<(ObjRef, f32)>,
+    k: usize,
+) -> OQLResult<Vec<(Arc<Document>, f32)>> {
+    let mut rows = Vec::with_capacity(found.len());
+    for (object_ref, _) in found {
+        let Some(document) = logical_document(state, object_ref)? else {
+            continue;
+        };
+        let Some(score) = document
+            .fields
+            .get(field)
+            .and_then(Value::as_vector)
+            .map(|vector| crate::vector::score(metric, &vector, query))
+        else {
+            continue;
+        };
+        rows.push((document, score));
+    }
+    rows.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.id.cmp(&b.0.id)));
+    rows.truncate(k);
+    Ok(rows)
+}
+
 /// Bring every vector index built for `schema` up to date with one row
 /// written or deleted, as of commit `lsn`.
 fn keep_vector_indexes(
@@ -13113,14 +13213,6 @@ impl DocumentStore for RustStore {
         exact: bool,
         compare: Option<usize>,
     ) -> OQLResult<Option<(Vec<(Arc<Document>, f32)>, crate::storage_engine::VectorSearched)>> {
-        use crate::storage::{VectorIndexState, VectorMetricType};
-        use crate::vector::Metric;
-        let declared_as = match metric {
-            Metric::Cosine => VectorMetricType::Cosine,
-            Metric::L2 => VectorMetricType::L2,
-            // No index serves the dot product; every vector is compared.
-            Metric::Dot => return Ok(None),
-        };
         if !self.pending_operations()?.is_empty() {
             return Ok(None);
         }
@@ -13130,75 +13222,96 @@ impl DocumentStore for RustStore {
             .state
             .read()
             .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
-        let declared = state.vector_indexes.get(schema).is_some_and(|indexes| {
-            indexes.iter().any(|index| {
-                index.field == field && index.metric == declared_as && index.state == VectorIndexState::Ready
-            })
-        });
-        let dimension = state
-            .schemas
-            .get(schema)
-            .and_then(|declared| declared.fields.get(field))
-            .and_then(|field| field.vector_dimension());
-        let Some(dimension) = dimension.filter(|dimension| declared && *dimension as usize == query.len()) else {
+        let Some(index) = current_vector_index(&state, schema, field, query.len(), metric)? else {
             return Ok(None);
         };
-        let stamps = (
-            state.collection_stamps.get(schema).copied().unwrap_or(0),
-            state.catalog_stamp,
-        );
-        let key = (schema.to_string(), field.to_string());
-        let good = |index: &Arc<crate::storage_engine::VectorIndex>| {
-            index.stamps == stamps && index.metric() == metric && index.dimension() == dimension as usize
-        };
-        let lock = || OQLError::generic("vector index lock poisoned");
-        let ready = state
-            .built_vectors
+        let (found, searched) = index.search(query, k, exact, compare);
+        Ok(Some((rows_scored(&state, field, metric, query, found, k)?, searched)))
+    }
+
+    fn search_vector_index_among(
+        &self,
+        schema: &str,
+        field: &str,
+        query: &[f32],
+        metric: crate::vector::Metric,
+        k: usize,
+        among: crate::storage::VectorCandidates<'_>,
+    ) -> OQLResult<Option<(Vec<(Arc<Document>, f32)>, crate::storage_engine::VectorSearched)>> {
+        use crate::storage::VectorCandidates;
+        if !self.pending_operations()?.is_empty() {
+            return Ok(None);
+        }
+        let state = self
+            .state
             .read()
-            .map_err(|_| lock())?
-            .get(&key)
-            .filter(|index| good(index) && !index.wants_dividing())
-            .cloned();
-        let index = match ready {
-            Some(index) => index,
-            None => {
-                let mut built = state.built_vectors.write().map_err(|_| lock())?;
-                // Another search may have built or divided it meanwhile.
-                let mut index = match built.get(&key).filter(|index| good(index)).cloned() {
-                    Some(index) => index,
-                    None => match build_vector_index(&state, schema, field, dimension as usize, metric, stamps)? {
-                        Some(index) => Arc::new(index),
-                        None => return Ok(None),
-                    },
+            .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+        let Some(index) = current_vector_index(&state, schema, field, query.len(), metric)? else {
+            return Ok(None);
+        };
+        let chosen: Vec<ObjRef> = match among {
+            VectorCandidates::Positions { stamp, positions } => {
+                let built = self
+                    .built_columns
+                    .lock()
+                    .map_err(|_| OQLError::generic("column cache lock poisoned"))?;
+                let Some(kept) = built.collections.get(schema).filter(|kept| kept.stamp == stamp) else {
+                    return Ok(None);
                 };
-                if index.wants_dividing() {
-                    Arc::make_mut(&mut index).divide();
+                // Which row is at each position, however the columns keep
+                // track of their rows.
+                let listed;
+                let by_position: Vec<ObjRef> = match (&kept.refs, &kept.rows) {
+                    (Some(refs), _) => positions.iter().filter_map(|at| refs.get(*at as usize).copied()).collect(),
+                    (None, Some(rows)) => {
+                        let mut found = Vec::with_capacity(positions.len());
+                        for row in positions.iter().filter_map(|at| rows.get(*at as usize)) {
+                            found.extend(lookup_object_ref(&state, schema, &row.id)?);
+                        }
+                        found
+                    }
+                    (None, None) => {
+                        listed = logical_collection_object_refs(&state, schema)?;
+                        positions.iter().filter_map(|at| listed.get(*at as usize).copied()).collect()
+                    }
+                };
+                if by_position.len() != positions.len() {
+                    return Ok(None);
                 }
-                built.insert(key, index.clone());
-                index
+                by_position
+            }
+            VectorCandidates::Referring { target_schema, target_id, field: through } => {
+                let Some(target) = lookup_object_ref(&state, target_schema, &target_id.to_string())? else {
+                    return Ok(Some((Vec::new(), crate::storage_engine::VectorSearched::default())));
+                };
+                let Some(collection) = state.collection_ids.get(schema).copied() else {
+                    return Ok(None);
+                };
+                let prefix = target.packed().to_be_bytes().to_vec();
+                let end = target
+                    .packed()
+                    .checked_add(1)
+                    .map(|next| Bound::Excluded(next.to_be_bytes().to_vec()))
+                    .unwrap_or(Bound::Unbounded);
+                let mut sources = Vec::new();
+                state
+                    .reverse_reference_index
+                    .visit_range(Bound::Included(prefix), end, &mut |key, source| {
+                        let by_field = through
+                            .is_none_or(|expected| key.get(8..).unwrap_or_default() == expected.as_bytes());
+                        if by_field && source.collection_id() == collection {
+                            sources.push(source);
+                        }
+                    })
+                    .map_err(|error| OQLError::storage_error(&error, None))?;
+                // A row that refers twice, through two fields, is one row.
+                sources.sort_unstable();
+                sources.dedup();
+                sources
             }
         };
-        let (found, searched) = index.search(query, k, exact, compare);
-        // The rows found, each scored from its own vector as a search
-        // that reads every row scores it, and put in that search's order.
-        let mut rows = Vec::with_capacity(found.len());
-        for (object_ref, _) in found {
-            let Some(document) = logical_document(&state, object_ref)? else {
-                continue;
-            };
-            let Some(score) = document
-                .fields
-                .get(field)
-                .and_then(Value::as_vector)
-                .map(|vector| crate::vector::score(metric, &vector, query))
-            else {
-                continue;
-            };
-            rows.push((document, score));
-        }
-        rows.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.id.cmp(&b.0.id)));
-        rows.truncate(k);
-        Ok(Some((rows, searched)))
+        let (found, searched) = index.nearest_among(chosen.into_iter(), query, k);
+        Ok(Some((rows_scored(&state, field, metric, query, found, k)?, searched)))
     }
 
     fn scan_vector_column(&self, schema: &str, field: &str) -> OQLResult<Option<ColumnBatch>> {

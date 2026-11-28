@@ -35,7 +35,10 @@ impl Db {
         // Every `$q` here is the same direction: along the first axis.
         let mut params = HashMap::new();
         params.insert("q".to_string(), Value::List(vec![Value::Float(1.0), Value::Float(0.0), Value::Float(0.0)]));
-        let bound = match query.contains("$q") {
+        // And every `$k` is three.
+        params.insert("k".to_string(), Value::Integer(3));
+        params.insert("none".to_string(), Value::Integer(0));
+        let bound = match query.contains('$') {
             true => bind_parameters(&parsed, &params)?,
             false => parsed,
         };
@@ -546,6 +549,25 @@ fn what_twenty_thousand_vectors_cost() {
         &format!("docs.where {{ .id != \"\" }}.{}", near(&query, "cosine", "")),
     );
     time("nearest 10 by distance, no index, from the column", &format!("docs.{}", near(&query, "l2", "")));
+    time(
+        "nearest 10 of the rare tenth, which rows pass read off the column",
+        &format!("docs.where {{ .kind == \"rare\" }}.{}", near(&query, "cosine", "")),
+    );
+    time(
+        "nearest 10 of the rare tenth, every row read",
+        &format!("docs.where {{ .kind == \"rare\" && .id != \"\" }}.{}", near(&query, "cosine", "")),
+    );
+    time(
+        "sort by similarity, limit 10",
+        &format!("docs.sort {{ similarity(.embedding, {}) desc }}.limit(10).select {{ id }}", written(&query)),
+    );
+    time(
+        "sort by similarity, limit 10, of the rare tenth",
+        &format!(
+            "docs.where {{ .kind == \"rare\" }}.sort {{ similarity(.embedding, {}) desc }}.limit(10).select {{ id }}",
+            written(&query)
+        ),
+    );
 
     // How much of the truth the index finds when left to itself.
     let (mut right, mut compared) = (0, 0);
@@ -588,15 +610,30 @@ fn what_twenty_thousand_vectors_cost() {
 /// for the truth.
 fn clumps() -> Db {
     let db = Db::open(TempDir::new().unwrap());
-    let schema = r#"schema docs { id: String, kind: String, embedding: Optional(Vector(16)), index(.embedding, metric: "cosine") }"#;
+    let schema = r#"
+        schema owners { id: String, name: String }
+        schema docs { id: String, owner: Ref(owners), kind: String, embedding: Optional(Vector(16)), index(.embedding, metric: "cosine") }
+    "#;
     let report = execute_oql_file(&parse_oql_file(schema).unwrap(), &db.executor).unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let owners: Vec<owl_db::Fields> = (0..OWNERS)
+        .map(|owner| {
+            let mut fields = owl_db::Fields::default();
+            fields.insert("id".to_string(), Value::String(format!("o{owner:02}")));
+            fields.insert("name".to_string(), Value::String(format!("Owner {owner}")));
+            fields
+        })
+        .collect();
+    db.executor.insert_documents("owners", owners).unwrap();
     for chunk in 0..6 {
         let rows: Vec<owl_db::Fields> = (0..1000).map(|at| clump_row(chunk * 1000 + at)).collect();
         db.executor.insert_documents("docs", rows).unwrap();
     }
     db
 }
+
+/// How many owners the documents of [`clumps`] are shared among.
+const OWNERS: usize = 37;
 
 /// SplitMix64 of `seed`, as a number between -1 and 1.
 fn unit(seed: u64) -> f32 {
@@ -616,6 +653,7 @@ fn clump_row(row: usize) -> owl_db::Fields {
     let mut fields = owl_db::Fields::default();
     fields.insert("id".to_string(), Value::String(format!("d{row:05}")));
     fields.insert("kind".to_string(), Value::String(if row % 2 == 0 { "even" } else { "odd" }.to_string()));
+    fields.insert("owner".to_string(), Value::String(format!("o{:02}", row % OWNERS)));
     fields.insert(
         "embedding".to_string(),
         Value::List(clump_vector(row).iter().map(|number| Value::Float(f64::from(*number))).collect()),
@@ -696,7 +734,7 @@ fn an_index_is_kept_in_step_with_what_is_written() {
     db.rows(&format!(r#"docs.where {{ .id == "{}" }}.delete()"#, before[0]));
     db.rows(&format!(r#"docs.where {{ .id == "{}" }}.update {{ embedding: null }}"#, before[1]));
     db.rows(&format!(r#"docs.where {{ .id == "{}" }}.update {{ embedding: .embedding * -1 }}"#, before[2]));
-    db.rows(&format!(r#"docs.insert {{ id: "new", kind: "even", embedding: {query} }}"#));
+    db.rows(&format!(r#"docs.insert {{ id: "new", owner: "o00", kind: "even", embedding: {query} }}"#));
     let after = same(&db, 5999);
     assert_eq!(after[0], "new");
     for gone in &before[..3] {
@@ -732,4 +770,226 @@ fn an_index_is_kept_in_step_with_what_is_written() {
     last_vector_index_search();
     db.rows(&format!(r#"docs.nearest {{ field: .embedding, query: {query}, metric: "l2", k: 3 }}"#));
     assert!(last_vector_index_search().is_none());
+}
+
+/// The rows of a query as text: each row's fields in name order.
+fn shown(rows: &[Document]) -> Vec<String> {
+    rows.iter()
+        .map(|row| {
+            let mut fields: Vec<String> = row
+                .fields
+                .iter()
+                .filter(|(name, _)| !name.starts_with('_'))
+                .map(|(name, value)| format!("{name}={value:?}"))
+                .collect();
+            fields.sort();
+            fields.join(" ")
+        })
+        .collect()
+}
+
+#[test]
+fn a_search_after_a_filter_ranks_only_the_rows_that_pass_and_reads_only_the_rows_found() {
+    use owl_db::executor::last_vector_index_search;
+    let db = clumps();
+    let query = written(&clump_vector(100_011));
+    let near = |k: usize| {
+        format!(r#"nearest {{ field: .embedding, query: {query}, metric: "cosine", k: {k} }}.select {{ id, kind, score: ._score }}"#)
+    };
+    // The same filter two ways. Written plainly, which rows pass is read
+    // off the column and the index ranks exactly those. With a condition
+    // on the id added, which every row passes, each row is read.
+    let both = |filter: &str, k: usize| -> (Vec<String>, Option<usize>) {
+        last_vector_index_search();
+        let by_row = shown(&db.rows(&format!(r#"docs.where {{ {filter} && .id != "" }}.{}"#, near(k))));
+        assert!(last_vector_index_search().is_none(), "read row by row");
+        let found = shown(&db.rows(&format!("docs.where {{ {filter} }}.{}", near(k))));
+        assert_eq!(found, by_row, "{filter}, k {k}");
+        (found, last_vector_index_search().map(|did| did.compared))
+    };
+    // The store makes a collection's columns once it has been asked twice.
+    both(r#".kind == "even""#, 10);
+    let (found, compared) = both(r#".kind == "even""#, 10);
+    assert_eq!(found.len(), 10);
+    assert!(found.iter().all(|row| row.contains(r#"kind=String("even")"#)));
+    assert_eq!(compared, Some(3000), "the three thousand even rows, and no other");
+
+    let (_, compared) = both(r#".kind != "even""#, 7);
+    assert_eq!(compared, Some(3000));
+    // Two filters, one after the other.
+    last_vector_index_search();
+    let chained = shown(&db.rows(&format!(r#"docs.where {{ .kind == "odd" }}.where {{ .owner == "o05" }}.{}"#, near(4))));
+    let did = last_vector_index_search();
+    let by_row = shown(&db.rows(&format!(r#"docs.where {{ .kind == "odd" && .owner == "o05" && .id != "" }}.{}"#, near(4))));
+    assert_eq!(chained, by_row);
+    assert_eq!(chained.len(), 4);
+    // A reference compared with an id is not read off a column; whichever
+    // way it was answered, the rows are right.
+    let _ = did;
+
+    // Fewer rows pass than are asked for; and none.
+    db.rows(r#"docs.where { .id in ["d00000", "d00002", "d00004"] }.update { kind: "rare" }"#);
+    both(r#".kind == "rare""#, 10);
+    let (found, compared) = both(r#".kind == "rare""#, 10);
+    assert_eq!((found.len(), compared), (3, Some(3)));
+    let (found, _) = both(r#".kind == "nothing""#, 10);
+    assert!(found.is_empty());
+    // A row that passes the filter and has no embedding is not found.
+    db.rows(r#"docs.where { .id == "d00002" }.update { embedding: null }"#);
+    both(r#".kind == "rare""#, 10);
+    assert_eq!(both(r#".kind == "rare""#, 10).0.len(), 2);
+}
+
+#[test]
+fn a_search_through_a_relationship_ranks_only_the_rows_that_refer_to_the_row() {
+    use owl_db::executor::last_vector_index_search;
+    let db = clumps();
+    let query = written(&clump_vector(100_021));
+    let near = format!(r#"nearest {{ field: .embedding, query: {query}, metric: "cosine", k: 3 }}"#);
+    let per_owner = format!("owners.select {{ id, near: .docs.{near}.select {{ id, score: ._score }} }}");
+    let nearest_one = format!("owners.select {{ id, best: .docs.{near}.first().id, far: .docs.{near}.where {{ ._score < 0.5 }}.count() }}");
+    let captured = format!("owners {{ d in .docs.{near}  select {{ id, doc: d.id }} }}");
+
+    last_vector_index_search();
+    let found = shown(&db.rows(&per_owner));
+    let did = last_vector_index_search().expect("each owner's documents ranked from the index");
+    // Six thousand documents among thirty-seven owners.
+    assert!((150..=170).contains(&did.compared), "compared {} for one owner", did.compared);
+    assert_eq!(found.len(), OWNERS);
+    let first = shown(&db.rows(&nearest_one));
+    let pairs = shown(&db.rows(&captured));
+    assert_eq!(pairs.len(), OWNERS * 3);
+
+    // The truth: inside a transaction that has written, the index is not
+    // asked and every related row is read.
+    let transaction = db.store.begin_transaction().unwrap();
+    {
+        let _bound = db.store.bind_transaction(transaction).unwrap();
+        db.rows(r#"owners.insert { id: "zz", name: "Nobody" }"#);
+        last_vector_index_search();
+        let by_row = shown(&db.rows(&per_owner));
+        assert!(last_vector_index_search().is_none(), "read row by row");
+        assert_eq!(by_row[..OWNERS], found[..]);
+        // An owner with no documents has none near.
+        assert!(by_row[OWNERS].contains("near=List([])"), "{}", by_row[OWNERS]);
+        assert_eq!(shown(&db.rows(&nearest_one))[..OWNERS], first[..]);
+        assert_eq!(shown(&db.rows(&captured)), pairs);
+    }
+    db.store.rollback_transaction(transaction).unwrap();
+
+    // One owner's documents by the search of the whole collection,
+    // filtered: the same three.
+    let one = db.rows(&format!(r#"owners.where {{ .id == "o07" }}.select {{ near: .docs.{near}.select {{ id }} }}"#));
+    let filtered = db.column(&format!(r#"docs.where {{ .owner == "o07" && .id != "" }}.{near}.select {{ id }}"#), "id");
+    let Some(Value::List(near_o07)) = one[0].get_field("near") else {
+        panic!("{:?}", one[0].fields);
+    };
+    let near_o07: Vec<String> = near_o07
+        .iter()
+        .map(|row| match row {
+            Value::Object(fields) => fields["id"].to_string_repr(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(near_o07, filtered);
+}
+
+#[test]
+fn how_many_rows_to_find_may_be_a_parameter_or_worked_out() {
+    let db = library();
+    let near = |k: &str| format!(r#"docs.nearest {{ field: .embedding, query: $q, metric: "cosine", k: {k} }}.select {{ id }}"#);
+    let three = db.column(&near("3"), "id");
+    assert_eq!(three, ["d1", "d2", "d4"]);
+    assert_eq!(db.column(&near("$k"), "id"), three);
+    assert_eq!(db.column(&near("$k - 1"), "id"), three[..2]);
+    assert_eq!(db.column(&near("1 + 2"), "id"), three);
+    // Through a relationship, and after a filter, the same.
+    let per_owner = db.rows(r#"owners.select { name, n: .docs.nearest { field: .embedding, query: $q, k: $k }.count() }"#);
+    assert_eq!(per_owner[0].get_field("n"), Some(&Value::Integer(2)));
+    assert_eq!(per_owner[1].get_field("n"), Some(&Value::Integer(2)));
+    assert_eq!(
+        db.column(r#"docs.where { .kind == "y" }.nearest { field: .embedding, query: $q, k: $k - 1 }.select { id }"#, "id"),
+        ["d2", "d4"]
+    );
+    // What is not a number of rows is refused, and says what it was given.
+    let none = db.error(&near("$none"));
+    assert!(none.contains("a whole number above zero, and it was given 0"), "{none}");
+    let text = db.error(&near(r#"upper("x")"#));
+    assert!(text.contains("it was given X"), "{text}");
+    assert!(db.error(&near("0")).contains("nearest.k must be a positive integer"));
+    let unbound = db.error(&near("$missing"));
+    assert!(unbound.contains("$missing has no value"), "{unbound}");
+}
+
+#[test]
+fn a_sort_by_how_near_cut_to_a_few_is_answered_as_a_search() {
+    use owl_db::executor::{last_vector_index_search, vector_column_searches};
+    let db = clumps();
+    let query = written(&clump_vector(100_031));
+    let nearest = |filter: &str, metric: &str, k: usize| {
+        format!(r#"docs{filter}.nearest {{ field: .embedding, query: {query}, metric: "{metric}", k: {k}, exact: true }}.select {{ id }}"#)
+    };
+    let sorted = |filter: &str, key: &str, k: usize| format!("docs{filter}.sort {{ {key} }}.limit({k}).select {{ id }}");
+
+    // By similarity: the field's index, asked to be exact, as a sort is.
+    last_vector_index_search();
+    let found = db.column(&sorted("", &format!("similarity(.embedding, {query}) desc"), 10), "id");
+    let did = last_vector_index_search().expect("answered from the index");
+    assert_eq!(did.compared, 6000, "every vector compared: a sort is exact");
+    assert_eq!(found, db.column(&nearest("", "cosine", 10), "id"));
+    // The row's id as the key after, the vector written first, and the
+    // method form are the same question.
+    for key in [
+        format!("similarity(.embedding, {query}) desc, .id"),
+        format!("similarity({query}, .embedding) desc"),
+        format!(".embedding.similarity({query}) desc"),
+    ] {
+        last_vector_index_search();
+        assert_eq!(db.column(&sorted("", &key, 10), "id"), found, "{key}");
+        assert!(last_vector_index_search().is_some(), "{key}");
+    }
+    // What a sort gives are the rows as they are: no score with them.
+    let rows = db.rows(&format!("docs.sort {{ similarity(.embedding, {query}) desc }}.limit(2)"));
+    assert!(rows.iter().all(|row| row.get_field("_score").is_none() && row.get_field("embedding").is_some()));
+
+    // After a filter the column says which rows pass. Its columns are
+    // made once it has been asked twice.
+    let even = r#".where { .kind == "even" }"#;
+    db.rows(&sorted(even, &format!("similarity(.embedding, {query}) desc"), 10));
+    last_vector_index_search();
+    let filtered = db.column(&sorted(even, &format!("similarity(.embedding, {query}) desc"), 10), "id");
+    assert_eq!(last_vector_index_search().map(|did| did.compared), Some(3000));
+    assert_eq!(filtered, db.column(&nearest(even, "cosine", 10), "id"));
+
+    // By distance, nearest first: no index is declared for it, so every
+    // vector is compared where they are kept packed.
+    let by_distance = sorted("", &format!("distance(.embedding, {query})"), 10);
+    db.rows(&by_distance);
+    let before = vector_column_searches();
+    let near = db.column(&by_distance, "id");
+    assert_eq!(vector_column_searches() - before, 1);
+    assert_eq!(near, db.column(&nearest("", "l2", 10), "id"));
+
+    // What is not that question is sorted as any sort is: farthest first,
+    // a key that reads the row twice, an offset before the limit.
+    last_vector_index_search();
+    let farthest = db.column(&sorted("", &format!("similarity(.embedding, {query})"), 3), "id");
+    assert!(last_vector_index_search().is_none());
+    assert!(farthest.iter().all(|id| !found.contains(id)));
+    db.rows("docs.sort { similarity(.embedding, .embedding) desc }.limit(3)");
+    assert!(last_vector_index_search().is_none());
+    let paged = db.column(&format!("docs.sort {{ similarity(.embedding, {query}) desc }}.offset(2).limit(3).select {{ id }}"), "id");
+    assert_eq!(paged, found[2..5]);
+
+    // Fewer rows have a vector than are asked for: the sort goes on to
+    // the rows with none, which a search would not give.
+    let small = library();
+    assert_eq!(
+        small.column("docs.sort { similarity(.embedding, $q) desc }.limit(5).select { id }", "id"),
+        ["d1", "d2", "d4", "d3", "d5"]
+    );
+    assert_eq!(
+        small.column("docs.sort { similarity(.embedding, $q) desc }.limit(3).select { id }", "id"),
+        ["d1", "d2", "d4"]
+    );
 }

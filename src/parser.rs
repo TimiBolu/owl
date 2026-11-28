@@ -1057,6 +1057,10 @@ pub struct NearestBlock {
     pub k: u64,
     pub num_candidates: Option<u64>,
     pub exact: Option<bool>,
+    /// `k` when it is not a number written in the query: a `$parameter`
+    /// or an expression, worked out when the search runs. `k` is then 0.
+    #[serde(default)]
+    pub k_expression: Option<Expression>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2855,14 +2859,26 @@ impl Parser {
                     })
                     .collect(),
             }),
-            Operation::Nearest(block) => Operation::Nearest(NearestBlock {
-                field: block.field.clone(),
-                query: Self::substitute_scoped_locals_expression(&block.query, locals),
-                metric: block.metric.clone(),
-                k: block.k,
-                num_candidates: block.num_candidates,
-                exact: block.exact,
-            }),
+            Operation::Nearest(block) => {
+                // A `k` that is now a number is a number from here on.
+                let computed = block
+                    .k_expression
+                    .as_ref()
+                    .map(|k| fold_constant_integer(Self::substitute_scoped_locals_expression(k, locals)));
+                let (k, k_expression) = match computed {
+                    Some(Expression::Literal(Literal::Integer(k))) if k > 0 => (k as u64, None),
+                    computed => (block.k, computed),
+                };
+                Operation::Nearest(NearestBlock {
+                    field: block.field.clone(),
+                    query: Self::substitute_scoped_locals_expression(&block.query, locals),
+                    metric: block.metric.clone(),
+                    k,
+                    num_candidates: block.num_candidates,
+                    exact: block.exact,
+                    k_expression,
+                })
+            }
             Operation::Combine { how, other } => Operation::Combine {
                 how: how.clone(),
                 other: Self::substitute_scoped_locals_expression(other, locals),
@@ -4512,6 +4528,7 @@ impl Parser {
         let mut query: Option<Expression> = None;
         let mut metric = VectorMetric::Cosine;
         let mut k: u64 = 10;
+        let mut k_expression: Option<Expression> = None;
         let mut num_candidates: Option<u64> = None;
         let mut exact: Option<bool> = None;
 
@@ -4580,10 +4597,16 @@ impl Parser {
                     let value = self.parse_expression()?;
                     k = match value {
                         Expression::Literal(Literal::Integer(v)) if v > 0 => v as u64,
-                        _ => {
+                        Expression::Literal(_) => {
                             return Err(ParseError::TypeError {
                                 message: "nearest.k must be a positive integer".to_string(),
                             })
+                        }
+                        // A `$parameter` or an expression: worked out
+                        // when the search runs.
+                        computed => {
+                            k_expression = Some(computed);
+                            0
                         }
                     };
                 }
@@ -4642,6 +4665,7 @@ impl Parser {
             k,
             num_candidates,
             exact,
+            k_expression,
         })
     }
 
