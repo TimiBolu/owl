@@ -1096,6 +1096,10 @@ pub fn check(loaded: &Loaded, case: &Case) -> Result<Verdict> {
             Some(difference) => Verdict::Differs(format!("after the write: {difference}")),
         });
     }
+    // The check runs nothing, so it must refuse nothing that runs.
+    if let Some(refusal) = crate::refused_by_check(loaded, &case.oql) {
+        return Ok(Verdict::Failed(refusal));
+    }
     let sqlite = loaded.sqlite.query(&case.sql).map_err(|error| anyhow::anyhow!("{error}\n{}", case.sql))?;
     owl_db::executor::set_capture_planning(true);
     let arranged = match loaded.owl.query(&case.oql) {

@@ -89,6 +89,21 @@ async fn a_reader_serves_what_the_writer_checkpointed_and_takes_no_writes() {
     let (status, body) = reader.post("/v1/query", json!({ "query": "notes.delete()" })).await;
     assert_ne!(status, StatusCode::OK, "{body}");
     assert_eq!(reader.count().await, 300);
+    // A read marked read-only, and a model's tools, work on a copy too.
+    let (status, body) = reader
+        .post("/v1/query", json!({ "query": "notes.limit(2)", "read_only": true }))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["rows"].as_array().unwrap().len(), 2);
+    let (status, body) = reader
+        .post(
+            "/mcp",
+            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": { "name": "query", "arguments": { "query": "notes.limit(1)" } } }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["isError"], false, "{body}");
 
     // Opened again after the next checkpoint, it sees more.
     writer.store.checkpoint().unwrap();

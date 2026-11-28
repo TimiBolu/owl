@@ -6434,6 +6434,16 @@ impl Parser {
                 self.advance();
                 Ok(Literal::Null)
             }
+            // `big: .where { .. }.count()`: an operation on the rows in
+            // hand, written as if it were a field of the row.
+            Some(Token::Dot) if self.peek_token().is_some_and(Token::is_operation_keyword) => {
+                let word = self.peek_token().and_then(Token::keyword_text).unwrap_or("where");
+                Err(ParseError::UnexpectedToken(format!(
+                    "'.{word}' has nothing before the dot. An operation on the rows in hand is written \
+                     with no dot, as in `{word} {{ .. }}.count()`; after a path it follows the path, as in \
+                     `.orders.{word} {{ .. }}`"
+                )))
+            }
             Some(token) => Err(ParseError::UnexpectedToken(format!(
                 "Expected literal value, found {:?}",
                 token
@@ -6704,6 +6714,25 @@ pub fn parse_oql_statement(input: &str) -> Result<OQLStatement, Box<dyn std::err
     };
     reject_legacy_outer(&statement)?;
     Ok(statement)
+}
+
+/// Where a statement stops being OQL: the line and column, counted from
+/// one, of the first thing the parser could not accept. `None` for a
+/// statement that parses, and for one the tokenizer refuses, whose
+/// message says where.
+pub fn parse_error_position(input: &str) -> Option<(usize, usize)> {
+    let (tokens, offsets) = Tokenizer::tokenize_with_offsets(input).ok()?;
+    let mut parser = Parser::new(tokens);
+    parser.parse().err()?;
+    let offset = offsets
+        .get(parser.position)
+        .or(offsets.last())
+        .copied()
+        .unwrap_or(input.len())
+        .min(input.len());
+    let before = &input[..offset];
+    let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
+    Some((before.matches('\n').count() + 1, before[line_start..].chars().count() + 1))
 }
 
 /// Turn a parse failure into a message about the user's text: what was

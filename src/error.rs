@@ -112,6 +112,10 @@ pub enum OQLError {
     #[error("Query execution error: {message}")]
     QueryExecution { message: String },
 
+    /// A statement was stopped because it passed the budget it was given.
+    #[error("Over budget: {message}")]
+    BudgetExceeded { message: String },
+
     #[error("Generic error: {message}")]
     Generic { message: String },
 
@@ -267,6 +271,7 @@ impl OQLError {
             }
             OQLError::ConcurrencyError { message } => format!("Concurrency error: {}", message),
             OQLError::QueryExecution { message } => format!("Query execution error: {}", message),
+            OQLError::BudgetExceeded { message } => format!("Over budget: {}", message),
             OQLError::Io(e) => format!("IO error: {}", e),
             OQLError::Generic { message } => message.clone(),
 
@@ -374,6 +379,7 @@ impl OQLError {
             OQLError::TransactionConflict { .. } => ErrorSeverity::Error,
             OQLError::ConcurrencyError { .. } => ErrorSeverity::Warning,
             OQLError::QueryExecution { .. } => ErrorSeverity::Error,
+            OQLError::BudgetExceeded { .. } => ErrorSeverity::Error,
             OQLError::Io(_) => ErrorSeverity::Error,
             OQLError::Generic { .. } => ErrorSeverity::Error,
             OQLError::BatchError { .. } => ErrorSeverity::Error,
@@ -415,6 +421,7 @@ impl OQLError {
             OQLError::TransactionConflict { .. } => None,
             OQLError::ConcurrencyError { .. } => None,
             OQLError::QueryExecution { .. } => None,
+            OQLError::BudgetExceeded { .. } => None,
             OQLError::Io(_) => None,
             OQLError::Generic { .. } => None,
             OQLError::BatchError { .. } => None,
@@ -456,6 +463,7 @@ impl OQLError {
             OQLError::TransactionConflict { .. } => None,
             OQLError::ConcurrencyError { .. } => None,
             OQLError::QueryExecution { .. } => None,
+            OQLError::BudgetExceeded { .. } => None,
             OQLError::Io(_) => None,
             OQLError::Generic { .. } => None,
 
@@ -529,6 +537,9 @@ impl Clone for OQLError {
                 message: message.clone(),
             },
             OQLError::QueryExecution { message } => OQLError::QueryExecution {
+                message: message.clone(),
+            },
+            OQLError::BudgetExceeded { message } => OQLError::BudgetExceeded {
                 message: message.clone(),
             },
             OQLError::Io(e) => OQLError::Generic {

@@ -41,6 +41,19 @@ struct Arguments {
     /// Roll back a transaction left untouched for this many seconds.
     #[arg(long, default_value_t = 60)]
     transaction_idle_seconds: u64,
+    /// Stop any statement sent to /v1/query once it has run this many
+    /// milliseconds. A request may ask for less.
+    #[arg(long)]
+    query_ms: Option<u64>,
+    /// Stop any statement sent to /v1/query once it holds more rows than
+    /// this at one time.
+    #[arg(long)]
+    query_rows: Option<usize>,
+    /// The same two for a statement a language model sends through /mcp.
+    #[arg(long, default_value_t = 5000)]
+    assistant_ms: u64,
+    #[arg(long, default_value_t = 100_000)]
+    assistant_rows: usize,
 
     /// Keep the database's parts in this S3 bucket as well as on disk.
     /// The access key and secret are read from AWS_ACCESS_KEY_ID and
@@ -206,6 +219,14 @@ async fn main() -> Result<()> {
             token: arguments.token,
             transaction_idle: Duration::from_secs(arguments.transaction_idle_seconds.max(1)),
             backup_directory: arguments.backup_dir,
+            budget: owl_db::Budget {
+                time: arguments.query_ms.map(Duration::from_millis),
+                rows: arguments.query_rows,
+            },
+            assistant_budget: owl_db::Budget {
+                time: Some(Duration::from_millis(arguments.assistant_ms.max(1))),
+                rows: Some(arguments.assistant_rows.max(1)),
+            },
         },
     );
     let slot = janitor.store();

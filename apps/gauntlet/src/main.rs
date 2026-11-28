@@ -6,6 +6,7 @@
 //! query OQL cannot express yet. `check` requires the same rows from both
 //! engines; `bench` also times them; `show` prints both answers.
 
+mod ask;
 mod columns;
 mod data;
 mod scope;
@@ -44,6 +45,23 @@ enum Command {
         /// Print every query, not only those that fail.
         #[arg(long)]
         verbose: bool,
+    },
+    /// Questions in plain English, for a program that has only the
+    /// language card and the catalogue to learn OQL from. With no file
+    /// named, the questions are held to their own reference queries.
+    Ask {
+        #[arg(long, default_value_t = 300)]
+        people: usize,
+        /// Write what the model is given to this file.
+        #[arg(long)]
+        prompt: Option<PathBuf>,
+        /// Score this file of answers: a JSON object from id to OQL.
+        #[arg(long)]
+        answers: Option<PathBuf>,
+        /// Write what the database said about the answers it did not
+        /// accept to this file, to give the model once.
+        #[arg(long)]
+        feedback: Option<PathBuf>,
     },
     /// Require every query to return the same rows on both engines.
     Check {
@@ -730,6 +748,10 @@ fn compare(loaded: &Loaded, query: &Query) -> Result<Outcome> {
     let Some(oql) = &query.oql else {
         return Ok(Outcome::Missing);
     };
+    // The check runs nothing, so it must refuse nothing that runs.
+    if let Some(refusal) = refused_by_check(loaded, oql) {
+        return Ok(Outcome::Failed(refusal));
+    }
     Ok(match loaded.owl.query(oql) {
         Err(error) => Outcome::Failed(error.to_string()),
         Ok(owl) => match first_difference(&owl, &sqlite) {
@@ -737,6 +759,14 @@ fn compare(loaded: &Loaded, query: &Query) -> Result<Outcome> {
             Some(difference) => Outcome::Differ(difference),
         },
     })
+}
+
+/// What the check says against a query, when it refuses it.
+fn refused_by_check(loaded: &Loaded, oql: &str) -> Option<String> {
+    let executor = owl_db::QueryExecutor::new_with_real_clock(loaded.owl.store().clone());
+    owl_db::assist::check(&executor, oql)
+        .err()
+        .map(|problem| format!("the check refused it: {}", problem.message))
 }
 
 /// The median of `samples` runs after one untimed run, in milliseconds.
@@ -909,6 +939,9 @@ fn export(people: usize, to: &std::path::Path, only: Option<&str>) -> Result<()>
 fn main() -> Result<()> {
     match Arguments::parse().command {
         Command::Scope { people, count, seed, verbose } => scope(people, count, seed, verbose),
+        Command::Ask { people, prompt, answers, feedback } => {
+            ask::run(&load(people)?, prompt.as_deref(), answers.as_deref(), feedback.as_deref())
+        }
         Command::Check { people, only } => run(people, only.as_deref(), None),
         Command::Bench { people, only, samples } => run(people, only.as_deref(), Some(samples)),
         Command::Show { people, rows, queries } => show(people, rows, &queries),

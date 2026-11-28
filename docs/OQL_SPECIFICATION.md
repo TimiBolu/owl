@@ -939,6 +939,34 @@ A walk followed by a write is described and not run.
 
 ---
 
+### 20.1 For a program that writes queries
+
+Three things are given as data, by the library (`owl_db::assist`), by the
+server and as tools over the Model Context Protocol
+(`apps/owl-server/README.md`):
+
+| What | Meaning |
+|---|---|
+| The catalogue | Every collection: fields and types, which field refers to which collection, the name each relationship is followed by from the other end, indexes, row counts, and the functions defined. No row is read. |
+| The check | Whether a statement would be accepted, with nothing run. It is the checks a statement gets before it runs: its collection, every name along every path, every function called, a field compared with a literal of another kind, a path through a collection compared with one value, and `count()` in a filter of stored rows. It refuses nothing that would have run; `gauntlet check` and `gauntlet scope` require that of every query they run. A statement that passes can still fail on a value. |
+| The problem | A refusal as data: a code (`parse_error`, `unknown_collection`, `unknown_name`, `unknown_function`, `type_mismatch`, `read_only`, `over_budget`, `rejected`), the message, the line and column of a parse error, the name that was probably meant, and the names that do exist where one did not. |
+
+A statement can be run under a budget of time and of rows held at one
+time. Past either it fails, having written nothing. The budget is checked
+between the entries of a block, for each starting row of a capture and at
+each nested query, which is where work grows faster than the data; one
+read of a collection is not interrupted.
+
+`docs/OQL_CARD.md` is the language on one page, for a program to learn it
+from. Every example on it is checked and run by `tests/oql_card_test.rs`,
+and every mistake on it must be refused by the check.
+
+An unknown function now comes with the nearest name that is defined, and
+`.where { .. }` written with nothing before the dot says how an operation
+on the rows in hand is written.
+
+---
+
 ## 20a. Forms that read as a SQL or MongoDB user expects
 
 Added after the completeness matrix showed where a query took more words in

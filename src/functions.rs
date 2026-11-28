@@ -172,6 +172,25 @@ impl FunctionRegistry {
         self.builtin_functions.contains_key(name) || self.get_user_function(name).is_some()
     }
 
+    /// The names of the functions built into the engine, sorted.
+    pub fn builtin_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.builtin_functions.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// The functions written in OQL, the standard library among them,
+    /// sorted by name.
+    pub fn oql_functions(&self) -> Vec<Arc<UserDefinedFunction>> {
+        let mut functions: Vec<Arc<UserDefinedFunction>> = self
+            .user_functions
+            .read()
+            .map(|functions| functions.values().cloned().collect())
+            .unwrap_or_default();
+        functions.sort_by(|left, right| left.definition.name.cmp(&right.definition.name));
+        functions
+    }
+
     /// Get all function names
     pub fn function_names(&self) -> Vec<String> {
         let mut names = Vec::new();
