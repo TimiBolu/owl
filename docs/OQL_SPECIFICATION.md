@@ -884,6 +884,7 @@ these have 3 and 2 numbers`.
 | A field declared `Optional(Vector(n))` | Works, searched and indexed. It was refused. Rows with no vector are not candidates. |
 | `k` as a `$parameter` or an expression | Not yet: `k` is a whole number written in the query. |
 | The index behind it | None. `index(.embedding, metric: ..)` is recorded and every search compares every candidate, exactly. `exact` and `num_candidates` are accepted and change nothing. |
+| A search of a whole collection | Compares the vectors where the store keeps them packed, one after another, and reads only the rows it finds. The packed vectors are made on the collection's second search and kept until its next commit, up to what the store may keep in memory (256 MB by default, about 170,000 vectors of 384 numbers); past that they are made for each search. The first search after a commit makes them again. A search after a filter, through a relationship, or inside a transaction that has written reads each row, as before. The answers are the same either way, in the same order. |
 
 A row written before vectors were packed holds its vector as a list. Search,
 every vector function and equality take it as the vector it is. Arithmetic

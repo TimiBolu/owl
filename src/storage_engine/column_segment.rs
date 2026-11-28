@@ -20,6 +20,8 @@ const KIND_FLOAT: u8 = 3;
 const KIND_BOOLEAN: u8 = 4;
 const KIND_DATETIME: u8 = 5;
 const KIND_REFERENCE: u8 = 6;
+/// In memory only: see [`ColumnValues::Vectors`].
+const KIND_VECTOR: u8 = 7;
 const FLAG_INTEGER_STATS: u8 = 1;
 const FLAG_VALUES_LZ4: u8 = 1 << 1;
 const FLAG_AUXILIARY_LZ4: u8 = 1 << 2;
@@ -89,10 +91,15 @@ pub(crate) enum ColumnValues {
     Booleans(Vec<u8>),
     DateTimes(Vec<DateTime<Utc>>),
     References(Vec<ObjRef>),
+    /// One vector after another, each `dimension` numbers long. Made of
+    /// rows held in memory, to be searched; a segment on disk does not
+    /// hold one, and a vector there stays in its row's record.
+    Vectors { dimension: usize, values: Vec<f32> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum TypedCell<'a> {
+    Vector(&'a [f32]),
     Missing,
     Null,
     String(&'a str),
@@ -552,6 +559,7 @@ impl TypedSegment {
                 TypedCell::Boolean(value) => Value::Boolean(value),
                 TypedCell::DateTime(value) => Value::DateTime(value),
                 TypedCell::Reference(value) => Value::Reference(value),
+                TypedCell::Vector(numbers) => Value::Vector(numbers.to_vec()),
             };
             fields.insert(field.name.clone(), value);
         }
@@ -733,6 +741,9 @@ impl TypedColumn {
             ColumnValues::Booleans(values) => Ok(TypedCell::Boolean(values[row] != 0)),
             ColumnValues::DateTimes(values) => Ok(TypedCell::DateTime(values[row])),
             ColumnValues::References(values) => Ok(TypedCell::Reference(values[row])),
+            ColumnValues::Vectors { dimension, values } => {
+                Ok(TypedCell::Vector(&values[row * dimension..(row + 1) * dimension]))
+            }
         }
     }
 }
@@ -754,6 +765,7 @@ impl TypedColumn {
                 ColumnValues::DateTimes(_) => rows * std::mem::size_of::<DateTime<Utc>>(),
                 ColumnValues::References(_) => rows * std::mem::size_of::<ObjRef>(),
                 ColumnValues::Integers(_) | ColumnValues::Floats(_) => rows * 8,
+                ColumnValues::Vectors { values, .. } => values.len() * 4,
             }
     }
 
@@ -764,8 +776,9 @@ impl TypedColumn {
         field_name: &str,
         field_type: &FieldType,
         rows: &[Arc<Document>],
+        vectors: bool,
     ) -> OQLResult<Option<Self>> {
-        let Some(mut builder) = ColumnBuilder::new(field_name, field_type, rows.len()) else {
+        let Some(mut builder) = ColumnBuilder::new(field_name, field_type, rows.len(), vectors) else {
             return Ok(None);
         };
         for document in rows {
@@ -788,14 +801,27 @@ pub(crate) struct ColumnBuilder {
 }
 
 impl ColumnBuilder {
-    /// `None` when the field's type has no column form.
-    pub(crate) fn new(field_name: &str, field_type: &FieldType, expected_rows: usize) -> Option<Self> {
-        let kind = column_kind(field_type)?;
+    /// `None` when the field's type has no column form. A vector has one
+    /// only for a caller that asks with `vectors`: it is made in memory to
+    /// be searched, and nothing else is given one.
+    pub(crate) fn new(
+        field_name: &str,
+        field_type: &FieldType,
+        expected_rows: usize,
+        vectors: bool,
+    ) -> Option<Self> {
+        let values = match field_type.vector_dimension().filter(|_| vectors) {
+            Some(dimension) => ColumnValues::Vectors {
+                dimension: dimension as usize,
+                values: Vec::with_capacity(expected_rows * dimension as usize),
+            },
+            None => empty_values(column_kind(field_type)?, expected_rows),
+        };
         Some(Self {
             name: field_name.to_string(),
             presence: Vec::with_capacity(expected_rows.div_ceil(8)),
             nulls: Vec::with_capacity(expected_rows.div_ceil(8)),
-            values: empty_values(kind, expected_rows),
+            values,
             rows: 0,
             mistyped: false,
         })
@@ -856,6 +882,7 @@ impl ColumnValues {
             Self::Booleans(_) => KIND_BOOLEAN,
             Self::DateTimes(_) => KIND_DATETIME,
             Self::References(_) => KIND_REFERENCE,
+            Self::Vectors { .. } => KIND_VECTOR,
         }
     }
 
@@ -874,6 +901,7 @@ impl ColumnValues {
             }
             Self::DateTimes(values) => values.len() == rows,
             Self::References(values) => values.len() == rows,
+            Self::Vectors { dimension, values } => *dimension > 0 && values.len() == rows * dimension,
         };
         if valid {
             Ok(())
@@ -890,6 +918,7 @@ impl ColumnValues {
             Self::Booleans(values) => values.len(),
             Self::DateTimes(values) => values.len(),
             Self::References(values) => values.len(),
+            Self::Vectors { dimension, values } => values.len() / (*dimension).max(1),
         }
     }
 }
@@ -995,6 +1024,7 @@ fn push_default(values: &mut ColumnValues) -> OQLResult<()> {
         ColumnValues::Booleans(values) => values.push(0),
         ColumnValues::DateTimes(values) => values.push(timestamp(0, 0)?),
         ColumnValues::References(values) => values.push(ObjRef::null()),
+        ColumnValues::Vectors { dimension, values } => values.resize(values.len() + *dimension, 0.0),
     }
     Ok(())
 }
@@ -1010,6 +1040,11 @@ fn push_value(values: &mut ColumnValues, value: &Value) -> OQLResult<()> {
         (ColumnValues::Booleans(values), Value::Boolean(value)) => values.push(u8::from(*value)),
         (ColumnValues::DateTimes(values), Value::DateTime(value)) => values.push(*value),
         (ColumnValues::References(values), Value::Reference(value)) => values.push(*value),
+        // A vector, or one stored as a list before vectors were packed.
+        (ColumnValues::Vectors { dimension, values }, value) => match value.as_vector() {
+            Some(numbers) if numbers.len() == *dimension => values.extend_from_slice(&numbers),
+            _ => return Err(storage_error("a vector of another length than its field declares")),
+        },
         _ => {
             return Err(storage_error(
                 "typed segment value disagrees with its schema field type",
@@ -1211,6 +1246,11 @@ fn encoded_value_len(kind: u8, rows: usize) -> OQLResult<usize> {
 fn encode_values(values: &ColumnValues) -> OQLResult<(Vec<u8>, Vec<u8>)> {
     let mut bytes = Vec::new();
     let auxiliary = match values {
+        ColumnValues::Vectors { .. } => {
+            return Err(storage_error(
+                "a vector column is made in memory to be searched and is not written to a segment",
+            ))
+        }
         ColumnValues::Strings {
             offsets,
             bytes: strings,

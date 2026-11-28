@@ -88,6 +88,17 @@ pub enum Metric {
 /// position and score. `rows` holds one vector after another, each as
 /// long as the query. Rows that score the same keep their order.
 pub fn nearest(rows: &[f32], query: &[f32], metric: Metric, k: usize) -> Vec<(usize, f32)> {
+    nearest_among(rows, query, metric, k, |_| true)
+}
+
+/// [`nearest`], of only the rows `candidate` says are to be compared.
+pub fn nearest_among(
+    rows: &[f32],
+    query: &[f32],
+    metric: Metric,
+    k: usize,
+    candidate: impl Fn(usize) -> bool,
+) -> Vec<(usize, f32)> {
     let dimension = query.len();
     if dimension == 0 || k == 0 {
         return Vec::new();
@@ -95,7 +106,9 @@ pub fn nearest(rows: &[f32], query: &[f32], metric: Metric, k: usize) -> Vec<(us
     let query_norm = norm(query);
     let mut scored: Vec<(usize, f32)> = rows
         .chunks_exact(dimension)
-        .map(|row| match metric {
+        .enumerate()
+        .filter(|(position, _)| candidate(*position))
+        .map(|(position, row)| (position, match metric {
             Metric::Dot => dot(row, query),
             Metric::L2 => -squared_distance(row, query),
             Metric::Cosine => {
@@ -106,8 +119,7 @@ pub fn nearest(rows: &[f32], query: &[f32], metric: Metric, k: usize) -> Vec<(us
                     dot(row, query) / lengths
                 }
             }
-        })
-        .enumerate()
+        }))
         .collect();
     let nearer = |a: &(usize, f32), b: &(usize, f32)| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0));
     if k < scored.len() {
