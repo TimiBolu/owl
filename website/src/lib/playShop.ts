@@ -1,14 +1,10 @@
 // What the playground starts with and offers to run. The shop is the one the
 // language tour draws: the same customers and orders, with the products and
 // order lines its first chapter declares.
-import { CUSTOMERS, ORDERS } from "./shop";
+import { CUSTOMERS, ORDERS, PRODUCTS, SOUGHT } from "./shop";
 
-const PRODUCTS = [
-  { id: "kettle", name: "Kettle", price: 45 },
-  { id: "mug", name: "Mug", price: 12 },
-  { id: "tea", name: "Tea", price: 8 },
-  { id: "lamp", name: "Lamp", price: 40 },
-];
+// A vector as it is written in a query: every number with a decimal point.
+const vector = (numbers: readonly number[]) => `[${numbers.map((n) => n.toFixed(1)).join(", ")}]`;
 
 // What each order was for. The lines add up to the order's total.
 const LINES: Record<string, Array<[product: string, qty: number]>> = {
@@ -25,7 +21,8 @@ const DAYS: Record<string, string> = { o1: "02", o2: "03", o3: "05", o4: "06", o
 const rows = <T>(items: readonly T[], write: (item: T) => string) => items.map((item) => `  ${write(item)}`).join(",\n");
 
 export const SHOP = `schema customers { id: String, name: String, country: String }
-schema products { id: String, name: String, price: Float }
+// about: how much a product has to do with hot drinks, and with lighting
+schema products { id: String, name: String, price: Float, about: Vector(2) }
 schema orders {
   id: String,
   customer: Ref(customers),
@@ -40,7 +37,7 @@ ${rows(CUSTOMERS, (c) => `{ id: "${c.id}", name: "${c.name}", country: "${c.coun
 ]
 
 products.insert [
-${rows(PRODUCTS, (p) => `{ id: "${p.id}", name: "${p.name}", price: ${p.price}.0 }`)}
+${rows(PRODUCTS, (p) => `{ id: "${p.id}", name: "${p.name}", price: ${p.price}.0, about: ${vector(p.about)} }`)}
 ]
 
 orders.insert [
@@ -51,6 +48,11 @@ ${rows(ORDERS, (o) => {
 ]`;
 
 export const SCHEMA = SHOP.slice(0, SHOP.indexOf("\n\ncustomers.insert"));
+
+// A shop kept in a visitor's browser from before products held a vector is given one: the
+// field, which may be absent since rows existed before it, and each product's own.
+export const SHOP_VECTORS = `schema products { id: String, name: String, price: Float, about: Optional(Vector(2)) }
+${PRODUCTS.map((p) => `products.where { .id == "${p.id}" }.update { about: ${vector(p.about)} }`).join("\n")}`;
 
 export type Sample = { name: string; says: string; code: string };
 
@@ -121,6 +123,35 @@ export const SAMPLES: Sample[] = [
     product: line.product.name,
     qty: line.qty
   }
+}`,
+  },
+  {
+    name: "Near",
+    says: "Find rows by what they are about, not by an exact value.",
+    code: `products
+  .nearest { field: .about, query: ${vector(SOUGHT)}, k: 2 }
+  .select { name, score: round(._score, 3) }`,
+  },
+  {
+    name: "Alike",
+    says: "Search with a row's own vector to find the rows most like it.",
+    code: `products.sort { .id.asc }.select {
+  name,
+  most_like: products
+    .where { .id != products.id }
+    .nearest { field: .about, query: products.about, k: 1 }
+    .first().name
+}`,
+  },
+  {
+    name: "Their taste",
+    says: "Average the vectors a path reaches, and compare the result.",
+    code: `customers.sort { .id.asc }.select {
+  name,
+  hot_drinks: round(
+    similarity(centroid(.orders.items.product.about), [1.0, 0.0]),
+    2
+  )
 }`,
   },
   {

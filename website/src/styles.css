@@ -448,6 +448,9 @@ h3 { margin: 0 0 10px; font: 800 21px/1.2 var(--body); }
 .tv-rule.strong { opacity: 1; stroke-width: 2.5; }
 .tv-bar { fill: var(--tape); stroke: var(--ink); stroke-width: 2; }
 .tv-badge { fill: var(--ink); }
+.tv-dot { fill: var(--paper); stroke: var(--ink); stroke-width: 2.5; }
+.tv-dot.lit { fill: var(--tape); }
+.tv path.tv-link { fill: none; stroke: var(--ink); stroke-width: 2; stroke-linecap: round; stroke-dasharray: 2 8; opacity: .3; }
 .tv .tv-badge-text { fill: var(--paper-2); font: 600 13px var(--mono); }
 @keyframes march { to { stroke-dashoffset: -16; } }
 

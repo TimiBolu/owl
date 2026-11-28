@@ -18,5 +18,17 @@ export const ORDERS: Order[] = [
   { id: "o6", customer: "ada", status: "paid", total: 97 },
 ];
 
+// What the shop sells. `about` is a vector: how much a product has to do with hot drinks, and
+// with lighting.
+export const PRODUCTS = [
+  { id: "kettle", name: "Kettle", price: 45, about: [0.6, 0.6] },
+  { id: "mug", name: "Mug", price: 12, about: [0.9, 0.3] },
+  { id: "tea", name: "Tea", price: 8, about: [1.0, 0.0] },
+  { id: "lamp", name: "Lamp", price: 40, about: [0.1, 1.0] },
+] as const;
+
+// The vector the tour and the playground search with: mostly hot drinks, a little light.
+export const SOUGHT = [0.9, 0.2] as const;
+
 export const nameOf = (id: string) => CUSTOMERS.find((c) => c.id === id)!.name;
 export const countryOf = (id: string) => CUSTOMERS.find((c) => c.id === id)!.country;

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { CSSProperties, KeyboardEvent } from "react";
 import { Engine } from "../lib/owl";
 import type { About, Answer } from "../lib/owl";
-import { SAMPLES, SHOP } from "../lib/playShop";
+import { SAMPLES, SHOP, SHOP_VECTORS } from "../lib/playShop";
 import { GITHUB_URL } from "../lib/seo";
 import { usePerch } from "../lib/usePerch";
 import { Owl } from "./Hero";
@@ -181,6 +181,14 @@ export function Playground() {
       if (seeded.answer.errors.length) throw new Error(seeded.answer.errors.join(" "));
       setFound("new");
       return "new";
+    }
+    // A shop kept from before its products held a vector is given one, so that every
+    // sample still has something to answer from. A products collection of the visitor's
+    // own shape is left as it is.
+    const products = there.collections.find((c) => c.name === "products");
+    const isShop = SHOP_NAMES.every((name) => there.collections.some((c) => c.name === name));
+    if (isShop && products && !products.fields.some((field) => field.name === "about")) {
+      await owl.run(SHOP_VECTORS);
     }
     setFound("kept");
     return "kept";
