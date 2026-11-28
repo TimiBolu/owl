@@ -1,5 +1,5 @@
 import type { CSSProperties, ReactNode } from "react";
-import { CUSTOMERS, ORDERS, countryOf, nameOf } from "../lib/shop";
+import { CUSTOMERS, ORDERS, PRODUCTS as SOLD, SOUGHT, countryOf, nameOf } from "../lib/shop";
 
 // Every visual is one 480×400 drawing whose parts move or fade as `stage` advances. Positions
 // are computed from the shop's rows with the same filter and sort the query applies, so a
@@ -342,6 +342,65 @@ export function PairsVisual({ stage }: Stage) {
           </g>
         );
       })}
+    </Frame>
+  );
+}
+
+/* ---------- 09 Near: products as points, and the two that point most nearly the query's way ---------- */
+
+// How nearly two vectors point the same way: the cosine of the angle between them.
+const alike = (a: readonly number[], b: readonly number[]) => {
+  const dot = a.reduce((sum, n, i) => sum + n * b[i], 0);
+  return dot / (Math.hypot(...a) * Math.hypot(...b));
+};
+
+// Where a vector lands in the drawing: hot drinks to the right, lighting upwards.
+const plot = ([drinks, light]: readonly number[]) => ({ x: 70 + drinks * 300, y: 330 - light * 260 });
+
+// Where each name is written from its point, so that no two names touch: beside the point,
+// or under the line the point sits on.
+const NAME_AT: Record<string, { dx: number; dy: number; anchor: "start" | "middle" }> = {
+  kettle: { dx: 16, dy: 5, anchor: "start" },
+  mug: { dx: 16, dy: -2, anchor: "start" },
+  tea: { dx: 0, dy: 28, anchor: "middle" },
+  lamp: { dx: 16, dy: 5, anchor: "start" },
+};
+
+export function NearVisual({ stage }: Stage) {
+  const ranked = [...SOLD].sort((a, b) => alike(b.about, SOUGHT) - alike(a.about, SOUGHT));
+  const found = ranked.slice(0, 2);
+  const origin = plot([0, 0]);
+  // The query is a direction, drawn short of the points so that it crosses none of them.
+  const sought = plot(SOUGHT.map((n) => n * 0.6));
+  return (
+    <Frame label="Four products as points, and the two that point most nearly the same way as the vector asked about">
+      <path className="tv-rule" d={`M${origin.x} ${origin.y} H 440`} />
+      <path className="tv-rule" d={`M${origin.x} ${origin.y} V 40`} />
+      <g className="tv-head">
+        <text x={origin.x + 8} y={origin.y + 24}>hot drinks</text>
+        <text x={origin.x - 8} y={34}>lighting</text>
+      </g>
+
+      {SOLD.map((p) => {
+        const { x, y } = plot(p.about);
+        const lit = found.some((f) => f.id === p.id);
+        const name = NAME_AT[p.id];
+        return (
+          <g key={p.id} style={show(stage < 3 || lit, 0.25)}>
+            <path className="tv-link faint" d={`M${origin.x} ${origin.y} L ${x} ${y}`} style={show(stage >= 1)} />
+            <circle className={stage >= 3 && lit ? "tv-dot lit" : "tv-dot"} cx={x} cy={y} r={9} />
+            <text x={x + name.dx} y={y + name.dy} textAnchor={name.anchor}>{p.name}</text>
+            <text className="tv-strong" x={x + name.dx} y={y + name.dy + 17} textAnchor={name.anchor} style={show(stage >= 4 && lit)}>
+              {alike(p.about, SOUGHT).toFixed(3)}
+            </text>
+          </g>
+        );
+      })}
+
+      <g className={stage === 2 ? "tv-link walk" : "tv-link"} style={show(stage >= 2)}>
+        <path d={`M${origin.x} ${origin.y} L ${sought.x} ${sought.y}`} markerEnd="url(#arrow)" />
+        <text x={sought.x - 4} y={sought.y + 20} textAnchor="end">query</text>
+      </g>
     </Frame>
   );
 }

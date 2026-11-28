@@ -1,7 +1,8 @@
 import { Offstage } from "./Offstage";
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { BucketsVisual, LinksVisual, PairsVisual, PipelineVisual, PlaceVisual, SchemaVisual, TreeVisual } from "./TourVisuals";
+import { BucketsVisual, LinksVisual, NearVisual, PairsVisual, PipelineVisual, PlaceVisual, SchemaVisual, TreeVisual } from "./TourVisuals";
+import { SOUGHT } from "../lib/shop";
 
 /**
  * A piece of a chapter's code. `from` is the step that introduces it: before that step it is
@@ -212,6 +213,35 @@ const CHAPTERS: Chapter[] = [
       `{ who: "Chen", larger: "o4", smaller: "o5" }`,
     ],
     visual: (stage) => <PairsVisual stage={stage} />,
+  },
+  {
+    name: "Near",
+    title: "Find rows by what they are about.",
+    code: [
+      { from: 0, code: `products\n` },
+      { from: 1, code: `  .${k("nearest")} {\n    field: .about,\n` },
+      { from: 2, code: `    query: [${SOUGHT.map((n) => n.toFixed(1)).join(", ")}],\n` },
+      { from: 3, code: `    k: 2\n` },
+      { from: 1, code: `  }\n` },
+      { from: 4, code: `  .${k("select")} { name, score: ${k("round")}(._score, 3) }` },
+    ],
+    steps: [
+      <>
+        Each product holds a vector: two numbers that say how much it has to do with hot drinks, and with lighting.
+      </>,
+      <>
+        <code>nearest</code> compares a vector with the one in a field of every row. What matters is which way each points.
+      </>,
+      <>The vector to look for: mostly hot drinks, a little light.</>,
+      <>
+        <code>k</code> keeps the two that point most nearly the same way. The lamp points elsewhere.
+      </>,
+      <>
+        Each row found carries its score. 1 is exactly the same direction.
+      </>,
+    ],
+    answer: [`{ name: "Mug", score: 0.995 }`, `{ name: "Tea", score: 0.976 }`],
+    visual: (stage) => <NearVisual stage={stage} />,
   },
 ];
 
