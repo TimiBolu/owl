@@ -177,7 +177,7 @@ schema accounts {
 | Check | `check(.age >= 0 && .ends > .starts)` | Works: any condition over the document, enforced on insert and update |
 | Default | `plan: String = "free"`, `joined: DateTime = now()`, `label: String = upper(.handle)` | Works. A default is an expression evaluated against the fields the insert wrote; a written value wins. |
 | Index | `index(.status, .placed)` | Works. Reads that match use it. |
-| Vector index | `index(.embedding, metric: "cosine")` | Recorded, on a `Vector(n)` or `Optional(Vector(n))` field. Nothing is built from it yet: every search compares every candidate, exactly (18.2). |
+| Vector index | `index(.embedding, metric: "cosine")` | Works, on a `Vector(n)` or `Optional(Vector(n))` field, for `cosine` and `l2`: a search of the collection by that metric is answered from it (18.2). |
 | The declared set is the set | | Works. An index or unique rule dropped from the block is removed on redeclaration. |
 
 Field modifiers are written in this order after the type:
@@ -883,8 +883,16 @@ these have 3 and 2 numbers`.
 | The query vector's length differs from the field's | An error |
 | A field declared `Optional(Vector(n))` | Works, searched and indexed. It was refused. Rows with no vector are not candidates. |
 | `k` as a `$parameter` or an expression | Not yet: `k` is a whole number written in the query. |
-| The index behind it | None. `index(.embedding, metric: ..)` is recorded and every search compares every candidate, exactly. `exact` and `num_candidates` are accepted and change nothing. |
-| A search of a whole collection | Compares the vectors where the store keeps them packed, one after another, and reads only the rows it finds. The packed vectors are made on the collection's second search and kept until its next commit, up to what the store may keep in memory (256 MB by default, about 170,000 vectors of 384 numbers); past that they are made for each search. The first search after a commit makes them again. A search after a filter, through a relationship, or inside a transaction that has written reads each row, as before. The answers are the same either way, in the same order. |
+| An index | `index(.embedding, metric: "cosine")` or `"l2"`, on a `Vector(n)` or `Optional(Vector(n))` field. A search of the whole collection by that metric is answered from it. |
+| What an index does | It keeps the field's vectors in lists, each around a centre, and a search compares the query with the centres and then with the vectors of the nearest lists only. Vectors that are alike are in the same few lists, so the nearest are found among a fraction of all. Under 4,096 vectors there is one list, and the search is exact. |
+| Approximate by default | With lists, a search compares the nearest lists until it has compared an eighth of the vectors, and at least a hundred for each row asked for. A near vector in a list not reached is missed. How much is found depends on the data: nearly all when vectors fall in clumps, as embeddings of text do, and less when they have no structure at all. |
+| `exact: true` | Every vector the index holds is compared: the same rows, in the same order, as a search that reads every row. Still no row is read but the ones found. |
+| `num_candidates: n` | Compare about `n` vectors: the nearest lists, until that many have been. More finds more and takes longer. |
+| The score | From the row's own vector, as a search that reads every row gives it, whichever way the row was found. Rows equally near are in order of id. |
+| Kept in step | A row written, changed or deleted moves one vector in the index, at the cost of comparing it with the centres. No search waits for anything to be rebuilt after a commit. The centres are worked out again each time the collection has doubled, by the first search after. |
+| Not stored | The index is built from the rows, in memory, by the first search that wants it after the database is opened, and takes about as much memory as the vectors themselves. |
+| Where it is not used | A search by the dot product, by a metric other than the index's, after a filter, through a relationship, or in a transaction that has written. Those compare every candidate, as below. |
+| A search of a whole collection with no index for it | Compares the vectors where the store keeps them packed, one after another, and reads only the rows it finds. The packed vectors are made on the collection's second search and kept until its next commit, up to what the store may keep in memory (256 MB by default, about 170,000 vectors of 384 numbers); past that they are made for each search. The first search after a commit makes them again. A search after a filter, through a relationship, or inside a transaction that has written reads each row, as before. The answers are the same either way, in the same order. |
 
 A row written before vectors were packed holds its vector as a list. Search,
 every vector function and equality take it as the vector it is. Arithmetic

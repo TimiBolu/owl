@@ -807,6 +807,29 @@ pub trait DocumentStore: Send + Sync + 'static {
     fn scan_vector_column(&self, _schema: &str, _field: &str) -> OQLResult<Option<ColumnBatch>> {
         Ok(None)
     }
+    /// The `k` rows whose vector in `field` is nearest `query`, nearest
+    /// first with rows equally near in order of id, each with its score,
+    /// from an index the store keeps for the field; and what the search
+    /// did. `exact` compares every vector the index holds. Otherwise the
+    /// nearest of its lists are compared until `compare` vectors have
+    /// been, or as many as the index chooses when that is not given.
+    ///
+    /// `None` when there is no such index to ask: none is declared for the
+    /// field with this metric, the store keeps none, or there are writes
+    /// not yet committed.
+    #[allow(clippy::too_many_arguments)]
+    fn search_vector_index(
+        &self,
+        _schema: &str,
+        _field: &str,
+        _query: &[f32],
+        _metric: crate::vector::Metric,
+        _k: usize,
+        _exact: bool,
+        _compare: Option<usize>,
+    ) -> OQLResult<Option<(Vec<(Arc<Document>, f32)>, crate::storage_engine::VectorSearched)>> {
+        Ok(None)
+    }
     /// Something the caller made from columns stamped `stamp`, kept under
     /// `key` for as long as those columns are good. `None` when nothing was
     /// kept, or something has been committed since.

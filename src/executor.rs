@@ -6123,6 +6123,34 @@ impl<S: DocumentStore> QueryExecutor<S> {
         if wanted.len() != declared as usize {
             return Ok(None);
         }
+        let metric = match block.metric {
+            VectorMetric::Cosine => crate::vector::Metric::Cosine,
+            VectorMetric::L2 => crate::vector::Metric::L2,
+            VectorMetric::Dot => crate::vector::Metric::Dot,
+        };
+        // An index declared for the field, when the store keeps one.
+        if let Some((rows, searched)) = self.store.search_vector_index(
+            &query.collection,
+            field,
+            &wanted,
+            metric,
+            block.k as usize,
+            block.exact.unwrap_or(false),
+            block.num_candidates.map(|compare| compare as usize),
+        )? {
+            VECTOR_INDEX_SEARCHES.with(|last| last.set(Some(searched)));
+            return Ok(Some(
+                rows.into_iter()
+                    .map(|(row, score)| {
+                        let mut document = row.as_ref().clone();
+                        document
+                            .fields
+                            .insert("_score".to_string(), Value::Float(f64::from(score)));
+                        document
+                    })
+                    .collect(),
+            ));
+        }
         let Some(batch) = self.store.scan_vector_column(&query.collection, field)? else {
             return Ok(None);
         };
@@ -6133,11 +6161,6 @@ impl<S: DocumentStore> QueryExecutor<S> {
         if dimension != wanted.len() {
             return Ok(None);
         }
-        let metric = match block.metric {
-            VectorMetric::Cosine => crate::vector::Metric::Cosine,
-            VectorMetric::L2 => crate::vector::Metric::L2,
-            VectorMetric::Dot => crate::vector::Metric::Dot,
-        };
         // A row with no vector is not a candidate.
         let hits = crate::vector::nearest_among(values, &wanted, metric, block.k as usize, |row| {
             column.has_value(row)
@@ -16711,6 +16734,21 @@ fn within_budget(rows: usize) -> OQLResult<()> {
         }
     }
     Ok(())
+}
+
+thread_local! {
+    /// What the last search this thread answered from a vector index did.
+    static VECTOR_INDEX_SEARCHES: std::cell::Cell<Option<crate::storage_engine::VectorSearched>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// What the last search this thread answered from a vector index did, and
+/// forget it: how many lists the index holds, how many were compared, and
+/// how many vectors. `None` when no search has been answered from one
+/// since this was last asked. For tests.
+#[doc(hidden)]
+pub fn last_vector_index_search() -> Option<crate::storage_engine::VectorSearched> {
+    VECTOR_INDEX_SEARCHES.with(std::cell::Cell::take)
 }
 
 thread_local! {

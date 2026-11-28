@@ -707,6 +707,10 @@ struct State {
     /// what is needed to check the indexes afterwards.
     open_audit: Option<OpenAudit>,
     vector_indexes: HashMap<String, Vec<VectorIndexDefinition>>,
+    /// The vector indexes built so far, by collection and field. Built
+    /// from the rows by the first search that wants one, kept in step by
+    /// every commit after, and never stored.
+    built_vectors: RwLock<HashMap<(String, String), Arc<crate::storage_engine::VectorIndex>>>,
     reverse_reference_index: Arc<BTreeIndex>,
     /// What open transactions need in order to tell, at commit, whether
     /// someone else changed a document they wrote.
@@ -6505,6 +6509,7 @@ impl RustStore {
                             object_ref,
                         )?;
                     }
+                    keep_vector_indexes(state, &document.schema, object_ref, Some(&document), batch_lsn);
                     let delta_schema = document.schema.clone();
                     let delta_id = document.id.clone();
                     state.collection_stamps.insert(delta_schema.clone(), batch_lsn);
@@ -6556,6 +6561,7 @@ impl RustStore {
                         )?;
                         remove_reverse_reference_target(state, object_ref)?;
                     }
+                    keep_vector_indexes(state, &schema, object_ref, None, batch_lsn);
                     state.collection_stamps.insert(schema.clone(), batch_lsn);
                     state.forget_count(&schema);
                     if let Some(rows) = state.collection_rows.get_mut(&schema) {
@@ -6617,8 +6623,12 @@ impl RustStore {
                     }
                     state.scalar_index_deletes.insert(identity);
                 }
-                Mutation::PutVectorIndex(index) => upsert(&mut state.vector_indexes, index),
+                Mutation::PutVectorIndex(index) => {
+                    forget_vector_indexes(state, &index.schema);
+                    upsert(&mut state.vector_indexes, index)
+                }
                 Mutation::DeleteVectorIndex { schema, name } => {
+                    forget_vector_indexes(state, &schema);
                     remove_named(&mut state.vector_indexes, &schema, &name);
                 }
             }
@@ -9154,6 +9164,67 @@ fn logical_collection_identities(
 /// The live rows of a collection in id order, which is the order a scan
 /// yields them. Rows held in memory are already kept in that order, so only
 /// a collection with rows in typed segments needs the ids to merge by.
+/// Bring every vector index built for `schema` up to date with one row
+/// written or deleted, as of commit `lsn`.
+fn keep_vector_indexes(
+    state: &mut State,
+    schema: &str,
+    object_ref: ObjRef,
+    document: Option<&Document>,
+    lsn: u64,
+) {
+    let built = state.built_vectors.get_mut().unwrap_or_else(|poisoned| poisoned.into_inner());
+    for ((collection, field), index) in built.iter_mut() {
+        if collection != schema {
+            continue;
+        }
+        // No search holds the index while a commit is applied; if one
+        // somehow did, it keeps the copy it began with.
+        let index = Arc::make_mut(index);
+        match document.and_then(|document| document.fields.get(field)).and_then(Value::as_vector) {
+            Some(vector) => index.put(object_ref, &vector),
+            None => index.remove(object_ref),
+        }
+        index.stamps.0 = lsn;
+    }
+}
+
+/// Drop the vector indexes built for `schema`: what they were built to
+/// has changed.
+fn forget_vector_indexes(state: &mut State, schema: &str) {
+    state
+        .built_vectors
+        .get_mut()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .retain(|(collection, _), _| collection != schema);
+}
+
+/// A vector index for one field of `schema`, built from its rows as they
+/// stand. Only the field is read of each row.
+fn build_vector_index(
+    state: &State,
+    schema: &str,
+    field: &str,
+    dimension: usize,
+    metric: crate::vector::Metric,
+    stamps: (u64, u64),
+) -> OQLResult<Option<crate::storage_engine::VectorIndex>> {
+    let Some(mut index) = crate::storage_engine::VectorIndex::new(dimension, metric) else {
+        return Ok(None);
+    };
+    let wanted: HashSet<String> = HashSet::from([field.to_string()]);
+    for object_ref in logical_collection_object_refs(state, schema)? {
+        let Some(document) = sourced_document_reading(state, object_ref, Some(&wanted))? else {
+            continue;
+        };
+        if let Some(vector) = document.fields.get(field).and_then(Value::as_vector) {
+            index.put(object_ref, &vector);
+        }
+    }
+    index.stamps = stamps;
+    Ok(Some(index))
+}
+
 fn logical_collection_object_refs(state: &State, schema: &str) -> OQLResult<Vec<ObjRef>> {
     if !state.typed_id_fences.contains_key(schema)
         && state.overflow_id_counts.get(schema).copied().unwrap_or(0) == 0
@@ -13030,6 +13101,104 @@ impl DocumentStore for RustStore {
         Ok(self
             .rows_and_columns(schema, fields, false, true, false)?
             .map(|(_, batch)| vec![batch]))
+    }
+
+    fn search_vector_index(
+        &self,
+        schema: &str,
+        field: &str,
+        query: &[f32],
+        metric: crate::vector::Metric,
+        k: usize,
+        exact: bool,
+        compare: Option<usize>,
+    ) -> OQLResult<Option<(Vec<(Arc<Document>, f32)>, crate::storage_engine::VectorSearched)>> {
+        use crate::storage::{VectorIndexState, VectorMetricType};
+        use crate::vector::Metric;
+        let declared_as = match metric {
+            Metric::Cosine => VectorMetricType::Cosine,
+            Metric::L2 => VectorMetricType::L2,
+            // No index serves the dot product; every vector is compared.
+            Metric::Dot => return Ok(None),
+        };
+        if !self.pending_operations()?.is_empty() {
+            return Ok(None);
+        }
+        // Held throughout: nothing is committed while the index is read,
+        // so it and the rows it names are of one moment.
+        let state = self
+            .state
+            .read()
+            .map_err(|_| OQLError::generic("storage state lock poisoned"))?;
+        let declared = state.vector_indexes.get(schema).is_some_and(|indexes| {
+            indexes.iter().any(|index| {
+                index.field == field && index.metric == declared_as && index.state == VectorIndexState::Ready
+            })
+        });
+        let dimension = state
+            .schemas
+            .get(schema)
+            .and_then(|declared| declared.fields.get(field))
+            .and_then(|field| field.vector_dimension());
+        let Some(dimension) = dimension.filter(|dimension| declared && *dimension as usize == query.len()) else {
+            return Ok(None);
+        };
+        let stamps = (
+            state.collection_stamps.get(schema).copied().unwrap_or(0),
+            state.catalog_stamp,
+        );
+        let key = (schema.to_string(), field.to_string());
+        let good = |index: &Arc<crate::storage_engine::VectorIndex>| {
+            index.stamps == stamps && index.metric() == metric && index.dimension() == dimension as usize
+        };
+        let lock = || OQLError::generic("vector index lock poisoned");
+        let ready = state
+            .built_vectors
+            .read()
+            .map_err(|_| lock())?
+            .get(&key)
+            .filter(|index| good(index) && !index.wants_dividing())
+            .cloned();
+        let index = match ready {
+            Some(index) => index,
+            None => {
+                let mut built = state.built_vectors.write().map_err(|_| lock())?;
+                // Another search may have built or divided it meanwhile.
+                let mut index = match built.get(&key).filter(|index| good(index)).cloned() {
+                    Some(index) => index,
+                    None => match build_vector_index(&state, schema, field, dimension as usize, metric, stamps)? {
+                        Some(index) => Arc::new(index),
+                        None => return Ok(None),
+                    },
+                };
+                if index.wants_dividing() {
+                    Arc::make_mut(&mut index).divide();
+                }
+                built.insert(key, index.clone());
+                index
+            }
+        };
+        let (found, searched) = index.search(query, k, exact, compare);
+        // The rows found, each scored from its own vector as a search
+        // that reads every row scores it, and put in that search's order.
+        let mut rows = Vec::with_capacity(found.len());
+        for (object_ref, _) in found {
+            let Some(document) = logical_document(&state, object_ref)? else {
+                continue;
+            };
+            let Some(score) = document
+                .fields
+                .get(field)
+                .and_then(Value::as_vector)
+                .map(|vector| crate::vector::score(metric, &vector, query))
+            else {
+                continue;
+            };
+            rows.push((document, score));
+        }
+        rows.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.id.cmp(&b.0.id)));
+        rows.truncate(k);
+        Ok(Some((rows, searched)))
     }
 
     fn scan_vector_column(&self, schema: &str, field: &str) -> OQLResult<Option<ColumnBatch>> {

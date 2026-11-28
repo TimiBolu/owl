@@ -75,6 +75,23 @@ pub fn similarity(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+/// How near `row` is to `query` by `metric`: what a search ranks by and
+/// gives as `_score`. Higher is nearer in every metric.
+pub fn score(metric: Metric, row: &[f32], query: &[f32]) -> f32 {
+    match metric {
+        Metric::Dot => dot(row, query),
+        Metric::L2 => -squared_distance(row, query),
+        Metric::Cosine => {
+            let lengths = norm(row) * norm(query);
+            if lengths == 0.0 {
+                0.0
+            } else {
+                dot(row, query) / lengths
+            }
+        }
+    }
+}
+
 /// How a search ranks: by the cosine, by the straight-line distance, or
 /// by the dot product. A higher score is nearer in every one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
