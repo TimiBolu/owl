@@ -204,6 +204,8 @@ impl<'a> ProjectedValueRef<'a> {
             TypedCell::Boolean(value) => Some(Self::Boolean(value)),
             TypedCell::DateTime(value) => Some(Self::DateTime(value)),
             TypedCell::Reference(value) => Some(Self::Reference(value)),
+            // A vector column is made to be searched, never projected.
+            TypedCell::Vector(_) => None,
         }
     }
 
@@ -283,6 +285,8 @@ pub enum ColumnData<'a> {
     Booleans(&'a [u8]),
     DateTimes(&'a [DateTime<Utc>]),
     References(&'a [crate::document::ObjRef]),
+    /// Row `n` is `values[n * dimension..(n + 1) * dimension]`.
+    Vectors { dimension: usize, values: &'a [f32] },
 }
 
 impl<'a> Column<'a> {
@@ -294,6 +298,9 @@ impl<'a> Column<'a> {
             ColumnValues::Booleans(values) => ColumnData::Booleans(values),
             ColumnValues::DateTimes(values) => ColumnData::DateTimes(values),
             ColumnValues::References(values) => ColumnData::References(values),
+            ColumnValues::Vectors { dimension, values } => {
+                ColumnData::Vectors { dimension: *dimension, values }
+            }
         }
     }
 
@@ -789,6 +796,16 @@ pub trait DocumentStore: Send + Sync + 'static {
     /// `scan_columns` and takes its `None`.
     fn scan_columns_for_once(&self, schema: &str, fields: &[String]) -> OQLResult<Option<Vec<ColumnBatch>>> {
         self.scan_columns(schema, fields)
+    }
+    /// Every row's vector in `field`, packed one after another, for a
+    /// search to compare: row `n` of the column is row `n` of the
+    /// collection as `scan_documents_shared` gives it. Kept until the next
+    /// commit when it fits what the store may keep, and otherwise made for
+    /// this once. `None` when the store cannot give it: the field is not a
+    /// vector, a row holds one of another length, or there are writes not
+    /// yet committed.
+    fn scan_vector_column(&self, _schema: &str, _field: &str) -> OQLResult<Option<ColumnBatch>> {
+        Ok(None)
     }
     /// Something the caller made from columns stamped `stamp`, kept under
     /// `key` for as long as those columns are good. `None` when nothing was

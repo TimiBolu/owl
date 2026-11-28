@@ -367,6 +367,67 @@ fn a_vector_stored_as_a_list_before_vectors_were_packed_is_still_found() {
     assert_eq!(db.value(r#"docs.where { .id == "d5" }.select { embedding }"#), Value::Null);
 }
 
+#[test]
+fn a_search_of_a_whole_collection_compares_packed_vectors_and_reads_only_the_rows_found() {
+    use owl_db::executor::vector_column_searches;
+    let db = library();
+    let near = |k: usize, metric: &str| {
+        format!(r#"nearest {{ field: .embedding, query: $q, metric: "{metric}", k: {k} }}.select {{ id, score: ._score }}"#)
+    };
+    // The same search two ways: of the whole collection, which is
+    // answered from the vectors where they are kept packed, and after a
+    // filter that every row passes, which reads each row.
+    let both = |db: &Db, k: usize, metric: &str| {
+        let before = vector_column_searches();
+        let packed = db.rows(&format!("docs.{}", near(k, metric)));
+        let from_column = vector_column_searches() - before;
+        let by_row = db.rows(&format!(r#"docs.where {{ .id != "" }}.{}"#, near(k, metric)));
+        assert_eq!(vector_column_searches() - before, from_column, "a filtered search reads rows");
+        let shown = |rows: &[Document]| -> Vec<String> {
+            rows.iter().map(|row| format!("{:?} {:?}", row.get_field("id"), row.get_field("score"))).collect()
+        };
+        assert_eq!(shown(&packed), shown(&by_row), "k {k}, {metric}");
+        (packed.len(), from_column)
+    };
+    // The store makes a collection's columns once it has been asked twice.
+    both(&db, 2, "cosine");
+    for metric in ["cosine", "l2", "dot"] {
+        for k in [1, 2, 3, 4, 99] {
+            let (found, from_column) = both(&db, k, metric);
+            // d5 has no embedding, so there are four to find.
+            assert_eq!(found, k.min(4));
+            assert_eq!(from_column, 1, "k {k}, {metric}: answered from the column");
+        }
+    }
+
+    // What is written since is seen: a new nearest row, a row that loses
+    // its embedding, a row deleted, and a row whose embedding changes.
+    db.rows(r#"docs.insert { id: "d0", owner: "a", kind: "x", embedding: [1.0, 0.0, 0.0] }"#);
+    db.rows(r#"docs.where { .id == "d2" }.update { embedding: null }"#);
+    db.rows(r#"docs.where { .id == "d4" }.delete()"#);
+    db.rows(r#"docs.where { .id == "d3" }.update { embedding: [0.99, 0.01, 0.0] }"#);
+    both(&db, 3, "cosine");
+    let (_, from_column) = both(&db, 3, "cosine");
+    assert_eq!(from_column, 1);
+    // Equal scores keep the order of a scan: d0 before d1.
+    assert_eq!(db.column(&format!("docs.{}", near(3, "cosine")), "id"), ["d0", "d1", "d3"]);
+
+    // After a reopen, and with what follows the search applied to its rows.
+    let db = db.reopened();
+    both(&db, 3, "l2");
+    both(&db, 3, "l2");
+    assert_eq!(
+        db.column(
+            r#"docs.nearest { field: .embedding, query: $q, metric: "cosine", k: 3 }.where { .kind == "x" }.sort { .id desc }.select { id, owner: .owner.name }"#,
+            "id"
+        ),
+        ["d3", "d1", "d0"]
+    );
+    // A query vector of the wrong length is still refused.
+    let wrong = db.error("docs.nearest { field: .embedding, query: [1.0, 0.0], k: 2 }");
+    assert!(wrong.contains("Expected Vector(3), got Vector(2)"), "{wrong}");
+}
+
 /// Not a test of right and wrong: what 20,000 vectors of 384 numbers cost
 /// to keep and to search. Run with `--release -- --ignored --nocapture`.
 #[test]
@@ -444,8 +505,10 @@ fn what_twenty_thousand_vectors_cost() {
                 started.elapsed().as_secs_f64() * 1000.0
             })
             .collect();
+        // The first run may make what later runs find kept.
+        let first = times[0];
         times.sort_by(f64::total_cmp);
-        println!("{what}: {:.1} ms, {} rows", times[2], found.len());
+        println!("{what}: {:.1} ms, {} rows (first run {first:.1} ms)", times[2], found.len());
         found.iter().map(|row| row.get_field("id").map(Value::to_string_repr).unwrap_or_default()).collect::<Vec<_>>()
     };
     let near = format!("nearest {{ field: .embedding, query: {written}, metric: \"cosine\", k: 10 }}.select {{ id }}");

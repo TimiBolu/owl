@@ -1050,7 +1050,11 @@ impl<S: DocumentStore> QueryExecutor<S> {
         // For non-INSERT operations, start by scanning the collection
         if !is_insert_only {
             let scanned_docs =
-                if let Some((rows, applied)) = self.first_rows_by_id(query)? {
+                if let Some(rows) = self.nearest_from_column(query)? {
+                    // The search is done: only the rows it found were read.
+                    filters_applied = 1;
+                    rows
+                } else if let Some((rows, applied)) = self.first_rows_by_id(query)? {
                     filters_applied = applied;
                     rows
                 } else if let Some(prefiltered) = self.prefilter_documents_for_query(query)? {
@@ -1746,6 +1750,8 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 }
                 keep(&|_| false)
             }
+            // Given only to a search, never to a filter.
+            ColumnData::Vectors { .. } => return false,
         }
         true
     }
@@ -3814,6 +3820,8 @@ impl<S: DocumentStore> QueryExecutor<S> {
                         ColumnData::Strings { offsets, bytes } => {
                             ProjectedValueRef::String(Column::text(offsets, bytes, row))
                         }
+                        // Given only to a search, never to a projection.
+                        ColumnData::Vectors { .. } => return None,
                     })
                 };
                 let mut one = |row: usize| -> OQLResult<bool> {
@@ -6088,6 +6096,69 @@ impl<S: DocumentStore> QueryExecutor<S> {
         }
         documents.truncate(kept);
         Ok(documents)
+    }
+
+    /// `collection.nearest { .. }` over a whole collection, without reading
+    /// its rows: every vector is compared where the store keeps them
+    /// packed, one after another, and only the rows found are read.
+    /// `None` when the store has no such column to give, and for anything
+    /// the row-by-row search would refuse, so that it is the one to say so.
+    fn nearest_from_column(&self, query: &OQLQuery) -> OQLResult<Option<Vec<Document>>> {
+        let Some(Operation::Nearest(block)) = query.operations.first() else {
+            return Ok(None);
+        };
+        let [field] = block.field.path.as_slice() else {
+            return Ok(None);
+        };
+        if block.k == 0 {
+            return Ok(None);
+        }
+        let declared = self
+            .schema_of(&query.collection)?
+            .and_then(|schema| schema.fields.get(field).and_then(FieldType::vector_dimension));
+        let Some(declared) = declared else {
+            return Ok(None);
+        };
+        let wanted = self.resolve_query_vector(&block.query)?;
+        if wanted.len() != declared as usize {
+            return Ok(None);
+        }
+        let Some(batch) = self.store.scan_vector_column(&query.collection, field)? else {
+            return Ok(None);
+        };
+        let column = batch.column(0);
+        let crate::storage::ColumnData::Vectors { dimension, values } = column.data() else {
+            return Ok(None);
+        };
+        if dimension != wanted.len() {
+            return Ok(None);
+        }
+        let metric = match block.metric {
+            VectorMetric::Cosine => crate::vector::Metric::Cosine,
+            VectorMetric::L2 => crate::vector::Metric::L2,
+            VectorMetric::Dot => crate::vector::Metric::Dot,
+        };
+        // A row with no vector is not a candidate.
+        let hits = crate::vector::nearest_among(values, &wanted, metric, block.k as usize, |row| {
+            column.has_value(row)
+        });
+        let positions: Vec<u32> = hits.iter().map(|(row, _)| *row as u32).collect();
+        let Some(rows) = self.store.rows_of_columns(&query.collection, batch.stamp(), &positions)? else {
+            return Ok(None);
+        };
+        VECTOR_COLUMN_SEARCHES.with(|runs| runs.set(runs.get() + 1));
+        Ok(Some(
+            rows.iter()
+                .zip(&hits)
+                .map(|(row, (_, score))| {
+                    let mut document = row.as_ref().clone();
+                    document
+                        .fields
+                        .insert("_score".to_string(), Value::Float(f64::from(*score)));
+                    document
+                })
+                .collect(),
+        ))
     }
 
     /// Apply nearest-neighbor vector search to the current document set.
@@ -14745,6 +14816,8 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 ColumnData::References(values) => {
                     sort_order(&Value::Reference(values[mine]), &Value::Reference(values[theirs]))
                 }
+                // Given only to a search, never to a sort.
+                ColumnData::Vectors { .. } => Ordering::Equal,
             },
             (mine_has, _) => {
                 // Any value of the column's kind stands for the one that
@@ -14756,6 +14829,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     ColumnData::Floats(_) => Value::Float(0.0),
                     ColumnData::Booleans(_) => Value::Boolean(false),
                     ColumnData::References(values) => Value::Reference(values[0]),
+                    ColumnData::Vectors { .. } => Value::Vector(Vec::new()),
                 };
                 match mine_has {
                     true => sort_order(&some, &null),
@@ -15934,6 +16008,8 @@ impl<S: DocumentStore> QueryExecutor<S> {
                         ColumnData::Strings { offsets, bytes } => {
                             MatchAtom::Text(Column::text(offsets, bytes, at).to_string())
                         }
+                        // Given only to a search, never as a key to match.
+                        ColumnData::Vectors { .. } => continue 'rows,
                     });
                 }
                 table.entry(key).or_default().push(at);
@@ -16635,6 +16711,18 @@ fn within_budget(rows: usize) -> OQLResult<()> {
         }
     }
     Ok(())
+}
+
+thread_local! {
+    /// How many searches this thread has answered from a vector column.
+    static VECTOR_COLUMN_SEARCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many searches this thread has answered by comparing vectors where
+/// the store keeps them packed, reading only the rows found. For tests.
+#[doc(hidden)]
+pub fn vector_column_searches() -> u64 {
+    VECTOR_COLUMN_SEARCHES.with(std::cell::Cell::get)
 }
 
 /// Turn the planning of a block's captures on or off for this thread. It

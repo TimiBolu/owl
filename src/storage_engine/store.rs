@@ -11943,6 +11943,7 @@ impl RustStore {
         fields: &[String],
         with_rows: bool,
         for_once: bool,
+        vectors: bool,
     ) -> OQLResult<Option<(Option<Arc<Vec<Arc<Document>>>>, ColumnBatch)>> {
         if !self.pending_operations()?.is_empty() {
             return Ok(None);
@@ -11956,6 +11957,13 @@ impl RustStore {
         let Some(declared) = state.schemas.get(schema) else {
             return Ok(None);
         };
+        // A vector's column is given only to a caller that asks for one.
+        let holds_vector = |name: &String| {
+            declared.fields.get(name).is_some_and(|field| field.vector_dimension().is_some())
+        };
+        if !vectors && fields.iter().any(holds_vector) {
+            return Ok(None);
+        }
         let mut built = self
             .built_columns
             .lock()
@@ -12051,7 +12059,7 @@ impl RustStore {
                     let Some(builder) = declared
                         .fields
                         .get(name)
-                        .and_then(|field_type| ColumnBuilder::new(name, field_type, refs.len()))
+                        .and_then(|field_type| ColumnBuilder::new(name, field_type, refs.len(), vectors))
                     else {
                         return Ok(None);
                     };
@@ -12139,15 +12147,21 @@ impl RustStore {
             let Some(listed) = rows.as_deref() else {
                 return Ok(None);
             };
-            let Some(column) = TypedColumn::of_rows(name, field_type, listed.as_slice())?
+            let Some(column) = TypedColumn::of_rows(name, field_type, listed.as_slice(), vectors)?
             else {
                 return Ok(None);
             };
             let bytes = column.bytes();
-            if !built.makes_room(schema, bytes) {
-                return Ok(None);
-            }
             let column = Arc::new(column);
+            if !built.makes_room(schema, bytes) {
+                // More than may be kept. A search has no cheaper way, so
+                // it is given the column for this once.
+                if !vectors {
+                    return Ok(None);
+                }
+                columns.push(column);
+                continue;
+            }
             let kept = built.of(&state, schema);
             // Making room may have dropped the rows list this column is
             // of; then the column is used for this query and not kept.
@@ -13008,14 +13022,20 @@ impl DocumentStore for RustStore {
 
     fn scan_columns(&self, schema: &str, fields: &[String]) -> OQLResult<Option<Vec<ColumnBatch>>> {
         Ok(self
-            .rows_and_columns(schema, fields, false, false)?
+            .rows_and_columns(schema, fields, false, false, false)?
             .map(|(_, batch)| vec![batch]))
     }
 
     fn scan_columns_for_once(&self, schema: &str, fields: &[String]) -> OQLResult<Option<Vec<ColumnBatch>>> {
         Ok(self
-            .rows_and_columns(schema, fields, false, true)?
+            .rows_and_columns(schema, fields, false, true, false)?
             .map(|(_, batch)| vec![batch]))
+    }
+
+    fn scan_vector_column(&self, schema: &str, field: &str) -> OQLResult<Option<ColumnBatch>> {
+        Ok(self
+            .rows_and_columns(schema, &[field.to_string()], false, true, true)?
+            .map(|(_, batch)| batch))
     }
 
     fn scan_rows_and_columns(
@@ -13024,7 +13044,7 @@ impl DocumentStore for RustStore {
         fields: &[String],
     ) -> OQLResult<Option<(Arc<Vec<Arc<Document>>>, ColumnBatch)>> {
         Ok(self
-            .rows_and_columns(schema, fields, true, false)?
+            .rows_and_columns(schema, fields, true, false, false)?
             .and_then(|(rows, batch)| Some((rows?, batch))))
     }
     fn scan_projected_batches(
