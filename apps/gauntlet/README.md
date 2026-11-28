@@ -86,6 +86,62 @@ What it has found so far, all fixed:
 - Rows a sort found equal came in the index's order when an index had read
   them.
 
+## Can a program learn OQL from one page?
+
+A language model has read a great deal of SQL and almost no OQL. `ask`
+measures what that costs. It holds 30 questions in plain English over this
+data, from a filter to a walk down the management chain, each with the
+answer SQLite gives to a reference query. A model is handed
+`docs/OQL_CARD.md`, the catalogue of this database and the questions, and
+nothing else. What it writes is checked, run on Owl and compared with
+SQLite's answer.
+
+```bash
+./target/release/gauntlet ask
+```
+
+```bash
+./target/release/gauntlet ask --prompt prompt.md
+```
+
+```bash
+./target/release/gauntlet ask --answers first.json --feedback again.md
+```
+
+With no file named, the questions are held to their own reference OQL,
+which must give SQLite's answers: 30 of 30. `--prompt` writes what the
+model is given. `--answers` scores a JSON object from question id to OQL,
+and `--feedback` writes what the database said about each answer it did
+not accept, to give the model once. A wrong answer earns no hint, because
+in use nobody is there to give one. The harness never calls a model, so
+any model can sit between the two files.
+
+Each answer is right, wrong, refused by the check before anything ran, or
+failed when run. The split matters: a refusal costs the model one more
+try, and a wrong answer costs the person who trusted it.
+
+A first sitting, on 2026-11-28, 300 people, one run of each model with no
+tools and no other reading:
+
+| Model | Right at the first try | Refused by the check | Wrong | Right after one round of the database's own messages |
+|---|---|---|---|---|
+| Claude Sonnet | 29 of 30 | 1 | 0 | 30 of 30 |
+| Claude Haiku | 29 of 30 | 1 | 0 | 30 of 30 |
+
+The two refusals were `big: .where { .. }.count()`, an operation on a
+group's rows written with a dot before it, and `.hired.year` for
+`.hired.year()`. The second message already said what to write. The first
+said only that a literal was expected; it now says how the operation is
+written, and that is the message the model was given.
+
+What this does not show: both models are Claude, each sat once, and the
+questions and the card have one author, so the card may suit the
+questions better than it would suit a stranger's. Harder questions and
+other models are the next sitting.
+
+Both checkers now also hold the check to its promise: every query `check`
+and `scope` run must pass it, since it must refuse nothing that runs.
+
 ## Running it
 
 ```bash

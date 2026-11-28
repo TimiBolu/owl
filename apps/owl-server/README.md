@@ -14,6 +14,8 @@ cargo run --release -p owl-server -- --data shop.owl --listen 127.0.0.1:7878 --t
 | `--token` | `OWL_TOKEN` | none | Bearer token every request but the health check must carry |
 | `--max-gib` | | 64 | The most the database may grow to |
 | `--transaction-idle-seconds` | | 60 | Roll back a transaction left untouched this long |
+| `--query-ms`, `--query-rows` | | none | Stop any statement that runs longer or holds more rows at once |
+| `--assistant-ms`, `--assistant-rows` | | 5000, 100000 | The same for statements sent through `/mcp` |
 | `--decoded-documents` | `OWL_DECODED_DOCUMENTS` | none | Hold at most this many documents decoded in memory. The rest are decoded when read, from records read back from the checkpoint files, and a writer waits for overdue checkpoints so that memory stays bounded while loading |
 | `--backup-dir` | `OWL_BACKUP_DIR` | none | Where `POST /v1/backups` writes backups |
 | `--restore-from` | | none | Restore this backup as `--data` before serving; `--data` must not exist |
@@ -35,6 +37,9 @@ you do not trust.
 | `POST /v1/transactions/{id}/commit` | `{}` | `{"committed": true}` |
 | `POST /v1/transactions/{id}/rollback` | `{}` | `{"rolled_back": true}` |
 | `POST /v1/backups` | `{}` | `{"name": .., "committed_lsn": n, "files": n, "bytes": n}` |
+| `GET /v1/catalogue` | | what is in the database; see below |
+| `POST /v1/check` | `{"query": ".."}` | `{"ok": true, ..}` or `{"ok": false, "problem": {..}}` |
+| `POST /mcp` | one JSON-RPC message | the tools a language model uses; see below |
 
 `params` and `transaction` are optional.
 
@@ -48,6 +53,105 @@ you do not trust.
   its target.
 - **`/v1/script`** runs schema declarations, functions and statements in
   order. It is how a schema is created or changed.
+
+## For a program that writes queries
+
+A person reads a schema file and an error message. A program that writes
+OQL, a language model above all, needs the same things as data.
+
+**The catalogue.** `GET /v1/catalogue` gives every collection with its
+fields and their types, which field refers to which collection, the name
+each relationship is followed by from the other end, its indexes and its
+row count, and the functions defined in the database. `"text"` in the
+answer is the same as a schema, short enough to put in a prompt:
+
+```text
+schema people {  // 300 rows
+  id: String
+  manager: Optional(Ref(people))
+  name: String
+  // .reports: the people whose .manager is this row
+  // index, ordered: level
+}
+```
+
+It reads schemas, index definitions and counts, and no rows.
+
+**The check.** `POST /v1/check` says whether a statement would be
+accepted, and runs nothing: nothing is read and nothing is written, so it
+costs the same on any amount of data. A statement that passes comes back
+with whether it would write and which `$name` parameters it needs. One
+that does not comes back with a problem:
+
+```json
+{ "ok": false, "problem": {
+  "code": "unknown_name",
+  "message": "'people' has no field or relationship 'levle'. Did you mean 'level'?",
+  "suggestion": "level",
+  "names": { "people": ["id", "level", "manager", "name", "reports"] } } }
+```
+
+| Code | The statement |
+|---|---|
+| `parse_error` | is not OQL; `line` and `column` say where |
+| `unknown_collection` | names a collection that is not there |
+| `unknown_name` | reads a field or relationship that is not there |
+| `unknown_function` | calls a function that is not defined |
+| `type_mismatch` | compares kinds that could never be equal |
+| `read_only` | would write, where only reads are taken |
+| `over_budget` | was stopped at its budget |
+| `rejected` | was refused for another reason; see the message |
+
+These are the checks every statement gets before it runs, so the check
+refuses nothing that would have run. A statement that passes can still
+fail on a value: a division by zero, a constraint, a budget.
+
+A statement that fails at `/v1/query` keeps the `code` it always had and
+now carries the same `problem` beside it, under `error`.
+
+**Reads that cannot write, and a budget.** `/v1/query` takes three more
+fields:
+
+| Field | Does |
+|---|---|
+| `"read_only": true` | Refuses a statement that would write, with `403` and `read_only`. Sent outside a transaction, the statement is also run in one that is rolled back, so nothing it calls can write either |
+| `"max_ms": n` | Stops the statement once it has run that long |
+| `"max_rows": n` | Stops the statement once it holds more rows than that at one time |
+
+A statement stopped at its budget fails with `over_budget` and has written
+nothing. `--query-ms` and `--query-rows` set a budget for every statement;
+a request can ask for less and never for more. The budget bounds the work
+that grows faster than the data: the rows a block's captures make and the
+queries nested in a row. One read of a collection is not interrupted part
+way.
+
+### Tools for a language model
+
+`POST /mcp` speaks the Model Context Protocol, so an assistant that takes
+MCP servers can use the database directly. It is the protocol's HTTP
+transport answered with plain JSON: one message in, one out, nothing kept
+between them. It carries the same bearer token as every other request.
+
+```bash
+claude mcp add --transport http owl http://127.0.0.1:7878/mcp --header "Authorization: Bearer $OWL_TOKEN"
+```
+
+| Tool | Does |
+|---|---|
+| `language` | OQL on one page, `docs/OQL_CARD.md`: every example on it is run by the test suite |
+| `describe` | The catalogue as text |
+| `check` | The check |
+| `explain` | How a query would run |
+| `query` | Runs a query that reads; at most 100 rows come back unless `limit` asks for more, up to 1000 |
+
+Nothing sent to `/mcp` can change the database: every statement is run
+read-only, as above. Every statement is held to a budget of five seconds
+and 100,000 rows, which `--assistant-ms` and `--assistant-rows` change. A
+refusal comes back to the model as the problem above, so it can correct
+the query itself.
+
+A request to `/mcp` that names an `Origin` other than this machine is
+refused, so a page in a browser cannot reach a server on loopback.
 
 ## Transactions
 

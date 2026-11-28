@@ -181,9 +181,20 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     "Function '{name}' is stored in this database but cannot be used: {reason}. Define it again."
                 ),
             },
-            None => OQLError::Generic {
-                message: format!("Unknown function: {name}"),
-            },
+            None => {
+                let closest = self
+                    .functions
+                    .function_names()
+                    .into_iter()
+                    .map(|known| (Self::edit_distance(&known, name), known))
+                    .filter(|(distance, _)| *distance <= 2)
+                    .min()
+                    .map(|(_, known)| format!(". Did you mean '{known}'?"))
+                    .unwrap_or_default();
+                OQLError::Generic {
+                    message: format!("Unknown function: {name}{closest}"),
+                }
+            }
         }
     }
 
@@ -261,6 +272,123 @@ impl<S: DocumentStore> QueryExecutor<S> {
     /// Get access to the underlying store (for testing)
     pub fn store(&self) -> &Arc<S> {
         &self.store
+    }
+
+    /// Whether a statement changes the database: it inserts, updates,
+    /// deletes or defines a function, or it calls a function, which may.
+    pub fn writes(query: &OQLQuery) -> bool {
+        query.operations.iter().any(|operation| {
+            matches!(
+                operation,
+                Operation::Insert(_)
+                    | Operation::InsertMany(_)
+                    | Operation::InsertFrom(_)
+                    | Operation::Upsert(_)
+                    | Operation::Update(_)
+                    | Operation::Delete
+                    | Operation::FunctionDef(_)
+            )
+        })
+    }
+
+    /// Check a statement without running it: that its collection exists,
+    /// that every name it reads is one the schemas declare, that every
+    /// function it calls is defined, and that no comparison is between
+    /// kinds that could never be equal. Nothing is read and nothing is
+    /// written.
+    ///
+    /// These are the checks a statement gets before it runs, so a
+    /// statement this refuses would have been refused when run. One it
+    /// passes can still fail on a value, as `1 / 0` does.
+    pub fn check_query(&self, query: &OQLQuery) -> OQLResult<()> {
+        let _statement = StatementGuard::enter();
+        let described = match query.operations.split_last() {
+            Some((Operation::Explain, described)) => Some(OQLQuery {
+                collection: query.collection.clone(),
+                operations: described.to_vec(),
+            }),
+            _ => None,
+        };
+        let query = described.as_ref().unwrap_or(query);
+        self.check_functions(query)?;
+        if matches!(query.operations.first(), Some(Operation::Call(_))) {
+            return Ok(());
+        }
+        let makes = query.operations.iter().any(|operation| {
+            matches!(
+                operation,
+                Operation::Insert(_)
+                    | Operation::InsertMany(_)
+                    | Operation::InsertFrom(_)
+                    | Operation::Upsert(_)
+                    | Operation::FunctionDef(_)
+            )
+        });
+        if !makes && self.schema_of(&query.collection)?.is_none() {
+            self.check_collection_is_known(&query.collection)?;
+        }
+        self.validate_declared_paths(query)?;
+        if query
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, Operation::Capture { .. }))
+        {
+            self.plan_captures(query)?;
+        }
+        Ok(())
+    }
+
+    /// Every function a statement calls, anywhere in it, must be defined.
+    fn check_functions(&self, query: &OQLQuery) -> OQLResult<()> {
+        fn calls(node: &serde_json::Value, found: &mut Vec<String>) {
+            match node {
+                serde_json::Value::Object(fields) => {
+                    if let Some(name) = fields
+                        .get("FunctionCall")
+                        .and_then(|call| call.get("name"))
+                        .and_then(|name| name.as_str())
+                    {
+                        found.push(name.to_string());
+                    }
+                    // A function a statement defines is checked when called.
+                    for (key, value) in fields {
+                        if key != "FunctionDef" {
+                            calls(value, found);
+                        }
+                    }
+                }
+                serde_json::Value::Array(items) => items.iter().for_each(|item| calls(item, found)),
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        if let Ok(tree) = serde_json::to_value(query) {
+            calls(&tree, &mut found);
+        }
+        for name in found {
+            if !self.function_is_known(&name) {
+                return Err(self.unknown_function(&name));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `name` can be called: a function, an aggregate, a position
+    /// in a window, or one of the forms the language itself gives.
+    fn function_is_known(&self, name: &str) -> bool {
+        matches!(name, "exists" | "is_null" | "is_missing" | "is_broken_ref")
+            || name.starts_with('$')
+            || name.starts_with('_')
+            || name == crate::parser::LOCAL_VALUE
+            || Self::is_aggregate_name(name)
+            || WindowFrame::is_position_function(name)
+            || self.functions.get_function(name).is_some()
+            || self.functions.get_user_function(name).is_some()
+    }
+
+    /// The functions that can be called, for a catalogue.
+    pub fn functions(&self) -> &FunctionRegistry {
+        &self.functions
     }
 
     /// Get function names (for testing)
@@ -698,6 +826,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
                 .any(|operation| matches!(operation, Operation::GroupBy(_)));
             for (position, operation) in after.iter().enumerate() {
                 let rows_in = documents.len();
+                within_budget(rows_in)?;
                 let step_started = Instant::now();
                 if grouped
                     && documents.is_empty()
@@ -2689,13 +2818,85 @@ impl<S: DocumentStore> QueryExecutor<S> {
         Ok(place)
     }
 
+    /// Whether a condition calls `count()` with nothing to count: written
+    /// in the condition itself, not in a collection or a query nested in it.
+    fn counts_nothing(condition: &Condition) -> bool {
+        fn found(node: &serde_json::Value) -> bool {
+            match node {
+                serde_json::Value::Object(fields) => {
+                    if let Some(call) = fields.get("FunctionCall") {
+                        let bare = call.get("name").and_then(|name| name.as_str()) == Some("count")
+                            && call.get("args").and_then(|args| args.as_array()).is_some_and(Vec::is_empty);
+                        if bare {
+                            return true;
+                        }
+                    }
+                    fields.iter().any(|(key, value)| {
+                        !matches!(key.as_str(), "CollectionExpression" | "QueryExpression") && found(value)
+                    })
+                }
+                serde_json::Value::Array(items) => items.iter().any(found),
+                _ => false,
+            }
+        }
+        serde_json::to_value(condition).is_ok_and(|tree| found(&tree))
+    }
+
+    /// The error for `count()` asked of one row.
+    fn count_of_nothing() -> OQLError {
+        OQLError::FunctionError {
+            message: "count() has no collection to count here; use it in select or having, \
+                      or call it on a collection as in .orders.count()"
+                .to_string(),
+        }
+    }
+
+    /// Whether the schemas say a path from a stored row passes through a
+    /// collection, and so has a value for each row it reaches: it follows
+    /// a relationship, or goes on past a field declared as a list.
+    fn passes_a_collection(&self, place: &Place, path: &[String]) -> OQLResult<bool> {
+        fn is_list(declared: &FieldType) -> bool {
+            match declared {
+                FieldType::List(_) => true,
+                FieldType::Optional(inner) => is_list(inner),
+                _ => false,
+            }
+        }
+        let mut place = place.clone();
+        for (position, name) in path.iter().enumerate() {
+            let Place::Rows(schema) = &place else {
+                return Ok(false);
+            };
+            match schema.fields.get(name) {
+                Some(declared) if is_list(declared) => return Ok(position + 1 < path.len()),
+                Some(_) => {}
+                None if DocumentSystemField::from_name(name).is_some() => return Ok(false),
+                None => {
+                    return Ok(matches!(
+                        self.reverse_relationship(&schema.name, name)?,
+                        ReverseRelationship::Declared { .. }
+                    ))
+                }
+            }
+            place = self.step_place(&place, name)?;
+        }
+        Ok(false)
+    }
+
     /// Check every path of a chain of operations against the declared shape
     /// of the rows each operation is given.
     fn check_operations(&self, place: Place, operations: &[Operation]) -> OQLResult<()> {
         let mut place = place;
         for operation in operations {
             match operation {
-                Operation::Where(block) => self.check_condition(&place, &block.condition)?,
+                Operation::Where(block) => {
+                    // A filter of stored rows is asked of one row at a
+                    // time, so `count()` in it has nothing to count.
+                    if matches!(place, Place::Rows(_)) && Self::counts_nothing(&block.condition) {
+                        return Err(Self::count_of_nothing());
+                    }
+                    self.check_condition(&place, &block.condition)?
+                }
                 Operation::Having(block) => self.check_condition(&place, &block.condition)?,
                 Operation::Sort(block) => {
                     for field in &block.fields {
@@ -2822,6 +3023,12 @@ impl<S: DocumentStore> QueryExecutor<S> {
                     };
                     if compares && one_value(value) && self.declared_a_list(place, &access.path)? {
                         return Err(Self::list_compared_with_one(access, value, operator));
+                    }
+                    // A path the schemas say passes through a collection,
+                    // compared with one value: refused for every row when
+                    // run, so refused here, before any is read.
+                    if compares && one_value(value) && self.passes_a_collection(place, &access.path)? {
+                        return Err(Self::many_compared_with_one(list, value, operator));
                     }
                     if let (true, Expression::Literal(literal)) = (compares, value) {
                         if let Some(kind) = self.declared_kind(place, &access.path) {
@@ -8528,6 +8735,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
         // the enclosing row; but in a query inside that one, it means the
         // nearer row of that collection, which is not known yet. Those are
         // left for when it is.
+        within_budget(0)?;
         let nearer = query.collection == scope_document.schema;
         let outer = NAME_TAKEN_NEARER.with(|taken| taken.replace(taken.get() || nearer));
         let operations = query
@@ -12771,11 +12979,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
         if args.is_empty() {
             // Reaching here means `count()` was evaluated for one row with
             // no collection to count: for example inside `where`.
-            Err(OQLError::FunctionError {
-                message: "count() has no collection to count here; use it in select or having, \
-                          or call it on a collection as in .orders.count()"
-                    .to_string(),
-            })
+            Err(Self::count_of_nothing())
         } else if args.len() == 1 {
             // count(field) - count non-null values
             match &args[0] {
@@ -13538,6 +13742,7 @@ impl<S: DocumentStore> QueryExecutor<S> {
             && serde_json::to_string(source).is_ok_and(|text| !text.contains(crate::parser::CAPTURE_PREFIX));
         let mut held: Option<(String, Vec<Document>, bool)> = None;
         for document in documents {
+            within_budget(combined.len())?;
             let (members, whole) = match &held {
                 Some((id, members, whole)) if once && *id == document.id => (members.clone(), *whole),
                 _ => {
@@ -16549,6 +16754,65 @@ thread_local! {
     /// that row's values: the name belongs to the nearer row in anything
     /// nested deeper.
     static NAME_TAKEN_NEARER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The most a statement may cost before it is stopped.
+///
+/// It bounds the work that grows faster than the data: the rows a block's
+/// captures make, and the queries nested in a row. A single read of a
+/// collection is not interrupted part way; it is bounded by the collection.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Budget {
+    /// Stop once the statement has run this long.
+    pub time: Option<std::time::Duration>,
+    /// Stop once the statement holds more rows than this at one time.
+    pub rows: Option<usize>,
+}
+
+thread_local! {
+    /// The budget of the statement this thread is running: when it must
+    /// have finished by, how long that allowed, and the most rows.
+    static BUDGET: std::cell::Cell<Option<(Option<(Instant, u128)>, Option<usize>)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `work` under `budget`. A statement in it that passes the budget
+/// fails with [`OQLError::BudgetExceeded`]; what it wrote is undone as for
+/// any failed statement.
+pub fn with_budget<T>(budget: Budget, work: impl FnOnce() -> T) -> T {
+    struct Restore(Option<(Option<(Instant, u128)>, Option<usize>)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            BUDGET.with(|held| held.set(self.0));
+        }
+    }
+    let deadline = budget.time.map(|time| (Instant::now() + time, time.as_millis()));
+    let _restore = Restore(BUDGET.with(|held| held.replace(Some((deadline, budget.rows)))));
+    work()
+}
+
+/// Fail if the statement has passed its budget, holding `rows` rows now.
+fn within_budget(rows: usize) -> OQLResult<()> {
+    let Some((deadline, most)) = BUDGET.with(|held| held.get()) else {
+        return Ok(());
+    };
+    if let Some(most) = most {
+        if rows > most {
+            return Err(OQLError::BudgetExceeded {
+                message: format!(
+                    "the query held {rows} rows at once, over its budget of {most}. Filter earlier, or add a limit"
+                ),
+            });
+        }
+    }
+    if let Some((deadline, allowed)) = deadline {
+        if Instant::now() >= deadline {
+            return Err(OQLError::BudgetExceeded {
+                message: format!("the query ran past its budget of {allowed} ms"),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Turn the planning of a block's captures on or off for this thread. It

@@ -44,6 +44,9 @@ pub mod batch_operations;
 // Task 16: Admin tools for cluster management
 pub mod admin;
 
+// What a program that writes queries needs: a check, and a catalogue.
+pub mod assist;
+
 #[cfg(test)]
 mod implicit_null_test;
 
@@ -59,7 +62,7 @@ pub use config::{
 pub use document::{Document, DocumentId, Fields, Value};
 pub use error::{OQLError, OQLResult};
 pub use execution::OperatorExecutionStats;
-pub use executor::{BatchQueryExecution, QueryExecution, QueryExecutor};
+pub use executor::{with_budget, BatchQueryExecution, Budget, QueryExecution, QueryExecutor};
 pub use functions::{BuiltinFunction, FunctionRegistry};
 pub use monitoring::{
     Alert, AlertSeverity, DashboardData, MonitoringConfig, MonitoringSystem, QueryMetrics,
