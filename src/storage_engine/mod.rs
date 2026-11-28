@@ -20,6 +20,7 @@ mod parts;
 mod record;
 mod s3;
 mod store;
+mod vector_index;
 
 pub(crate) use arena::Arena;
 pub use btree::BTreeIndex;
@@ -40,6 +41,8 @@ pub use backup::{BackupFile, BackupInfo};
 pub use s3::{Request, Response, S3Config, S3Faults, S3ObjectStore, SimulatedS3, Transport};
 #[cfg(feature = "s3")]
 pub use s3::HttpTransport;
+pub use vector_index::Searched as VectorSearched;
+pub(crate) use vector_index::VectorIndex;
 pub use store::{
     AutoCheckpointPolicy, IntegrityReport, MaintenanceStatus, ReclamationReport, RustStore,
     StorageLayoutStats, TransactionBinding, WriteOperation,

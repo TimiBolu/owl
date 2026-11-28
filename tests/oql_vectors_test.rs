@@ -369,20 +369,26 @@ fn a_vector_stored_as_a_list_before_vectors_were_packed_is_still_found() {
 
 #[test]
 fn a_search_of_a_whole_collection_compares_packed_vectors_and_reads_only_the_rows_found() {
-    use owl_db::executor::vector_column_searches;
+    use owl_db::executor::{last_vector_index_search, vector_column_searches};
     let db = library();
     let near = |k: usize, metric: &str| {
         format!(r#"nearest {{ field: .embedding, query: $q, metric: "{metric}", k: {k} }}.select {{ id, score: ._score }}"#)
     };
     // The same search two ways: of the whole collection, which is
     // answered from the vectors where they are kept packed, and after a
-    // filter that every row passes, which reads each row.
+    // filter that every row passes, which reads each row. The field's
+    // index is declared for the cosine, so a search by the cosine is
+    // answered from the index and one by another metric from the column.
     let both = |db: &Db, k: usize, metric: &str| {
         let before = vector_column_searches();
+        last_vector_index_search();
         let packed = db.rows(&format!("docs.{}", near(k, metric)));
-        let from_column = vector_column_searches() - before;
+        let from_index = usize::from(last_vector_index_search().is_some());
+        let from_column = (vector_column_searches() - before) as usize + from_index;
+        assert_eq!(from_index, usize::from(metric == "cosine" && from_column == 1), "{metric}");
         let by_row = db.rows(&format!(r#"docs.where {{ .id != "" }}.{}"#, near(k, metric)));
-        assert_eq!(vector_column_searches() - before, from_column, "a filtered search reads rows");
+        assert_eq!(vector_column_searches() - before, (from_column - from_index) as u64, "a filtered search reads rows");
+        assert!(last_vector_index_search().is_none(), "a filtered search reads rows");
         let shown = |rows: &[Document]| -> Vec<String> {
             rows.iter().map(|row| format!("{:?} {:?}", row.get_field("id"), row.get_field("score"))).collect()
         };
@@ -390,13 +396,13 @@ fn a_search_of_a_whole_collection_compares_packed_vectors_and_reads_only_the_row
         (packed.len(), from_column)
     };
     // The store makes a collection's columns once it has been asked twice.
-    both(&db, 2, "cosine");
+    both(&db, 2, "l2");
     for metric in ["cosine", "l2", "dot"] {
         for k in [1, 2, 3, 4, 99] {
             let (found, from_column) = both(&db, k, metric);
             // d5 has no embedding, so there are four to find.
             assert_eq!(found, k.min(4));
-            assert_eq!(from_column, 1, "k {k}, {metric}: answered from the column");
+            assert_eq!(from_column, 1, "k {k}, {metric}: answered without reading every row");
         }
     }
 
@@ -406,9 +412,12 @@ fn a_search_of_a_whole_collection_compares_packed_vectors_and_reads_only_the_row
     db.rows(r#"docs.where { .id == "d2" }.update { embedding: null }"#);
     db.rows(r#"docs.where { .id == "d4" }.delete()"#);
     db.rows(r#"docs.where { .id == "d3" }.update { embedding: [0.99, 0.01, 0.0] }"#);
-    both(&db, 3, "cosine");
-    let (_, from_column) = both(&db, 3, "cosine");
-    assert_eq!(from_column, 1);
+    for metric in ["cosine", "l2", "l2", "dot", "dot"] {
+        both(&db, 3, metric);
+    }
+    for metric in ["cosine", "l2", "dot"] {
+        assert_eq!(both(&db, 3, metric).1, 1, "{metric}");
+    }
     // Equal scores keep the order of a scan: d0 before d1.
     assert_eq!(db.column(&format!("docs.{}", near(3, "cosine")), "id"), ["d0", "d1", "d3"]);
 
@@ -429,13 +438,17 @@ fn a_search_of_a_whole_collection_compares_packed_vectors_and_reads_only_the_row
 }
 
 /// Not a test of right and wrong: what 20,000 vectors of 384 numbers cost
-/// to keep and to search. Run with `--release -- --ignored --nocapture`.
+/// to keep and to search. They are in 300 clumps, as the embeddings of
+/// documents on a few hundred subjects are. Run with
+/// `--release -- --ignored --nocapture`.
 #[test]
 #[ignore]
 fn what_twenty_thousand_vectors_cost() {
+    use owl_db::executor::last_vector_index_search;
     use std::time::Instant;
     const ROWS: usize = 20_000;
     const NUMBERS: usize = 384;
+    const CLUMPS: u64 = 300;
     let directory = TempDir::new().unwrap();
     let store = Arc::new(RustStore::new(directory.path().join("db.owl"), 4 << 30).unwrap());
     let executor = QueryExecutor::new_with_real_clock(store.clone());
@@ -445,35 +458,26 @@ fn what_twenty_thousand_vectors_cost() {
     let report = execute_oql_file(&parse_oql_file(&schema).unwrap(), &executor).unwrap();
     assert!(report.errors.is_empty(), "{:?}", report.errors);
 
-    // SplitMix64, so the same rows every run.
-    let mut state = 7u64;
-    let mut unit = move || {
-        state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        ((z ^ (z >> 31)) >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+    let vector_of = |row: u64| -> Vec<f32> {
+        let clump = row % CLUMPS;
+        (0..NUMBERS as u64)
+            .map(|at| unit(clump * 100_000 + at) + 0.3 * unit(1_000_000_000 + row * 1000 + at))
+            .collect()
     };
-    let mut flat: Vec<f32> = Vec::with_capacity(ROWS * NUMBERS);
+    let row_of = |row: usize| {
+        let mut fields = owl_db::Fields::default();
+        fields.insert("id".to_string(), Value::String(format!("d{row:06}")));
+        let kind = if row % 10 == 0 { "rare" } else { "common" };
+        fields.insert("kind".to_string(), Value::String(kind.to_string()));
+        fields.insert(
+            "embedding".to_string(),
+            Value::List(vector_of(row as u64).iter().map(|number| Value::Float(f64::from(*number))).collect()),
+        );
+        fields
+    };
     let started = Instant::now();
     for chunk in 0..ROWS / 1000 {
-        let rows: Vec<owl_db::Fields> = (0..1000)
-            .map(|at| {
-                let row = chunk * 1000 + at;
-                let numbers: Vec<f32> = (0..NUMBERS).map(|_| unit()).collect();
-                flat.extend(&numbers);
-                let mut fields = owl_db::Fields::default();
-                fields.insert("id".to_string(), Value::String(format!("d{row:06}")));
-                let kind = if row % 10 == 0 { "rare" } else { "common" };
-                fields.insert("kind".to_string(), Value::String(kind.to_string()));
-                fields.insert(
-                    "embedding".to_string(),
-                    Value::List(numbers.iter().map(|number| Value::Float(f64::from(*number))).collect()),
-                );
-                fields
-            })
-            .collect();
-        executor.insert_documents("docs", rows).unwrap();
+        executor.insert_documents("docs", (0..1000).map(|at| row_of(chunk * 1000 + at)).collect()).unwrap();
     }
     println!("insert {ROWS} x {NUMBERS}: {:.1} s", started.elapsed().as_secs_f64());
     store.checkpoint().unwrap();
@@ -493,41 +497,239 @@ fn what_twenty_thousand_vectors_cost() {
         (ROWS * NUMBERS * 4) as f64 / 1e6
     );
 
-    let query: Vec<f32> = (0..NUMBERS).map(|_| unit()).collect();
-    let written = format!("[{}]", query.iter().map(|number| format!("{number:.6}")).collect::<Vec<_>>().join(", "));
-    let time = |what: &str, text: String| {
-        let parsed = parse_oql(&text).unwrap();
-        let mut found = Vec::new();
+    let ids = |text: &str| -> Vec<String> {
+        executor
+            .execute_query(&parse_oql(text).unwrap())
+            .unwrap()
+            .iter()
+            .map(|row| row.get_field("id").map(Value::to_string_repr).unwrap_or_default())
+            .collect()
+    };
+    let time = |what: &str, text: &str| {
+        let parsed = parse_oql(text).unwrap();
+        let mut found = 0;
         let mut times: Vec<f64> = (0..5)
             .map(|_| {
                 let started = Instant::now();
-                found = executor.execute_query(&parsed).unwrap();
+                found = executor.execute_query(&parsed).unwrap().len();
                 started.elapsed().as_secs_f64() * 1000.0
             })
             .collect();
         // The first run may make what later runs find kept.
         let first = times[0];
         times.sort_by(f64::total_cmp);
-        println!("{what}: {:.1} ms, {} rows (first run {first:.1} ms)", times[2], found.len());
-        found.iter().map(|row| row.get_field("id").map(Value::to_string_repr).unwrap_or_default()).collect::<Vec<_>>()
+        println!("{what}: {:.2} ms, {found} rows (first run {first:.1} ms)", times[2]);
     };
-    let near = format!("nearest {{ field: .embedding, query: {written}, metric: \"cosine\", k: 10 }}.select {{ id }}");
-    let nearest = time("nearest 10 of all", format!("docs.{near}"));
-    time("nearest 10 of the rare tenth", format!("docs.where {{ .kind == \"rare\" }}.{near}"));
-    let sorted = time(
-        "sort by similarity, limit 10",
-        format!("docs.sort {{ similarity(.embedding, {written}) desc }}.limit(10).select {{ id }}"),
-    );
-    assert_eq!(nearest, sorted, "a search and a sort by similarity agree");
-    time("for scale, every id", "docs.select { id }".to_string());
+    let near = |query: &[f32], metric: &str, options: &str| {
+        format!(
+            "nearest {{ field: .embedding, query: {}, metric: \"{metric}\", k: 10{options} }}.select {{ id }}",
+            written(query)
+        )
+    };
+    let query = vector_of(5_000_000);
 
-    let mut times: Vec<f64> = (0..5)
-        .map(|_| {
-            let started = Instant::now();
-            assert_eq!(owl_db::vector::nearest(&flat, &query, owl_db::vector::Metric::Cosine, 10).len(), 10);
-            started.elapsed().as_secs_f64() * 1000.0
-        })
-        .collect();
-    times.sort_by(f64::total_cmp);
-    println!("the comparison alone, over packed numbers: {:.2} ms", times[2]);
+    // The index is built by the first search that wants it.
+    let started = Instant::now();
+    ids(&format!("docs.{}", near(&query, "cosine", "")));
+    let did = last_vector_index_search().expect("answered from the index");
+    println!(
+        "the first search, which builds the index: {:.0} ms, into {} lists",
+        started.elapsed().as_secs_f64() * 1000.0,
+        did.lists
+    );
+    time("nearest 10, from the index", &format!("docs.{}", near(&query, "cosine", "")));
+    let did = last_vector_index_search().unwrap();
+    println!("  it compared {} of {} vectors, in {} of {} lists", did.compared, did.held, did.probed, did.lists);
+    time("nearest 10, from the index, exact", &format!("docs.{}", near(&query, "cosine", ", exact: true")));
+    time(
+        "nearest 10, every row read",
+        &format!("docs.where {{ .id != \"\" }}.{}", near(&query, "cosine", "")),
+    );
+    time("nearest 10 by distance, no index, from the column", &format!("docs.{}", near(&query, "l2", "")));
+
+    // How much of the truth the index finds when left to itself.
+    let (mut right, mut compared) = (0, 0);
+    for probe in 0..40u64 {
+        let query = vector_of(6_000_000 + probe * 13);
+        let truth = ids(&format!("docs.{}", near(&query, "cosine", ", exact: true")));
+        let found = ids(&format!("docs.{}", near(&query, "cosine", "")));
+        compared += last_vector_index_search().unwrap().compared;
+        right += truth.iter().filter(|id| found.contains(id)).count();
+    }
+    println!(
+        "over 40 searches it found {:.3} of the true nearest ten, comparing {:.3} of the vectors",
+        right as f64 / 400.0,
+        compared as f64 / (40.0 * ROWS as f64)
+    );
+
+    // A row written between searches costs the index one vector's work.
+    let mut after_write = Vec::new();
+    for extra in 0..5 {
+        executor.insert_documents("docs", vec![row_of(ROWS + extra)]).unwrap();
+        let started = Instant::now();
+        ids(&format!("docs.{}", near(&query, "cosine", "")));
+        after_write.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    after_write.sort_by(f64::total_cmp);
+    println!("nearest 10 straight after a row is written: {:.2} ms", after_write[2]);
+    let mut after_write = Vec::new();
+    for extra in 5..10 {
+        executor.insert_documents("docs", vec![row_of(ROWS + extra)]).unwrap();
+        let started = Instant::now();
+        ids(&format!("docs.{}", near(&query, "l2", "")));
+        after_write.push(started.elapsed().as_secs_f64() * 1000.0);
+    }
+    after_write.sort_by(f64::total_cmp);
+    println!("  the same by distance, with no index: {:.1} ms", after_write[2]);
+}
+
+/// Six thousand vectors of sixteen numbers in sixty clumps: enough for an
+/// index to divide into lists, and small enough to compare all of them
+/// for the truth.
+fn clumps() -> Db {
+    let db = Db::open(TempDir::new().unwrap());
+    let schema = r#"schema docs { id: String, kind: String, embedding: Optional(Vector(16)), index(.embedding, metric: "cosine") }"#;
+    let report = execute_oql_file(&parse_oql_file(schema).unwrap(), &db.executor).unwrap();
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    for chunk in 0..6 {
+        let rows: Vec<owl_db::Fields> = (0..1000).map(|at| clump_row(chunk * 1000 + at)).collect();
+        db.executor.insert_documents("docs", rows).unwrap();
+    }
+    db
+}
+
+/// SplitMix64 of `seed`, as a number between -1 and 1.
+fn unit(seed: u64) -> f32 {
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    ((z ^ (z >> 31)) >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+}
+
+/// The vector of row `row`: its clump's centre, with a little of its own.
+fn clump_vector(row: usize) -> Vec<f32> {
+    let clump = (row % 60) as u64;
+    (0..16u64).map(|at| unit(clump * 1000 + at) + 0.2 * unit(1_000_000 + row as u64 * 16 + at)).collect()
+}
+
+fn clump_row(row: usize) -> owl_db::Fields {
+    let mut fields = owl_db::Fields::default();
+    fields.insert("id".to_string(), Value::String(format!("d{row:05}")));
+    fields.insert("kind".to_string(), Value::String(if row % 2 == 0 { "even" } else { "odd" }.to_string()));
+    fields.insert(
+        "embedding".to_string(),
+        Value::List(clump_vector(row).iter().map(|number| Value::Float(f64::from(*number))).collect()),
+    );
+    fields
+}
+
+/// A vector as it is written in a query. Plain decimals: OQL has no form
+/// for a number with an exponent, which is how a very small one prints.
+fn written(vector: &[f32]) -> String {
+    format!("[{}]", vector.iter().map(|number| format!("{number:.9}")).collect::<Vec<_>>().join(", "))
+}
+
+#[test]
+fn an_index_finds_the_nearest_among_a_fraction_and_exactly_when_asked() {
+    use owl_db::executor::last_vector_index_search;
+    let db = clumps();
+    let ids = |query: &str| db.column(query, "id");
+    let (mut right, mut wanted, mut compared) = (0usize, 0usize, 0usize);
+    for probe in 0..25usize {
+        // A vector near the middle of a clump, not one that is stored.
+        let query = written(&clump_vector(100_000 + probe * 7));
+        let near = |options: &str| {
+            format!(r#"nearest {{ field: .embedding, query: {query}, metric: "cosine", k: 10{options} }}.select {{ id, score: ._score }}"#)
+        };
+        // The truth: every row read and compared.
+        last_vector_index_search();
+        let truth = ids(&format!(r#"docs.where {{ .id != "" }}.{}"#, near("")));
+        assert!(last_vector_index_search().is_none());
+
+        // Asked to be exact, the index gives the same rows in the same
+        // order, having compared every vector and read ten rows.
+        let exact = db.rows(&format!("docs.{}", near(", exact: true")));
+        let did = last_vector_index_search().expect("answered from the index");
+        assert_eq!(did.held, 6000);
+        assert_eq!((did.compared, did.probed), (6000, did.lists));
+        assert!(did.lists > 1, "six thousand vectors are divided into lists");
+        let exact_ids: Vec<String> = exact.iter().map(|row| row.get_field("id").unwrap().to_string_repr()).collect();
+        assert_eq!(exact_ids, truth);
+
+        // Left to itself it compares an eighth, or a little over.
+        let found = ids(&format!("docs.{}", near("")));
+        let did = last_vector_index_search().expect("answered from the index");
+        assert!(did.compared < 6000 / 4, "compared {} of 6000", did.compared);
+        assert!(did.probed < did.lists);
+        right += truth.iter().filter(|id| found.contains(id)).count();
+        wanted += truth.len();
+        compared += did.compared;
+
+        // Told how many to compare, it compares about that many.
+        ids(&format!("docs.{}", near(", num_candidates: 200")));
+        let did = last_vector_index_search().unwrap();
+        assert!((200..600).contains(&did.compared), "compared {}", did.compared);
+    }
+    let recall = right as f64 / wanted as f64;
+    assert!(recall >= 0.97, "found {recall:.3} of the true nearest, comparing {} of 6000 a search", compared / 25);
+}
+
+#[test]
+fn an_index_is_kept_in_step_with_what_is_written() {
+    use owl_db::executor::last_vector_index_search;
+    let db = clumps();
+    let query = written(&clump_vector(100_003));
+    let exact = format!(r#"nearest {{ field: .embedding, query: {query}, metric: "cosine", k: 12, exact: true }}.select {{ id }}"#);
+    let same = |db: &Db, held: usize| {
+        last_vector_index_search();
+        let by_row = db.column(&format!(r#"docs.where {{ .id != "" }}.{exact}"#), "id");
+        let by_index = db.column(&format!("docs.{exact}"), "id");
+        let did = last_vector_index_search().expect("answered from the index");
+        assert_eq!(did.held, held, "vectors the index holds");
+        assert_eq!(by_index, by_row);
+        by_index
+    };
+    let before = same(&db, 6000);
+
+    // The nearest row is deleted, the next loses its embedding, the third
+    // is moved far away, and a row is added at the very spot asked about.
+    db.rows(&format!(r#"docs.where {{ .id == "{}" }}.delete()"#, before[0]));
+    db.rows(&format!(r#"docs.where {{ .id == "{}" }}.update {{ embedding: null }}"#, before[1]));
+    db.rows(&format!(r#"docs.where {{ .id == "{}" }}.update {{ embedding: .embedding * -1 }}"#, before[2]));
+    db.rows(&format!(r#"docs.insert {{ id: "new", kind: "even", embedding: {query} }}"#));
+    let after = same(&db, 5999);
+    assert_eq!(after[0], "new");
+    for gone in &before[..3] {
+        assert!(!after.contains(gone), "{gone} is no longer among the nearest");
+    }
+
+    // Many more rows than there were, which divides the index again.
+    for chunk in 6..13 {
+        let rows: Vec<owl_db::Fields> = (0..1000).map(|at| clump_row(chunk * 1000 + at)).collect();
+        db.executor.insert_documents("docs", rows).unwrap();
+    }
+    same(&db, 12_999);
+
+    // Inside a transaction that has written, every row is read: the index
+    // knows nothing of what is not committed. Rolled back, nothing changed.
+    let transaction = db.store.begin_transaction().unwrap();
+    {
+        let _bound = db.store.bind_transaction(transaction).unwrap();
+        db.rows(r#"docs.where { .id == "new" }.delete()"#);
+        last_vector_index_search();
+        let inside = db.column(&format!("docs.{exact}"), "id");
+        assert!(last_vector_index_search().is_none(), "read row by row");
+        assert_ne!(inside[0], "new");
+    }
+    db.store.rollback_transaction(transaction).unwrap();
+    assert_eq!(same(&db, 12_999)[0], "new");
+
+    // Opened afresh, the index is built again from the rows.
+    let db = db.reopened();
+    assert_eq!(same(&db, 12_999)[0], "new");
+    // The index is the field's, for the metric it was declared with: by
+    // straight-line distance every vector is compared another way.
+    last_vector_index_search();
+    db.rows(&format!(r#"docs.nearest {{ field: .embedding, query: {query}, metric: "l2", k: 3 }}"#));
+    assert!(last_vector_index_search().is_none());
 }
